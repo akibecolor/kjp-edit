@@ -1,0 +1,33 @@
+node_modules/
+lib/
+dist/
+build/
+out/
+*.tsbuildinfo
+.eslintcache
+
+# Theia
+plugins/
+.theia/
+gen-webpack*.js
+
+# Electron / packaging
+applications/*/dist/
+*.asar
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Local env
+.env
+.env.local
