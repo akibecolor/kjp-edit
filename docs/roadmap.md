@@ -239,6 +239,54 @@ architecture.md D3 の実装。
 **完了条件:** 外出先のタブレットから、家のマシンで走っているエージェントの進捗を見て、
 差分をレビューして、承認できる。ターミナル権限は明示的に付与しない限り無い。
 
+## Phase 6: ビューアパネル
+
+設計は [viewer.md](viewer.md)。
+
+**⚠️ Markdown ビューアは Phase 3 に前倒しすべき。** エージェントを走らせ始めた瞬間から
+設計文書・計画・レポートが Markdown で*ストリームされて*くるので、
+それを読む手段が無いとエージェント統合が完成しない。
+残りのビューアは Phase 6 でよい。
+
+**Markdown（Phase 3 と同時）:**
+- **Streamdown (Apache-2.0)** をレンダラに。ストリーミング・未完成markdown処理・
+  `rehype-harden`・KaTeX・Shiki・Mermaid の配線が1依存で入る
+- **サンドボックス化された別オリジンのフレームで描画し、すべてサニタイズする**
+  （エージェント出力は半信頼。プロンプトインジェクションで `<img onerror=…>` が来る）
+- **`DiagramRenderer` インタフェースを最初から切る** — クライアント側 mermaid (v1) と
+  デーモン側 Kroki (v2) の2実装、共通のコンテンツハッシュSVGキャッシュ。
+  **クライアント側 mermaid を直結するとセカンダリのバンドルが維持不能になった時点で書き直しになる**
+- Shiki の代わりに **Monaco のトークナイザ再利用**をプロトタイプする（追加約0KB、
+  プレビューの色がエディタと完全一致）。先行事例が無いのでアイデア段階
+- `.excalidraw` パネル（**Excalidraw は MIT**）— 安く、効果が高く、エージェントが編集可能な図を書ける
+
+**ブラウザパネル（Phase 6）:**
+- 通常の Theia `ReactWidget` 内の **`<iframe>`**。`persist:preview` パーティションで
+  `X-Frame-Options` と CSP `frame-ancestors` を除去（**アプリ全体では絶対にやらない**）
+- **プレビューは別オリジン/サブドメインから配信する。交渉不可**
+  （Theia mini-browser の RCE アドバイザリが教訓）
+- **Eruda (MIT)** を注入して devtools パネル。デバイス「エミュレーション」はCSS 3サイズ
+  （desktop / 390×844 / ドラッグ可能）。**Vibe Kanban の実体がこれで、CDPではない**
+- 自前の要素ピッカー（~300行）: shadow-DOM オーバーレイ、`elementFromPoint`、
+  `{selector, outerHTML, computedStyles, boundingRect, screenshotDataURL, __source?}` →
+  エージェントの文脈へ。**stagewise は AGPLv3 なので採用しない**
+
+**その他のビューア（Phase 6、全部安い）:**
+- 画像/SVG（**SVG は `<script>` を運べるのでサンドボックスかDOMPurify**）
+- HTML → ブラウザパネルに流すだけ
+- ログ → xterm.js（デスクトップのみ。**必ず仮想化する**）
+- **CSV/Parquet/SQL → hyparquet + HighTable + squirreling（全部MIT、合計 ~50KB gz）**
+
+**後回し:** PDF（pdfjs-dist は展開69MB、モバイルで悪い）、Jupyter、WYSIWYG編集
+（**分割ペインプレビューの方がむしろ良い** — WYSIWYG→markdown の直列化が
+エージェントの編集に対してノイズだらけの diff を生む）。**tldraw は永久に使わない**（プロプライエタリ）。
+
+**Phase 7 候補（差別化要素）:** 人間とエージェントで**1つのブラウザを共有**する。
+エージェントが人間のログイン済みセッションを継承するので「エージェントが認証壁を越えられない」問題が消える。
+`connectOverCDP` で技術的には踏み固められているが、**OSSでやっているプロジェクトが無い。**
+危険が2つ: 同じタブの取り合い（→エージェントに専用ターゲットを与え人間が adopt する）と、
+クッキージャー共有がプロンプトインジェクションの増幅器になること（→プロジェクト単位の明示的オプトイン）。
+
 ---
 
 ## 意識しておくべきリスク

@@ -11,6 +11,7 @@
 | **D3** | レイアウトは**単一のコンテナツリー**。dock/pane の区別を作らない | Zed の分かりづらさの根本原因がこの非対称性 |
 | **D4** | エージェントは **ACP** 経由。デーモンがACPクライアントかつファンアウト点 | 35エージェントが既にネイティブ対応。CLIラッパ8個を書かない |
 | **D5** | セカンダリ（モバイル）は**ワークベンチを載せず別実装の軽量クライアント**にする | 縦積み折りたたみは Theia の設定では得られない。Jupyter が同じ道を試して撤回済み。Monaco のモバイル問題もこれで消える |
+| **D6** | ビューア（ブラウザ/Markdown）は **iframe 既定**。`WebContentsView` はタイル単位のオプトイン | ネイティブオーバーレイは D3 の単一ツリーと根本的に衝突する。iframe なら同一コンポーネントがセカンダリでも動く |
 
 ---
 
@@ -386,6 +387,60 @@ Theia 自身のドキュメントが正解を示している —
 （`@theia/collaboration` / Eclipse Open Collaboration Tools は**これではない。**
 Live Share 型の P2P ライブ*共有*プロトコルで、マルチクライアント対単一バックエンドではない。beta 警告付き。）
 
+## D6: ビューアパネル
+
+設計と根拠は [viewer.md](viewer.md)。要点だけ:
+
+**埋め込みブラウザは `<iframe>` を既定の描画経路にする。`WebContentsView` は
+タイル単位のオプトインな能力アップグレードにとどめる。**
+
+**なぜ D3 と衝突するのか:** `WebContentsView`（および deprecated な `BrowserView`）は
+**DOM に存在せず、常に最前面で、コンテナにクリップされない。**
+Electron でフルのブラウザを作ったチームは、この結果として
+**ドロップダウン・モーダル・ツールチップごとに別のビューを作り、
+main プロセスに Facebook Yoga でレイアウトエンジンを再実装した。**
+ドラッグ分割・タブ並べ替え・コマンドパレット・コンテキストメニューを持つ
+再帰的タイリングツリーは、この方式にとって最悪のケース。
+**任意のスクロール祖先にクリップするAPIは存在しない — 直せるバグではない。**
+
+iframe の唯一の弱点（X-Frame-Options / CSP `frame-ancestors` でブロックされる）は
+Electron 側で消せる — 専用の `persist:preview` パーティションで `onHeadersReceived` により
+該当ヘッダを除去する（**アプリ全体では絶対にやらない**。クリックジャッキング防御の無効化なので）。
+
+そして決定的な利点として、**iframe なら同一コンポーネントがセカンダリ（モバイル）でも動く。**
+この対称性は `WebContentsView` の単一機能より価値が高い。
+
+`WebContentsView` に昇格する価値があるのは、本物の `enableDeviceEmulation`、
+`setDevToolsWebContents` による本物の Chrome DevTools タイル、クロスオリジンの `capturePage`、
+エージェント用CDPが必要になったときだけ。その場合は
+**スプリッタドラッグ中・タブドラッグ中・オーバーレイが開いている間は `setVisible(false)`** を
+ハードルールにする。
+
+**Theia の既存資産と注意点:**
+- `@theia/mini-browser` は本物の Lumino ウィジェットで iframe ベース。オーバーレイ問題ゼロで正しくタイルされる。
+  **ただし公開されたRCEアドバイザリがあり、`{{uuid}}.mini-browser.{{hostname}}` による
+  オリジン分離は任意ではなく必須**
+- `@theia/preview` は **deprecated かつ npm 未公開**。Theia の markdown preview では Mermaid が描画されない
+- **theia#16275: `allow-same-origin` + `allow-scripts` の組み合わせにより
+  *browser* アプリでは webview がブロックされる（Electron では起きない）。
+  この非対称性は2クライアント設計を刺すので早めに確認する**
+
+**Markdown レンダラは自作する（Theia/VS Code のものを使わない）。**
+両方とも*ファイル指向*でストリーミングの概念を持たないが、
+**我々の主要ユースケースはまさにそれ — エージェントは設計文書やレポートをストリームする。**
+実装は **Streamdown (Apache-2.0)** に乗る（remark/rehype + GFM + 未完成markdown処理 +
+`rehype-harden` + KaTeX + Shiki + Mermaid の配線が1依存で入る）。
+
+⚠️ **エージェントの出力は半信頼。** プロンプトインジェクションでエージェントが
+`<img onerror=…>` を書き、それを我々が描画しうる。サニタイズし、
+**プレビューはサンドボックス化された別オリジンのフレームで描画する。**
+
+⚠️ **Mermaid の描画場所は Markdown パネルを書く前に決める。**
+~1.5〜2.7MB で DOM を要求し、動的ESMインポートが Electron のパッケージングと喧嘩し、
+**軽量なはずのセカンダリを軽量でなくする張本人。**
+プラガブルな `DiagramRenderer` インタフェース（クライアント側 mermaid / デーモン側 Kroki）を
+最初から設計し、両方が同じコンテンツハッシュSVGキャッシュに供給する形にしておく。
+
 ## Monaco のタッチ非対応の実レベル（プライマリには影響しない）
 
 セカンダリが Monaco を使わないので設計上の争点ではなくなったが、
@@ -417,6 +472,10 @@ GitLab は Monaco製 Web IDE で壁に当たり、モバイル用に Ace ベー�
 | レイアウト | Lumino（`ApplicationShell` サブクラス化）。非Theia案は dockview 7.x | D3参照 |
 | エディタ（プライマリ） | Monaco（Theia同梱） | セカンダリは Monaco を使わないので争点にならない（D5） |
 | セカンダリクライアント | 別実装。`<details>` アコーディオン + `@git-diff-view/react` (MIT) + `anser` (MIT) | [secondary-client.md](secondary-client.md)。**xterm.js をログビューアに使わない**（ページのスクロールコンテナと喧嘩する） |
+| ブラウザパネル | **`<iframe>`** + `persist:preview` でヘッダ除去 + **Eruda** (MIT) で devtools + CSS 3サイズ | [viewer.md](viewer.md)。Vibe Kanban の「devtools内蔵ブラウザ」の実体がこれ（CDPではない） |
+| 要素ピッカー | **自作**（~300行） | **stagewise は AGPLv3 なので使わない**（IDE全体をAGPLに強制する）。技術だけ借りる: `__source` (click-to-component/MIT)、shadow-DOM 分離の考え方 |
+| Markdown | **Streamdown** (Apache-2.0) + KaTeX (MIT) + Mermaid (MIT, 遅延) + Excalidraw (MIT) | **tldraw は使わない**（SDK 4.0以降プロプライエタリ、商用 年$6,000/チーム）。**PlantUML はバンドルしない**（GPL系、Kroki経由でHTTP） |
+| データビューア | **hyparquet + HighTable + squirreling**（全部MIT） | **合計 ~50KB gz で CSV + Parquet + SQL。** duckdb-wasm は数MBのwasmなので過剰 |
 | ターミナル | `@xterm/xterm` 6 + `@xterm/addon-webgl` | v6でcanvasレンダラ削除。DEC mode 2026同期出力がTUIのちらつきに効く |
 | PTY | node-pty、長寿命セッションは tmux/abduco でバック | VS Code と同じもの。Windows は ConPTY のみ |
 | git | `git` シェルアウト + `core.commitGraph` | 構成上正しく、gitの最適化を全部継承、ABI地獄なし |
