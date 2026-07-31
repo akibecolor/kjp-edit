@@ -12,6 +12,7 @@
 | **D4** | エージェントは **ACP** 経由。デーモンがACPクライアントかつファンアウト点 | 35エージェントが既にネイティブ対応。CLIラッパ8個を書かない |
 | **D5** | セカンダリ（モバイル）は**ワークベンチを載せず別実装の軽量クライアント**にする | 縦積み折りたたみは Theia の設定では得られない。Jupyter が同じ道を試して撤回済み。Monaco のモバイル問題もこれで消える |
 | **D6** | ビューア（ブラウザ/Markdown）は **iframe 既定**。`WebContentsView` はタイル単位のオプトイン | ネイティブオーバーレイは D3 の単一ツリーと根本的に衝突する。iframe なら同一コンポーネントがセカンダリでも動く |
+| **D7** | **アカウント登録なしでプライマリが完全に動く。** 認証はリモートアクセスをオプトインした時だけ現れる | ユーザ登録を嫌う層を排除しない。OSSローカルファーストツールとして譲れない線 |
 
 ---
 
@@ -164,14 +165,64 @@ Obsidian の `workspace.json` と同じ。**レイアウトは継続的に永続
 変更ごとに書き直す。**クライアント（デバイス）毎に別のレイアウトを保存する** — D2の通り、
 レイアウトは共有しない。
 
-### 実装ライブラリ
+### 実装ライブラリと Theia の実態（S1 調査済み）
 
-Theia ベースなら **Lumino DockPanel** が既にこのモデルの大部分を提供する。
-ただし `ApplicationShell` の left/right サイドパネルは `'single-document'` モードで分割不可なので、
-**ルール3（すべて同一ツリー）を満たすには `ApplicationShell` をサブクラス化して
-左右エリアも `TheiaDockPanel` の `'multiple-document'` にする必要がある。**
-これは Theia の DI で公式にサポートされた拡張点（コアサービスの rebind とシェルのサブクラス化）だが、
-**どれだけの改変で済むかは Phase 0 のスパイクで測る。**
+ソース調査の詳細は [spikes.md](spikes.md)。**設計に効く3点だけ:**
+
+**◎ ルール1（ズーム）は Theia に既に実装されている。**
+`ApplicationShell.doToggleMaximized` が親の `SplitLayout` から detach し、
+`(index, stretch, relativeSizes)` を記憶し、`position:fixed; z-index:2000` の
+`maximizedElement` に attach し、トグルで `setRelativeSizes(sizes)` で厳密復元する。
+**「1ノードに対する可逆なジオメトリ交換、どこのサイズにも触らない」は Theia の既存戦略そのもの。**
+`maximizedElement` + `unmaximize` が `zoomedNodeId` のホストとして既にあり、両方 `protected`。
+**広げるべきは `canToggleMaximized`/`toggleMaximized` のゲート2つだけ**
+（現在 `main`/`bottom` のみ・エリア単位のみ）。両方 `public` なのでサブクラスで自明に外せる。
+関連 issue [#14511](https://github.com/eclipse-theia/theia/issues/14511) が open で競合PRも無い。
+
+**○ シェルのサブクラス化は公式に可能。** `@theia/toolbar` が in-tree で
+`rebind(ApplicationShell).toService(...)` + `createLayout()` オーバーライドを**約95行**でやっている。
+全レイアウトメソッドが `protected` で、`createLayout` の JSDoc が
+「メインエリアとサイドパネルの配置を変えるにはこのメソッドをオーバーライドせよ」と招待している。
+68ファイルの `@inject(ApplicationShell)` は全部トークン解決なので**呼び出し側の変更ゼロ。**
+（制約: クラスがトークンなので**サブクラスのみ**、ゼロから書いたシェルは型が合わない。
+そして `@theia/toolbar` が既に rebind スロットを占有している。）
+
+**× ルール3（すべて同一ツリー）には硬いブロッカーが2つあり、サブクラスからは届かない:**
+
+1. **`ApplicationShell.Area` は閉じた string-literal union**
+   （`'main'|'top'|'left'|'right'|'bottom'|'secondaryWindow'`）で、リストが `isValidArea` に
+   2度ハードコードされ、`addWidget` の `switch` は `default: throw new Error('Unexpected area')`。
+   **エクスポートされた型を111ファイルと `@theia/plugin-ext` が消費しているので外部から広げられない。**
+   Theia の公開APIは**エリアキーであってツリーキーではない**
+2. **`LayoutData` が非対称。** main/bottom は完全な `DockPanel.ILayoutConfig` ツリーを得るが、
+   **left/right は `expanded: boolean` 1個のフラットな `items[]`。分割されたサイドパネルは表現できない**
+   → レイアウトバージョンのバンプが強制される
+
+加えて **ルール5（focus parent）は今は表現不可能。**
+`focusParent` の出現はリポジトリ全体でゼロ。ナビゲーションは *エリア → タブバー → タブ* の平坦な3階層。
+コンテナツリーは `DockPanel` の内側にだけあり parent ポインタは非エクスポートの `Private` 名前空間。
+**そして `DockLayout` の内部ノードとシェル外側の `BoxLayout`/`SplitLayout` を跨ぐ共通ノード型が無い**
+（ツリー体系が2つある）。
+
+**→ 方針: ズームのゲート拡張（＝Zed 対策の本体）を先に取り、
+「完全な単一ツリー」は段階的に寄せる。** サイドパネルの `multiple-document` 化は
+`mode` の1行ではなく **`SidePanelHandler` のフォーク**として見積もる
+（`refresh()` の `selectWidget` が毎回選択を単一に引き戻し、`SideTabBar` が dock panel の外側にあるので
+タブUIが二重になり、`SidePanel.LayoutData` がツリーを保持できない）。
+
+**🆕 そして安い代替が 1.74 で登場した。** `PerspectiveService`（[#17832](https://github.com/eclipse-theia/theia/pull/17832)）
+が `getLayoutData()`/`setLayoutData()` で `LayoutData` を丸ごと差し替える公式の仕組みを提供し、
+`PerspectiveContribution` が拡張点になっている。**1.74 における公式の「別の配置を得る方法」は
+シェルのサブクラス化ではなくこれ。** spikes.md の S1 Step 8 でこれを評価し、
+perspectives + `WidgetAreaResolver` + 一般化した `doToggleMaximized` で要件が足りるなら
+サブクラス化は `createLayout` の変更だけに留める。
+
+Theia を採らない場合は **dockview 7.x**（MIT、ネスト+タイル内タブ+ポップアウト+
+真の maximize API を全部持つ唯一のライブラリ）の上に自前のコマンド層を載せる。
+あるいはコンテナツリーを完全に自作して **allotment**（VS Code の splitview/sash 由来なので
+リサイズ挙動が正しい）でサッシュだけ描く — ツリーモデル自体は400〜600行程度で、
+i3の意味論を「近似」ではなく「厳密に」得られ、直列化も自分のものになる。
+捨てるのは dockview のドラッグ&ドロップオーバーレイとポップアウト配線で、これが高価な20%。
 
 Theia を採らない場合は **dockview 7.x**（MIT、ネスト+タイル内タブ+ポップアウト+
 真の maximize API を全部持つ唯一のライブラリ）の上に自前のコマンド層を載せる。
@@ -241,7 +292,13 @@ research.md の G1: **コミットグラフ中心の履歴操作UIを持つツ�
 
 ### 実装方針
 
-**バックエンド:** `git` をシェルアウトする。
+**バックエンド:** `git` をシェルアウトする。**そして Theia には他の選択肢が無い**（S2 で確定）。
+`@theia/git` は 1.71 で完全に削除され（#17148）、`scm-backend-module.ts` は文字通り設定だけ。
+**git は connection-scoped なプラグインホスト内の `vscode.git` としてのみ存在し、
+バックエンドDIから呼べるサービスもRPC経路も無い。** headless プラグインからも到達できない
+（別のプラグインホストプロセスなので）。元々シェルアウトと決めていたので設計変更は不要だが、
+**`@theia/scm` の SCM ビューと Theia 1.71 のコミットDAGはプラグインホスト内の `vscode.git` に
+駆動されているので、我々の git エンジンとの共存方針を最初に決める**（並置するか、SCM ビューを置き換えるか）。
 `git log --topo-order --all -z --pretty=format:%H%x00%P%x00%an%x00%at%x00%s` を
 ストリームして逐次パース。`core.commitGraph` を有効化し `git commit-graph write` を打つ
 （10万コミット超の走査に対する単独最大の効果）。
@@ -380,12 +437,68 @@ Theia 自身のドキュメントが正解を示している —
 その内部で Theia の注入済みサービス（`FileService`、terminal、SCM、task、LSPプロキシ）を
 通常の Inversify DI で消費する。** Theia のサービス実装は使うが、そのワイヤフォーマットには依存しない。
 
+**S2 で確定した裏付け:** `BackendApplicationContribution` の JSDoc が
+「Express アプリを起動前に設定するために使う。**例えば追加のエンドポイントを提供するため**」と明言し、
+`server.setMaxListeners(0)` に `/* Allow any number of websocket servers. */` というコメントが付いている。
+そして **`@theia/ai-mcp-server` が in-tree の実証** — MCP の `StreamableHTTPServerTransport` 丸ごとを
+Theia 自身の Express アプリに乗せている。
+`DiskFileSystemProvider` / `IShellTerminalServer` / `ProcessManager` / `TaskServer` は
+**バックエンドrootのシングルトンなのでフロントエンドがゼロでも `@inject` で直接使える。**
+
+**🎯 デーモンが存在する理由の最も強い実証（S2 Step 6-3 で観察できる）:**
+ターミナルIDはブラウザの localStorage に住んでいる。別のブラウザから開くと
+**プロセスは生きているのに誰もそのIDを知らないのでターミナルが見えない。**
+この登録簿をデーモンが所有する必要がある。
+（副作用: `IShellTerminalServer.attach(id)` は**所有権チェックを一切しない**ので、
+どのクライアントでも他のクライアントのターミナルにアタッチできる。
+「スマホがデスクトップのターミナルにアタッチする」には機能だが、意図的に決めること。）
+
+⚠️ **1.74 の新しいゲートに注意:** ブラウザデプロイでは `theia-connection-token` の
+`SameSite=Strict; HttpOnly` クッキーと same-origin 検証が WS upgrade に強制される（#17701）。
+**ネイティブのモバイルクライアントは先にHTTP GETでクッキーを拾わない限り Theia の
+socket.io を話せない → 自前のプレーンWSプロトコルを持つ実質的な論拠。**
+ただし**自前の `/api/v0/ws` は `WsRequestValidator` を完全にバイパスする = 既定で認証が無い。そこは自分の責任。**
+
 足場として **`@theia/plugin-ext-headless`** がある。ここのプラグインは、フロントエンド接続毎に
 ホストを起こす `@theia/plugin-ext` と違って**全フロントエンドで共有される1つの
 バックエンドホストプロセスに住む** — まさに必要なスコープで、公式の意図もそう書かれている。
+ただし**APIサーフェスは意図的にほぼ空**（`theia.*` 名前空間も contribution point も無い）なので、
+**自分のコードをバックエンドに置きたいだけなら素の `BackendApplicationContribution` の方が圧倒的に安い。**
+headless プラグインは*第三者*にデーモンを拡張させたくなったときの手段。
+
+⚠️ **プラグインホストは接続毎なので、フロントエンドが増えるたびに
+全VS Code拡張と言語サーバのコピーが1式増える。**（#10526, #6412）
+ワークベンチ + 軽量モバイルクライアントには問題ないが、
+**モバイルクライアントがプラグインホストを必要とする設計にしてはいけない**（D5 と一致）。
 
 （`@theia/collaboration` / Eclipse Open Collaboration Tools は**これではない。**
 Live Share 型の P2P ライブ*共有*プロトコルで、マルチクライアント対単一バックエンドではない。beta 警告付き。）
+
+## D7: サインアップ不要 — プライマリはアカウントなしで完全に動く
+
+**プライマリを使うのにアカウント作成・ログイン・サーバ通信を一切要求しない。**
+認証が登場するのは、ユーザが自分でリモートアクセスを有効にしたときだけ。
+
+これは実は他の判断から自然に達成される:
+
+| 認証を要求しそうな箇所 | なぜ要らないか |
+|---|---|
+| **エージェント** | D4 で **ユーザ自身の CLI バイナリをサブプロセス起動**すると決めた（Agent SDK を埋め込むと Anthropic のポリシーで APIキー強制になるため）。認証はユーザの `~/.claude` に留まり、我々は一切知らない |
+| **リモートアクセス** | デーモンは `127.0.0.1` のみにバインドする。ローカルだけで使うなら露出もトンネルも認証も不要。Tailscale / OIDC は**リモートを有効にしたときだけ**登場する |
+| **拡張機能** | Open VSX は匿名で読める |
+| **セカンダリのペアリング** | QRに鍵材を載せる方式なので、我々のサーバにアカウントを作る必要がない。リレーを使わない `tailscale serve` 経路も並置する |
+| **テレメトリ** | 送らない |
+
+**帰結として設計に課す制約:**
+
+1. **初回起動でネットワークに触らない。** ライセンス確認もバージョンチェックも更新通知も、
+   初回起動をブロックしない（オプトインの後で、明示的に）
+2. **リモート関連のUIは既定で畳んでおく。** 「リモートを有効にする」を押すまで
+   トンネル設定・トークン・ペアリングQRは出てこない
+3. **ホスト型リレーを必須にしない。** [secondary-client.md](secondary-client.md) で
+   Nimbalyst 方式の暗号化リレーを推したが、**`tailscale serve` 経路を対等な選択肢として並置する** —
+   「どこかのSaaSに登録しないとスマホから見られない」を作らない
+4. **セカンダリを使わない人が損をしない。** セカンダリ用のコード・依存はプライマリのバンドルに入れない
 
 ## D6: ビューアパネル
 

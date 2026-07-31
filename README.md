@@ -32,6 +32,7 @@
 | [docs/secondary-client.md](docs/secondary-client.md) | モバイル/セカンダリ設計 — Monaco のタッチ非対応の実レベル、Theia のモバイル状況、先行事例が収束したUIパターン |
 | [docs/viewer.md](docs/viewer.md) | ビューアパネル — 埋め込みブラウザ（iframe vs WebContentsView）、リッチMarkdown、図、データビューア |
 | [docs/roadmap.md](docs/roadmap.md) | 検証スパイクと段階的な実装計画 |
+| [docs/spikes.md](docs/spikes.md) | **Phase 0 スパイクの実施手順** — Theia 1.74.0 のソースを読んで確定したファイルパス・DIシンボル・コードスケッチ付き |
 
 ## 現在の状態
 
