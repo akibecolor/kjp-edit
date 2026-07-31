@@ -28,7 +28,8 @@
 | | |
 |---|---|
 | [docs/research.md](docs/research.md) | 実現可能性調査 — ベース候補の比較、部品の棚卸し、先行事例とギャップ分析 |
-| [docs/architecture.md](docs/architecture.md) | 設計 — デーモン/クライアント分離、レイアウトツリー、リモート、セキュリティ |
+| [docs/architecture.md](docs/architecture.md) | 設計 — D1〜D5 の判断、レイアウトツリー、リモート、セキュリティ |
+| [docs/secondary-client.md](docs/secondary-client.md) | モバイル/セカンダリ設計 — Monaco のタッチ非対応の実レベル、Theia のモバイル状況、先行事例が収束したUIパターン |
 | [docs/roadmap.md](docs/roadmap.md) | 検証スパイクと段階的な実装計画 |
 
 ## 現在の状態
