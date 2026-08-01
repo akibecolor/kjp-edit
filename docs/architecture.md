@@ -6,7 +6,7 @@
 
 | # | 判断 | 一行の理由 |
 |---|---|---|
-| **D1** | コアは**ヘッドレスデーモン**。ローカルUIもリモートUIも同じプロトコルを話す対等なクライアント | 「リモートモード」を作らない。クライアントは1種類だけ作り、ローカルUIをクライアント#1にする |
+| **D1** | コアは**ヘッドレスデーモン**。**クライアント2種・トランスポート2種・権威1つ** | プライマリは Theia の socket.io、kjp 固有機能とセカンダリは `/api/v0`。権威はFS・git・**ターミナルIDレジストリ**（デーモンが存在する最大の理由） |
 | **D2** | 状態は**サーバ権威**。CRDTは使わない | ファイルシステムは物理的に1つしかない。調停するものが無い |
 | **D3** | レイアウトは**単一のコンテナツリー**。dock/pane の区別を作らない | Zed の分かりづらさの根本原因がこの非対称性 |
 | **D4** | エージェントは **ACP** 経由。デーモンがACPクライアントかつファンアウト点 | 35エージェントが既にネイティブ対応。CLIラッパ8個を書かない |
@@ -23,7 +23,7 @@
   ┌───────────────────────────────────────────────────────────┐
   │  kjp-core デーモン（長寿命・すべてのUIより長く生きる）        │
   │   ・ワークスペース/worktree レジストリ + git エンジン        │
-  │   ・ドキュメントモデル（開いているバッファ、dirty状態）← 権威 │
+  │   ・ターミナルID レジストリと所有権 ← 権威                   │
   │   ・イベントバス → N購読者へファンアウト                    │
   │   ・エージェントスーパバイザ（ACPクライアント、worktree毎）  │
   │   ・LSP スーパバイザ                                       │
@@ -139,8 +139,9 @@ VS Code の重複排除・除外・サスペンド/ポーリング設計をそ�
 |---|---|
 | **プレゼンス** | 全クライアントが「他にどのクライアントが繋がっているか」を見られる |
 | **レイアウトは共有しない** | セカンダリにプライマリのタブ構成をミラーさせない。**「同じ環境」とは「同じ共有ワークスペース状態 + クライアント毎のアクティブビュー」**を意味する。さもないとスマホを使うとデスクトップが勝手に動く。そもそも3画面デスクトップとタブレットは違うレイアウトが欲しい |
-| **共有される状態** | ファイルシステム、git状態、worktree、開いているバッファの内容とdirty状態、ターミナルセッション、エージェントセッションとその出力 |
-| **書き込みリース** | バッファ毎にソフトリース、worktree毎にハードリース。**gitの変更操作（rebase / merge / branch操作）は例外なく worktree の排他ロックを取る** |
+| **共有される状態** | ファイルシステム、git状態、worktree、ターミナルセッション、エージェントセッションとその出力。🛑 **バッファ内容と dirty 状態はフロントエンド毎**（D1 の訂正参照 — `FileService` はフロントエンド専用で dirty は Theia の `saveableService`/Monaco モデルに住む） |
+| **書き込みリース** | **worktree毎にハードリース。gitの変更操作（rebase / merge / branch操作）は例外なく worktree の排他ロックを取り、read→decide→write を跨いで保持する**（GitButler の postmortem「リポジトリ変更に DB セマンティクスが必要」）。~~バッファ毎のソフトリース~~ は**セカンダリにエディタを持たせないので消費者が居ない → v1 スコープ外** |
+| **ターミナルの所有権** | 🛑 **`IShellTerminalServer.attach(id)` は所有権チェックを一切しない**ので、Theia の RPC 経路にいる限りリースは強制不能。**Phase 3 で `IShellTerminalServer` を kjp-core のガード背後に rebind し、IDレジストリ・所有権・リース・リモートのシェル起動 capability を kjp-core が持つ。** ワイヤプロトコルに `ProcessManager` の整数IDを出さない（推測不能なハンドルにする） |
 | **ターミナルのアタッチ** | 閲覧者はN人可。ただし**入力は排他とし、明示的な takeover が必要**（tmux の非共有モードと同じ）。さもないとキーストロークが交互に混ざる |
 | **インテントは冪等かつバージョン付き** | 再接続してリプレイしたときにコミットやマージが二重適用されないように |
 
@@ -158,7 +159,10 @@ CRDTを基盤にすると、git・ターミナル・エージェントプロセ�
 
 ## D3: レイアウト — 単一コンテナツリー
 
-**これが差別化の核であり、Zed への直接の回答。**
+🛑 **差別化の第一位ではありません**（決定2 で降ろし、R2-2 でさらに縮小）。
+**Zed の具体的な不満への回答**として、VS Code が構造的にできない2点
+（非エディタタイルの leaf 粒度ズーム / 単独グループのズーム）に絞ります。
+**ルール3（単一ツリー）とルール5（focus parent）は降ろしました。**
 
 ### モデル
 
@@ -366,7 +370,8 @@ research.md の G1: **コミットグラフ中心の履歴操作UIを持つツ�
 ### 実装方針
 
 **バックエンド:** `git` をシェルアウトする。**そして Theia には他の選択肢が無い**（S2 で確定）。
-`@theia/git` は 1.71 で完全に削除され（#17148）、`scm-backend-module.ts` は文字通り設定だけ。
+`@theia/git` は **1.70.0** で完全に削除され（#17148、milestone 1.70.0）、
+`scm-backend-module.ts` は文字通り設定だけ。
 **git は connection-scoped なプラグインホスト内の `vscode.git` としてのみ存在し、
 バックエンドDIから呼べるサービスもRPC経路も無い。** headless プラグインからも到達できない
 （別のプラグインホストプロセスなので）。元々シェルアウトと決めていたので設計変更は不要だが、
@@ -598,11 +603,19 @@ main プロセスに Facebook Yoga でレイアウトエンジンを再実装し
 **任意のスクロール祖先にクリップするAPIは存在しない — 直せるバグではない。**
 
 iframe の唯一の弱点（X-Frame-Options / CSP `frame-ancestors` でブロックされる）は
-Electron 側で消せる — 専用の `persist:preview` パーティションで `onHeadersReceived` により
-該当ヘッダを除去する（**アプリ全体では絶対にやらない**。クリックジャッキング防御の無効化なので）。
+🛑 **訂正済み**（[viewer.md](viewer.md) A3）: **`persist:preview` は素の `<iframe>` には使えません**
+（`partition` は webContents のプロパティで、iframe は親のセッションを使う）。
+**ヘッダ書き換えはデーモン側リバースプロキシで行う。**
+これで Electron のセッションを改変せず、**ブラウザプライマリとセカンダリでも同じ挙動になる**。
+以下は旧記述: ~~Electron 側で消せる — 専用の `persist:preview` パーティションで `onHeadersReceived` により
+該当ヘッダを除去する（アプリ全体では絶対にやらない）。~~
 
-そして決定的な利点として、**iframe なら同一コンポーネントがセカンダリ（モバイル）でも動く。**
-この対称性は `WebContentsView` の単一機能より価値が高い。
+そして **iframe を既定にする本来の理由は D3 との衝突回避**（`WebContentsView` は DOM に無く
+常に最前面でコンテナにクリップされない）で、これは無傷です。
+**加えてヘッダ書き換えをデーモン側プロキシに移したことで、
+「同一コンポーネントがセカンダリでも動く」も部分的に本当になります** —
+ただし共有されるのは **framework 非依存の `<iframe>` ラッパと Markdown レンダラ**であって
+`ReactWidget` ではありません（D5 でセカンダリは別実装なので）。
 
 `WebContentsView` に昇格する価値があるのは、本物の `enableDeviceEmulation`、
 `setDevToolsWebContents` による本物の Chrome DevTools タイル、クロスオリジンの `capturePage`、
@@ -622,8 +635,18 @@ Electron 側で消せる — 専用の `persist:preview` パーティション�
 **Markdown レンダラは自作する（Theia/VS Code のものを使わない）。**
 両方とも*ファイル指向*でストリーミングの概念を持たないが、
 **我々の主要ユースケースはまさにそれ — エージェントは設計文書やレポートをストリームする。**
-実装は **Streamdown (Apache-2.0)** に乗る（remark/rehype + GFM + 未完成markdown処理 +
-`rehype-harden` + KaTeX + Shiki + Mermaid の配線が1依存で入る）。
+🛑 **実装は決定1 で変更しました。`markdown-it@14` + `remend`（Apache-2.0、string→string、
+依存ゼロ）+ VS Code の `ParagraphBuffer`/rAF morpher 移植（MIT、~200行）で合計 ~250-300行。**
+理由: **Streamdown は `mermaid` をハード実行時依存に持ち、これは自分で
+「最大の技術リスク」と書いた直結そのもの**でした。かつ KaTeX を含まず、Shiki は devDep のみ、
+`marked ^17` 依存で `rehype-raw` により生HTMLが有効。詳細は [decisions.md](decisions.md) 決定1。
+
+以下は旧記述: ~~実装は **Streamdown (Apache-2.0)** に乗る（remark/rehype + GFM + 未完成markdown処理 +
+`rehype-harden` + KaTeX + Shiki + Mermaid の配線が1依存で入る）。~~
+
+⚠️ **`markdown-it` の唯一の実在する穴は `highlight` オプション**で、
+fence ルールがハイライタの戻り値を**生で挿入**します（XSS が実証済み）。
+Shiki を繋ぐならエスケープは我々の責任。`validateLink` も blocklist なので **allowlist に上書き**する。
 
 ⚠️ **エージェントの出力は半信頼。** プロンプトインジェクションでエージェントが
 `<img onerror=…>` を書き、それを我々が描画しうる。サニタイズし、
@@ -666,9 +689,9 @@ GitLab は Monaco製 Web IDE で壁に当たり、モバイル用に Ace ベー�
 | レイアウト | Lumino（`ApplicationShell` サブクラス化）。非Theia案は dockview 7.x | D3参照 |
 | エディタ（プライマリ） | Monaco（Theia同梱） | セカンダリは Monaco を使わないので争点にならない（D5） |
 | セカンダリクライアント | 別実装。`<details>` アコーディオン + `@git-diff-view/react` (MIT) + `anser` (MIT) | [secondary-client.md](secondary-client.md)。**xterm.js をログビューアに使わない**（ページのスクロールコンテナと喧嘩する） |
-| ブラウザパネル | **`<iframe>`** + `persist:preview` でヘッダ除去 + **Eruda** (MIT) で devtools + CSS 3サイズ | [viewer.md](viewer.md)。Vibe Kanban の「devtools内蔵ブラウザ」の実体がこれ（CDPではない） |
+| ブラウザパネル | **`<iframe>`** + **デーモン側プロキシでヘッダ書き換え** + **Eruda** (MIT) で devtools + CSS 3サイズ | [viewer.md](viewer.md)。Vibe Kanban の「devtools内蔵ブラウザ」の実体がこれ（CDPではない）。⚠️ `persist:preview` パーティションは iframe に使えない（訂正済み） |
 | 要素ピッカー | **自作**（~300行） | **stagewise は AGPLv3 なので使わない**（IDE全体をAGPLに強制する）。技術だけ借りる: `__source` (click-to-component/MIT)、shadow-DOM 分離の考え方 |
-| Markdown | **Streamdown** (Apache-2.0) + KaTeX (MIT) + Mermaid (MIT, 遅延) + Excalidraw (MIT) | **tldraw は使わない**（SDK 4.0以降プロプライエタリ、商用 年$6,000/チーム）。**PlantUML はバンドルしない**（GPL系、Kroki経由でHTTP） |
+| Markdown | 🛑 **決定1 で変更: `markdown-it@14` + `remend`（Apache-2.0）+ 自前ストリーミング層 ~250-300行** + KaTeX (MIT) + Mermaid (MIT, `DiagramRenderer` 経由) + Excalidraw (MIT) | ~~Streamdown~~ は **`mermaid` をハード依存に持ち KaTeX を含まない**ので却下（[decisions.md](decisions.md) 決定1）。`markdown-it` は `@theia/core` 経由で既にツリーにある。**tldraw は使わない**（v5 でプロプライエタリ、本番利用はライセンスキー必須）。**PlantUML はバンドルしない**（GPL系、Kroki経由でHTTP） |
 | データビューア | **hyparquet + HighTable + squirreling**（全部MIT） | **合計 ~50KB gz で CSV + Parquet + SQL。** duckdb-wasm は数MBのwasmなので過剰 |
 | ターミナル | `@xterm/xterm` 6 + `@xterm/addon-webgl` | v6でcanvasレンダラ削除。DEC mode 2026同期出力がTUIのちらつきに効く |
 | PTY | node-pty、長寿命セッションは tmux/abduco でバック | VS Code と同じもの。Windows は ConPTY のみ |

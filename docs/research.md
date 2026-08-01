@@ -57,7 +57,10 @@ VS Code の「View は sidebar/panel に固定」という制約が無い。タ�
 「SCMビューコンテナ内に完全に描画されたコミットDAG」— ブランチのレーン線、
 重複排除された ref バッジ、ページング可能なグラフモデル、線形/マージ/分岐/オクトパス/兄弟トポロジを
 カバーするDAGレーン計算、VS Code互換 `SourceControlHistoryProvider` プラグインAPI。
-同 1.71 で `@theia/git` は削除され、git は完全に VS Code 組み込み git 拡張が担う。
+**1.70.0** で `@theia/git` は削除され（#17148）、git は VS Code 組み込み git 拡張が担う。
+⚠️ **ただし決定3 でその `vscode.git` をビルドから除外すると決めたので、
+この節が挙げている「アプリ内コミットグラフ」は自前実装になる**
+（[s0-verification.md](s0-verification.md) / [decisions.md](decisions.md) 決定3）。
 
 **browser / electron デュアルターゲット:** 単一モノレポで `"theia": { "target": "browser" }` と
 `"electron"` の2つの薄いアプリパッケージだけが違う。browser ターゲットは
@@ -74,7 +77,7 @@ InversifyJS DI 経由でコア内部にフルアクセスできる。**コアサ
 `packages/` に既に `ai-claude-code`, `ai-chat`, `ai-mcp`, `ai-terminal`, `terminal-manager`,
 `secondary-window`, `collaboration`, `remote`, `dev-container`, `scm`, `navigator` がある。
 
-**出発点:** `eclipse-theia/theia-blueprint` は **MIT** で、明示的に
+**出発点:** `eclipse-theia/theia-ide` は **MIT** で、明示的に
 「Eclipse Theia プラットフォームベースのデスクトップ製品を作るためのテンプレート」。
 electron-app + browser-app + ブランディング拡張 + インストーラパッケージングを含む。
 
@@ -127,7 +130,12 @@ VS Code エコシステム完全互換がレイアウト自由度より重要な
 
 ## 2. 部品の棚卸し
 
-### レイアウト — 最重要かつ差別化の核
+### レイアウト（🛑 当初「最重要かつ差別化の核」と書いたが、決定2 で第一位から降ろした）
+
+**降ろした理由:** `Area` が閉じた union で111ファイルが消費、`LayoutData` が非対称
+（＝コアのフォークが必要）、そして **VS Code が `toggleMaximizeEditorGroup` で
+leaf 粒度・バイト単位復元・サイドバー維持を既に出荷している**。
+現在の差別化は [s0-verification.md](s0-verification.md) を参照。以下は調査記録として残します。
 
 | ライブラリ | 版/日付 | ライセンス | サイズ(gz) | ネスト | タイル内タブ | ドラッグ分割 | ポップアウト | 直列化 | 最大化 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -708,7 +716,7 @@ opencode のサーバモード、Vibe Kanban のローカル Rust/axum サーバ
 |---|---|
 | **Theia Electron + 共有バックエンドで2台目デバイス** | 文書化されていないトポロジ。Electron ターゲットは自身のバックエンドをエフェメラルな localhost ポートで起動し、それを2台目に公開するのは文書化された経路ではない。**クリーンな設計は「browser バックエンドをプライマリプロセスとして走らせ、Electronアプリと2台目のブラウザの両方をそのクライアントにする」だが、この正確なトポロジを是認する公式文書は見つからなかった。→ Phase 0 スパイク必須** |
 | **Theia SCM History Graph の品質と性能** | 機能が出荷されていることと何を主張しているかはリリースノートで確認したが、**実際に動かしていない**。5万コミットのリポジトリでレーンが受容可能に描画されるか要検証 |
-| `theia-blueprint` とAI機能 | READMEは「AI機能を含まない」と言うが、Theia IDE *製品*は 2026-05 リリースで Theia AI/Coder を出荷している。READMEが古い可能性。実際の `electron-app/package.json` の依存を確認せよ |
+| `theia-ide` とAI機能 | READMEは「AI機能を含まない」と言うが、Theia IDE *製品*は 2026-05 リリースで Theia AI/Coder を出荷している。READMEが古い可能性。実際の `electron-app/package.json` の依存を確認せよ |
 | EPL-2.0 の正確な義務 | 「弱いファイル単位コピーレフト、クローズド製品はOK、Theiaファイルへの改変は公開義務」は標準的な解釈で法的助言ではない |
 | dockview の `LICENCE.md` | GitHub は `NOASSERTION` を報告する（`dockview-enterprise` の切り出しのため）。OSSパッケージは明確にMITだが、法務確認前に自分でファイルを読むこと |
 | node-pty の正確なライセンス文 | GitHub は "Other"、npm は MIT を報告 |
@@ -741,7 +749,7 @@ opencode のサーバモード、Vibe Kanban のローカル Rust/axum サーバ
 [AWSがOpen VSXを支援 (The Register)](https://www.theregister.com/2026/03/03/open_vsx_aws/) ·
 [VS Code forks landscape 2026 H1](https://www.vgtc.io/insights/vs-code-forks-ide-landscape-2026-h1) ·
 [eclipse-theia/theia](https://github.com/eclipse-theia/theia) ·
-[theia-blueprint](https://github.com/eclipse-theia/theia-blueprint) ·
+[theia-ide](https://github.com/eclipse-theia/theia-ide) ·
 [Theia 1.71 release notes](https://eclipsesource.com/blogs/2026/05/21/eclipse-theia-1-71-release-news-and-noteworthy/) ·
 [Theia community release 2026-05](https://eclipsesource.com/blogs/2026/06/19/the-eclipse-theia-community-release-2026-05/) ·
 [Theia ApplicationShell](https://deepwiki.com/eclipse-theia/theia/3.1-application-shell-and-layout) ·

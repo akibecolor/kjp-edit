@@ -1,5 +1,17 @@
 # 決定記録（2026-08-01）
 
+> 🛑 **この文書の後に第2回レビュー（[review-2.md](review-2.md)）と
+> S0 検証（[s0-verification.md](s0-verification.md)）が入り、決定2 と決定3 が更新されました。**
+>
+> | | 現在の状態 |
+> |---|---|
+> | **決定1**（Markdown = markdown-it + remend） | **有効。** 裏取りで実装コストが ~250-300行と確定 |
+> | **決定2**（G1 = グラフ + 履歴編集を第一位に） | **🛑 前提が否定された。** lazygit と GitUp が全項目実装済み。**差別化は「N worktree の並行エージェントに対する git 安全性 + 統合」に再定義**（[s0-verification.md](s0-verification.md)）|
+> | **決定3**（kjp-core が git を所有、`vscode.git` を除外） | **有効。** ただし ②の解釈は「グラフが選択面、変更操作は git をシェルアウト」で確定。**加えて `clash`（MIT）を依存として取り込み、コンフリクト予測は自作しない** |
+> | **決定4**（S0 を最優先に繰り上げ） | **完了。** S0 を実施した結果が上記 |
+>
+> ライセンスは **MIT で確定**（[licensing.md](licensing.md)）。
+
 [review-findings.md](review-findings.md) で「ユーザ決定事項」として上げた4件の決定と、
 決定後に実施した裏取り調査の結果。
 

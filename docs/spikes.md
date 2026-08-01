@@ -8,7 +8,7 @@ Theia **1.74.0**（2026-07-31リリース、`@lumino/widgets` 2.7.5 ピン）の
 | | 判定 | 一行 |
 |---|---|---|
 | **S1: シェルのサブクラス化** | **○ できる** | `@theia/toolbar` が in-tree で同じことをやっている（~95行）。全レイアウトメソッドが `protected` |
-| **S1: ズーム意味論** | **◎ 既に実装済み** | `doToggleMaximized` が D3 ルール1をそのままやっている。ゲートを広げるだけ |
+| **S1: ズーム意味論** | **△ 可逆な*エリア*交換のみ** | 🛑 当初「◎既に実装済み、ゲートを広げるだけ」と書いたのは**過大評価**。`doToggleMaximized` はエリア単位・全ウィンドウ固定オーバーレイ・比率サイズなので D3 ルール1/3/4 から外れる。**ノード単位・非オーバーレイ・非比率は自作。** かつ **VS Code は `toggleMaximizeEditorGroup` で leaf 粒度のこれを既に出荷している**（[review-2.md](review-2.md) R2-2） |
 | **S1: 単一統合ツリー** | **× 硬いブロッカー2つ** | `Area` が閉じた union、`LayoutData` が非対称。サブクラスからは届かない |
 | **S1: focus parent** | **× 今は表現不可能** | ツリー体系が2つあり共通ノード型が無い |
 | **S2: バックエンドを器にする** | **○ できる** | `@theia/ai-mcp-server` が in-tree の証拠。FS/ターミナル/タスクは root シングルトン |
@@ -136,14 +136,31 @@ export const bindToolbarApplicationShell = (bind, rebind, unbind): void => {
   モンキーパッチしている（拡張の継ぎ目が足りなかった証拠）
 - **Eclipse Che / che-theia: 検証済みでゼロ。** 全ツリーを grep して9行3ファイル、
   すべて素の `@inject(ApplicationShell)` 消費者。シェルを触っていない
-- **theia-blueprint: 検証済みでゼロ。** ブランディングと製品設定のみ
+- **theia-ide（旧 theia-blueprint）: 検証済みでゼロ。** ブランディングと製品設定のみ
 - **`examples/api-samples`: シェル/レイアウトのサンプルは無い。** `@theia/toolbar` が事実上のサンプル
 - ST / Samsung / TI / Arm / Google Cloud Shell はクローズドソースで確認不可
   （1.74 の changelog に TI と ST が貢献者として出てくるので、上流化が彼らの戦略と見える）
 
-## 1-B. ◎ ズーム意味論は既に実装されている
+## 1-B. △ ズーム: Theia には可逆な*エリア*交換がある（ルール1そのものではない）
 
-**これが今回最大の発見。** `application-shell.ts:2187-2237`:
+🛑 **訂正。** 当初この節を「◎ 既に実装されている / これが今回最大の発見」と書いたが**過大評価**でした
+（[review-2.md](review-2.md) R2-2、[architecture.md](architecture.md) D3 の訂正）。
+実装は3点でルール1〜4から外れます: **粒度がエリア単位**（単一タブでもサブsplitでもない）、
+**`position:fixed` の全ウィンドウオーバーレイに再親付け**（＝dock を丸ごと隠す）、
+**`relativeSizes()` を使う**（＝ルール4が禁じる比率モデル）。
+`unmaximize` は `parent`/`index`/`stretch`/`sizes` を**クロージャに持つ = ツリーの外**。
+
+**さらに VS Code が `workbench.action.toggleMaximizeEditorGroup` で
+leaf 粒度・バイト単位復元・サイドバー維持を既に出荷しています**
+（`gridview.ts:1542` が LeafNode 以外で throw、`exitMaximizedView()` のコメントが
+「previous size is cached … made visible in reverse order」と機構を明記）。
+**残る差分は「非エディタタイルのズーム」と「単独グループのズーム」の2点のみ。**
+
+**それでも流用できるものはあります** — `maximizedElement`、`unmaximize` スロット、
+`MAXIMIZED_CLASS`、`onDidToggleMaximized`、`core.toggleMaximized` と `alt+m`、
+`UnsafeWidgetUtilities.attach/detach`。以下は**その流用元としての**参考です。
+
+`application-shell.ts:2187-2237`:
 
 ```ts
 protected unmaximize: (() => void) | undefined;
@@ -196,7 +213,7 @@ this.maximizedElement.style.zIndex = '2000';
 - コマンド `core.toggleMaximized`、**キーバインド `alt+m`**
 - タブのダブルクリックで最大化（`workbench.tab.maximize` 設定）
 
-### 広げるべきゲート（2箇所だけ）
+### 広げるべきゲート2箇所（※これだけでは足りない — 上記の訂正参照）
 
 `:2162-2173`:
 ```ts

@@ -255,7 +255,9 @@ method/URL/headers/body を多重化フレームに直列化し、chunked レス
    クリップ・スクロール・リサイズ・スタッキングが**何の努力もなく正しく**動く。
    そして決定的に、**同一のコンポーネントがモバイルWebクライアントでも動く。**
    この対称性は `WebContentsView` の単一機能より価値がある
-2. Electron では専用の `persist:preview` パーティションで `onHeadersReceived` により
+2. 🛑 **訂正済み（A3 参照）: `persist:preview` は素の `<iframe>` には使えない。**
+   **デーモン側リバースプロキシでヘッダを書き換える。** 以下は旧記述:
+   ~~Electron では専用の `persist:preview` パーティションで `onHeadersReceived` により~~
    `X-Frame-Options` と CSP `frame-ancestors` を除去
 3. **Eruda (MIT)** をプレビュー対象ページに注入して devtools パネルにする。
    開発サーバのミドルウェア / プロキシのHTML書き換えで注入すればどのフレームワークでも動く
@@ -388,7 +390,7 @@ Copyright (c) 2014 - 2022 Knut Sveidqvist」。制限的ライセンスに変わ
 | | ライセンス | 判断 |
 |---|---|---|
 | **Excalidraw** | **MIT（確認済み）** | **採用。**ビューア*かつ*エディタで `.excalidraw` を扱え、**エージェントが編集可能な図を出力できる。** Nimbalyst が埋め込んでいるもの |
-| **tldraw** | **OSS ではない（確認済み）** | **使わない。** SDK 4.0 (2025-09) 以降プロプライエタリな「tldraw license」。GitHub上は source-available だが本番利用にはライセンスキーが必要。無料の趣味/非商用ライセンスは "made with tldraw" 透かしが出る。**商用は年 $6,000 USD/チーム**（公開の反発を招いた） |
+| **tldraw** | **OSS ではない（確認済み）** | **使わない。** SDK 4.0 (2025-09) 以降プロプライエタリな「tldraw license」。GitHub上は source-available だが本番利用にはライセンスキーが必要。無料の趣味/非商用ライセンスは "made with tldraw" 透かしが出る。商用は有料（⚠️ 「年$6,000/チーム」はライセンスページに無く**未確認**）。🛑 **訂正: v5 で、しかも 4.0 以降「透かし付きなら無料」ではなくなっている** — commit `e455ab83` で `Use the Software in your commercial or non-commercial projects` が削除され `Development Environments` のみに、条件が `Not to use the Software in **Production Environments**` に変更。**本番利用はライセンスキー必須** |
 | **PlantUML** | **未確認、かつこれは重要** | GPL系。**バンドルしない。** Kroki 経由でHTTPで消費する（プロセス境界）。出荷前に確認すること |
 | **D2** (Terrastruct) | **MPL-2.0** | 言語・CLI・dagre と ELK レイアウトエンジン・全テーマ・VS Code拡張が MPL-2.0。ファイル単位コピーレフトなので別バイナリ/wasm なら問題ない。**⚠️ `tala` レイアウトエンジンはプロプライエタリ** — 無料なのは dagre/ELK のみ |
 | **Graphviz** | **両方未確認** | `@hpcc-js/wasm-graphviz` がラップ。Graphviz コアは EPL/CPL系、hpcc-js は Apache-2.0。使用前に確認 |

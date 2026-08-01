@@ -3,25 +3,39 @@
 エージェント開発のための、OSS・ローカルファーストな統合開発環境。
 
 エディタ・ファイラ・ターミナル・**コミットグラフ**が1つのアプリに統合され、
-すべてのパネルが単一のレイアウトツリー上のタイルとして縦横に無限にネストできる。
-コアはヘッドレスデーモンなので、**同じ生きたセッションをデスクトップと別端末の両方から**開ける。
+パネルは縦横にネストできるタイルとして扱える。
+コアはヘッドレスデーモンなので、**同じワークスペース状態をデスクトップと別端末の両方から**扱える。
 エージェントは ACP (Agent Client Protocol) 経由で差し替え可能。
 
 ## なぜ作るのか
 
-エージェント開発の実務は「複数エージェントを並列に走らせ、それぞれの差分をレビューし、
-汚い履歴を人間がレビュー可能な形に整形して統合する」という作業だが、2026年8月時点で
-これを1つのアプリで完結できるツールは存在しない。
+**「N 個のエージェントが N 個の git worktree で並行に動く」ことを前提にした
+git の安全性と統合を提供するツールが無いから。**
 
-- オーケストレータ勢 (Conductor / Vibe Kanban / claude-squad / ccmanager / uzi) は
-  **エディタを持たず**「Open in VS Code」に投げる
-- エディタを持つ勢 (Nimbalyst / Async) は **コミットグラフを持たない**
-- **履歴編集UI**(interactive rebase / squash / split / fixup / reflog救出) を
-  グラフ中心で提供するツールは1つもない ← エージェントが生む大量の雑な履歴を
-  整形するのが日常作業なのに、ここが完全に空白
-- 「同じローカルセッションを別端末から」を実現しているのは `coder/mux` のみ (AGPL-3.0)
+⚠️ **この理由は2回書き直しています。** 最初は「レイアウト」、次は「グラフ中心の履歴編集」を
+差別化としましたが、**どちらも検証で否定されました**（前者は Theia コアのフォークが必要、
+後者は lazygit と GitUp が既に全項目実装済み）。
+経緯は [docs/review-2.md](docs/review-2.md)、3回目の検証結果は
+[docs/s0-verification.md](docs/s0-verification.md)。
 
-詳細は [docs/research.md](docs/research.md) のギャップ分析を参照。
+**14以上のツールで「無い」ことを確認できた項目:**
+
+- **シーケンサ乗っ取りのガード** — git は `rebase -i` が `break` で止まっている最中でも
+  `checkout` / `commit` / `merge` を **exit 0** で通し、その後の `rebase --continue` が
+  **別のブランチにリプレイ**する。`checkout -b` は解決済み未コミットのマージの
+  **`MERGE_HEAD` を無警告で削除**して単一親コミットにする。**これを止めるツールが1つも無い**
+- **共有 `refs/stash` の認識** — `stash@{N}` は他の worktree の push でずれる。全ツールで0件
+- **全 worktree の HEAD を1枚のグラフに描く** — 誰もやっていない
+- **マージ順序の推奨** — `clash` が「まだできない」と明記、他は皆無
+- **並行安全な git 実行** — `GIT_OPTIONAL_LOCKS=0`、`gc.auto=0`、read→decide→write を跨ぐロック。
+  この分野で最強の既存実装がプロセス内の `threading.Lock()`
+- **統合** — `clash` は CLI+TUI、GitUp は macOS 専用スタンドアロン、lazygit はエディタの横に置く TUI
+
+**正直に降ろしたもの:** グラフ + 履歴編集（lazygit / GitUp が実装済み）、
+クロスworktreeのコンフリクト予測（[`clash`](https://github.com/clash-sh/clash) がやっている
+— MIT なので**敵にせず依存として取り込む**）、単一レイアウトツリー（Theia の `Area` が閉じた union）。
+
+詳細は [docs/s0-verification.md](docs/s0-verification.md)。
 
 ## ドキュメント
 
