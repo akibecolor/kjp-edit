@@ -80,8 +80,12 @@ try {
 async function measure(width) {
     const profile = await mkdtemp(join(tmpdir(), 'kjp-layout-'));
     const child = spawn(browser, [
-        '--headless=old', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+        // ⚠️ `--headless=old` は Chrome 132 で削除された。`=new` を使う
+        //    （どちらでも iframe 幅は正しく効くことを実測済み）。
+        '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
         '--disable-extensions', '--disable-background-networking',
+        // CI のコンテナでは sandbox が使えないことがある。ローカルでは付けない。
+        ...(process.env.CI ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
         `--user-data-dir=${profile}`, '--window-size=1200,2100',
         '--virtual-time-budget=8000', '--dump-dom',
         `${baseUrl}/__probe?w=${width}`,
