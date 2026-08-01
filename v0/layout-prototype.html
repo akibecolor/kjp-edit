@@ -1,0 +1,451 @@
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kjp-edit レイアウト検討用プロトタイプ</title>
+<!--
+  ⚠️ これは**レイアウトを目で判断するためのプロトタイプ**。製品ではない。
+
+  本物: worktree 一覧 / ブランチ / ahead-behind / dirty / 変更ファイル / コミットグラフ
+        （/api/v0/state をそのまま使う）
+  モック: エディタの中身、コンソールの出力、ファイラのツリー展開
+
+  答えたい問い（docs/scope.md の「統合」）:
+    N 個のエージェントのコンソールとエディタと1枚のグラフを、
+    PC の画面に同時に置いて成立するか。Zed の並列ペインが分かりにくい、を回避できるか。
+
+  ここに実エディタ（Monaco）や実ターミナル（PTY）を足さないこと。
+  v0 は読み取り専用で認証を持たない（docs/architecture.md D1）。
+  ターミナルを載せるのは別の判断が必要。
+-->
+<style>
+  :root {
+    --bg: #1e1e1e; --fg: #d4d4d4; --dim: #808080; --line: #333;
+    --card: #252526; --head: #2d2d30; --accent: #4fc1ff;
+    --danger: #f14c4c; --warn: #cca700; --ok: #4ec9b0;
+    --bar: 34px; --split: 6px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #fff; --fg: #1f1f1f; --dim: #6a6a6a; --line: #dcdcdc;
+      --card: #f6f6f6; --head: #ececec; --accent: #0066bf; }
+  }
+  * { box-sizing: border-box; min-width: 0; min-height: 0; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 12px/1.5 ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace; }
+
+  /* ---- 上部バー ---- */
+  .topbar { height: var(--bar); display: flex; align-items: center; gap: .8rem;
+    padding: 0 .7rem; background: var(--head); border-bottom: 1px solid var(--line); }
+  .topbar b { font-size: 13px; }
+  .topbar .proto { color: var(--warn); border: 1px solid var(--warn);
+    border-radius: 3px; padding: 0 .4em; font-size: 11px; }
+  .topbar .path { color: var(--dim); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; flex: 1 1 auto; }
+  .topbar button { font: inherit; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; padding: .15rem .5rem; cursor: pointer; }
+
+  /* ---- シェル: 横に [ファイラ | 中央 | グラフ] ---- */
+  .shell { height: calc(100% - var(--bar)); display: flex; }
+  .col, .row { display: flex; min-width: 0; min-height: 0; }
+  .col { flex-direction: column; }
+  .row { flex-direction: row; }
+  #filer { flex: 0 0 190px; }
+  #center { flex: 1 1 auto; flex-direction: column; }
+  #graphcol { flex: 0 0 460px; }
+  #editors { flex: 1 1 60%; }
+  #consoles { flex: 1 1 40%; }
+
+  /* ---- スプリッタ ---- */
+  .split { flex: 0 0 var(--split); background: transparent; position: relative; }
+  .split::after { content: ''; position: absolute; inset: 0; background: var(--line);
+    transition: background .1s; }
+  .split:hover::after, .split.dragging::after { background: var(--accent); }
+  .split.x { cursor: col-resize; }
+  .split.y { cursor: row-resize; }
+  .split.x::after { left: 2px; right: 2px; }
+  .split.y::after { top: 2px; bottom: 2px; }
+
+  /* ---- ペイン ---- */
+  .pane { display: flex; flex-direction: column; background: var(--card);
+    border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
+    flex: 1 1 auto; margin: 2px; }
+  .pane > header { display: flex; align-items: center; gap: .3rem; flex: 0 0 auto;
+    padding: .25rem .45rem; background: var(--head); border-bottom: 1px solid var(--line);
+    font-size: 11px; white-space: nowrap; }
+  /* ⚠️ タイトルは縮む側、タグとボタンは縮まない側にはっきり分ける。
+     .tag に flex-shrink: 0 が無いと、ペインが狭いときタグがタイトル文字と
+     重なって読めなくなる（1440px で4ペイン並べたときに実際に起きた）。 */
+  .pane > header .ttl { flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; }
+  .pane > header .grow { flex: 1 1 auto; min-width: 0; }
+  .pane > header .tag { flex: 0 0 auto; }
+  .pane > header button { font: inherit; background: transparent; color: var(--dim);
+    border: 0; cursor: pointer; padding: 0 .25rem; border-radius: 2px;
+    line-height: 1.4; flex: 0 0 auto; }
+  .pane > header button:hover { color: var(--fg); background: rgba(127,127,127,.2); }
+  .pane > .body { flex: 1 1 auto; overflow: auto; }
+
+  /* 最大化: シェル全体に被せる。これが「展開」 */
+  .pane.max { position: fixed; inset: var(--bar) 0 0 0; z-index: 50; margin: 0;
+    border-radius: 0; }
+  /* 最小化: ヘッダだけ残す */
+  .pane.min { flex: 0 0 auto; }
+  .pane.min > .body { display: none; }
+
+  .tag { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
+    color: var(--dim); font-size: 10px; }
+  .tag.br { color: var(--accent); border-color: var(--accent); }
+  .tag.dirty { color: var(--warn); border-color: var(--warn); }
+  .tag.danger { color: var(--danger); border-color: var(--danger); }
+
+  /* ---- ファイラ ---- */
+  .tree { padding: .3rem 0; }
+  .tree div { padding: .05rem .5rem; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; cursor: default; }
+  .tree div:hover { background: rgba(127,127,127,.15); }
+  .tree .d { color: var(--fg); }
+  .tree .f { color: var(--dim); }
+  .tree .st { color: var(--accent); display: inline-block; width: 1.1em; }
+
+  /* ---- エディタ（モック） ---- */
+  .tabs { display: flex; flex: 0 0 auto; background: var(--head);
+    border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .tabs button { font: inherit; background: transparent; border: 0;
+    border-right: 1px solid var(--line); color: var(--dim);
+    padding: .25rem .6rem; cursor: pointer; white-space: nowrap; }
+  .tabs button.on { background: var(--card); color: var(--fg); }
+  .code { display: grid; grid-template-columns: auto 1fr; font-size: 12px; }
+  /* ⚠️ white-space: pre が無いと textContent の改行が空白に潰れ、
+     行番号が横一列に並んで巨大なグレーの帯になる（実際にそうなった）。 */
+  .code .ln { text-align: right; color: var(--dim); padding: 0 .5rem;
+    user-select: none; background: rgba(127,127,127,.06); white-space: pre; }
+  .code .src { padding: 0 .5rem; white-space: pre; }
+  .code .src .k { color: #c586c0; } .code .src .s { color: #ce9178; }
+  .code .src .c { color: #6a9955; } .code .src .fn { color: #dcdcaa; }
+  .mocknote { color: var(--warn); padding: .3rem .5rem; font-size: 11px;
+    border-bottom: 1px dashed var(--line); }
+
+  /* ---- コンソール（モック） ---- */
+  .term { padding: .3rem .5rem; white-space: pre-wrap; word-break: break-word;
+    font-size: 11px; line-height: 1.45; }
+  .term .p { color: var(--ok); } .term .w { color: var(--warn); }
+  .term .e { color: var(--danger); } .term .d { color: var(--dim); }
+
+  /* ---- グラフ（本物） ---- */
+  .grow { display: grid; grid-template-columns: auto auto 1fr; align-items: center;
+    height: 22px; gap: .35rem; }
+  .grow:hover { background: rgba(127,127,127,.12); }
+  .grow svg { display: block; }
+  .subject { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wtc { display: flex; gap: .2rem; overflow: hidden; white-space: nowrap; }
+  .ref { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
+    font-size: 10px; max-width: 11em; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .ref.wt { color: var(--accent); border-color: var(--accent); }
+  .empty { color: var(--dim); padding: .5rem; }
+</style>
+
+<div class="topbar">
+  <b>kjp-edit</b><span class="proto">レイアウト検討用プロトタイプ</span>
+  <span class="path" id="repo"></span>
+  <button id="reset">レイアウトを戻す</button>
+  <button id="unmax" hidden>最大化を解除</button>
+</div>
+
+<div class="shell" id="shell">
+  <div class="col" id="filer">
+    <div class="pane">
+      <header><span class="ttl">ファイラ</span><span class="grow"></span>
+        <button data-min title="最小化">–</button><button data-max title="最大化">⛶</button></header>
+      <div class="body"><div class="tree" id="tree"></div></div>
+    </div>
+  </div>
+  <div class="split x"></div>
+
+  <div class="col" id="center">
+    <div class="row" id="editors"></div>
+    <div class="split y"></div>
+    <div class="row" id="consoles"></div>
+  </div>
+  <div class="split x"></div>
+
+  <div class="col" id="graphcol">
+    <div class="pane">
+      <header><span class="ttl">統合グラフ（全 worktree の HEAD）</span>
+        <span class="grow"></span><span class="tag" id="gtag"></span>
+        <button data-min title="最小化">–</button><button data-max title="最大化">⛶</button></header>
+      <div class="body" id="graph"></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+const LANE_W = 10, ROW_H = 22, DOT_R = 3.2;
+const $ = s => document.querySelector(s);
+const el = (t, c, x) => { const n = document.createElement(t);
+  if (c) n.className = c; if (x !== undefined) n.textContent = x; return n; };
+
+/* ---------- スプリッタ: 前後の兄弟の flex-basis を実寸で固定して動かす ---------- */
+function wireSplit(sp) {
+  const dir = sp.classList.contains('x') ? 'x' : 'y';
+  sp.addEventListener('pointerdown', e => {
+    const prev = sp.previousElementSibling, next = sp.nextElementSibling;
+    if (!prev || !next) return;
+    e.preventDefault();
+    sp.classList.add('dragging');
+    sp.setPointerCapture(e.pointerId);
+    const at = ev => dir === 'x' ? ev.clientX : ev.clientY;
+    const size = n => dir === 'x'
+      ? n.getBoundingClientRect().width : n.getBoundingClientRect().height;
+    const start = at(e), p0 = size(prev), n0 = size(next);
+    const MIN = 60;
+    const move = ev => {
+      let d = at(ev) - start;
+      d = Math.max(-(p0 - MIN), Math.min(n0 - MIN, d));
+      prev.style.flex = `0 0 ${p0 + d}px`;
+      next.style.flex = `0 0 ${n0 - d}px`;
+    };
+    const up = () => {
+      sp.classList.remove('dragging');
+      sp.removeEventListener('pointermove', move);
+      sp.removeEventListener('pointerup', up);
+      sp.removeEventListener('pointercancel', up);
+    };
+    sp.addEventListener('pointermove', move);
+    sp.addEventListener('pointerup', up);
+    sp.addEventListener('pointercancel', up);
+  });
+}
+
+/* ---------- 最大化 / 最小化 ---------- */
+function wirePane(pane) {
+  pane.querySelector('[data-max]')?.addEventListener('click', () => {
+    const was = pane.classList.contains('max');
+    for (const p of document.querySelectorAll('.pane.max')) p.classList.remove('max');
+    if (!was) pane.classList.add('max');
+    $('#unmax').hidden = !document.querySelector('.pane.max');
+  });
+  pane.querySelector('[data-min]')?.addEventListener('click', () => {
+    pane.classList.toggle('min');
+  });
+}
+$('#unmax').addEventListener('click', () => {
+  for (const p of document.querySelectorAll('.pane.max')) p.classList.remove('max');
+  $('#unmax').hidden = true;
+});
+$('#reset').addEventListener('click', () => {
+  for (const n of document.querySelectorAll('.col,.row,.pane')) {
+    n.style.flex = ''; n.classList.remove('max', 'min');
+  }
+  $('#unmax').hidden = true;
+});
+
+/* ---------- グラフ（v0 と同じ描き方） ---------- */
+function rowSvg(row) {
+  const lanes = Math.max(row.input.length, row.output.length, row.lane + 1);
+  const w = Math.max(lanes, 1) * LANE_W + LANE_W;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width', w); svg.setAttribute('height', ROW_H);
+  const x = i => i * LANE_W + LANE_W / 2 + 2;
+  const add = (n, a) => { const e = document.createElementNS(NS, n);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, v);
+    svg.appendChild(e); return e; };
+  const fed = new Set();
+  row.input.forEach((node, i) => {
+    const t = node.id === row.hash ? row.lane
+      : row.output.findIndex(o => o.id === node.id);
+    if (node.id !== row.hash && t !== -1) fed.add(t);
+    add('path', { d: `M ${x(i)} 0 L ${x(i)} ${ROW_H / 2 - 5} L ${x(t === -1 ? i : t)} ${ROW_H / 2}`,
+      stroke: node.color, fill: 'none', 'stroke-width': 1.5 });
+  });
+  const mp = new Set(row.mergeParentLanes ?? []);
+  row.output.forEach((node, i) => {
+    const fresh = mp.has(i) && !fed.has(i);
+    const from = (i === row.firstParentLane || fresh) ? row.lane : i;
+    add('path', { d: `M ${x(from)} ${ROW_H / 2} L ${x(i)} ${ROW_H / 2 + 5} L ${x(i)} ${ROW_H}`,
+      stroke: node.color, fill: 'none', 'stroke-width': 1.5 });
+  });
+  for (const i of mp) {
+    if (!fed.has(i) || i === row.firstParentLane) continue;
+    add('path', { d: `M ${x(row.lane)} ${ROW_H / 2} L ${x(i)} ${ROW_H / 2 + 5}`,
+      stroke: row.output[i]?.color ?? row.color, fill: 'none', 'stroke-width': 1.5 });
+  }
+  const isHead = row.worktrees.length > 0;
+  add('circle', { cx: x(row.lane), cy: ROW_H / 2, r: isHead ? DOT_R + 1.3 : DOT_R,
+    fill: isHead ? 'var(--card)' : row.color, stroke: row.color,
+    'stroke-width': isHead ? 2.2 : 1 });
+  return svg;
+}
+
+/* ---------- モックのコード（レイアウト判断用。中身に意味は無い） ---------- */
+const MOCK_SRC = [
+  ['c', '// エディタの中身はモック。レイアウト判断用のダミー。'],
+  ['', ''],
+  ['k', 'export async function'], ['fn', ' collect'], ['', '(cwd) {'],
+  ['', '    const worktrees = '], ['k', 'await'], ['', ' listWorktrees(cwd);'],
+  ['', '    const refs = '], ['k', 'await'], ['', ' refMap(cwd);'],
+  ['', ''],
+  ['c', '    // ループの中で新しい git 呼び出しを足さない'],
+  ['k', '    for'], ['', ' (const wt of worktrees) {'],
+  ['', '        wt.status = '], ['k', 'await'], ['', ' worktreeStatus(wt.path);'],
+  ['', '    }'],
+  ['k', '    return'], ['', ' { worktrees, refs };'],
+  ['', '}'],
+];
+function mockCode(seedPath) {
+  const wrap = el('div', 'code');
+  const lnCol = el('div', 'ln'), src = el('div', 'src');
+  // 行に分ける（トークンの雑な連結。見た目だけ）
+  const lines = [];
+  let cur = [];
+  for (const [cls, text] of MOCK_SRC) {
+    if (text === '' && cls === '') { lines.push(cur); cur = []; continue; }
+    cur.push([cls, text]);
+    if (/\{$|\}$|;$|。$/.test(text)) { lines.push(cur); cur = []; }
+  }
+  if (cur.length) lines.push(cur);
+  // ペインが空だとレイアウトの判断材料にならないので、行数を稼ぐために繰り返す
+  const filled = [];
+  while (filled.length < 42) filled.push(...lines);
+  lnCol.textContent = Array.from({ length: filled.length }, (_, i) => i + 1).join('\n');
+  for (const line of filled) {
+    for (const [cls, text] of line) {
+      src.append(cls ? el('span', cls, text) : document.createTextNode(text));
+    }
+    src.append(document.createTextNode('\n'));
+  }
+  wrap.append(lnCol, src);
+  const box = el('div');
+  box.append(el('div', 'mocknote', `⚠ モック: ${seedPath} の中身は読んでいません`));
+  box.append(wrap);
+  return box;
+}
+
+/* ---------- モックのコンソール出力 ---------- */
+function mockTerm(wt) {
+  const t = el('div', 'term');
+  const line = (cls, s) => { t.append(el('span', cls, s), document.createTextNode('\n')); };
+  line('d', `$ cd ${wt.path}`);
+  line('p', `$ claude --worktree ${wt.branch ?? 'detached'}`);
+  line('', `● ${wt.branch ?? '(detached)'} で作業中`);
+  line('d',  '  読み込み: v0/git.mjs, v0/server.mjs');
+  if (wt.status?.dirty) {
+    line('w', `⚠ 未コミットの変更 ${wt.status.changed} 件 / 未追跡 ${wt.status.untracked} 件`);
+  }
+  for (const f of (wt.files ?? []).slice(0, 4)) line('', `  ${f.status}  ${f.path}`);
+  if (wt.prunable) line('e', '✖ 作業ツリーが失われています');
+  else if (wt.sequencer?.rebasing) line('e', '✖ rebase 進行中');
+  else line('p', `✔ ${wt.ahead} commit ahead / ${wt.behind} behind`);
+  line('d', '⚠ ここはモック出力。実ターミナルは載せていない');
+  return t;
+}
+
+/* ---------- 組み立て ---------- */
+function pane(title, tags = []) {
+  const p = el('div', 'pane');
+  const h = el('header');
+  h.append(el('span', 'ttl', title));
+  h.append(el('span', 'grow'));
+  for (const [cls, text] of tags) h.append(el('span', `tag ${cls}`, text));
+  const bmin = el('button', null, '–'); bmin.dataset.min = '1'; bmin.title = '最小化';
+  const bmax = el('button', null, '⛶'); bmax.dataset.max = '1'; bmax.title = '最大化';
+  h.append(bmin, bmax);
+  const body = el('div', 'body');
+  p.append(h, body);
+  return { p, body };
+}
+
+function render(s) {
+  $('#repo').textContent = `${s.repo}   base: ${s.base}`;
+  $('#gtag').textContent = `${s.graph.length} commits`;
+
+  // ファイラ（worktree ごとに変更ファイルを並べる。ツリー展開はモック）
+  const tree = $('#tree');
+  tree.replaceChildren();
+  for (const wt of s.worktrees) {
+    tree.append(el('div', 'd', `▾ ${wt.name}`));
+    for (const f of (wt.files ?? []).slice(0, 6)) {
+      const d = el('div', 'f');
+      d.append(el('span', 'st', f.status), document.createTextNode(f.path.split('/').pop()));
+      d.title = f.path;
+      tree.append(d);
+    }
+    if (!wt.files?.length) tree.append(el('div', 'f', '   (差分なし)'));
+  }
+
+  // エディタ: 2枚を横に並べる（並列ペインが成立するかを見る）
+  const editors = $('#editors');
+  editors.replaceChildren();
+  const withFiles = s.worktrees.filter(w => w.files?.length);
+  const picks = [withFiles[0], withFiles[1]].filter(Boolean);
+  if (picks.length === 0) picks.push(s.worktrees[0]);
+  picks.forEach((wt, i) => {
+    if (i > 0) { const sp = el('div', 'split x'); editors.append(sp); wireSplit(sp); }
+    const files = (wt.files ?? []).slice(0, 3);
+    const { p, body } = pane('エディタ', [['br', wt.branch ?? wt.name]]);
+    const tabs = el('div', 'tabs');
+    const holder = el('div');
+    files.forEach((f, k) => {
+      const b = el('button', k === 0 ? 'on' : null, f.path.split('/').pop());
+      b.title = f.path;
+      b.addEventListener('click', () => {
+        for (const o of tabs.children) o.classList.remove('on');
+        b.classList.add('on');
+        holder.replaceChildren(mockCode(f.path));
+      });
+      tabs.append(b);
+    });
+    if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
+    body.append(tabs, holder);
+    holder.append(mockCode(files[0]?.path ?? '(no file)'));
+    editors.append(p);
+    wirePane(p);
+  });
+
+  // コンソール: worktree 1本につき1枚、横に並べる（N 並列の本体）
+  const consoles = $('#consoles');
+  consoles.replaceChildren();
+  const live = s.worktrees.filter(w => !w.bare);
+  live.slice(0, 4).forEach((wt, i) => {
+    if (i > 0) { const sp = el('div', 'split x'); consoles.append(sp); wireSplit(sp); }
+    const tags = [['br', wt.branch ?? wt.name]];
+    if (wt.status?.dirty) tags.push(['dirty', 'dirty']);
+    if (wt.prunable) tags.push(['danger', 'prunable']);
+    if (wt.sequencer?.rebasing) tags.push(['danger', 'rebasing']);
+    const { p, body } = pane(`コンソール ${i + 1}`, tags);
+    body.append(mockTerm(wt));
+    consoles.append(p);
+    wirePane(p);
+  });
+
+  // グラフ（本物）
+  const g = $('#graph');
+  g.replaceChildren();
+  if (!s.graph.length) { g.append(el('div', 'empty', 'コミットがありません')); return; }
+  for (const row of s.graph) {
+    const r = el('div', 'grow');
+    r.append(rowSvg(row));
+    const wtc = el('div', 'wtc');
+    for (const n of row.worktrees) wtc.append(el('span', 'ref wt', `⌂ ${n}`));
+    r.append(wtc);
+    r.append(el('div', 'subject', row.subject));
+    r.title = `${row.hash.slice(0, 8)}  ${row.subject}`
+      + (row.worktrees.length ? `\nworktree: ${row.worktrees.join(', ')}` : '')
+      + (row.refs.length ? `\nrefs: ${row.refs.join(', ')}` : '');
+    g.append(r);
+  }
+}
+
+for (const sp of document.querySelectorAll('.shell > .split')) wireSplit(sp);
+for (const p of document.querySelectorAll('.pane')) wirePane(p);
+
+try {
+  const res = await fetch('/api/v0/state?fresh=1');
+  const s = await res.json();
+  if (s.error) throw new Error(s.error);
+  render(s);
+} catch (e) {
+  $('#repo').textContent = `状態を取得できませんでした: ${e.message}`;
+}
+</script>

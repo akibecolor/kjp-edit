@@ -340,6 +340,13 @@ const server = createServer(async (req, res) => {
             res.end(probeHarness(Number(url.searchParams.get('w'))));
             return;
         }
+        // レイアウト検討用のプロトタイプ（読み取り専用。中身の説明はファイル冒頭）
+        if (url.pathname === '/layout' || url.pathname === '/layout-prototype.html') {
+            const html = await readFile(join(HERE, 'layout-prototype.html'));
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+            res.end(html);
+            return;
+        }
         if (url.pathname === '/' || url.pathname === '/index.html') {
             const html = await readFile(join(HERE, 'index.html'));
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
