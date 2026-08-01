@@ -1,0 +1,21 @@
+root = true
+
+[*]
+end_of_line = lf
+charset = utf-8
+indent_style = space
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{js,mjs,cjs,jsx,ts,tsx,md}]
+indent_size = 4
+
+[*.{json,jsonc,yml,yaml}]
+indent_size = 2
+
+# cmd.exe は LF のみの batch を誤解釈する
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[Makefile]
+indent_style = tab

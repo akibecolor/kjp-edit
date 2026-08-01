@@ -3,6 +3,12 @@
 **この文書は製品の差別化が何であれ必要なので、[review-2.md](review-2.md) の
 差別化再定義と独立に今すぐ着手できます。**
 
+🔴 **文字コードとパスのハザードは [encoding-and-paths.md](encoding-and-paths.md) に分離しました。**
+日本語 Windows での実測で **Theia 側に日本語が壊れる欠陥が2つ**見つかっています
+（ターミナルの `MultiRingBuffer` が UTF-8 境界を見ずにバイト範囲をデコードする、
+`@parcel/watcher` の snapshot 経路が `FindFirstFileA` で CP932 を返す）。
+**スモークスイートの E1-E14 もそちらにあります。**
+
 方針: **エージェントが書いたコードは検証手段が無いと検証不能。
 だから最初の機能コミットより前にテストハーネスと検証コマンドを立てる。**
 （ご指摘の通りで、これは製品自身が解こうとしている「40個の fix tests コミット」問題と同じ構造です。）
@@ -196,9 +202,23 @@ typecheck → unit → browser smoke
 **エージェントに生のレポータを読ませない。** `-x` / `--max-failures=3` と組み合わせて
 壊れたビルドが200件の失敗を吐かないようにする。
 
-```bash
-PLAYWRIGHT_JSON_OUTPUT_NAME=results.json npx playwright test --reporter=json
+🛑 **当初ここに `PLAYWRIGHT_JSON_OUTPUT_NAME=results.json npx playwright test` と書いていたが、
+これは Windows で動きません**（実測で exit 1）。**npm の Windows でのシェルは `cmd.exe`**
+（`powershell` ではない）で、**インラインの `FOO=bar` 前置を解釈できません。**
+
+→ **環境変数は `verify.mjs` の中で設定する**（`cross-env` を足すより依存が減る）:
+```js
+// scripts/verify.mjs
+process.env.PLAYWRIGHT_JSON_OUTPUT_NAME = 'results.json';
+// spawn は shell を使わず、.bin の .cmd shim も踏まない
+spawn(process.execPath, [require.resolve('@playwright/test/cli'), 'test', '--reporter=json'], ...)
 ```
+
+⚠️ **`node_modules/.bin/*.cmd` を Node から spawn できません**（CVE-2024-27980 の対策で `EINVAL`。
+`{shell:true}` の抜け道も v24 で **DEP0190** として非推奨）。
+**`process.execPath` + `require.resolve` を使う。**
+
+詳細とその他のクロスプラットフォーム規則は **[encoding-and-paths.md](encoding-and-paths.md)**。
 
 ### 🎯 Anthropic 公式の「検証ゲート4段」— 私は1段しか使っていなかった
 

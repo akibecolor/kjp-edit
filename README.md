@@ -54,6 +54,7 @@ git の安全性と統合を提供するツールが無いから。**
 | ⭐ [docs/s0-verification.md](docs/s0-verification.md) | **差別化の検証結果（S0）** — 主張を立てる前に反証を試みた。`clash` という反例と、残った防御可能な差別化 |
 | [docs/licensing.md](docs/licensing.md) | **MIT で行ける**（条件つき）。前例比較、コピー禁止リスト、Phase 1 で追加するファイル |
 | [docs/development.md](docs/development.md) | **開発体制** — テスト4層、検証ゲート4段、スモークシナリオ、オーケストレーション、CI |
+| 🔴 [docs/encoding-and-paths.md](docs/encoding-and-paths.md) | **文字コードとパスのハザード**（日本語Windows実測）— Theia 側の欠陥2件、git 起動の正典レシピ、`chcp` 禁止、テストケース E1-E14 |
 
 ## 現在の状態
 

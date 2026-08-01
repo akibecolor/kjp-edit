@@ -1,0 +1,49 @@
+# eol を明示的にピンして core.autocrlf を参照させない。
+# 根本原因: Git for Windows のインストーラが system gitconfig に
+# core.autocrlf=true を書く（upstream git の既定は false）。
+# gitattributes で eol を指定すると contributor の設定が無関係になる。
+* text=auto eol=lf
+
+# 注: .gitattributes はインラインコメントを許さない（コメントは行頭のみ）
+# .ps1 は LF（VS Code 自身も LF で出荷している）
+# .bat/.cmd は CRLF（cmd.exe は LF のみの batch を誤解釈する）
+*.sh   text eol=lf
+*.ps1  text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+**/*.json linguist-language=jsonc
+package-lock.json text eol=lf -diff linguist-generated=true
+yarn.lock         text eol=lf -diff linguist-generated=true
+
+# エンコーディングのテストフィクスチャはバイト単位でディスクに届かないと
+# テストが無意味になるので変換を止める
+**/test/fixtures/** -text
+**/test-resources/** -text
+*.cp932.txt    -text
+*.shiftjis.txt -text
+*.eucjp.txt    -text
+*.utf16le.txt  -text
+*.utf16be.txt  -text
+*.nobom.txt    -text
+*.crlf.txt     -text
+
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.node  binary
+*.asar  binary
+*.exe   binary
+*.dll   binary
+*.dylib binary
+*.so    binary
+*.wasm  binary
+*.zip   binary
+*.gz    binary
+*.vsix  binary
+*.rtf   -text
