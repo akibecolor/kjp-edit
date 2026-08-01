@@ -204,6 +204,137 @@ git 状態の read→decide→write を守るものではありません。
 
 ---
 
+---
+
+# 🔴 追記: jujutsu (jj) の検証結果 — 4項目のうち3つが消えます
+
+最大の未確認だった jj を検証した結果。**判定は「部分的に殺される。しかも殺される側が大きい」。**
+
+## jj が構造的に消してしまうもの（3項目）
+
+| 我々の主張 | jj での状況 |
+|---|---|
+| **1. シーケンサ乗っ取りのガード** | **機構自体が存在しない。** 3,893行の CLI リファレンス全文を grep して **`--continue` / `--abort` / `--skip` の出現がゼロ**。`.git/rebase-merge` の類似物も無い。`jj rebase`/`squash`/`split` は op-log 1エントリの**アトミックな単一操作**。そして**コンフリクトが第一級**（コミットが*コンフリクトを含める*）なので、`MERGE_HEAD` に相当する「解決済み未コミットのマージ状態」が存在せず、破壊しようがない |
+| **2. 共有 `refs/stash` の認識** | **stash が存在しない。** `git stash` → `jj new @-` に対応し「古い作業コピーコミットが兄弟コミットとして残る」。インデックスが無いので `stash@{N}` のずれも無い |
+| **4'. 全 worktree の HEAD を1枚のグラフに** | **組み込みの revset がある。** `working_copies()` = 「全ワークスペースの作業コピーコミット」。**`jj log -r 'working_copies()'` の一行で我々の機能#3が終わる。** git では本当に自作が必要だが、jj では**組み込みを転売することになる** |
+
+## jj でも生き残るもの（1項目、ただし強く）
+
+**並行安全な実行（主張4）は生き残ります。** そして jj のマーケティングより実態は弱い:
+
+- **jj 自身の README が「安全な並行レプリケーション」を
+  `[!WARNING] experimental; they may have bugs, backwards incompatible storage changes` の下に置いている**
+- 🚨 **Git バックエンドはロックフリーではなく corruption しうる。**
+  `technical/concurrency.md` 逐語: 「with the Git backend, repository corruption is possible
+  because the backend is not entirely lock-free」→ **issue #2193 が 2023-09 から open のまま**
+- **jj も実際にロックを取る**（`working_copy.lock`）。FAQ に
+  ファイルウォッチャ（Vite）が `.jj` を監視したときの corruption が文書化されている
+- 🚨 **まさに N ワークスペースのシナリオで 2026年の open バグが3件:**
+  **#9314**（2026-04）並行 `jj workspace add` が呼び出し側ワークスペースを使用不能にする、
+  **#9408**（2026-05）並行 `describe` で checkout 失敗、
+  **#8801**（2026-02）`@` が6つの操作に解決されて詰む
+- **そして jj には*新しい*ガード面がある。** `working-copy.md`:
+  「ワークスペースB からワークスペースA の作業コピーコミットを書き換えると、
+  A の作業コピーは stale になる」。**N エージェントでは例外ではなく日常。**
+  staleness 検出、`jj workspace update-stale` の調整、
+  コンフリクトしたブックマーク（`main??`）の解決、divergent change id の処理が必要で、
+  **誰も製品化していない**
+
+## 🚨 しかし jj と無関係に、もっと痛い指摘がありました
+
+> 「シーケンサ乗っ取りのシナリオは、**エージェントが `break` 付きの `rebase -i` を
+> 走らせていること**を要求する。**ほとんどのコーディングエージェントはこれをやらない。**
+> あなたは稀な経路に対して精密なガードを作った。
+> **#1 を弱い差別化にしているのは jj ではなく、その稀少性である。**」
+
+**これは正しい指摘です。** 実際のエージェントのトランスクリプトで
+このパスがどれだけ踏まれるかを確認せずに、私はこれを差別化の柱にしていました。
+
+## jj の上に作るコスト（現実的には無理）
+
+- **v0.43.0、1.0 は無い。そして 0.26.0 から 0.43.0 まで
+  18リリース連続で「Breaking changes」セクションがある**
+- **Node/TS の API が存在しない。** `jj-lib` は Rust 専用・Apache-2.0・毎月破壊的変更。
+  **jj 自身のロードマップが認めている**: 「RPC API… should make it easier for tools like
+  VS Code that are not written in Rust」— **計画されているが作られていない**
+- 🚨 **colocated リポジトリは全ハザードを復活させ、しかも悪化させる。**
+  `git-compatibility.md` 逐語:
+  > 「Jujutsu will ignore Git's staging area. It will not understand merge conflicts as
+  > Git represents them, **unfinished `git rebase` states**, as well as other less common states」
+
+  **つまり colocated 環境でエージェントが生の `git rebase -i` をシェルアウトすると、
+  我々がガードしているハザードが全部戻ってきて、しかも jj はそれを見ていない。**
+- jj が非対応: **`git-worktree`**、hooks、`.gitattributes`、submodules、LFS、partial clone
+
+## そして「エージェント × jj」は萌芽期だが実在します
+
+`muloka/claude-plugins`（★6）が「**hard-wall git enforcement** — coding agents を jj に留める」、
+`espra/wk`（★1）が「git/jj ワークスペース横断の並行AIエージェント」、
+Claude Code skills も複数（`pkrusche/jj-parallel-agents-skill` 等）。
+**そして jj 上流自身が追っています** — #9755「coding agents 用の automatic-jj skill」、
+#9814「**AI エージェントは対話的(TUI)インタフェースを使えない**ので agent-friendly な
+split/squash/diffedit/restore を」。
+
+---
+
+## 🔴 これを受けた第4の再定義（提案）
+
+**パターンが見えました。私は3回、機構レベルの差別化を選んで3回commoditizeされました。**
+
+| 回 | 主張 | 何に負けたか |
+|---|---|---|
+| 1 | レイアウト（単一ツリー） | Theia の `Area` が閉じた union（コアのフォークが必要） |
+| 2 | グラフ + 履歴編集 | lazygit / GitUp が全項目実装済み |
+| 3 | git 安全性ガード | **jj が3項目を構造的に消す。かつ #1 は稀な経路** |
+
+**レビュー側の提案がおそらく正解です:**
+
+> 「git 安全性ガードを moat と呼ぶのをやめること。**それは賞味期限付きの table stakes。**
+> durable な差別化は **VCS 非依存の層** — **クロスエージェントレビュー、
+> マージ/ランディング順序の調停、誰が先に land するかのコンフリクト予測、
+> そして統合されたマルチエージェントグラフ**。
+> これは jj も git も誰も解いていないし、jj の #9814/#9755 の活動が示す通り
+> **VCS 層は我々の足元で commoditize されつつある**」
+
+**なぜこれが持つのか（VCS を跨いで生き残る）:**
+
+| | 解いていない理由 |
+|---|---|
+| **jj** | プリミティブを与えるがポリシーは与えない。`working_copies()` はグラフを描くが「どの順でマージすべきか」は言わない |
+| **clash** | コンフリクトを検出するが「まだ解決できない」と明記 |
+| **Cursor `/best-of-n`** | 同じタスクを N モデルが競走して人間が選ぶ。**別タスクの N ブランチの調停ではない** |
+| **Devin** | コーディネータが「コンフリクト解決」を担うと書くが**機構がドキュメントに無い** |
+| **Claude Code `agent-teams`** | 散文で「各担当が別のファイル集合を持つように分割せよ」だけ |
+
+**そして jj の存在自体が、この層に商機を作っています。**
+jj が「unfinished `git rebase` states を理解しない」ので、
+**エージェントが生の git も叩ける colocated 環境が最も危険な構成**になります。
+**「git をガードし、jj にはパススルーし、colocated の境界を監視する」**は防御可能で、
+境界監視の部分の先行事例は `muloka/claude-plugins`（★6）だけです。
+
+**✅ 提案する差別化（第4版）:**
+
+1. **ランディング順序の調停** — N ブランチをどの順でマージすべきか。
+   投機的マージで判定し、順序を提案する（clash が明示的に「まだ」と言っている領域）
+2. **クロスエージェントレビュー** — どの2ブランチが同じファイルを触ったか、
+   どれが衝突するか、誰が先に land すべきか（G4、今も未claimed）
+3. **統合されたマルチエージェントグラフ** — 全 worktree/ワークスペースの HEAD と
+   ブランチ帰属を1枚に（git では自作、jj では `working_copies()` を使う）
+4. **VCS 非依存にする** — git バックエンドと jj バックエンドの両方を持ち、
+   **colocated 境界の監視**を提供する
+5. **統合**（エディタ + ターミナル + エージェント監督 + グラフが1アプリ）
+6. git 安全性ガードは**残すが moat とは呼ばない。table stakes として実装する**
+
+**🔴 ただし今回は、これを主張する前に検証すべきことが2つあります:**
+- **実際のエージェントのトランスクリプトで、シーケンサ経路と
+  「複数ブランチのマージ順序で人が悩む」場面がどれだけ実在するか**
+  （#1 が稀だったのと同じ罠を避けるため）
+- **「マージ順序の調停」を本当に誰もやっていないか** —
+  `git-imerge` / Graphite / GitHub の mergeability API / Aviator / Mergify /
+  merge queue（GitHub Merge Queue、Bors、Zuul）を確認する。
+  ⚠️ **merge queue は「どの順でマージするか」を実際に扱う既存カテゴリなので、
+  ここが一番危険な未確認**
+
 ## 未確認（正直に）
 
 - **セッション上限で3エージェントが途中終了。** 未確認のまま:
