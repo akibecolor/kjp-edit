@@ -323,14 +323,52 @@ public リポジトリ + 標準ランナーで無料**。
 ⚠️ **制約は分数ではなく同時実行数**（Free: 20ジョブ / macOS 最大5）。
 ⚠️ larger runners は public でも有料。
 
-**実測の目安:** Theia も theia-ide も全ジョブに `timeout-minutes: 60` を置き、
-`NODE_OPTIONS=--max_old_space_size=4096` が必要。
-**Electron プラットフォーム1レグあたり 30〜50分**を計画値にする（公表実測値は無い）。
+### ✅ 実測値（theia-ide の run 履歴 約25件から直接測定。当初の推定は悲観的すぎた）
 
-**キャッシュ:** `~/.cache/ms-playwright`（lockfile ハッシュキー）、
-ネイティブモジュール（`--cacheRoot ../..`）、ダウンロード済みプラグイン。
+| | |
+|---|---|
+| **マトリクス全体の wall-clock** | **14分29秒 〜 28分38秒、典型 15〜19分**（4 OS が並列） |
+| ジョブ分の合計 | **約60〜80 job-minutes/run** |
+| PR run | 14〜25分 |
+| **成果物** | **約 3.1 GB/run**（linux 990MB / mac-x64 704MB / windows 699MB / mac-arm64 692MB）、`retention-days: 1` |
+
+**当初「Electron 1レグあたり30〜50分」と書いたのは誤り**（60分タイムアウトからの推定だった）。
+実際は4 OS 並列で全体15〜19分。
+
+**マトリクスは3 OS ではなく4:**
+`windows-2022` / `ubuntu-22.04` / `macos-15`(arm64) / `macos-15-intel`(x64) × Node **24.x のみ**。
+`fail-fast: false` なので**壊れたPRは4ジョブ全部を焼きます。**
+
+### 🎯 CI の最大の改善余地: キャッシュが存在しない
+
+**theia-ide の6ワークフローと Theia core の4ワークフロー全部を `actions/cache` で grep した結果、
+theia-ide が 0件、Theia core が 1件**（`playwright.yml` の `~/.cache/ms-playwright` のみ）。
+**node_modules も yarn も npm もキャッシュしていません。**
+
+**→ これが我々が取れる一番大きな CI の勝ち。** 上流が単にやっていないだけなので、
+`~/.cache/ms-playwright`（lockfile ハッシュキー）、yarn キャッシュ、
+ネイティブモジュール（`--cacheRoot ../..`）、ダウンロード済みプラグインを全部キャッシュする。
+
 ⚠️ `vscode-ripgrep` のレート制限を避けるため `GITHUB_TOKEN` を渡し、
-`--rate-limit=15 --parallel=false` で絞る（両上流がやっている）。
+`--rate-limit` で絞る（両上流がやっている）。
+⚠️ `NODE_OPTIONS=--max_old_space_size=4096` が全ビルドステップで必要。
+
+### 🚨 同時実行数が本当の制約（分数ではない）
+
+theia-ide のマトリクスは4ジョブでうち**2つが macOS**。
+**Free プランの macOS 同時実行上限は5**なので、
+**フルマトリクスの同時 run は約2本でキャップに当たります。**
+
+そして: **larger runner は public リポジトリでも常に課金される**ので、
+18分のビルドを8コアで縮めることは無料ではできません。
+
+### 署名は GitHub Actions では一切やっていない
+
+**全パッケージングスクリプトが `-c.mac.identity=null` を渡しています。**
+`after-pack.js` は `process.env.THEIA_IDE_JENKINS_CI === 'true'` で署名をゲートし、
+**実リリースは Eclipse Foundation の Jenkins で走ります**
+（*Release Preview* → *Notarize* → *Upload* の3連ジョブ）。
+→ **我々は署名を GitHub Actions の外に置く設計を最初から想定する。**
 
 **カデンツを強く分ける:**
 | | 内容 | 目標 |
@@ -350,8 +388,24 @@ public リポジトリ + 標準ランナーで無料**。
 | ESLint | **eslint 8 + Theia の `configs/*.eslintrc.json`** | **`@theia/eslint-plugin` は未公開。** そして Theia の共有 config は eslintrc 形式で flat config に落ちない。**エージェントは Theia のコードを真似るのでそのルール前提が要る** |
 | Prettier | **入れないか、Theia に合わせる** | Theia core は Prettier を使わず ESLint + `tsfmt.json`（4スペース、シングルクォート、`null` より `undefined`）。素で入れると喧嘩する |
 | TS project references | **使う**（Theia が依存している） | `theiaext build` = `tsc --build`。ルートの `compute-references` が workspace から参照グラフを**生成**する。同じ生成器を用意する |
-| 署名 | **DCO（`Signed-off-by`）** | **ECA は不要。** ECA は Eclipse Foundation ホストのプロジェクトへの貢献に対する合意で、**下流の製品には適用されない**。DCO は軽量で将来の上流化とも整合 |
+| 署名 | **DCO（`Signed-off-by`）** | **ECA は不要。** ECA は Eclipse Foundation ホストのプロジェクトへの*コミット*に対する合意で、npm から `@theia/*` を消費して自分のリポジトリを出す側には何も課していない。⚠️ ただし「再配布者に適用されない」と*明言した文*は見つからず、contributor-only の一貫した文脈と該当要件の不在からの推論。法務確認を推奨 |
 | リリース | lerna（両上流が使用）か changesets | どちらでも。lerna なら1ツール減る |
+
+⚠️ **上流から「継承」できない規約:**
+**Theia も theia-ide も prettier / husky / lefthook / commitlint / changesets /
+semantic-release を1つも使っていません**（設定ファイル全部 404 で確認）。
+バージョニングは `lerna version` + 手書き `CHANGELOG.md`。
+**入れるなら我々が導入するのであって、受け継ぐのではない。**
+
+⚠️ **ESLint はさらに厳しい状況でした。** `@theia/eslint-plugin` は
+**`configs` オブジェクトを一切エクスポートせず**、5つの Theia 固有ルール
+（`annotation-check`, `localization-check`, `no-src-import`,
+`runtime-import-check`, `shared-dependencies`）だけの CommonJS で、
+flat-config メタデータも無い。
+**そして theia-ide は eslint 設定を自分の `configs/` に vendor した上で、
+plugins から `"@theia"` を完全に外しています**（eslint ^7.32.0 で、Theia core の ^8.57.1 より古い）。
+→ **前例は「設定ファイルをコピーして、Theia の lint ツーリングには依存しない」。**
+flat config が欲しければ最初から自分で書く（後で移行するより安い）。
 
 **⭐ そして Theia 1.74 はリポジトリルートに `CLAUDE.md` を同梱しています。**
 ビルドコマンド、`src/{common,browser,node,electron-browser,electron-main}` のレイアウト規則、
@@ -361,6 +415,86 @@ public リポジトリ + 標準ランナーで無料**。
 `*.slow-spec.ts` 低速、リソースは `test-resources/`）が書かれています。
 **この構造を自分の `CLAUDE.md` にコピーし、Theia のドキュメントを `@` 参照する。**
 （なお上流に `.claude/agents/` は無いので、そこは前例なし。）
+
+---
+
+## 5b. 🚨 EPL-2.0 のコーディング規則（エージェントに守らせる必要がある）
+
+**EPL-2.0 §1 の "Modified Works" 定義が、我々の自作拡張を守る条項です。逐語:**
+
+> 「**Modified Works** shall mean any work in Source Code or other form that results from
+> an addition to, deletion from, or modification of the contents of the Program,
+> **including, for purposes of clarity any new file in Source Code form that contains
+> any contents of the Program.** Modified Works shall **not** include works that contain only
+> declarations, interfaces, types, classes, structures, or files of the Program solely in
+> each case in order to **link to, bind by name, or subclass** the Program …」
+
+**帰結: import / サブクラス化 / 名前でバインドするだけのコードは Modified Works ではないので、
+自分の拡張は好きなライセンスにできる（プロプライエタリも可）。**
+
+🚨 **そして罠が「Program の内容を含むいかなる新規ファイルも含む」の部分です。**
+
+**Theia のソースを自分のファイルにコピーペーストしない。**
+Theia のクラス本体を自分の拡張にコピーして手直しすると、**そのファイルは EPL-2.0 になります。**
+→ **DI の rebind（inversify）とサブクラス化を、コピーペーストより優先する。**
+これは theia-ide 自身の拡張の構造そのものです。
+
+⚠️ **我々の現行計画に直接効きます。** [spikes.md](spikes.md) の S1 Step 1 は
+**`@theia/toolbar` から `createLayout` の本体を逐語コピー**する形になっています。
+そのファイルは EPL-2.0 になるので、**意図してそうするか、`super.createLayout()` を呼んで
+差分だけ書く形に変えるかを決める必要があります。**
+（VS Code の `ParagraphBuffer` / `scmHistory.ts` 移植は **MIT なので方向としては問題なし** —
+ただし Microsoft の MIT 表示をコードに残し NOTICE に列挙する義務がある。）
+
+**エージェント向けに `CLAUDE.md` に書くルール:**
+```
+- Theia のソースをコピーペーストしない。サブクラス化と DI rebind を使う。
+  Theia のコードを1行でも自分のファイルに写したら、そのファイルは EPL-2.0 になる。
+- Theia のコードを参照する必要があるときは、import して継承するか、
+  ContainerModule で rebind する。
+- MIT 由来のコード（VS Code など）を移植したら、元の著作権表示を残し NOTICE に追記する。
+```
+
+**§3.1(a) の配布義務**（Electron インストーラの配布時）:
+Theia のソースが EPL-2.0 で入手可能である旨の声明を添付し、入手方法を示す
+（`github.com/eclipse-theia/theia` の正確なバージョンを指すのが慣例的な履行）。
+§3.2(b) で契約書のコピーを同梱。§3.3 で Theia の表示を改変しない。
+**→ これが about ボックス / Third-Party-Notices 画面の役割。**
+theia-ide の `theia-extensions/product` はまさに about ダイアログを所有するために存在します。
+
+**なお `theia-ide` リポジトリ自体は MIT** で、フレームワーク（`@theia/*`）が
+`EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0` の **disjunctive（選択式）**。
+**`OR` なので EPL-2.0 の枝を選んで GPL は無視する**（これは decisions.md で既に決定済み）。
+
+🚨 **商標は製品名に直接効きます。** Eclipse のロゴガイドライン逐語:
+> 「You may not incorporate the name of an Eclipse Project Trademark into the name of
+> your company or software product name.」
+
+許される形は **`<製品名> for Eclipse Theia`** または **`<製品名>, Eclipse Theia Edition`** のみ。
+つまり「KJPTheia」「Theia KJP」は**不可**。「kjp-edit for Eclipse Theia」は可。
+最初かつ最も目立つ言及は "Eclipse Theia" とし、以降は "Theia" に短縮可。
+
+### 🎁 asar の罠と `ADOPTER.md`
+
+**`theia-ide/ADOPTER.md` が下流製品にとって最も有用なファイル**でした。
+**asar / `__dirname` の罠**とその3つの緩和策を文書化しています:
+`asarUnpack`、`patch-package`、そして **esbuild 後処理（`@vscode/ripgrep` 向けに
+`.asar` → `.asar.unpacked` を書き換える `asarRipgrepPlugin`）**。
+
+`electron-builder.yml` の該当設定: `asar: true`、`nodeGypRebuild: false`、`npmRebuild: false`、
+`asarUnpack` が `**/lib/backend/native/**` / `**/lib/backend/shell-integrations/**` / `**/lib/prebuilds/**`、
+`extraResources` が `../../plugins` → `app/plugins`。
+
+**ネイティブモジュールのリビルドに専用の CI ステップは無く**、
+`@theia/cli` の中（`@electron/rebuild ^4.1.0`）で
+`theia rebuild:electron --cacheRoot ../..` として走ります。
+
+⚠️ **Electron 42 は Node 24 をバンドル**（22 から上がった）。
+
+⚠️ **公式サイトのドキュメントは古い。** `theia-ide.org/docs/composing_applications/` は
+yarn + Node >=18 と書き、まだ "theia-blueprint" と呼んでいます。
+`theia-ide.org/docs/publishing/` は 404。
+**リポジトリの `PUBLISHING.md` と `ADOPTER.md` を正典として扱う。**
 
 ---
 
