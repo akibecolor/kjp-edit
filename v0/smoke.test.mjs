@@ -115,13 +115,20 @@ after(async () => {
     proc?.kill();
     // worktree は repo の外に置いたので個別に消す
     const stem = repo.split(/[\\/]/).pop();
-    for (const n of ['a', 'b']) {
+    for (const n of ['a', 'b', 'gone']) {
         await rm(join(repo, '..', `${stem}-wt-${n}`), { recursive: true, force: true });
+    }
+    // basename 衝突テストが作るディレクトリ（テスト内で消し損ねた場合の保険）
+    for (const n of ['dup1', 'dup2']) {
+        await rm(join(repo, '..', `${stem}-${n}`), { recursive: true, force: true });
     }
     await rm(repo, { recursive: true, force: true });
 });
 
-const state = async () => (await fetch(`${baseUrl}/api/v0/state`)).json();
+// ⚠️ 必ず fresh=1 で叩く。サーバは短い TTL キャッシュを持つので、
+//    テストがリポジトリを変更した直後に素で読むと古い payload が返り、
+//    「変更が検出されない」形で偽陰性になる（実際にこれで乗っ取り検出が落ちた）。
+const state = async () => (await fetch(`${baseUrl}/api/v0/state?fresh=1`)).json();
 
 test('UI が返る', async () => {
     const res = await fetch(`${baseUrl}/`);
@@ -239,4 +246,116 @@ test('🚨 シーケンサ乗っ取りを検出する（どのツールもガー
     // 後片付け
     await g(['rebase', '--abort'], wt).catch(() => {});
     await g(['checkout', '-q', 'agent-a'], wt).catch(() => {});
+});
+
+// ---------------------------------------------------------------------------
+// レビューで見つかった「静かに 500 になる / 静かに混ざる」経路の回帰テスト。
+// いずれも worktree を作る・壊すので、既存のフィクスチャを乱さないように
+// 専用の worktree を作って自分で片付ける。
+// ---------------------------------------------------------------------------
+
+test('1回の収集で git を起動する回数が worktree 本数に比例して爆発しない', async () => {
+    const s = await state();
+    assert.ok(s.stats, 'payload に stats が無い');
+    const { gitSpawns, worktrees } = s.stats;
+    // 実測: 定数 5（worktree list / for-each-ref / git-common-dir /
+    // origin/HEAD / log）+ 1本あたり 3（status / rev-list / diff）。
+    // 1本あたり1プロセス分だけ余裕を持たせる。
+    const budget = worktrees * 4 + 6;
+    assert.ok(
+        gitSpawns <= budget,
+        `worktree ${worktrees} 本で ${gitSpawns} プロセス起動（上限 ${budget}）。`
+        + ' ループの中で新しい git 呼び出しを足していないか確認する',
+    );
+});
+
+test('worktree のディレクトリが消えても他の worktree は返る（500 にしない）', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const gone = join(repo, '..', `${stem}-wt-gone`);
+    await g(['worktree', 'add', '-q', '-b', 'agent-gone', gone], repo);
+    // ディレクトリだけ消す → git 的には prunable。cwd に使うと ENOENT。
+    await rm(gone, { recursive: true, force: true });
+
+    const res = await fetch(`${baseUrl}/api/v0/state?fresh=1`);
+    assert.equal(res.status, 200, 'prunable な worktree でエンドポイントが落ちてはいけない');
+    const s = await res.json();
+
+    // 生きている worktree は今までどおり出る
+    assert.ok(s.worktrees.find(w => w.branch === 'agent-a'), 'agent-a が消えている');
+    assert.ok(s.worktrees.find(w => w.branch === 'main'), 'main が消えている');
+    // 失われた worktree は黙って消えるのではなく prunable として現れる
+    const dead = s.worktrees.find(w => w.branch === 'agent-gone');
+    assert.ok(dead, 'prunable な worktree が一覧から消えている');
+    assert.ok(dead.prunable, 'prunable フラグが立っていない');
+    // 縮退したことが payload に残る
+    assert.ok(
+        s.errors.some(e => /失われて/.test(e.message)),
+        `errors に縮退が記録されていない: ${JSON.stringify(s.errors)}`,
+    );
+
+    await g(['worktree', 'prune'], repo);
+    await g(['branch', '-D', 'agent-gone'], repo).catch(() => {});
+});
+
+test('basename が衝突する worktree の変更が混ざらない', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const one = join(repo, '..', `${stem}-dup1`, 'dup');
+    const two = join(repo, '..', `${stem}-dup2`, 'dup');
+    await g(['worktree', 'add', '-q', '-b', 'dup-one', one], repo);
+    await g(['worktree', 'add', '-q', '-b', 'dup-two', two], repo);
+    // 両方が同じファイルを触る。basename でキーにしていると1本に見える。
+    await writeFile(join(one, 'dup-shared.txt'), 'from one\n', 'utf8');
+    await writeFile(join(two, 'dup-shared.txt'), 'from two\n', 'utf8');
+    await g(['add', '-A'], one);
+    await g(['commit', '-q', '-m', 'feat: dup one'], one);
+    await g(['add', '-A'], two);
+    await g(['commit', '-q', '-m', 'feat: dup two'], two);
+
+    const s = await state();
+    const dups = s.worktrees.filter(w => w.basename === 'dup');
+    assert.equal(dups.length, 2, '同名 worktree が2本見えていない');
+    // 表示名が一意になっている（親ディレクトリで区別される）
+    assert.equal(new Set(dups.map(w => w.name)).size, 2,
+        `表示名が衝突している: ${dups.map(w => w.name)}`);
+
+    // 重複検出が2本を別物として数える
+    const ov = s.overlaps.find(o => o.path === 'dup-shared.txt');
+    assert.ok(ov, 'dup-shared.txt の重複が検出されていない');
+    assert.equal(ov.worktrees.length, 2,
+        `basename でキーにすると1本に潰れる: ${JSON.stringify(ov)}`);
+
+    for (const [wt, branch] of [[one, 'dup-one'], [two, 'dup-two']]) {
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', branch], repo).catch(() => {});
+    }
+});
+
+test('解決できない --base を渡してもエンドポイントは生きている', async () => {
+    // 別プロセスを立てて、存在しない ref を --base に渡す
+    const child = spawn(
+        process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--base', 'refs/heads/no-such-branch'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } },
+    );
+    child.stdout.setEncoding('utf8');
+    try {
+        const url = await new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+                if (m) { clearTimeout(t); resolve(m[0]); }
+            });
+            child.on('error', reject);
+        });
+        const res = await fetch(`${url}/api/v0/state`);
+        assert.equal(res.status, 200, '壊れた --base で 500 にしてはいけない');
+        const s = await res.json();
+        // 自動推測にフォールバックしている
+        assert.notEqual(s.base, 'refs/heads/no-such-branch');
+        assert.ok(s.graph.length > 0, 'グラフが空になっている');
+    } finally {
+        child.kill();
+    }
 });

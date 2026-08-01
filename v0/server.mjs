@@ -15,8 +15,9 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import {
-    git, listWorktrees, log, mergeBase, aheadBehind,
+    git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
+    refMap, resolveRef, worktreeGitDirs, stats,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 
@@ -40,57 +41,141 @@ function parseArgs(argv) {
 
 const opts = parseArgs(process.argv);
 
-/** 既定ブランチを推測する。origin/HEAD → main → master の順。 */
-async function guessBase(cwd) {
-    if (opts.base) return opts.base;
-    for (const probe of [
-        ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'],
-        ['rev-parse', '--verify', '--quiet', 'refs/heads/main'],
-        ['rev-parse', '--verify', '--quiet', 'refs/heads/master'],
-    ]) {
-        try {
-            const out = (await git(probe, { cwd })).trim();
-            if (out) return probe[0] === 'symbolic-ref' ? out : probe[probe.length - 1];
-        } catch { /* 次を試す */ }
+/**
+ * 既定ブランチを推測する。origin/HEAD → main → master の順。
+ * ⚠️ 戻り値は必ず verifyRefs() を通してから log() に渡す。
+ *    `origin/HEAD` は remote 側でブランチが消えても残るため、
+ *    ここが解決できない ref を返してエンドポイント全体が 500 になっていた。
+ */
+async function guessBase(cwd, refs) {
+    if (opts.base) {
+        if (resolveRef(refs, opts.base)) return opts.base;
+        console.error(`⚠ --base ${opts.base} は解決できません。自動推測に切り替えます。`);
+    }
+    // origin/HEAD だけは symbolic-ref なので for-each-ref の表に出ない
+    try {
+        const out = (await git(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { cwd })).trim();
+        if (out && resolveRef(refs, out)) return out;
+    } catch { /* origin/HEAD が無い。次を試す */ }
+    for (const candidate of ['main', 'master']) {
+        if (refs.has(`refs/heads/${candidate}`)) return candidate;
     }
     return 'HEAD';
 }
 
-async function collect() {
-    const cwd = opts.repo;
-    const worktrees = await listWorktrees(cwd);
-    const base = await guessBase(cwd);
+/**
+ * basename が衝突する worktree に一意なラベルを与える。
+ * `~/a/agent` と `~/b/agent` が両方 "agent" になり、
+ * overlaps / headBy が別 worktree の変更を混ぜていた（レビューで発覚）。
+ */
+function assignLabels(worktrees) {
+    const byName = new Map();
+    for (const wt of worktrees) {
+        if (!byName.has(wt.name)) byName.set(wt.name, []);
+        byName.get(wt.name).push(wt);
+    }
+    for (const [name, group] of byName) {
+        if (group.length === 1) { group[0].label = name; continue; }
+        for (const wt of group) {
+            const parts = wt.path.split(/[\\/]/).filter(Boolean);
+            wt.label = parts.slice(-2).join('/') || name;
+        }
+    }
+}
 
-    // 各 worktree の状態を並行に集める
+async function collectFresh() {
+    const cwd = opts.repo;
+    const errors = [];
+    const spawnsBefore = stats.spawns;
+
+    // worktree 本数に比例しない準備。ここで3プロセス使う。
+    const [worktrees, refs, common] = await Promise.all([
+        listWorktrees(cwd),
+        refMap(cwd),
+        commonDir(cwd),
+    ]);
+    assignLabels(worktrees);
+    const gitDirs = await worktreeGitDirs(common);   // fs のみ、spawn なし
+
+    // メイン worktree は `<commonDir>/worktrees/` に現れないので、その $GIT_DIR は
+    // commonDir 自身。ただし「表に無いから main」と決め打つのは危険で、
+    // gitdir ファイルが壊れた linked worktree も表から落ちる。その場合に
+    // commonDir を渡すとメインのシーケンサ状態を誤って読むので、
+    // 表に無い worktree が1本だけのときに限って commonDir を使い、
+    // 複数あるなら全て rev-parse にフォールバックさせる。
+    const unmapped = worktrees.filter(w => !w.bare && !gitDirs.has(w.path));
+    if (unmapped.length === 1) gitDirs.set(unmapped[0].path, common);
+
+    const base = await guessBase(cwd, refs);
+
+    // 各 worktree の状態を並行に集める。1本が壊れても他は出す。
+    // 1本あたり 3 プロセス (status / rev-list / diff) に抑える。
+    // ref の解決は refs 表、$GIT_DIR は gitDirs 表を引くので spawn しない。
     await Promise.all(worktrees.map(async wt => {
-        const ref = wt.branch ?? wt.head;
-        const [status, seq, mb] = await Promise.all([
-            worktreeStatus(wt.path).catch(() => ({ changed: 0, untracked: 0, dirty: false })),
-            sequencerState(wt.path).catch(() => ({ warnings: [] })),
-            mergeBase(cwd, base, ref),
+        wt.status = { changed: 0, untracked: 0, unmerged: 0, dirty: false };
+        wt.sequencer = { warnings: [] };
+        wt.ahead = 0; wt.behind = 0; wt.files = [];
+
+        // bare worktree には作業ツリーが無い。status を叩くと必ず失敗するので飛ばす。
+        if (wt.bare) return;
+        // prunable は実体ディレクトリが消えている。spawn の cwd に使うと ENOENT。
+        if (wt.prunable) {
+            errors.push({ scope: wt.label, message: `worktree が失われています (${wt.prunable})` });
+            return;
+        }
+
+        const [status, seq] = await Promise.all([
+            worktreeStatus(wt.path).catch(e => {
+                errors.push({ scope: wt.label, message: `status: ${e.message}` });
+                return wt.status;
+            }),
+            sequencerState(wt.path, gitDirs.get(wt.path) ?? null).catch(e => {
+                errors.push({ scope: wt.label, message: `sequencer: ${e.message}` });
+                return wt.sequencer;
+            }),
         ]);
         wt.status = status;
         wt.sequencer = seq;
-        wt.mergeBase = mb;
+
+        const ref = wt.branch ?? wt.head;
+        if (!resolveRef(refs, ref)) {
+            errors.push({ scope: wt.label, message: `ref を解決できません: ${ref}` });
+            return;
+        }
+        wt.ref = ref;
+
+        // merge-base は別プロセスで取らない。`base...ref` の三点記法が
+        // 内部で merge base を計算するので、diff / rev-list に任せる。
+        // 無関係な履歴なら diff が失敗するのでそれを縮退の合図に使う。
         const ab = await aheadBehind(cwd, base, ref).catch(() => ({ ahead: 0, behind: 0 }));
         wt.ahead = ab.ahead;
         wt.behind = ab.behind;
-        wt.files = mb
-            ? await changedFiles(cwd, base, ref).catch(() => [])
-            : [];
+        wt.files = await changedFiles(cwd, base, ref).catch(() => []);
     }));
 
-    // 全 worktree の HEAD + base を含む1枚のグラフ
-    const refs = [...new Set([base, ...worktrees.map(w => w.branch ?? w.head)])];
-    const commits = await log(cwd, refs, opts.limit);
+    // 全 worktree の HEAD + base を含む1枚のグラフ。
+    // 解決できない ref は log() に渡さない（1本で全体が落ちるため）。
+    const wanted = [...new Set([base, ...worktrees.map(w => w.ref ?? w.branch ?? w.head)])];
+    const graphRefs = wanted.filter(r => resolveRef(refs, r) || r === 'HEAD');
+    let commits = [];
+    if (graphRefs.length === 0) {
+        errors.push({ scope: 'graph', message: '表示できる ref がありません' });
+    } else {
+        try {
+            commits = await log(cwd, graphRefs, opts.limit);
+        } catch (e) {
+            // グラフが落ちても worktree 一覧は返す（部分縮退）
+            errors.push({ scope: 'graph', message: e.message });
+        }
+    }
     const rows = computeSwimlanes(commits);
 
-    // どの worktree がどのコミットに居るか
+    // どの worktree がどのコミットに居るか。path をキーにして重複 basename を潰さない。
     const headBy = new Map();
     for (const wt of worktrees) {
         if (!wt.head) continue;
         if (!headBy.has(wt.head)) headBy.set(wt.head, []);
-        headBy.get(wt.head).push(wt.name);
+        headBy.get(wt.head).push(wt.label);
     }
 
     const graph = rows.map((row, i) => ({
@@ -99,40 +184,95 @@ async function collect() {
         worktrees: headBy.get(row.hash) ?? [],
     }));
 
-    // ファイル重複の検出（クロスエージェントレビューの最小版）
+    // ファイル重複の検出（クロスエージェントレビューの最小版）。
+    // path をキーにするので同名 worktree でも別扱いになる。
     const byFile = new Map();
     for (const wt of worktrees) {
         for (const f of wt.files) {
-            if (!byFile.has(f.path)) byFile.set(f.path, []);
-            byFile.get(f.path).push(wt.name);
+            if (!byFile.has(f.path)) byFile.set(f.path, new Map());
+            byFile.get(f.path).set(wt.path, wt.label);
         }
     }
     const overlaps = [...byFile.entries()]
-        .filter(([, names]) => new Set(names).size > 1)
-        .map(([path, names]) => ({ path, worktrees: [...new Set(names)] }))
-        .sort((a, b) => b.worktrees.length - a.worktrees.length);
+        .filter(([, owners]) => owners.size > 1)
+        .map(([path, owners]) => ({ path, worktrees: [...owners.values()] }))
+        .sort((a, b) => b.worktrees.length - a.worktrees.length || a.path.localeCompare(b.path));
 
     return {
         repo: cwd,
         base,
         generatedAt: new Date().toISOString(),
         worktrees: worktrees.map(w => ({
-            name: w.name, path: w.path, branch: w.shortBranch, head: w.head,
+            name: w.label, basename: w.name, path: w.path,
+            branch: w.shortBranch, head: w.head,
             detached: w.detached, bare: w.bare, locked: w.locked, prunable: w.prunable,
             ahead: w.ahead, behind: w.behind, status: w.status,
+            // sequencer の全状態を渡す。UI が rebase/merge 中を出せなかったのは
+            // warnings しか払い出していなかったため（レビューで発覚）。
+            sequencer: {
+                rebasing: !!w.sequencer.rebasing,
+                merging: !!w.sequencer.merging,
+                cherryPicking: !!w.sequencer.cherryPicking,
+                reverting: !!w.sequencer.reverting,
+                bisecting: !!w.sequencer.bisecting,
+                rebaseHeadName: w.sequencer.rebaseHeadName ?? null,
+                headRef: w.sequencer.headRef ?? null,
+                warnings: w.sequencer.warnings ?? [],
+            },
             warnings: w.sequencer.warnings ?? [],
             files: w.files,
         })),
         graph,
         overlaps,
+        errors,
+        // 1回の収集で git を何回起動したか。worktree 本数に対する伸び方を
+        // スモークテストで固定する（コメントだけでは回帰を防げない）。
+        stats: { gitSpawns: stats.spawns - spawnsBefore, worktrees: worktrees.length },
     };
+}
+
+/**
+ * 短い TTL のキャッシュと in-flight の合流。
+ *
+ * 本体の対策は collectFresh() 側のプロセス削減。実測のコストは
+ *   定数 5 (worktree list / for-each-ref / git-common-dir / origin/HEAD / log)
+ *   + worktree 1本あたり 3 (status / rev-list / diff)
+ * で、11本なら 59 → 38。ref 解決と $GIT_DIR は表引きなので spawn しない。
+ * この式は payload の stats.gitSpawns でスモークテストが固定している。
+ * ここで効くのは「同時に来た複数リクエスト」だけ:
+ *   - 15秒ポーリングは TTL を跨ぐので毎回収集し直す（意図通り）
+ *   - タブを複数開いた場合や再読込連打は1回の収集に合流する
+ * ⚠️ 状態を変えた直後に読む場合（テスト・手動再読込）は ?fresh=1 が必要。
+ */
+const CACHE_TTL_MS = 1500;
+let cached = null;      // { at, value }
+let inFlight = null;
+
+async function collect({ force = false } = {}) {
+    const now = process.hrtime.bigint();
+    if (!force && cached && Number(now - cached.at) / 1e6 < CACHE_TTL_MS) {
+        return cached.value;
+    }
+    if (inFlight) return inFlight;           // 同時リクエストは1回の収集に合流させる
+    inFlight = (async () => {
+        try {
+            const value = await collectFresh();
+            cached = { at: process.hrtime.bigint(), value };
+            return value;
+        } finally {
+            inFlight = null;
+        }
+    })();
+    return inFlight;
 }
 
 const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     try {
         if (url.pathname === '/api/v0/state') {
-            const body = JSON.stringify(await collect());
+            // ?fresh=1 で TTL キャッシュを無視する（手動リロード用）
+            const force = url.searchParams.get('fresh') === '1';
+            const body = JSON.stringify(await collect({ force }));
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',

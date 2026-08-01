@@ -23,6 +23,17 @@ node --test v0/smoke.test.mjs
 
 **成功を主張するのではなく証拠を示すこと。** テストを通したなら、その出力を貼る。
 
+テストを書くときの規則:
+
+- **リポジトリを変更した直後に読むテストは `?fresh=1` を付ける。**
+  サーバは短い TTL キャッシュを持つので、素で読むと古い payload が返り
+  「変更が検出されない」形の**偽陰性**になる（これでシーケンサ乗っ取り検出が落ちた）
+- **グラフアルゴリズムの期待値を手で決める前に、「その形で何が起きるのが正しいか」を
+  先に言語化する。** レーン割当のテストで**自分の期待値が誤っていた事故が2回**ある
+  （`docs/review-v0-code.md` 末尾）。実装ではなくテストが誤っている可能性を先に潰す
+- **性能や資源消費の主張はコメントに書かず、テストで固定する。**
+  プロセス起動数は payload の `stats.gitSpawns` として観測できるようにしてある
+
 ## 🚨 スクリプトの規則（実際に事故を起こした）
 
 1. **PowerShell でファイルを読み書きしない。** Read/Write/Edit ツールか Node を使う。
@@ -37,6 +48,14 @@ node --test v0/smoke.test.mjs
    Windows では `pkill` が `node.exe` に効かない。
    `Get-NetTCPConnection -LocalPort <port> -State Listen` でコマンドラインを照合してから停止する
    （検証用サーバを残してポートを塞いだことがある）
+6. **ソースに生の制御文字を書かない。必ずエスケープ表記にする。**
+   `/[^\x00-\x80]/` と書く。生の NUL を入れると git がファイルを **binary** と判定し、
+   `git diff` / `git log -p` / `git grep` の全てから見えなくなる
+   （`v0/git.mjs` が丸ごとレビュー不可能になっていた。`docs/review-v0-code.md` #1）
+7. **生の制御文字を含む置換を `node -e "..."` でやらない。**
+   bash → `node -e` → テンプレートリテラルの3段でエスケープが失われる。
+   6 の修正でこれを踏み、NUL が消えずに移動しただけ（3039 → 3456）になり、
+   さらに無関係な行のコメントを壊した。**スクリプトを `.mjs` ファイルに書いて実行する**
 
 ## 🚨 git の呼び方（`v0/git.mjs` に実装済み。必ずこれを通す）
 
@@ -59,6 +78,17 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
   `git fetch` が永久にハングしうる
 - テストで設定を隔離するときは **`/dev/null` ではなく空ファイル**を指す
   （`os.devNull` は Windows で `\\.\nul` になり git が落ちる）
+- **`-z` の出力で NUL をレコード区切りに使わない。** NUL はフィールド区切り専用。
+  `%D` が空だと NUL が3連続して分割が1つずれる（`log()`）。
+  `status --porcelain=v2 -z` の rename は `<path>` NUL `<origPath>` の**2トークン**
+  （`worktreeStatus()`）。**改行を含みえないフィールドなら改行を区切りにする**
+- **`git for-each-ref` に `-z` は無い**（`unknown switch 'z'` で 129 終了）。
+  refname は改行を含みえないので `--format=%(refname)%00%(objectname)` +
+  改行区切りで安全にパースできる
+- **ループの中で新しい `git` 呼び出しを足さない。** worktree 本数に比例して
+  プロセスが増える（11本で 59 spawn になっていた）。ref 解決は `refMap()`、
+  `$GIT_DIR` は `worktreeGitDirs()` の表引きで済ませる。
+  payload の `stats.gitSpawns` をスモークテストが上限で固定している
 
 ## パスの扱い
 

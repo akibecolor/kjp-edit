@@ -26,6 +26,7 @@
   .card h3 { margin: 0 0 .3rem; font-size: 13px; display: flex; gap: .4rem; align-items: center; }
   .badge { font-size: 11px; padding: 0 .35em; border-radius: 3px; border: 1px solid var(--line); color: var(--dim); }
   .badge.dirty { color: var(--warn); border-color: var(--warn); }
+  .badge.danger { color: var(--danger); border-color: var(--danger); }
   .ab { color: var(--dim); font-size: 12px; }
   .ab b { color: var(--fg); font-weight: 600; }
   .files { margin: .4rem 0 0; padding: 0; list-style: none; max-height: 8rem; overflow: auto; }
@@ -101,11 +102,14 @@ function rowSvg(row) {
     return e;
   };
 
-  // 上半分: input レーンを行の中央まで引く
+  // 上半分: input レーンを行の中央まで引く。
+  // どの output レーンが input から供給されているかも同時に記録する。
+  const fedByInput = new Set();
   row.input.forEach((node, i) => {
     // 自分のコミットを指すレーンは点へ寄せる（合流）。それ以外は下の同じIDへ。
     const target = node.id === row.hash ? row.lane
       : row.output.findIndex(o => o.id === node.id);
+    if (node.id !== row.hash && target !== -1) fedByInput.add(target);
     const x2 = target === -1 ? x(i) : x(target);
     add('path', {
       d: `M ${x(i)} 0 L ${x(i)} ${ROW_H / 2 - 5} L ${x2} ${ROW_H / 2}`,
@@ -114,14 +118,28 @@ function rowSvg(row) {
   });
 
   // 下半分: output レーンを行の中央から下へ。
-  // 第一親のレーンだけは点 (row.lane) から引く。
+  // 点 (row.lane) から引くのは第一親のレーンと、
+  // このマージ行で新しく開いた第二親以降のレーン。
+  // ⚠️ mergeParentLanes を見ていなかったため、マージの第二親レーンが
+  //    行の途中から何にも繋がらずに突然生えていた（レビューで発覚）。
+  const mergeLanes = new Set(row.mergeParentLanes ?? []);
   row.output.forEach((node, i) => {
-    const from = i === row.firstParentLane ? row.lane : i;
+    const fresh = mergeLanes.has(i) && !fedByInput.has(i);
+    const from = (i === row.firstParentLane || fresh) ? row.lane : i;
     add('path', {
       d: `M ${x(from)} ${ROW_H / 2} L ${x(i)} ${ROW_H / 2 + 5} L ${x(i)} ${ROW_H}`,
       stroke: node.color, fill: 'none', 'stroke-width': 1.6,
     });
   });
+
+  // 既に開いているレーンへのマージは、上の縦線とは別に点からの分岐線を足す。
+  for (const i of mergeLanes) {
+    if (!fedByInput.has(i) || i === row.firstParentLane) continue;
+    add('path', {
+      d: `M ${x(row.lane)} ${ROW_H / 2} L ${x(i)} ${ROW_H / 2 + 5}`,
+      stroke: row.output[i]?.color ?? row.color, fill: 'none', 'stroke-width': 1.6,
+    });
+  }
 
   // コミットのドット。worktree の HEAD は塗りを抜いて強調する。
   const isHead = row.worktrees.length > 0;
@@ -147,9 +165,17 @@ function render(s) {
   $('#base').textContent = `base: ${s.base}`;
   $('#at').textContent = when(s.generatedAt);
 
-  // 警告（シーケンサ乗っ取り / MERGE_HEAD）
+  // 収集そのものが部分的に失敗した場合（worktree 消失・ref 未解決など）。
+  // これを出さないと、壊れた worktree が静かに一覧から消えるだけになる。
   const alerts = $('#alerts');
   alerts.replaceChildren();
+  for (const e of s.errors ?? []) {
+    const d = el('div', 'alert');
+    d.append(el('b', null, `${e.scope}: `), document.createTextNode(e.message));
+    alerts.append(d);
+  }
+
+  // 警告（シーケンサ乗っ取り / MERGE_HEAD）
   for (const wt of s.worktrees) {
     for (const w of wt.warnings) {
       const d = el('div', `alert ${w.level === 'danger' ? 'danger' : ''}`);
@@ -168,13 +194,29 @@ function render(s) {
     if (wt.branch) h.append(el('span', 'badge', wt.branch));
     if (wt.detached) h.append(el('span', 'badge', 'detached'));
     if (wt.locked) h.append(el('span', 'badge', 'locked'));
+    // ⚠️ prunable / bare / 進行中のシーケンサは payload に来ていたのに
+    //    どのバッジも描いていなかった（レビューで発覚）。
+    //    これが見えないと「なぜこの worktree の数字が 0 なのか」が分からない。
+    if (wt.prunable) h.append(el('span', 'badge danger', 'prunable'));
+    if (wt.bare) h.append(el('span', 'badge', 'bare'));
+    const seq = wt.sequencer ?? {};
+    for (const [flag, label] of [
+      ['rebasing', 'rebasing'], ['merging', 'merging'],
+      ['cherryPicking', 'cherry-pick'], ['reverting', 'revert'], ['bisecting', 'bisect'],
+    ]) {
+      if (seq[flag]) h.append(el('span', 'badge danger', label));
+    }
     if (wt.status?.dirty) h.append(el('span', 'badge dirty', 'dirty'));
     c.append(h);
 
     const ab = el('div', 'ab');
     ab.innerHTML = `+<b>${wt.ahead}</b> / -<b>${wt.behind}</b>`
-      + (wt.status ? ` · 変更 <b>${wt.status.changed}</b> · 未追跡 <b>${wt.status.untracked}</b>` : '');
+      + (wt.status ? ` · 変更 <b>${wt.status.changed}</b> · 未追跡 <b>${wt.status.untracked}</b>` : '')
+      + (wt.status?.unmerged ? ` · <b>未解決 ${wt.status.unmerged}</b>` : '');
     c.append(ab);
+    if (wt.prunable) {
+      c.append(el('div', 'ab', `作業ツリーが失われています: ${wt.prunable}`));
+    }
 
     if (wt.files.length) {
       const ul = el('ul', 'files');
@@ -219,9 +261,11 @@ function render(s) {
   }
 }
 
-async function load() {
+// force=true のときだけサーバの TTL キャッシュを無視する。
+// 自動ポーリングはキャッシュに当てて git の spawn を抑える。
+async function load(force = false) {
   try {
-    const res = await fetch('/api/v0/state');
+    const res = await fetch(force ? '/api/v0/state?fresh=1' : '/api/v0/state');
     const s = await res.json();
     if (s.error) throw new Error(s.error);
     render(s);
@@ -229,7 +273,7 @@ async function load() {
     $('#alerts').replaceChildren(el('div', 'alert danger', String(e.message || e)));
   }
 }
-$('#refresh').addEventListener('click', load);
+$('#refresh').addEventListener('click', () => load(true));
 load();
-setInterval(load, 15000);
+setInterval(() => load(), 15000);
 </script>

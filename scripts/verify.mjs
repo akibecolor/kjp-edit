@@ -12,9 +12,10 @@
 //   - exit 0 = 合格、exit 1 = 不合格（Stop hook では exit 2 に変換される）
 
 import { spawn } from 'node:child_process';
-import { readdir } from 'node:fs/promises';
+import { readdir, readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join, relative } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const quick = process.argv.includes('--quick');
@@ -41,15 +42,52 @@ function run(args, { timeout = 300_000 } = {}) {
     });
 }
 
-/** *.mjs を再帰的に集める（node_modules と .git は除く） */
-async function sources(dir, acc = []) {
+/** 拡張子で再帰的に集める（node_modules と .git は除く） */
+async function sources(dir, exts = ['.mjs'], acc = []) {
     for (const e of await readdir(dir, { withFileTypes: true })) {
         if (e.name === 'node_modules' || e.name === '.git' || e.name.startsWith('.claude')) continue;
         const p = join(dir, e.name);
-        if (e.isDirectory()) await sources(p, acc);
-        else if (e.name.endsWith('.mjs')) acc.push(p);
+        if (e.isDirectory()) await sources(p, exts, acc);
+        else if (exts.some(x => e.name.endsWith(x))) acc.push(p);
     }
     return acc;
+}
+
+/**
+ * HTML の中に埋まっている <script type="module"> を取り出して構文チェックする。
+ *
+ * ⚠️ これが無かったせいで v0/index.html は検証の対象外だった。
+ *    描画バグ（マージの第二親レーンが繋がらない、レーン色が6本目で衝突する）が
+ *    verify.mjs を緑のまま通り抜けた構造的な原因はここ（レビューで発覚）。
+ */
+async function checkInlineModules(htmlFiles) {
+    const bad = [];
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-verify-'));
+    try {
+        for (const file of htmlFiles) {
+            const html = await readFile(file, 'utf8');
+            const scripts = [...html.matchAll(
+                /<script\b[^>]*\btype\s*=\s*["']module["'][^>]*>([\s\S]*?)<\/script>/gi,
+            )];
+            if (scripts.length === 0) {
+                bad.push(`${relative(ROOT, file)}: type="module" の script が見つかりません`);
+                continue;
+            }
+            for (const [i, m] of scripts.entries()) {
+                const tmp = join(dir, `${i}-${file.split(/[\\/]/).pop()}.mjs`);
+                await writeFile(tmp, m[1], 'utf8');
+                const r = await run(['--check', tmp], { timeout: 20_000 });
+                if (r.code !== 0) {
+                    const first = r.output.split('\n')
+                        .find(l => /Error/.test(l)) ?? r.output.split('\n')[0] ?? '';
+                    bad.push(`${relative(ROOT, file)} (script #${i + 1}): ${first.trim()}`);
+                }
+            }
+        }
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+    return bad;
 }
 
 /** node --test の出力から失敗だけを抜き出して短くする */
@@ -80,8 +118,10 @@ const steps = [];
 let failed = false;
 
 // 1. 構文チェック（型チェックの代わり。依存ゼロを保つため tsc は入れない）
+//    *.mjs と、HTML に埋め込まれた type="module" の両方を見る。
 {
-    const files = await sources(ROOT);
+    const files = await sources(ROOT, ['.mjs']);
+    const htmlFiles = await sources(ROOT, ['.html']);
     const bad = [];
     for (const f of files) {
         const r = await run(['--check', f], { timeout: 20_000 });
@@ -90,9 +130,11 @@ let failed = false;
             bad.push(`${relative(ROOT, f)}: ${first.trim()}`);
         }
     }
+    bad.push(...await checkInlineModules(htmlFiles));
+    const label = `syntax (${files.length} mjs, ${htmlFiles.length} html)`;
     steps.push(bad.length
-        ? { name: `syntax (${files.length} files)`, ok: false, detail: bad.slice(0, 5) }
-        : { name: `syntax (${files.length} files)`, ok: true });
+        ? { name: label, ok: false, detail: bad.slice(0, 5) }
+        : { name: label, ok: true });
     if (bad.length) failed = true;
 }
 
