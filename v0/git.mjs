@@ -121,7 +121,9 @@ export async function listWorktrees(cwd) {
                 case 'bare': wt.bare = true; break;
                 case 'detached': wt.detached = true; break;
                 case 'locked': wt.locked = true; wt.lockReason = val; break;
-                case 'prunable': wt.prunable = true; break;
+                // prunable は理由を伴う（`prunable gitdir file points to non-existent location`）。
+                // フラグだけにすると UI が「(true)」と出して原因が分からなくなる。
+                case 'prunable': wt.prunable = true; wt.prunableReason = val || null; break;
             }
         }
         wt.name = wt.path ? wt.path.split(/[\\/]/).pop() : '(unknown)';

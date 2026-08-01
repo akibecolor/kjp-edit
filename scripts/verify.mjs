@@ -166,10 +166,28 @@ if (!quick && !failed) {
     steps.push({ name: 'smoke', ok: true, skipped: true });
 }
 
+// 4. レイアウト検査（ブラウザが有る環境だけ。CI では自動でスキップされる）
+//    CSS の「見た目で気付けない」バグ用。詳細は v0/layout-check.mjs のコメント。
+if (!quick && !failed) {
+    const r = await run(['v0/layout-check.mjs'], { timeout: 240_000 });
+    const skipped = /skipped/.test(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: 'layout',
+        ok,
+        skipped,
+        detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),
+    });
+    if (!ok) failed = true;
+} else if (quick) {
+    steps.push({ name: 'layout', ok: true, skipped: true });
+}
+
 // ---- 出力: 20行以内 ----
 for (const s of steps) {
     const mark = s.skipped ? '–' : s.ok ? '✔' : '✖';
-    console.log(`${mark} ${s.name}${s.skipped ? ' (skipped: --quick)' : ''}`);
+    const why = s.skipped ? (quick ? ' (skipped: --quick)' : ' (skipped: ブラウザ無し)') : '';
+    console.log(`${mark} ${s.name}${why}`);
     for (const d of s.detail ?? []) console.log(`    ${d}`);
 }
 if (failed) {

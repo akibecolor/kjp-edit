@@ -14,43 +14,105 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
     font: 13px/1.5 ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace; }
+  /* 別端末（スマホ）から見るので、ヘッダは常に届く位置に置く */
   header { padding: .75rem 1rem; border-bottom: 1px solid var(--line);
-    display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
+    display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap;
+    position: sticky; top: 0; z-index: 10; background: var(--bg); }
+  /* ⚠️ ここから下の min-width: 0 / overflow-wrap / flex-wrap は**予防的**な宣言。
+     grid・flex アイテムの min-width が既定 auto であることに備えている。
+     いずれも外しても現行フィクスチャ（6レーン）では横溢れは再現しなかった
+     ので、「これが無いと崩れる」とは書かない（v0/layout-check.mjs で確認）。
+     実証済みで load-bearing なのは .grow のバッジ配置だけ（下記）。 */
+  header > * { min-width: 0; }
   h1 { font-size: 14px; margin: 0; font-weight: 600; }
-  .meta { color: var(--dim); font-size: 12px; }
+  .meta { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
   main { padding: 1rem; display: grid; gap: 1rem; max-width: 1400px; }
+  /* .graph の overflow: auto は幅が確定して初めて効く（レーン数が多い場合に備える）。 */
+  main > *, .body { min-width: 0; }
   section > h2 { font-size: 13px; margin: 0 0 .5rem; color: var(--dim);
     text-transform: uppercase; letter-spacing: .05em; }
+  /* 折り畳み。縦に並べて最小化・展開できるようにする（モバイルの運用イメージ）。
+     <details> は静的マークアップに置き、中身だけを差し替えるので
+     15秒ごとの再描画でも開閉状態が保たれる。 */
+  details { border: 1px solid var(--line); border-radius: 4px; background: var(--card); }
+  details > summary { cursor: pointer; list-style: none; padding: .6rem .7rem;
+    display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap;
+    font-size: 13px; color: var(--dim); text-transform: uppercase;
+    letter-spacing: .05em; min-height: 40px; }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before { content: '▸'; color: var(--dim); font-size: 11px; }
+  details[open] > summary::before { content: '▾'; }
+  details > summary:hover { color: var(--fg); }
+  /* 畳んだままでも状況が分かるように要約を出す */
+  .sum-note { text-transform: none; letter-spacing: 0; color: var(--fg); font-size: 12px; }
+  .sum-note .warn { color: var(--warn); }
+  .sum-note .danger { color: var(--danger); }
+  .body { padding: 0 .7rem .7rem; }
   .cards { display: grid; gap: .5rem; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: .6rem .7rem; }
-  .card h3 { margin: 0 0 .3rem; font-size: 13px; display: flex; gap: .4rem; align-items: center; }
+  .card h3 { margin: 0 0 .3rem; font-size: 13px; display: flex; gap: .4rem;
+    align-items: center; flex-wrap: wrap; }
   .badge { font-size: 11px; padding: 0 .35em; border-radius: 3px; border: 1px solid var(--line); color: var(--dim); }
   .badge.dirty { color: var(--warn); border-color: var(--warn); }
   .badge.danger { color: var(--danger); border-color: var(--danger); }
-  .ab { color: var(--dim); font-size: 12px; }
+  .ab { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
   .ab b { color: var(--fg); font-weight: 600; }
   .files { margin: .4rem 0 0; padding: 0; list-style: none; max-height: 8rem; overflow: auto; }
   .files li { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .files .st { display: inline-block; width: 1.2em; color: var(--accent); }
   .alert { border-left: 3px solid var(--warn); padding: .4rem .6rem; margin: .3rem 0;
-    background: var(--card); font-size: 12px; }
+    background: var(--card); font-size: 12px; overflow-wrap: anywhere; }
   .alert.danger { border-left-color: var(--danger); }
   .alert code { color: var(--accent); }
   /* グラフ: 行を1枚の SVG + テキストの grid で並べる */
   .graph { border: 1px solid var(--line); border-radius: 4px; overflow: auto; background: var(--card); }
-  .grow { display: grid; grid-template-columns: auto 1fr auto; align-items: center;
-    height: var(--row); gap: .6rem; padding-right: .6rem; }
+  /* ⚠️ バッジ（worktree HEAD / ref）を .subject の中に入れてはいけない。
+     .subject は overflow: hidden なので、狭い画面ではバッジが
+     クリップされて**完全に見えなくなる**（横スクロールでも到達できない。
+     .graph の scrollWidth にも寄与しないので溢れとして検出もされない）。
+     「どのコミットがどのエージェントの HEAD か」はこのツールの核心情報なので、
+     独立した列に置いて .subject 側を truncate させる。 */
+  .grow { display: grid; grid-template-columns: auto auto auto 1fr auto;
+    align-items: center; height: var(--row); gap: .4rem; padding-right: .6rem; }
+  /* ⚠️ ここに max-width: <パーセント> を書かないこと。grid の `auto` 列に対する
+     パーセント max-width は幅が循環参照になり、バッジが `a…` `HE…` のように
+     1〜2文字へ潰れる（実測）。各バッジ側の max-width: 12em で足りる。
+     行が詰まったときは 1fr の .subject が縮んで吸収する。 */
+  .wtcell, .refcell { display: flex; gap: .2rem; align-items: center;
+    overflow: hidden; white-space: nowrap; }
   .grow:hover { background: rgba(127,127,127,.12); }
   .grow svg { display: block; }
-  .subject { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* grid の 1fr は minmax(auto, 1fr) なので、min-width: 0 で内容幅を下回れるようにする
+     （これも上記と同じ予防的な宣言。外しても現行フィクスチャでは再現しない）。 */
+  .subject { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   .refs { color: var(--dim); font-size: 11px; }
-  .ref { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em; margin-left: .3em; }
+  .ref { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
+    font-size: 11px; max-width: 12em; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; flex: 0 1 auto; }
   .ref.wt { color: var(--accent); border-color: var(--accent); }
   .when { color: var(--dim); font-size: 11px; white-space: nowrap; }
   .empty { color: var(--dim); padding: .5rem; }
+  /* タッチで押せる大きさを確保する（44px 目安） */
   button { font: inherit; background: var(--card); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 3px; padding: .2rem .6rem; cursor: pointer; }
-  @media (max-width: 700px) { main { padding: .5rem; } .when { display: none; } }
+    border: 1px solid var(--line); border-radius: 3px;
+    padding: .35rem .8rem; min-height: 32px; cursor: pointer; }
+  @media (max-width: 700px) {
+    main { padding: .5rem; gap: .5rem; }
+    .when { display: none; }
+    /* カードは1列に積む（レイアウトの保持は諦めて縦に並べる方針） */
+    .cards { grid-template-columns: 1fr; }
+    /* グラフの行は縦に伸ばして指で追いやすくする */
+    .grow { gap: .4rem; padding-right: .3rem; }
+    header { padding: .5rem .6rem; gap: .5rem; }
+    /* 変更ファイル一覧はスマホでは短く。展開はカードのスクロールで足りる */
+    .files { max-height: 6rem; }
+    /* ⚠️ ref バッジは 390px では 1〜2文字（`a…` `機…`）に潰れ、
+       場所を取って何も伝えない。worktree HEAD バッジとグラフ形状を優先して落とす。
+       ブランチ名は worktree カードと行の title に残るので失われない。 */
+    .refcell { display: none; }
+    details > summary { padding: .7rem .6rem; }
+    .body { padding: 0 .6rem .6rem; }
+  }
 </style>
 
 <header>
@@ -62,19 +124,23 @@
 </header>
 
 <main>
+  <!-- 警告は畳めない。見落とすと壊れるのが目的の情報なので常に開く。 -->
   <section id="alerts"></section>
-  <section>
-    <h2>Worktrees</h2>
-    <div class="cards" id="worktrees"></div>
-  </section>
-  <section id="overlap-section" hidden>
-    <h2>同じファイルを触っている worktree</h2>
-    <div id="overlaps"></div>
-  </section>
-  <section>
-    <h2>統合グラフ（全 worktree の HEAD を1枚に）</h2>
-    <div class="graph" id="graph"></div>
-  </section>
+
+  <details id="d-wt" open>
+    <summary>Worktrees <span class="sum-note" id="sum-wt"></span></summary>
+    <div class="body"><div class="cards" id="worktrees"></div></div>
+  </details>
+
+  <details id="d-ov" hidden>
+    <summary>同じファイルを触っている worktree <span class="sum-note" id="sum-ov"></span></summary>
+    <div class="body" id="overlaps"></div>
+  </details>
+
+  <details id="d-graph" open>
+    <summary>統合グラフ（全 worktree の HEAD を1枚に）<span class="sum-note" id="sum-graph"></span></summary>
+    <div class="body"><div class="graph" id="graph"></div></div>
+  </details>
 </main>
 
 <script type="module">
@@ -215,7 +281,7 @@ function render(s) {
       + (wt.status?.unmerged ? ` · <b>未解決 ${wt.status.unmerged}</b>` : '');
     c.append(ab);
     if (wt.prunable) {
-      c.append(el('div', 'ab', `作業ツリーが失われています: ${wt.prunable}`));
+      c.append(el('div', 'ab', `作業ツリーが失われています: ${wt.prunableReason ?? '理由不明'}`));
     }
 
     if (wt.files.length) {
@@ -232,7 +298,7 @@ function render(s) {
   }
 
   // ファイル重複
-  const ovSec = $('#overlap-section'), ov = $('#overlaps');
+  const ovSec = $('#d-ov'), ov = $('#overlaps');
   ov.replaceChildren();
   if (s.overlaps.length) {
     ovSec.hidden = false;
@@ -243,6 +309,21 @@ function render(s) {
     }
   } else ovSec.hidden = true;
 
+  // 畳んだままでも状況が分かる要約。スマホでは全部展開すると縦に長すぎる。
+  const dirty = s.worktrees.filter(w => w.status?.dirty).length;
+  const broken = s.worktrees.filter(w => w.prunable).length;
+  const danger = s.worktrees.reduce(
+    (n, w) => n + (w.warnings ?? []).filter(x => x.level === 'danger').length, 0);
+  const wtNote = [`${s.worktrees.length} 本`];
+  if (dirty) wtNote.push(`dirty ${dirty}`);
+  if (broken) wtNote.push(`prunable ${broken}`);
+  const sumWt = $('#sum-wt');
+  sumWt.replaceChildren(document.createTextNode(wtNote.join(' · ')));
+  if (danger) sumWt.append(el('span', 'danger', ` · 🚨 ${danger}`));
+
+  $('#sum-ov').textContent = s.overlaps.length ? `${s.overlaps.length} ファイル` : '';
+  $('#sum-graph').textContent = `${s.graph.length} コミット · base ${s.base}`;
+
   // グラフ
   const g = $('#graph');
   g.replaceChildren();
@@ -250,13 +331,21 @@ function render(s) {
   for (const row of s.graph) {
     const r = el('div', 'grow');
     r.append(rowSvg(row));
-    const mid = el('div', 'subject');
-    mid.append(document.createTextNode(row.subject));
-    for (const name of row.worktrees) mid.append(el('span', 'ref wt', `⌂ ${name}`));
-    for (const ref of row.refs) mid.append(el('span', 'ref', ref));
-    r.append(mid);
+    // worktree の HEAD → ref → 件名 の順。狭い画面では件名から削る。
+    const wtCell = el('div', 'wtcell');
+    for (const name of row.worktrees) wtCell.append(el('span', 'ref wt', `⌂ ${name}`));
+    r.append(wtCell);
+    const refCell = el('div', 'refcell');
+    for (const ref of row.refs) refCell.append(el('span', 'ref', ref));
+    r.append(refCell);
+    r.append(el('div', 'subject', row.subject));
     r.append(el('div', 'when', `${row.author} · ${when(row.date)}`));
-    r.title = `${row.hash.slice(0, 8)}  ${row.subject}`;
+    // バッジは truncate されうるので、全文は title で辿れるようにする
+    r.title = [
+        `${row.hash.slice(0, 8)}  ${row.subject}`,
+        row.worktrees.length ? `worktree: ${row.worktrees.join(', ')}` : null,
+        row.refs.length ? `refs: ${row.refs.join(', ')}` : null,
+    ].filter(Boolean).join('\n');
     g.append(r);
   }
 }
@@ -273,6 +362,19 @@ async function load(force = false) {
     $('#alerts').replaceChildren(el('div', 'alert danger', String(e.message || e)));
   }
 }
+// 開閉状態を残す。スマホで毎回グラフを畳み直すのは使えないので。
+// localStorage が使えない環境（プライベートモード等）でも落ちないようにする。
+for (const d of document.querySelectorAll('details')) {
+  const key = `kjp-open:${d.id}`;
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved !== null) d.open = saved === '1';
+  } catch { /* 保存できなくても動く */ }
+  d.addEventListener('toggle', () => {
+    try { localStorage.setItem(key, d.open ? '1' : '0'); } catch { /* 同上 */ }
+  });
+}
+
 $('#refresh').addEventListener('click', () => load(true));
 load();
 setInterval(() => load(), 15000);

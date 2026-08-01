@@ -24,19 +24,70 @@ import { computeSwimlanes } from './swimlanes.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
-    const opts = { repo: process.cwd(), port: 7749, limit: 300, base: null };
+    const opts = { repo: process.cwd(), port: 7749, limit: 300, base: null, layoutProbe: false };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--repo') opts.repo = resolve(argv[++i]);
         else if (a === '--port') opts.port = Number(argv[++i]);
         else if (a === '--limit') opts.limit = Number(argv[++i]);
         else if (a === '--base') opts.base = argv[++i];
+        else if (a === '--layout-probe') opts.layoutProbe = true;
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
+            console.log('       --layout-probe  レイアウト検査用の /__probe を有効にする (layout-check.mjs が使う)');
             process.exit(0);
         }
     }
     return opts;
+}
+
+/**
+ * レイアウト検査用のハーネス。UI を指定幅の iframe に入れて、
+ * 内側から実寸を測れるようにする（同一オリジンなので contentDocument が読める）。
+ *
+ * ⚠️ 既定では無効（`--layout-probe` が必要）。このサーバは認証を持たないので、
+ *    検査専用の経路を常時開けない。
+ * ⚠️ headless Chrome の `--window-size` は Windows では最小幅に丸められ、
+ *    390 を指定しても innerWidth が 500 になる（実測）。iframe なら正確に効く。
+ */
+function probeHarness(width) {
+    const w = Number.isFinite(width) && width >= 200 && width <= 4000 ? Math.floor(width) : 390;
+    return `<!doctype html><meta charset="utf-8"><title>layout probe</title>
+<body style="margin:0">
+<iframe id="f" src="/" style="width:${w}px;height:2000px;border:0"></iframe>
+<pre id="out"></pre>
+<script type="module">
+const f = document.getElementById('f');
+await new Promise(r => f.addEventListener('load', r, { once: true }));
+await new Promise(r => setTimeout(r, 2000));
+const win = f.contentWindow, doc = f.contentDocument;
+const vw = win.innerWidth;
+const rect = e => e.getBoundingClientRect();
+const over = [...doc.querySelectorAll('*')].filter(e => rect(e).right > vw + 1)
+  .map(e => e.tagName + (e.id ? '#' + e.id : '')
+    + (e.className ? '.' + String(e.className).trim().split(/\\s+/).join('.') : ''));
+// ⚠️ 「描かれているか」は getClientRects() で見る。
+//    自分の display が none でなくても、祖先が none なら描かれていない。
+//    getComputedStyle(e).display だけで判定すると、意図的に隠した .refcell の
+//    中のバッジを「幅0に潰れている」と誤検出する（実際に踏んだ）。
+const drawn = e => e.getClientRects().length > 0;
+const badges = [...doc.querySelectorAll('.ref')].filter(drawn);
+// 描かれているのに幅が無い = overflow:hidden や循環参照で情報が消えている
+const squashed = badges.filter(e => rect(e).width < 24)
+  .map(e => e.textContent.trim() + ' w=' + Math.round(rect(e).width));
+document.getElementById('out').textContent = JSON.stringify({
+  innerWidth: vw,
+  bodyScrollWidth: doc.body.scrollWidth,
+  bodyClientWidth: doc.body.clientWidth,
+  overflowing: over.slice(0, 12),
+  overflowingCount: over.length,
+  squashedBadges: squashed.slice(0, 12),
+  squashedCount: squashed.length,
+  visibleBadges: badges.length,
+  // worktree HEAD バッジは狭い画面でも消してはいけない（このツールの核心情報）
+  visibleWorktreeBadges: [...doc.querySelectorAll('.ref.wt')].filter(drawn).length,
+});
+</script>`;
 }
 
 const opts = parseArgs(process.argv);
@@ -120,7 +171,10 @@ async function collectFresh() {
         if (wt.bare) return;
         // prunable は実体ディレクトリが消えている。spawn の cwd に使うと ENOENT。
         if (wt.prunable) {
-            errors.push({ scope: wt.label, message: `worktree が失われています (${wt.prunable})` });
+            errors.push({
+                scope: wt.label,
+                message: `worktree が失われています: ${wt.prunableReason ?? '理由不明'}`,
+            });
             return;
         }
 
@@ -205,7 +259,8 @@ async function collectFresh() {
         worktrees: worktrees.map(w => ({
             name: w.label, basename: w.name, path: w.path,
             branch: w.shortBranch, head: w.head,
-            detached: w.detached, bare: w.bare, locked: w.locked, prunable: w.prunable,
+            detached: w.detached, bare: w.bare, locked: w.locked,
+            prunable: w.prunable, prunableReason: w.prunableReason ?? null,
             ahead: w.ahead, behind: w.behind, status: w.status,
             // sequencer の全状態を渡す。UI が rebase/merge 中を出せなかったのは
             // warnings しか払い出していなかったため（レビューで発覚）。
@@ -278,6 +333,11 @@ const server = createServer(async (req, res) => {
                 'cache-control': 'no-store',
             });
             res.end(body);
+            return;
+        }
+        if (opts.layoutProbe && url.pathname === '/__probe') {
+            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+            res.end(probeHarness(Number(url.searchParams.get('w'))));
             return;
         }
         if (url.pathname === '/' || url.pathname === '/index.html') {

@@ -58,6 +58,34 @@ HEAD は今: hijacked
 同様に `git checkout -b` は解決済み未コミットのマージの **`MERGE_HEAD` を無警告で削除**し、
 次の commit を単一親にします（マージの内容は残るが関係が消える）。
 
+## 別端末（スマホ）から見る
+
+UI は縦に積む折り畳みパネルで、各セクションは畳んだままでも要約が読めます
+（`WORKTREES 6 本 · dirty 1 · prunable 1`）。開閉状態は `localStorage` に残ります。
+
+390px 幅で実測して確認していること（`node v0/layout-check.mjs`）:
+
+| | |
+|---|---|
+| 横スクロール | 出ない（`bodyScrollWidth == bodyClientWidth`） |
+| worktree HEAD バッジ | **必ず見える。**これが消えるとこのツールの意味が無くなる |
+| ブランチ ref バッジ | 700px 以下では隠す。390px では1〜2文字に潰れて情報にならないため |
+| worktree カード | 1列に積む |
+| 変更ファイル一覧 | カード内でスクロール |
+
+### 🔒 トンネルの注意
+
+このサーバは**認証を持ちません。**外から届かせる場合、
+**トンネルをループバックで終端させ、トンネル側で認証してください。**
+
+```bash
+tailscale serve --bg 7749        # Tailnet 内のみ。推奨
+```
+
+**`cloudflared` の quick tunnel（`trycloudflare.com`）を使わないこと。**
+URL を知っている誰でも無認証でリポジトリの中身が読めます
+（[../docs/hosting.md](../docs/hosting.md) の §2 に調査結果）。
+
 ## 設計上の約束
 
 - 🔒 **`127.0.0.1` のみにバインド。認証は持たない。**
@@ -76,9 +104,15 @@ HEAD は今: hijacked
 |---|---|
 | `git.mjs` | git の起動と解析。worktree 列挙、log、diff、シーケンサ状態検出 |
 | `swimlanes.mjs` | レーン割当。VS Code の `scmHistory.ts`（MIT）を参考に再実装 |
-| `swimlanes.test.mjs` | 回帰テスト。実装中に踏んだ2つのバグを固定 |
-| `server.mjs` | HTTP + `/api/v0/state` |
+| `swimlanes.test.mjs` | 回帰テスト。実際に踏んだバグを固定 |
+| `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe`） |
 | `index.html` | 単一ページ UI。ビルド不要、フレームワークなし |
+| `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
+| `layout-check.mjs` | 実ブラウザで 390 / 768 / 1280px を測る。ブラウザが無ければスキップ |
+
+`/api/v0/state` は `?fresh=1` で TTL キャッシュを無視します。
+`stats.gitSpawns` に1回の収集で起動した git のプロセス数が入ります
+（定数5 + worktree 1本あたり3）。
 
 ## 実装中に踏んだバグ（回帰テスト済み）
 

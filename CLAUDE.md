@@ -11,14 +11,15 @@ IDE（Eclipse Theia）に進むかは v0 を使ってから判断する。設計
 **変更したら必ずこれを走らせる。合否が出るまで「できた」と言わない。**
 
 ```bash
-node scripts/verify.mjs          # 構文 + ユニット + スモーク
-node scripts/verify.mjs --quick  # スモークを飛ばす（速い）
+node scripts/verify.mjs          # 構文 + ユニット + スモーク + レイアウト
+node scripts/verify.mjs --quick  # スモークとレイアウトを飛ばす（速い）
 ```
 
 出力は20行以内に収めてある。失敗したら個別に再現する:
 ```bash
 node --test v0/swimlanes.test.mjs
 node --test v0/smoke.test.mjs
+node v0/layout-check.mjs         # 実ブラウザでレイアウトを測る（無ければスキップ）
 ```
 
 **成功を主張するのではなく証拠を示すこと。** テストを通したなら、その出力を貼る。
@@ -33,6 +34,25 @@ node --test v0/smoke.test.mjs
   （`docs/review-v0-code.md` 末尾）。実装ではなくテストが誤っている可能性を先に潰す
 - **性能や資源消費の主張はコメントに書かず、テストで固定する。**
   プロセス起動数は payload の `stats.gitSpawns` として観測できるようにしてある
+- **レイアウトの主張も同じ。`v0/layout-check.mjs` で実ブラウザで測る。**
+  「狭い画面で崩れていない」をコメントに書いても回帰は防げない。
+  **入れた検査は、壊れたときに実際に落ちることを確認する**
+  （`main > * { min-width: 0 }` を消しても落ちなかったので、
+  「これが無いと溢れる」というコメントを撤回した）
+
+## 🚨 ブラウザで検証するときの規則（実際に事故を起こした）
+
+1. **headless Chrome の `--window-size` は Windows では最小幅に丸められる。**
+   390 を指定しても `innerWidth` は 500 になる（実測）。
+   **狭い viewport は iframe を指定幅で作って中から測る**（`--layout-probe`）
+2. **スクリーンショットは撮影前に消し、mtime で新しさを検証する。**
+   Chrome が上書きに失敗しても exit 0 を返すので、
+   古い画像を3回見て「修正が効いていない」と誤診断した
+3. **ブラウザは撮影後に必ず落とす。** 残留した Chrome が後続の撮影の
+   書き込みを妨げる（**53プロセス残した**）
+4. **画像の切り取りを「レイアウトの崩れ」と読み違えないこと。**
+   viewport 500px のページを 390px の PNG に収めると右が切れるだけで、
+   横溢れではない。`bodyScrollWidth` と `bodyClientWidth` を比べて判断する
 
 ## 🚨 スクリプトの規則（実際に事故を起こした）
 
