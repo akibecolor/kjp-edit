@@ -28,11 +28,13 @@
 | | |
 |---|---|
 | [docs/research.md](docs/research.md) | 実現可能性調査 — ベース候補の比較、部品の棚卸し、先行事例とギャップ分析 |
-| [docs/architecture.md](docs/architecture.md) | 設計 — D1〜D6 の判断、レイアウトツリー、リモート、セキュリティ |
+| [docs/architecture.md](docs/architecture.md) | 設計 — D1〜D7 の判断、レイアウトツリー、リモート、セキュリティ |
 | [docs/secondary-client.md](docs/secondary-client.md) | モバイル/セカンダリ設計 — Monaco のタッチ非対応の実レベル、Theia のモバイル状況、先行事例が収束したUIパターン |
 | [docs/viewer.md](docs/viewer.md) | ビューアパネル — 埋め込みブラウザ（iframe vs WebContentsView）、リッチMarkdown、図、データビューア |
 | [docs/roadmap.md](docs/roadmap.md) | 検証スパイクと段階的な実装計画 |
 | [docs/spikes.md](docs/spikes.md) | **Phase 0 スパイクの実施手順** — Theia 1.74.0 のソースを読んで確定したファイルパス・DIシンボル・コードスケッチ付き |
+| [docs/hosting.md](docs/hosting.md) | ホスティング設計 — Cloudflare Workers/DO を暗号化リレーにする4段のはしご、費用、ToS、代替比較 |
+| 🔴 [docs/review-findings.md](docs/review-findings.md) | **敵対的レビューの結果** — 別エージェント2体による矛盾・セキュリティ・証拠の質の指摘。BLOCKING 7件。**ユーザ決定事項4件が未解決** |
 
 ## 現在の状態
 

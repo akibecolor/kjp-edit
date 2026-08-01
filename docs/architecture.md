@@ -2,7 +2,7 @@
 
 前提となる調査結果は [research.md](research.md)。ここでは設計判断とその理由だけを書く。
 
-## 設計の核となる5つの判断
+## 設計の核となる7つの判断
 
 | # | 判断 | 一行の理由 |
 |---|---|---|
@@ -169,15 +169,34 @@ Obsidian の `workspace.json` と同じ。**レイアウトは継続的に永続
 
 ソース調査の詳細は [spikes.md](spikes.md)。**設計に効く3点だけ:**
 
-**◎ ルール1（ズーム）は Theia に既に実装されている。**
-`ApplicationShell.doToggleMaximized` が親の `SplitLayout` から detach し、
-`(index, stretch, relativeSizes)` を記憶し、`position:fixed; z-index:2000` の
-`maximizedElement` に attach し、トグルで `setRelativeSizes(sizes)` で厳密復元する。
-**「1ノードに対する可逆なジオメトリ交換、どこのサイズにも触らない」は Theia の既存戦略そのもの。**
-`maximizedElement` + `unmaximize` が `zoomedNodeId` のホストとして既にあり、両方 `protected`。
-**広げるべきは `canToggleMaximized`/`toggleMaximized` のゲート2つだけ**
-（現在 `main`/`bottom` のみ・エリア単位のみ）。両方 `public` なのでサブクラスで自明に外せる。
+**△ ズーム: Theia には可逆な*エリア*交換がある。ルール1そのものではない。**
+
+🛑 **訂正（レビュー指摘、[review-findings.md](review-findings.md) #3）:**
+当初ここに「ルール1は Theia に既に実装済み、ゲート2つを広げるだけ」と書いたが**過大評価だった。**
+`doToggleMaximized` の実際の中身は3点でルール1〜4から外れている:
+
+1. **粒度がエリア単位。** 最大化するのは `TheiaDockPanel` 丸ごとで、単一タブでもサブsplitでもない。
+   「ターミナルをズーム」するとボトム dock の全 split が出てくる = **Zed #27237 そのもの**
+   （Phase 2 の受入テスト項目に挙げていたもの）
+2. **`position:fixed; z-index:2000` の全ウィンドウオーバーレイに再親付けする。**
+   これは事実上「dock を丸ごと隠す」= **Zed #32715 そのもの**。
+   ルール3（ファイルツリーを残したままエディタをズーム）を満たさない
+3. **`relativeSizes()` / `setRelativeSizes()` を使う** = ルール4が禁じている比率モデル。
+   そして `unmaximize` は `parent`/`index`/`stretch`/`sizes` を**クロージャに持つ = ツリーの外**。
+   `parent` が消えたりズーム中に兄弟数が変わると非同期化する = **Zed #21776 と同じ構造**
+
+**正しい評価: Theia が持っているのは「可逆なエリア交換」であって、
+ノード単位ズーム・非オーバーレイズーム・非比率サイジングは我々が作るもの。**
+`Private.SplitLayoutNode` / `TabLayoutNode` は非エクスポートで parent ポインタも無いので、
+ノード単位ズームは「ゲート2つ」ではなく再実装。
+
+**流用できるものはある** — `maximizedElement`、`unmaximize` スロット、
+`MAXIMIZED_CLASS`、`onDidToggleMaximized`、`core.toggleMaximized` コマンドと `alt+m`、
+`UnsafeWidgetUtilities.attach/detach`（レイアウト抜きの再親付け）はすべて再利用できる。
 関連 issue [#14511](https://github.com/eclipse-theia/theia/issues/14511) が open で競合PRも無い。
+
+**S1 に検証項目を追加する必要がある: 「ファイルツリーを見えたまま単一エディタタブをズームする」**
+（#32715 と #27237 相当）を Phase 2 のスケジュール前に確かめること。
 
 **○ シェルのサブクラス化は公式に可能。** `@theia/toolbar` が in-tree で
 `rebind(ApplicationShell).toService(...)` + `createLayout()` オーバーライドを**約95行**でやっている。
@@ -223,13 +242,9 @@ Theia を採らない場合は **dockview 7.x**（MIT、ネスト+タイル内�
 リサイズ挙動が正しい）でサッシュだけ描く — ツリーモデル自体は400〜600行程度で、
 i3の意味論を「近似」ではなく「厳密に」得られ、直列化も自分のものになる。
 捨てるのは dockview のドラッグ&ドロップオーバーレイとポップアウト配線で、これが高価な20%。
-
-Theia を採らない場合は **dockview 7.x**（MIT、ネスト+タイル内タブ+ポップアウト+
-真の maximize API を全部持つ唯一のライブラリ）の上に自前のコマンド層を載せる。
-あるいはコンテナツリーを完全に自作して **allotment**（VS Code の splitview/sash 由来なので
-リサイズ挙動が正しい）でサッシュだけ描く — ツリーモデル自体は400〜600行程度で、
-i3の意味論を「近似」ではなく「厳密に」得られ、直列化も自分のものになる。
-捨てるのは dockview のドラッグ&ドロップオーバーレイとポップアウト配線で、これが高価な20%。
+（dockview のライセンスはレビューで実物確認済み: **MIT**。`dockview-enterprise` のみ
+proprietary として除外され、`dockview-core`/`dockview`/`dockview-react`/`dockview-vue`/
+`dockview-angular` は MIT。research.md の未確認フラグは外してよい。）
 
 ---
 
@@ -453,7 +468,15 @@ Theia 自身の Express アプリに乗せている。
 どのクライアントでも他のクライアントのターミナルにアタッチできる。
 「スマホがデスクトップのターミナルにアタッチする」には機能だが、意図的に決めること。）
 
-⚠️ **1.74 の新しいゲートに注意:** ブラウザデプロイでは `theia-connection-token` の
+⚠️ **1.73.0 のゲートに注意**（当初 1.74 と書いていたが誤り。PR #17701 はマイルストーン 1.73.0）。
+**そして Theia には 1.73.0 で修正された High 級アドバイザリが2件あり、
+`>= 1.73.0` をハードフロアにする必要がある** —
+**GHSA-78g8-vm3p-97c6（CVSS 8.8、shell-terminal への cross-origin WebSocket アクセスで
+コマンド実行と出力の窃取）はこの製品の脅威モデルそのもの**、および
+GHSA-2m57-xxmh-v696（CVSS 8.5、`/services/request-service` 経由の SSRF）。
+`THEIA_HOSTS` を明示的に設定し既定に依存しないこと。詳細は [review-findings.md](review-findings.md)。
+
+ブラウザデプロイでは `theia-connection-token` の
 `SameSite=Strict; HttpOnly` クッキーと same-origin 検証が WS upgrade に強制される（#17701）。
 **ネイティブのモバイルクライアントは先にHTTP GETでクッキーを拾わない限り Theia の
 socket.io を話せない → 自前のプレーンWSプロトコルを持つ実質的な論拠。**
@@ -602,7 +625,29 @@ GitLab は Monaco製 Web IDE で壁に当たり、モバイル用に Ace ベー�
 
 ## ライセンス上の遵守事項
 
-- Theia ベースなら **Theia由来ファイルの改変は EPL-2.0 で公開**する義務。OSS方針なので問題なし
+- 🛑 **EPL-2.0 の記述を訂正した**（レビュー指摘、[review-findings.md](review-findings.md) B3）。
+  当初「Theia由来ファイルの改変は EPL-2.0 で公開する義務。OSS方針なので問題なし」と書いたが
+  3点誤っていた:
+  - **ライセンス本文に「ファイル単位」という概念は無い。** 単位は Contribution / **Modified Works** で、
+    定義は「Program の内容への追加・削除・変更から生じる、ソースコードまたは他の形式のあらゆる著作物。
+    **Program の内容を含む新しいソースファイルを含む**」（除外は「宣言・インタフェース・
+    リンク機構のみを含む著作物」）。**`SidePanelHandler` をフォークして新ファイルに置くのは明確に対象。
+    `createLayout` の本体をコピーして改変するサブクラスも「宣言・インタフェースのみ」からは程遠い。**
+    サブクラス / rebind / 本体コピー / フォークを区別して分類する必要がある
+  - **Theia は EPL-2.0 単独ではない。** リポジトリルートに `LICENSE-EPL`、
+    `LICENSE-GPL-2.0-ONLY-CLASSPATH-EXCEPTION`、`LICENSE-MIT.txt`、`LICENSE-vscode.txt`、`NOTICE.md` があり、
+    パッケージは `"EPL-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0"` を公開している。
+    **一部の Theia ファイルは MIT / vscode ライセンス**
+  - **§3.1(a) の後半が抜けていた。** Electron インストーラの配布は Object Code 形式での Distribute なので、
+    **「Source Code が本契約の下で入手可能である旨の声明」を添付し、各コピーに契約書のコピーを含める**義務がある。
+    **NOTICE ファイル・about ボックスの帰属表示・ソース入手可能性の声明が Phase 1 の成果物として必要**
+- 🛑 **デュアルライセンスのどちらの枝を選ぶかを Phase 1 で明示的に決める。**
+  **EPL-2.0 の枝を選ぶこと。** GPL-2.0-only+CPE の枝を行使すると、
+  採用予定の Apache-2.0 依存（Streamdown, pdfjs-dist, MathJax, ACP ツール, frp/zrok 等）が
+  **Apache-2.0 / GPL-2.0 の特許条項非互換**に当たる
+- MIT の `scmHistory.ts` を移植することは**方向としては問題ない**（MIT は inbound 互換でサブライセンス可能。
+  Theia 自身が同じ理由で `LICENSE-MIT.txt` を同梱している）。ただし
+  **Microsoft の MIT 表示をコードに残し、NOTICE に列挙する**義務がある
 - **製品名に「Theia」を含めない**（Eclipse Foundation 商標ポリシー）。`kjp-edit` は問題なし
 - **MS マーケットプレイス不可** → Open VSX
 - **`mhutchie/vscode-git-graph` のコードは流用不可**（derivative works の配布を禁止）

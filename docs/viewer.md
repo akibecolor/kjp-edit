@@ -71,21 +71,47 @@ Electron #15899（BrowserView の z-ordering サポート）が「HTML要素を�
 コマンドパレット・コンテキストメニューを持つ再帰的リサイズ可能タイリングツリーは、
 「他のすべての上に座る」OSレベルビューにとってまさに最悪のケース。
 
-### A3. iframe の唯一の弱点は Electron 側で消せる
+### A3. 🛑 訂正: `persist:preview` パーティションは素の `<iframe>` には使えない
 
-```js
-session.fromPartition('persist:preview').webRequest.onHeadersReceived((d, cb) => {
-  const h = d.responseHeaders;
-  delete h['x-frame-options']; delete h['X-Frame-Options'];
-  // CSP からは frame-ancestors だけを外科的に除去する
-  cb({ responseHeaders: h });
-});
-```
+**当初ここに「専用の `persist:preview` パーティションで `onHeadersReceived` すれば
+iframe の弱点が消える」と書いたが誤り**（レビュー指摘、[review-findings.md](review-findings.md) A2）。
 
-これで「iframe に入れられないサイトがある」という `WebContentsView` を選ぶ最大の理由が消える。
+**`partition` は webContents のプロパティ**（`BrowserWindow` の `webPreferences` /
+`<webview>` / `WebContentsView`）。**素の `<iframe>` は親 webContents 内のフレームなので
+親のセッションを使う。iframe 単位のパーティションは存在しない。**
+Electron のドキュメントも `<webview>` について「iframe と違い、webview はアプリとは
+別プロセスで走る」と明示している。
 
-**ただし専用の preview パーティションでのみ行い、アプリ全体では絶対にやらない** —
-クリックジャッキング防御を無効化しているので。
+つまり `<iframe>` プレビューでヘッダを除去するには**ウィンドウのセッションに
+`onHeadersReceived` を登録する**しかなく、それは「アプリ全体でやってはいけない」と
+自分で書いた通りのクリックジャッキング防御の全面除去になる。
+副作用として**プレビューが IDE のクッキージャーとストレージを共有する**ので、
+A8 の「IDEのクッキー/localStorageに触れないように」も無効化される。
+
+**どちらかを選ぶ必要がある:**
+
+| 案 | 内容 | 代償 |
+|---|---|---|
+| **案1（推奨）** | **ヘッダ書き換えをデーモン側のリバースプロキシで行う** | A8 でどうせプロキシが必要なので追加コストが小さく、**Electron のセッションを一切改変しない**。かつ**ブラウザプライマリとセカンダリでも同じ挙動になる** |
+| 案2 | ヘッダ除去が必要なプレビューだけ `WebContentsView`/`<webview>` に昇格する | D3 のオーバーレイ制約を受け入れることになる |
+
+**案1 を採る。** これで「iframe 既定」の判断自体は保たれる（D3 との衝突回避という
+本来の理由は無傷）が、**D6 の根拠から「Electron 側でヘッダを消せる」は削除される。**
+
+### A3b. 🛑 サブドメイン分離はクッキーを分離しない
+
+**「別オリジン/サブドメインから配信する」だけでは `theia-connection-token` は守れない**
+（同レビュー A3）。このクッキーは `httpOnly: true, sameSite: 'strict', path: '/'` で発行され、
+**SameSite は登録可能ドメイン単位で評価される。**
+`{{uuid}}.preview.hostname` は `hostname` と **same-site なのでクッキーが付く。**
+
+サブドメイン分離が買えるのは DOM/ストレージに対する same-origin policy の保護だけで、
+**アンビエントなクッキー資格情報には何の効果も無い。**
+
+**→ プレビュー分離は「別サイト」（異なる登録可能ドメイン）である必要がある。
+そしてデーモンの制御プレーンは非アンビエントな資格情報
+（`Authorization` ヘッダか `Sec-WebSocket-Protocol` トークン）を使い、
+どのブラウザコンテキストからも暗黙に付与されないようにする。**
 
 ### A4. Theia の既存資産
 
@@ -285,15 +311,42 @@ VS Code は **markdown-it**。Streamdown/react-markdown と Next/Astro/Gatsby �
 **トップレベルの安定した*ブロック*に分割し、描画済みブロックをメモ化し、
 末尾の未完成ブロックだけ再描画し、パース前に閉じていないフェンス/テーブルを閉じる。**
 
-**→ 採用: Streamdown (Vercel, Apache-2.0 確認済み)。**
-`react-markdown` の drop-in 代替で、remark/rehype + **Shiki** + **KaTeX** + **Mermaid** +
-**`rehype-harden`**（セキュリティ）+ **`remend`**（未終端ブロックのパース）+ メモ化描画。
-GFM テーブル/タスクリスト。v2.5 (2026) でインラインKaTeXとストリーミングアニメーション。
+### 🛑 訂正: Streamdown の依存内容を誤っていた
 
-理由: Theia のウィジェットは React なので drop-in できる、Apache-2.0 は OSS IDE と両立する、
-そして**下記 B2 の8割を他人が保守している1つの依存で手に入る。**
-非React レンダラが必要になるかバンドル重量を拒否する場合のみ
-markdown-it + 自前ブロックメモ化にフォールバックする。
+当初「Streamdown を採用。remark/rehype + Shiki + KaTeX + Mermaid + rehype-harden +
+remend の配線が1依存で入る」と書いたが、**実際の `package.json` を読んだら3点間違っていた**
+（レビュー指摘、[review-findings.md](review-findings.md) B1）。
+
+`streamdown@2.5.0` の実 `dependencies`:
+```
+clsx, marked ^17.0.1, remend 1.3.0, mermaid ^11.12.2, unified, rehype-raw,
+remark-gfm, remark-parse, rehype-harden ^1.1.8, remark-rehype, tailwind-merge,
+rehype-sanitize, unist-util-visit, html-url-attributes,
+hast-util-to-jsx-runtime, unist-util-visit-parents
+```
+
+| 誤り | 実際 |
+|---|---|
+| KaTeX が入っている | **入っていない。** dependency も peer も無い |
+| Shiki が入っている | **devDependencies にしか無い** |
+| remark/rehype パイプライン | **`marked ^17` が dependency**。B1 の比較表の前提と違う |
+| — | **`rehype-raw` が入っている** = 生HTMLのパースが意図的に有効。`<img onerror>` 経路は*設定*の問題で、依存構成では解決しない |
+| — | **`mermaid ^11.12.2` がハード実行時依存** |
+
+**最後の1点が致命的。** 本ドキュメントは「B の最大の技術リスクは Mermaid で、
+**クライアント側 mermaid をコンポーネントに直結してはいけない**、
+`DiagramRenderer` インタフェース経由にせよ」と書いている。
+**Streamdown を採用することがまさにその直結である。**
+つまり最大リスクへの緩和策が、レンダラを選んだ瞬間に無効化される。
+
+**→ 判断が必要（ユーザ決定事項）:**
+
+| 案 | 内容 |
+|---|---|
+| **案A** | Streamdown をプライマリで採用し mermaid 同梱を受け入れる。**そして Streamdown をセカンダリのバンドルに入れることを明示的に禁止する**（セカンダリは別実装なので技術的には可能） |
+| **案B** | ドキュメント記載のフォールバック（**markdown-it + 自前ブロックメモ化**）を採る。`DiagramRenderer` が本当に要求しているのはこれ |
+
+いずれの案でも **KaTeX と Shiki は独立した明示的な行項目に戻し、それぞれのバンドル予算を持たせる。**
 
 ### ⚠️ サニタイズは交渉不可
 

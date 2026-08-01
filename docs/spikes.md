@@ -805,7 +805,24 @@ allowRequest(request: http.IncomingMessage): boolean {
 クロスクライアント分離の穴でもあるので意図的に決めること。
 （`DispatchingBaseTerminalClient` はターミナルの exit/error イベントを**全**登録クライアントにファンアウトする。）
 
-## 2-G. ⚠️ 1.74 の新しいセキュリティゲート
+## 2-G. ⚠️ セキュリティゲート（**1.73.0** で追加。1.74 ではない）
+
+🛑 **訂正:** 当初この節を「1.74 の新しいゲート」と書いていたが**誤り。
+PR #17701 は 2026-06-23 マージ、マイルストーン 1.73.0**（1.73.0 は 2026-06-25 公開、
+1.74.0 は 2026-07-31）。CVE 修正のバージョン境界を間違えると脆弱な系列をピンすることになる。
+
+🛑 **そして Theia には 2026-07-03 公開の High 級アドバイザリが2件あり、
+両方 1.73.0 で修正されている。`>= 1.73.0` をハードフロアにする:**
+
+| GHSA | CVSS | 内容 |
+|---|---|---|
+| **GHSA-78g8-vm3p-97c6** | **8.8** | Cross-Origin WebSocket Access To Shell-Terminal Enables Command Execution And Output Exfiltration。根本原因は **`@theia/core` の WebSocket origin 検証が fail-open**（`Origin` ヘッダが無い場合、または `THEIA_HOSTS` 未設定＝既定の場合に接続を受理）+ **socket.io 統合が信頼できる `Origin` をクライアント供給の `fix-origin` ヘッダで置き換えていた** |
+| **GHSA-2m57-xxmh-v696** | **8.5** | `/services/request-service` RPC 経由の SSRF と localhost レスポンス開示。`BackendRequestFacade` の宛先URLが検証もallowlistもされていない典型的なSSRF |
+
+**1件目はこの製品の脅威モデルそのもの。** `THEIA_HOSTS` を明示的に設定し、
+既定に依存しないこと。両CVEをスパイクの回帰テストにする。
+（別途 CVE-2021-34435 mini-browser RCE 8.8、CVE-2019-17636 8.1、
+CVE-2021-41038 webview postMessage ハイジャックもある。）
 
 `packages/core/src/node/hosting/browser-connection-token.ts`:
 ```ts
@@ -1017,9 +1034,28 @@ KJP_DAEMON_PORT=4000 yarn --cwd applications/electron start
 **PASS:** Electron ウィンドウがワークベンチをロードし、`ps` に Electron が fork した `main.js` が
 **無い** — バックエンド1つ、フロントエンド2つ（Electron + ブラウザタブ）でターミナルを共有。
 **FAIL 1:** WS upgrade が403 → `ElectronSecurityToken` の不一致。
-デーモンを Electron main が生成するのと同じ値で起動するか、未設定にする。
-そしてデーモン側が自分を Electron だと*思う*必要がある（`THEIA_ELECTRON_VERSION` を設定）—
-さもないとクッキーゲートが `file://` オリジンのレンダラを拒否する。
+
+🛑 **ここで絶対にやってはいけない対処が2つある**（レビューで指摘。詳細は
+[review-findings.md](review-findings.md) A1）:
+
+- **`ElectronSecurityToken` を未設定にする** — `electron-token-validator.ts` は
+  `if (!this.electronSecurityToken) { return true; }` なので検査が全許可になる
+- **`THEIA_ELECTRON_VERSION` を設定してデーモンに自分を Electron だと思わせる** —
+  `browser-connection-token.ts` の `allowWsUpgrade()` は
+  `if (environment.electron.is()) { return true; }` で始まるので、
+  **そのデーモンに繋ぐ*すべての*ブラウザフロントエンド（`/` も `/m` も）に対して
+  クッキーゲートと same-origin 検証が無効化される**
+
+そして `ws-request-validators.ts` の集約は**fail-open**（どれかが明示的に `false` を
+返さない限り `true`）なので、この2つを組み合わせると
+**`/services/shell-terminal` を含む全 RPC が任意オリジンに開放される。**
+これは公開済みの **GHSA-78g8-vm3p-97c6（CVSS 8.8、1.73.0 で修正済み）**
+「Cross-Origin WebSocket Access To Shell-Terminal Enables Command Execution
+And Output Exfiltration」を設定で再現する行為。
+
+**正しい対処:** **デーモン側が `ElectronSecurityToken` を生成し、
+それを Electron main に渡す**（逆方向にする）。`THEIA_HOSTS` を明示的に設定する。
+そして**3つのゲートのどれかが allow-all に解決したら listen を拒否する起動時アサーション**を入れる。
 **FAIL 2:** ウィンドウが白く、コンソールが `localhost:3000` に繋いでいる →
 `?port=` クエリが `Endpoint` に届いていない。
 
