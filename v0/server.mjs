@@ -155,8 +155,52 @@ const server = createServer(async (req, res) => {
     }
 });
 
+// 起動時エラーは生のスタックトレースではなく、次の一手が分かる形で出す
+server.on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`\n✖ ポート ${opts.port} は既に使われています。\n`);
+        console.error('  別のポートで起動する:');
+        console.error(`      node v0/server.mjs --port ${opts.port + 1}\n`);
+        console.error('  掴んでいるプロセスを調べる:');
+        if (process.platform === 'win32') {
+            console.error(`      Get-NetTCPConnection -LocalPort ${opts.port} -State Listen |`);
+            console.error('        ForEach-Object { Get-Process -Id $_.OwningProcess }');
+        } else {
+            console.error(`      lsof -nP -iTCP:${opts.port} -sTCP:LISTEN`);
+        }
+        console.error('');
+        process.exit(1);
+    }
+    if (err.code === 'EACCES') {
+        console.error(`\n✖ ポート ${opts.port} を開く権限がありません。1024 以上のポートを指定してください。\n`);
+        process.exit(1);
+    }
+    console.error(err);
+    process.exit(1);
+});
+
+// リポジトリとして開けるかを先に確認して、UI で 500 を見せずに済ませる
+try {
+    await git(['rev-parse', '--git-dir'], { cwd: opts.repo });
+} catch (err) {
+    console.error(`\n✖ git リポジトリとして開けません: ${opts.repo}`);
+    console.error(`  ${err.message}\n`);
+    console.error('  --repo でリポジトリのパスを指定してください:');
+    console.error('      node v0/server.mjs --repo C:/path/to/repo\n');
+    process.exit(1);
+}
+
 // 🔒 ループバックのみ
 server.listen(opts.port, '127.0.0.1', () => {
     console.log(`kjp-edit v0  →  http://127.0.0.1:${opts.port}`);
     console.log(`repo: ${opts.repo}`);
+    console.log('停止: Ctrl+C');
 });
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+        server.close(() => process.exit(0));
+        // ソケットが残っていても確実に終わらせる
+        setTimeout(() => process.exit(0), 500).unref();
+    });
+}
