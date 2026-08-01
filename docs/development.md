@@ -200,6 +200,39 @@ typecheck → unit → browser smoke
 PLAYWRIGHT_JSON_OUTPUT_NAME=results.json npx playwright test --reporter=json
 ```
 
+### 🎯 Anthropic 公式の「検証ゲート4段」— 私は1段しか使っていなかった
+
+[code.claude.com/docs/en/best-practices](https://code.claude.com/docs/en/best-practices)
+（旧 engineering ブログの best-practices は**ここに308リダイレクト**する生きたドキュメント）に
+「Give Claude a way to verify its work」という節があり、**セットアップコストと引き換えに
+強度が上がる4段のゲート**として明示されています。
+
+| 段 | 機構 | 我々の状態 |
+|---|---|---|
+| 1. プロンプト1回の中 | 「実装したらテストを走らせて」 | — |
+| 2. **セッションを跨いで** | **`/goal` の条件 — 別の評価器が毎ターン後に再チェックする** | **❌ 使っていなかった** |
+| 3. 決定的 | **`Stop` フック** — 「Claude Code は8回連続でブロックされるとフックを上書きしてターンを終了する」 | ✅ 計画済み |
+| 4. **セカンドオピニオン** | **検証サブエージェント** — 「**新しいモデルに結果の反証を試させる。作業したエージェントが採点者にならないように**」 | **❌ 使っていなかった** |
+
+そして全体を貫く制約が
+「**Claude のコンテキストウィンドウはすぐ埋まり、埋まるにつれ性能が落ちる。
+コンテキストウィンドウは最も重要な管理対象リソースである。**」
+
+もう1つの指針: **「成功を主張させるのではなく証拠を示させる」**。
+
+**→ 追加する2つ:**
+- **`/goal` を使う。** 「スモークがグリーンであること」をセッションを跨ぐ条件として設定すれば、
+  毎ターン後に別の評価器がチェックする。`Stop` フックより早く気づける
+- **検証サブエージェント（`verifier.md`）を追加する。** `test-writer` / `test-runner` に加えて、
+  **「作業したエージェントとは別のモデルが結果を反証しようとする」**役を置く。
+  **この文書自体が2回、私の主張を私自身が検証できなかった実例**なので、
+  このプロジェクトでは特に効きます
+
+（併せて Claude Code には `agent-view`（セッション一覧）と `agent-teams`（複数エージェントの
+タスク要求）のドキュメントもあります。`agent-teams` のコンフリクト対策は散文の
+「各担当が別のファイル集合を持つように分割せよ」だけなので、
+[s0-verification.md](s0-verification.md) の通りここは我々の領域です。）
+
 ### hooks: スモークは `Stop`、`PostToolUse` ではない
 
 | イベント | 適否 |
@@ -508,7 +541,7 @@ yarn + Node >=18 と書き、まだ "theia-blueprint" と呼んでいます。
 | **2** | **層1ハーネス。** vendor した `test-setup.js`（ESM ローダフック + `DragEvent` モック）、`.mocharc.yml`、mocha + chai + sinon + nyc、**`jsdom ^22` を明示インストール**、そして `new Container()` + `enableJSDOM()` を使う**実際に通る spec を1本** |
 | **3** | **層4 browser スモーク。** `@theia/playwright@1.74.0` + `@playwright/test@^1.62`、上記11シナリオ、テスト毎 `TheiaWorkspace` フィクスチャ、捨て `THEIA_CONFIG_DIR`、**コンソールエラーカナリア**、`--forbid-only`。**4分未満でグリーン** |
 | **4** | **エージェントの検証面。** `scripts/verify.mjs` = typecheck → unit → browser smoke、`--reporter=json` を読んで**20行以内の要約**。**エージェントと hook が呼ぶ唯一のコマンド** |
-| **5** | **hooks + agents。** `Stop` → `verify.mjs`、`PostToolUse(Edit\|Write)` → `tsc --noEmit`。`.claude/agents/test-writer.md` と `test-runner.md`。製品の `CLAUDE.md` を Theia のものをモデルに |
+| **5** | **hooks + agents（検証ゲート4段のうち2/3/4）。** `Stop` → `verify.mjs`（段3）、`PostToolUse(Edit\|Write)` → `tsc --noEmit`。`.claude/agents/` に `test-writer.md` / `test-runner.md` / **`verifier.md`（段4: 作業者とは別のモデルが反証を試す）**。**`/goal` でスモークのグリーンをセッション横断条件にする（段2）。** 製品の `CLAUDE.md` を Theia のものをモデルに + **EPL コピペ禁止ルール**（5b節） |
 | **6** | **worktree 衛生。** `.claude/worktrees/` を `.gitignore`、`.worktreeinclude`、`worktree.baseRef: "head"`、**リポジトリ配下にジャンクション/シンボリックリンクを置かない** |
 | **7** | **CI（public リポジトリ）。** PR ワークフロー（ubuntu、lint+typecheck+unit+browser smoke、`paths-ignore`、SHA ピン、Playwright キャッシュ）+ nightly（3 OS + `@theia/api-tests` 適合性 + `--repeat-each=3 --fail-on-flaky-tests`）|
 | **8** | **出荷前に:** パッケージ済み Electron の WDIO スモーク（`@wdio/electron-service@10`、theia-ide の6シナリオ、Linux は `xvfb-run -a`）— nightly、PR毎ではない |
