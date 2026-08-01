@@ -34,11 +34,13 @@
 | [docs/roadmap.md](docs/roadmap.md) | 検証スパイクと段階的な実装計画 |
 | [docs/spikes.md](docs/spikes.md) | **Phase 0 スパイクの実施手順** — Theia 1.74.0 のソースを読んで確定したファイルパス・DIシンボル・コードスケッチ付き |
 | [docs/hosting.md](docs/hosting.md) | ホスティング設計 — Cloudflare Workers/DO を暗号化リレーにする4段のはしご、費用、ToS、代替比較 |
-| 🔴 [docs/review-findings.md](docs/review-findings.md) | **敵対的レビューの結果** — 別エージェント2体による矛盾・セキュリティ・証拠の質の指摘。BLOCKING 7件。**ユーザ決定事項4件が未解決** |
+| 🔴 [docs/review-findings.md](docs/review-findings.md) | **敵対的レビューの結果** — 別エージェント2体による矛盾・セキュリティ・証拠の質の指摘。BLOCKING 7件 |
+| ⭐ [docs/decisions.md](docs/decisions.md) | **決定記録** — 上のレビューを受けた4つの決定と、決定後の裏取り調査。**まずここを読むのが早い** |
 
 ## 現在の状態
 
 **設計フェーズ。** コードはまだ無い。
+決定1〜4は [docs/decisions.md](docs/decisions.md) で確定済み。
 まず [docs/roadmap.md](docs/roadmap.md) の Phase 0 スパイクで技術選定を確定させる。
 
 ## ライセンス
