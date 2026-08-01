@@ -190,9 +190,10 @@ try {
     process.exit(1);
 }
 
-// 🔒 ループバックのみ
+// 🔒 ループバックのみ。--port 0 で OS に空きポートを選ばせる（テスト用）
 server.listen(opts.port, '127.0.0.1', () => {
-    console.log(`kjp-edit v0  →  http://127.0.0.1:${opts.port}`);
+    const { port } = server.address();
+    console.log(`kjp-edit v0  →  http://127.0.0.1:${port}`);
     console.log(`repo: ${opts.repo}`);
     console.log('停止: Ctrl+C');
 });

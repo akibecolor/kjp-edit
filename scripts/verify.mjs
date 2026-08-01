@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+//
+// エージェントと hook が呼ぶ唯一の検証コマンド。
+//
+//   node scripts/verify.mjs          # 全部
+//   node scripts/verify.mjs --quick  # スモークを飛ばす（構文 + ユニットのみ）
+//
+// 設計方針 (docs/development.md):
+//   - 出力は 20 行以内に収める。エージェントに生のレポータを読ませない
+//   - 失敗時は file:line と原因の先頭数行だけを出す
+//   - exit 0 = 合格、exit 1 = 不合格（Stop hook では exit 2 に変換される）
+
+import { spawn } from 'node:child_process';
+import { readdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { join, relative } from 'node:path';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const quick = process.argv.includes('--quick');
+
+/** Node を子プロセスで走らせる。shell は使わない (docs/encoding-and-paths.md)。 */
+function run(args, { timeout = 300_000 } = {}) {
+    return new Promise(resolve => {
+        const child = spawn(process.execPath, args, {
+            cwd: ROOT, shell: false, windowsHide: true,
+            env: { ...process.env, NO_COLOR: '1' },
+        });
+        const out = [];
+        child.stdout.on('data', c => out.push(c));
+        child.stderr.on('data', c => out.push(c));
+        const t = setTimeout(() => child.kill('SIGKILL'), timeout);
+        child.on('error', e => {
+            clearTimeout(t);
+            resolve({ code: 1, output: String(e.message) });
+        });
+        child.on('close', code => {
+            clearTimeout(t);
+            resolve({ code: code ?? 1, output: Buffer.concat(out).toString('utf8') });
+        });
+    });
+}
+
+/** *.mjs を再帰的に集める（node_modules と .git は除く） */
+async function sources(dir, acc = []) {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+        if (e.name === 'node_modules' || e.name === '.git' || e.name.startsWith('.claude')) continue;
+        const p = join(dir, e.name);
+        if (e.isDirectory()) await sources(p, acc);
+        else if (e.name.endsWith('.mjs')) acc.push(p);
+    }
+    return acc;
+}
+
+/** node --test の出力から失敗だけを抜き出して短くする */
+function summarizeTests(output) {
+    const lines = output.split('\n');
+    // node --test は ✖ を2回出す（インラインと末尾の "failing tests:" 要約）。
+    // 名前で重複排除し、原因が取れている方を残す。
+    const byName = new Map();
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^✖\s+(.+?)\s+\(/);
+        if (!m) continue;
+        const cause = lines.slice(i + 1, i + 6)
+            .map(l => l.trim())
+            .find(l => /Error|Assertion|expected|actual|!==/.test(l)) ?? '';
+        const prev = byName.get(m[1]);
+        if (!prev || (!prev.cause && cause)) byName.set(m[1], { name: m[1], cause });
+    }
+    const failing = [...byName.values()];
+    const counts = {};
+    for (const key of ['pass', 'fail']) {
+        const m = output.match(new RegExp(`^ℹ ${key} (\\d+)`, 'm'));
+        counts[key] = m ? Number(m[1]) : 0;
+    }
+    return { failing, ...counts };
+}
+
+const steps = [];
+let failed = false;
+
+// 1. 構文チェック（型チェックの代わり。依存ゼロを保つため tsc は入れない）
+{
+    const files = await sources(ROOT);
+    const bad = [];
+    for (const f of files) {
+        const r = await run(['--check', f], { timeout: 20_000 });
+        if (r.code !== 0) {
+            const first = r.output.split('\n').find(l => l.includes('Error') || l.includes('^')) ?? '';
+            bad.push(`${relative(ROOT, f)}: ${first.trim()}`);
+        }
+    }
+    steps.push(bad.length
+        ? { name: `syntax (${files.length} files)`, ok: false, detail: bad.slice(0, 5) }
+        : { name: `syntax (${files.length} files)`, ok: true });
+    if (bad.length) failed = true;
+}
+
+// 2. ユニットテスト
+{
+    const r = await run(['--test', 'v0/swimlanes.test.mjs'], { timeout: 60_000 });
+    const s = summarizeTests(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `unit (${s.pass} pass, ${s.fail} fail)`,
+        ok,
+        detail: s.failing.slice(0, 5).map(f => `${f.name} — ${f.cause}`),
+    });
+    if (!ok) failed = true;
+}
+
+// 3. スモークテスト（一時リポジトリを作るので時間がかかる）
+if (!quick && !failed) {
+    const r = await run(['--test', 'v0/smoke.test.mjs'], { timeout: 240_000 });
+    const s = summarizeTests(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `smoke (${s.pass} pass, ${s.fail} fail)`,
+        ok,
+        detail: s.failing.slice(0, 5).map(f => `${f.name} — ${f.cause}`),
+    });
+    if (!ok) failed = true;
+} else if (quick) {
+    steps.push({ name: 'smoke', ok: true, skipped: true });
+}
+
+// ---- 出力: 20行以内 ----
+for (const s of steps) {
+    const mark = s.skipped ? '–' : s.ok ? '✔' : '✖';
+    console.log(`${mark} ${s.name}${s.skipped ? ' (skipped: --quick)' : ''}`);
+    for (const d of s.detail ?? []) console.log(`    ${d}`);
+}
+if (failed) {
+    console.log('\n再現するには:');
+    console.log('    node --test v0/swimlanes.test.mjs');
+    console.log('    node --test v0/smoke.test.mjs');
+}
+process.exit(failed ? 1 : 0);

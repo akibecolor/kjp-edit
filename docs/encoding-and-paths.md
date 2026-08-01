@@ -154,7 +154,22 @@ git -c i18n.logOutputEncoding=Shift_JIS log -1 …    → CP932 ❌
 `i18n.logOutputEncoding=cp932` を `~/.gitconfig` に書くのは**日本語圏のブログでよく推奨される**設定で、
 **VS Code はこれに対して防御していません**。
 **→ コミットメッセージの読み取りは `-c i18n.logOutputEncoding=UTF-8` と `--encoding=UTF-8` の両方を渡す。**
-CI では `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` で決定性を確保する。
+
+🛑 **訂正: CI/テストでの設定隔離に `/dev/null` は Windows で使えません。**
+当初「`GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`」と書きましたが、
+Node の `os.devNull` は Windows で `\\.\nul` になり、git が落ちます（実測）:
+```
+fatal: unable to access '//./nul': Invalid argument
+```
+**空ファイルを指すのが移植性のある方法です**（`v0/smoke.test.mjs` の `isolatedConfig()`）:
+```js
+const emptyConfig = join(tmpDir, '.empty-gitconfig');
+await writeFile(emptyConfig, '', 'utf8');
+env.GIT_CONFIG_GLOBAL = emptyConfig;
+env.GIT_CONFIG_SYSTEM = emptyConfig;
+```
+⚠️ グローバル設定を潰すと `user.name`/`user.email` も消えるので、
+テスト用リポジトリには repo local で入れるか `GIT_AUTHOR_*`/`GIT_COMMITTER_*` を渡すこと。
 
 （なお **`core.commitEncoding` は存在しません。** 実在するのは
 `i18n.commitEncoding`（既定 utf-8）と `i18n.logOutputEncoding`。）

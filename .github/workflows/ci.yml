@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md']
+  pull_request:
+    paths-ignore: ['**/*.md']
+  workflow_dispatch:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows が主環境。Linux も回して差異を早く見つける。
+        os: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+      # 依存パッケージゼロなので install ステップは無い
+      - run: node scripts/verify.mjs
+      # 改行が正規化されていること (.gitattributes)
+      - name: line endings are LF in the index
+        shell: bash
+        run: |
+          bad=$(git ls-files --eol | grep -v -e 'i/lf' -e 'i/-text' -e 'i/none' || true)
+          if [ -n "$bad" ]; then echo "$bad"; exit 1; fi
+      # 大文字小文字だけが違うパスが無いこと (macOS/Windows でクローンできなくなる)
+      - name: no case-only path collisions
+        shell: bash
+        run: |
+          dup=$(git ls-files | tr 'A-Z' 'a-z' | sort | uniq -d || true)
+          if [ -n "$dup" ]; then echo "$dup"; exit 1; fi
