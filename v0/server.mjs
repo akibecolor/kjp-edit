@@ -93,7 +93,18 @@ function probeHarness(width) {
 <script type="module">
 const f = document.getElementById('f');
 await new Promise(r => f.addEventListener('load', r, { once: true }));
-await new Promise(r => setTimeout(r, 2000));
+// ⚠️ 固定時間で待たない。描画は state の取得（+ 衝突予測）を待つので、
+//    処理が増えると足りなくなる。実際に 390px だけ「バッジ0個」で
+//    CI が落ちた（幅ごとに別の Chrome を起動するのでレースになる）。
+//    **中身が出るまでポーリングする。**
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+for (let i = 0; i < 100; i++) {
+  const d = f.contentDocument;
+  // グラフ行が1本でも描かれたら、state の取得と描画は終わっている
+  if (d && d.querySelector('.grow')) break;
+  await sleep(200);
+}
+await sleep(300);   // 直後のレイアウト確定を待つ
 const win = f.contentWindow, doc = f.contentDocument;
 const vw = win.innerWidth;
 const rect = e => e.getBoundingClientRect();
