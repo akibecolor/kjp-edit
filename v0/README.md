@@ -129,7 +129,29 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `/api/v0/state` | 全状態。`?fresh=1` で TTL キャッシュを無視。`stats.gitSpawns` に git の起動回数（定数5 + worktree 1本あたり3） |
 | `/api/v0/diff?base=&ref=&path=` | 1ファイルの unified diff |
 | `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`、NUL 混入は `binary` |
+| `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す） |
+| `POST /api/v0/checkout` | ブランチ切り替え。**`--allow-write` が必要** |
 | `/layout` | レイアウト検討用プロトタイプ |
+
+### 書き込み（既定オフ）
+
+```bash
+node v0/server.mjs --allow-write
+```
+
+**`--allow-write` を付けない限り、書き込みの経路は 403 です。**
+有効にすると worktree カードに checkout が出ます
+（切り替え先は「他の worktree が使っていないブランチ」だけを候補にします。
+git は使用中のブランチを拒否するので、出しても必ず失敗する選択肢になるため）。
+
+🚨 **checkout はシーケンサ停止中を拒否します。**
+rebase / マージ未コミット / cherry-pick / revert / bisect の進行中は 409。
+git はこれを exit 0 で通しますが、続きの `rebase --continue` は
+**別のブランチにリプレイ**し、`MERGE_HEAD` は無警告で消えます。
+
+副作用のある操作は `requireMutation()` を必ず通ります
+（`--allow-write` / POST / `Sec-Fetch-Site: same-origin` / `X-Kjp-Token`）。
+順序と理由は [../docs/auth-ordering.md](../docs/auth-ordering.md)。
 
 🔒 **`diff` / `blob` は追跡されている内容だけを返します。**
 `git cat-file` / `git diff` 経由で読むので、fs には触りません。

@@ -11,6 +11,7 @@
 //    このサーバは認証を持たない。0.0.0.0 にバインドしないこと。
 
 import { createServer } from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -18,7 +19,7 @@ import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
-    showBlob, fileDiff,
+    showBlob, fileDiff, toNFC, samePath,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 
@@ -28,6 +29,8 @@ function parseArgs(argv) {
     const opts = {
         repo: process.cwd(), port: 7749, limit: 300, base: null,
         layoutProbe: false, allowHosts: new Set(),
+        // 🔒 書き込みは既定オフ。経路そのものを存在させない
+        allowWrite: false, token: null,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -37,9 +40,13 @@ function parseArgs(argv) {
         else if (a === '--base') opts.base = argv[++i];
         else if (a === '--layout-probe') opts.layoutProbe = true;
         else if (a === '--allow-host') opts.allowHosts.add(String(argv[++i]).toLowerCase());
+        else if (a === '--allow-write') opts.allowWrite = true;
+        else if (a === '--token') opts.token = argv[++i];
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
+            console.log('       --allow-write        checkout 等の書き込み操作を有効にする（既定オフ）');
+            console.log('       --token <s>          書き込み用トークン（既定は起動時にランダム生成）');
             console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
             process.exit(0);
         }
@@ -372,6 +379,84 @@ function siteAllowed(req) {
     return site === 'same-origin' || site === 'same-site' || site === 'none';
 }
 
+/* =========================================================================
+ * 🔒 副作用のある操作の関門。**変更・実行する経路は必ずここを通す。**
+ *
+ * docs/auth-ordering.md の要点: retrofit が高いのは認証そのものではなく
+ * 経路の形。散らしてから認証を入れると全経路の監査になり、1つ忘れると穴が残る。
+ * だから追加する認可はすべてこの1関数に足す。
+ * ========================================================================= */
+
+const TOKEN_HEADER = 'x-kjp-token';
+
+function denyJson(res, code, message) {
+    res.writeHead(code, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify({ error: message }));
+}
+
+/** 長さを漏らさずトークンを比較する */
+function tokenMatches(given) {
+    if (typeof given !== 'string' || !opts.token) return false;
+    const a = Buffer.from(given, 'utf8');
+    const b = Buffer.from(opts.token, 'utf8');
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
+}
+
+/**
+ * 通ってよければ true。駄目なら応答を書いて false。
+ *
+ * 4つ全部を要求する:
+ *   1. --allow-write（ケイパビリティ。既定オフ）
+ *   2. POST（GET で副作用を起こさない。リンクや prefetch で発火しないため）
+ *   3. Sec-Fetch-Site が same-origin（ブラウザからの他サイト起点を弾く）
+ *   4. X-Kjp-Token（カスタムヘッダなので cross-origin では preflight が必須になる。
+ *      ⚠️ これが CSRF 対策の本体。フォーム POST は preflight されないので、
+ *      カスタムヘッダを必須にしないと素通りする）
+ */
+function requireMutation(req, res) {
+    if (!opts.allowWrite) {
+        denyJson(res, 403, '書き込みは無効です。--allow-write を付けて起動してください');
+        return false;
+    }
+    if (req.method !== 'POST') {
+        denyJson(res, 405, 'POST のみ受け付けます');
+        return false;
+    }
+    const site = req.headers['sec-fetch-site'];
+    if (site && site !== 'same-origin') {
+        denyJson(res, 403, `別サイト起点の書き込みは拒否します (Sec-Fetch-Site: ${site})`);
+        return false;
+    }
+    if (!tokenMatches(req.headers[TOKEN_HEADER])) {
+        denyJson(res, 403, `${TOKEN_HEADER} が一致しません`);
+        return false;
+    }
+    return true;
+}
+
+/** JSON ボディを読む。上限付き（無制限に読むと DoS になる）。 */
+function readJson(req, maxBytes = 64 * 1024) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let size = 0;
+        req.on('data', c => {
+            size += c.length;
+            if (size > maxBytes) { reject(new Error('ボディが大きすぎます')); req.destroy(); return; }
+            chunks.push(c);
+        });
+        req.on('end', () => {
+            const raw = Buffer.concat(chunks).toString('utf8');
+            if (!raw) { resolve({}); return; }
+            try { resolve(JSON.parse(raw)); } catch { reject(new Error('JSON として読めません')); }
+        });
+        req.on('error', reject);
+    });
+}
+
 const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     // 🔒 すべての経路の手前で判定する。個別のハンドラに任せない
@@ -398,6 +483,95 @@ const server = createServer(async (req, res) => {
             res.end(probeHarness(Number(url.searchParams.get('w'))));
             return;
         }
+        // クライアントが書き込み可否とトークンを知るための経路。
+        // 🔒 Host 検証と Sec-Fetch-Site を通った同一オリジンにだけ返る。
+        //    cross-origin では CORS が無いので応答が読めない。
+        if (url.pathname === '/api/v0/session') {
+            const site = req.headers['sec-fetch-site'];
+            const sameOrigin = !site || site === 'same-origin' || site === 'none';
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                allowWrite: opts.allowWrite,
+                tokenHeader: TOKEN_HEADER,
+                token: opts.allowWrite && sameOrigin ? opts.token : null,
+            }));
+            return;
+        }
+
+        // 🔒 checkout。**このツールの主張そのもの**なので、git が exit 0 で通してしまう
+        //    危険な checkout を明示的に拒否する。
+        if (url.pathname === '/api/v0/checkout') {
+            if (!requireMutation(req, res)) return;
+            let body;
+            try {
+                body = await readJson(req);
+            } catch (err) {
+                denyJson(res, 400, err.message);
+                return;
+            }
+            const ref = String(body.ref ?? '');
+            const wantPath = toNFC(String(body.worktree ?? ''));
+
+            // ⚠️ cwd に任意のパスを受け取らない。既知の worktree のみ。
+            //    ここを緩めるとリポジトリ外で git を走らせられる。
+            const worktrees = await listWorktrees(opts.repo);
+            const wt = worktrees.find(w => samePath(w.path, wantPath));
+            if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
+            if (wt.bare) { denyJson(res, 400, 'bare worktree では checkout できません'); return; }
+            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
+
+            const refs = await refMap(opts.repo);
+            if (!resolveRef(refs, ref)) {
+                denyJson(res, 400, `解決できない ref です: ${ref}`);
+                return;
+            }
+
+            // 🚨 シーケンサ停止中の checkout を拒否する。
+            //    git はこれを exit 0 で通し、その後の `rebase --continue` は
+            //    **別のブランチにリプレイする**。MERGE_HEAD も無警告で消える。
+            //    v0 がこれを警告として検出しているのに、自分の checkout で
+            //    それを起こしたら本末転倒。
+            const seq = await sequencerState(wt.path).catch(() => ({}));
+            const blockers = [
+                [seq.rebasing, 'rebase 進行中'],
+                [seq.merging, 'マージ未コミット（MERGE_HEAD あり）'],
+                [seq.cherryPicking, 'cherry-pick 進行中'],
+                [seq.reverting, 'revert 進行中'],
+                [seq.bisecting, 'bisect 進行中'],
+            ].filter(([f]) => f).map(([, label]) => label);
+            if (blockers.length) {
+                denyJson(res, 409,
+                    `${blockers.join(' / ')} のため checkout を拒否しました。`
+                    + ' git はこれを通しますが、続きの rebase --continue が別ブランチに'
+                    + 'リプレイされたり MERGE_HEAD が無警告で消えます。'
+                    + ' 先に --continue / --abort で決着させてください');
+                return;
+            }
+
+            try {
+                // optionalLocks: index の stat-cache 更新を許す（書き込み操作なので）
+                await git(['checkout', ref, '--'], { cwd: wt.path, optionalLocks: true });
+            } catch (err) {
+                // git 自身が拒否した場合（未コミットの変更が消える等）もここに来る
+                denyJson(res, 409, `git が checkout を拒否しました: ${err.message}`);
+                return;
+            }
+            cached = null;   // 状態が変わったのでキャッシュを捨てる
+            const after = (await listWorktrees(opts.repo)).find(w => samePath(w.path, wantPath));
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                ok: true, worktree: wantPath,
+                branch: after?.shortBranch ?? null, head: after?.head ?? null,
+            }));
+            return;
+        }
+
         // ファイルの中身と差分。**追跡されている内容だけ**を返す（git オブジェクト経由）。
         // fs で読まないので、リポジトリ外や未追跡の秘密ファイルには触れない。
         // 引数の検証は git.mjs の isSafeRef / isSafeRepoPath が持つ。
@@ -478,10 +652,27 @@ try {
 }
 
 // 🔒 ループバックのみ。--port 0 で OS に空きポートを選ばせる（テスト用）
+// 🔒 書き込みを有効にしたときだけトークンを用意する。
+//    --token が無ければ起動ごとにランダム。プロセスを再起動すれば無効化される。
+if (opts.allowWrite && !opts.token) {
+    opts.token = randomBytes(32).toString('base64url');
+}
+
 server.listen(opts.port, '127.0.0.1', () => {
     const { port } = server.address();
     console.log(`kjp-edit v0  →  http://127.0.0.1:${port}`);
     console.log(`repo: ${opts.repo}`);
+    if (opts.allowHosts.size) {
+        console.log(`許可した Host: ${[...opts.allowHosts].join(', ')}`);
+    }
+    if (opts.allowWrite) {
+        console.log('');
+        console.log('⚠️ 書き込み有効 (--allow-write)。checkout が可能です。');
+        console.log('   トンネルを開けている場合、そのトンネルに届く相手は');
+        console.log('   ブランチを切り替えられます。読み取りだけで良いなら外してください。');
+    } else {
+        console.log('読み取り専用（書き込みは --allow-write で有効化）');
+    }
     console.log('停止: Ctrl+C');
 });
 

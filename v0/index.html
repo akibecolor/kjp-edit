@@ -57,6 +57,15 @@
   .badge.danger { color: var(--danger); border-color: var(--danger); }
   .ab { color: var(--dim); font-size: 12px; overflow-wrap: anywhere; }
   .ab b { color: var(--fg); font-weight: 600; }
+  /* 書き込み操作（--allow-write のときだけ出る） */
+  .wr { display: flex; gap: .3rem; align-items: center; margin-top: .4rem;
+    flex-wrap: wrap; }
+  .wr select { font: inherit; font-size: 11px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; padding: .1rem .2rem;
+    max-width: 11rem; }
+  .wr button { font-size: 11px; padding: .1rem .5rem; min-height: 24px; }
+  .wrmsg { font-size: 11px; color: var(--dim); overflow-wrap: anywhere; }
+  .wrmsg.bad { color: var(--danger); }
   .files { margin: .4rem 0 0; padding: 0; list-style: none; max-height: 8rem; overflow: auto; }
   .files li { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .files .st { display: inline-block; width: 1.2em; color: var(--accent); }
@@ -226,6 +235,65 @@ function when(iso) {
   return `${Math.round(h / 24)}日前`;
 }
 
+/* ---- 書き込み: checkout ------------------------------------------------
+   サーバ側の関門（--allow-write / POST / Sec-Fetch-Site / トークン）を
+   通すのに必要なものだけを送る。判断はすべてサーバが持つ。 */
+let session = { allowWrite: false, token: null, tokenHeader: 'x-kjp-token' };
+
+function checkoutForm(wt, s) {
+  const box = el('div', 'wr');
+  const sel = el('select');
+  // ⚠️ 他の worktree がチェックアウト済みのブランチを候補に出さない。
+  //    git は「既に別の worktree にある」ブランチの checkout を拒否するので、
+  //    出すと必ず失敗する選択肢になる。
+  const inUse = new Set(s.worktrees.map(w => w.branch).filter(Boolean));
+  const localBranches = s.graph
+    .flatMap(r => r.refs)
+    .map(r => r.replace(/^HEAD -> /, '').trim())
+    .filter(r => r && !r.startsWith('origin/') && !r.startsWith('tag: '));
+  const cands = [...new Set([...localBranches, s.base])]
+    .filter(r => r && !inUse.has(r));
+
+  for (const r of cands.slice(0, 30)) {
+    const o = el('option', null, r);
+    o.value = r;
+    sel.append(o);
+  }
+  const btn = el('button', null, 'checkout');
+  const msg = el('span', 'wrmsg');
+  if (!cands.length) {
+    btn.disabled = true;
+    sel.disabled = true;
+    msg.textContent = '切り替え先がありません（全ブランチが使用中）';
+  }
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    msg.className = 'wrmsg';
+    msg.textContent = '実行中…';
+    try {
+      const res = await fetch('/api/v0/checkout', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          [session.tokenHeader]: session.token ?? '',
+        },
+        body: JSON.stringify({ worktree: wt.path, ref: sel.value }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+      msg.textContent = `→ ${d.branch ?? d.head?.slice(0, 8)}`;
+      await load(true);
+    } catch (e) {
+      msg.className = 'wrmsg bad';
+      msg.textContent = e.message;
+      btn.disabled = false;
+    }
+  });
+  box.append(sel, btn, msg);
+  return box;
+}
+
 function render(s) {
   $('#repo').textContent = s.repo;
   $('#base').textContent = `base: ${s.base}`;
@@ -282,6 +350,11 @@ function render(s) {
     c.append(ab);
     if (wt.prunable) {
       c.append(el('div', 'ab', `作業ツリーが失われています: ${wt.prunableReason ?? '理由不明'}`));
+    }
+
+    // checkout（--allow-write のときだけ出す）
+    if (session.allowWrite && !wt.bare && !wt.prunable) {
+      c.append(checkoutForm(wt, s));
     }
 
     if (wt.files.length) {
@@ -373,6 +446,17 @@ for (const d of document.querySelectorAll('details')) {
   d.addEventListener('toggle', () => {
     try { localStorage.setItem(key, d.open ? '1' : '0'); } catch { /* 同上 */ }
   });
+}
+
+// 書き込み可否とトークンを先に取る。取れなくても読み取りは動かす。
+try {
+  const r = await fetch('/api/v0/session');
+  if (r.ok) session = { ...session, ...await r.json() };
+} catch { /* 読み取り専用として動く */ }
+if (session.allowWrite) {
+  const b = el('span', 'meta', '⚠️ 書き込み有効');
+  b.style.color = 'var(--warn)';
+  $('#at').after(b);
 }
 
 $('#refresh').addEventListener('click', () => load(true));

@@ -506,6 +506,186 @@ test('--allow-host で指定したホスト名だけは通る（トンネル用�
     }
 });
 
+// ---------------------------------------------------------------------------
+// 🔒 書き込み（checkout）。関門の4条件すべてと、シーケンサ停止中の拒否を固定する。
+//    docs/auth-ordering.md の 1〜4 段。
+// ---------------------------------------------------------------------------
+
+test('🔒 --allow-write なしでは checkout の経路が存在しない', async () => {
+    const res = await fetch(`${baseUrl}/api/v0/checkout`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ worktree: repo, ref: 'main' }),
+    });
+    assert.equal(res.status, 403);
+    assert.match((await res.json()).error, /--allow-write/);
+});
+
+test('🔒 --allow-write なしでは session がトークンを返さない', async () => {
+    const res = await fetch(`${baseUrl}/api/v0/session`);
+    const d = await res.json();
+    assert.equal(d.allowWrite, false);
+    assert.equal(d.token, null);
+});
+
+/** 書き込み有効のサーバを立てる。呼び出し側が kill する。 */
+async function startWritable(extra = []) {
+    const child = spawn(
+        process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-write', ...extra],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } },
+    );
+    child.stdout.setEncoding('utf8');
+    const url = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('起動しなかった')), 15000);
+        let buf = '';
+        child.stdout.on('data', d => {
+            buf += d;
+            const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+            if (m) { clearTimeout(t); resolve(m[0]); }
+        });
+        child.on('error', reject);
+    });
+    const s = await (await fetch(`${url}/api/v0/session`)).json();
+    return { child, url, session: s };
+}
+
+test('🔒 checkout の関門: token / method / Sec-Fetch-Site をそれぞれ要求する', async () => {
+    const { child, url, session } = await startWritable();
+    try {
+        assert.equal(session.allowWrite, true);
+        assert.ok(session.token && session.token.length >= 20, 'トークンが返っていない');
+        const wtPath = (await (await fetch(`${url}/api/v0/state?fresh=1`)).json())
+            .worktrees.find(w => w.branch === 'agent-b').path;
+        const body = JSON.stringify({ worktree: wtPath, ref: 'main' });
+        const H = session.tokenHeader;
+
+        // トークン無し
+        let r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body,
+        });
+        assert.equal(r.status, 403, 'トークン無しが通った');
+        assert.match((await r.json()).error, /token/i);
+
+        // トークンが違う
+        r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST', headers: { 'content-type': 'application/json', [H]: 'wrong' }, body,
+        });
+        assert.equal(r.status, 403, '誤ったトークンが通った');
+
+        // GET では副作用を起こさない
+        r = await fetch(`${url}/api/v0/checkout`, { headers: { [H]: session.token } });
+        assert.equal(r.status, 405, 'GET が通った');
+
+        // 別サイト起点
+        r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                [H]: session.token, 'sec-fetch-site': 'cross-site',
+            },
+            body,
+        });
+        assert.equal(r.status, 403, 'cross-site が通った');
+
+        // Host が攻撃者ドメイン（入口の検証が書き込み経路にも効く）
+        r = await rawGet(`${url}/api/v0/checkout`, { host: 'evil.example' });
+        assert.equal(r.status, 403);
+    } finally {
+        child.kill();
+    }
+});
+
+test('🔒 checkout は既知の worktree 以外を cwd にしない', async () => {
+    const { child, url, session } = await startWritable();
+    try {
+        for (const bad of [tmpdir(), `${repo}-not-a-worktree`, '']) {
+            const r = await fetch(`${url}/api/v0/checkout`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+                body: JSON.stringify({ worktree: bad, ref: 'main' }),
+            });
+            assert.equal(r.status, 400, `既知でない worktree が通った: ${bad}`);
+            assert.match((await r.json()).error, /既知の worktree ではありません/);
+        }
+    } finally {
+        child.kill();
+    }
+});
+
+test('checkout が実際にブランチを切り替える', async () => {
+    const { child, url, session } = await startWritable();
+    try {
+        // ⚠️ このフィクスチャの worktree は agent-a / agent-b の2本だけ。
+        //    agent-c はスクリーンショット用の別フィクスチャにしか無い。
+        const wt = (await (await fetch(`${url}/api/v0/state?fresh=1`)).json())
+            .worktrees.find(w => w.branch === 'agent-b');
+        const post = ref => fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+            body: JSON.stringify({ worktree: wt.path, ref }),
+        });
+        // ⚠️ レスポンスボディは1回しか読めない。assert のメッセージの中で
+        //    await r.json() を書くとテンプレートリテラルが先に評価されて body を
+        //    消費し、後続の r.json() が "Body is unusable" で落ちる（実際に踏んだ）。
+        // E7 日本語ブランチ名へ切り替える
+        let r = await post('機能/新規');
+        let d = await r.json();
+        assert.equal(r.status, 200, `切り替え失敗: ${JSON.stringify(d)}`);
+        assert.equal(d.branch, '機能/新規');
+        // payload にも反映されている（キャッシュを捨てていること）
+        const s2 = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        assert.equal(s2.worktrees.find(w => w.path === wt.path).branch, '機能/新規');
+        // 戻す
+        r = await post('agent-b');
+        d = await r.json();
+        assert.equal(r.status, 200, `戻せなかった: ${JSON.stringify(d)}`);
+        assert.equal(d.branch, 'agent-b');
+    } finally {
+        child.kill();
+    }
+});
+
+test('🚨 checkout はシーケンサ停止中を拒否する（git は通してしまう操作）', async () => {
+    const { child, url, session } = await startWritable();
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-wt-a`);
+    try {
+        // 停止する rebase を作る（乗っ取りテストと同じ手口）
+        await new Promise((resolve, reject) => {
+            const c = spawn('git', ['rebase', '-i', 'HEAD~2'], {
+                cwd: wt, shell: false, windowsHide: true,
+                env: {
+                    ...process.env, ...isolatedConfig(),
+                    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com',
+                    GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com',
+                    GIT_SEQUENCE_EDITOR: `${JSON.stringify(process.execPath)} -e `
+                        + JSON.stringify(
+                            'const f=process.argv[1],fs=require("fs");'
+                            + 'const l=fs.readFileSync(f,"utf8").split("\\n");'
+                            + 'l.splice(1,0,"break");fs.writeFileSync(f,l.join("\\n"));'),
+                },
+            });
+            c.on('error', reject);
+            c.on('close', () => resolve());
+        });
+
+        const r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+            body: JSON.stringify({ worktree: wt, ref: 'main' }),
+        });
+        assert.equal(r.status, 409, 'rebase 中の checkout が通ってしまった');
+        const d = await r.json();
+        assert.match(d.error, /rebase 進行中/);
+        assert.match(d.error, /リプレイ/, '危険の説明が入っていない');
+    } finally {
+        child.kill();
+        await g(['rebase', '--abort'], wt).catch(() => {});
+        await g(['checkout', '-q', 'agent-a'], wt).catch(() => {});
+    }
+});
+
 test('解決できない --base を渡してもエンドポイントは生きている', async () => {
     // 別プロセスを立てて、存在しない ref を --base に渡す
     const child = spawn(

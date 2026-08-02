@@ -344,6 +344,25 @@ export async function verifyRefs(cwd, refs) {
 }
 
 /**
+ * 同じパスを指しているか。
+ *
+ * ⚠️ 区切り文字を揃えずに `===` で比べてはいけない。git は Windows でも
+ *    `C:/Users/...` と**スラッシュ**で返すが、クライアントが `path.join()` で
+ *    作った値は `\` になる。worktree の allowlist 照合をこれで落とした。
+ *    Windows / macOS は大文字小文字を区別しないので畳んで比べる
+ *    （allowlist との比較なので、緩めても既知の worktree にしか一致しない）。
+ */
+export function samePath(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const norm = s => {
+        let t = toNFC(s).replace(/[\\/]+/g, '/').replace(/\/+$/, '');
+        if (process.platform === 'win32' || process.platform === 'darwin') t = t.toLowerCase();
+        return t;
+    };
+    return norm(a) === norm(b) && a !== '' && b !== '';
+}
+
+/**
  * リポジトリ内のパスとして受け付けてよいかを検証する。
  *
  * ⚠️ これはネットワーク越しに来る値を git に渡す唯一の経路なので、
