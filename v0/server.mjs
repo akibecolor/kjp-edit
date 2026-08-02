@@ -548,6 +548,7 @@ function reserveExecSlot() {
 async function killTree(child) {
     if (!child.pid) return;
     if (process.platform === 'win32') {
+        // Windows: taskkill /T で木ごと
         try {
             const { execFile } = await import('node:child_process');
             await new Promise(resolve => {
@@ -555,11 +556,24 @@ async function killTree(child) {
                     { windowsHide: true }, () => resolve());
             });
         } catch { /* taskkill が無い環境では下の kill に任せる */ }
+    } else {
+        // ⚠️ POSIX も同じ問題がある。`sh -c "node x & wait"` の sh を SIGKILL しても
+        //    バックグラウンドの node は別プロセスとして残る（ubuntu CI で実測）。
+        //    spawn 側で detached:true にしてプロセスグループを作り、
+        //    ここで -pid に送ってグループごと殺す。
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* グループが無い/既に死んでいる */ }
     }
     try { child.kill('SIGKILL'); } catch { /* 既に死んでいる */ }
     // 孫がパイプを握っていても応答を閉じられるようにする
     try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* noop */ }
 }
+
+/**
+ * 走っている子プロセス。**サーバ終了時に置き去りにしないため**に持つ。
+ * （Windows では libuv が SILENT_BREAKAWAY_OK を立てるので、
+ *   サーバが死んでも孫は回収されない）
+ */
+const activeExec = new Set();
 
 /** JSON ボディを読む。上限付き（無制限に読むと DoS になる）。 */
 function readJson(req, maxBytes = 64 * 1024) {
@@ -688,6 +702,9 @@ const server = createServer(async (req, res) => {
             try {
                 child = spawn(argv[0], argv.slice(1), {
                     cwd: wt.path, shell: false, windowsHide: true,
+                    // POSIX では新しいプロセスグループを作る。killTree が -pid で
+                    // グループごと殺せるようにするため（中間シェルの孫を残さない）。
+                    detached: process.platform !== 'win32',
                     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', NO_COLOR: '1' },
                 });
             } catch (err) {
@@ -710,6 +727,7 @@ const server = createServer(async (req, res) => {
             child.stdout.on('data', c => send({ t: 'out', d: decOut.write(c) }));
             child.stderr.on('data', c => send({ t: 'err', d: decErr.write(c) }));
 
+            activeExec.add(child);
             // ⚠️ 後始末は1回だけ走らせる。`exit` と保険タイマーと切断の
             //    どこから来ても同じ finish() に集約する。
             let finished = false;
@@ -718,6 +736,7 @@ const server = createServer(async (req, res) => {
                 if (finished) return;
                 finished = true;
                 clearTimeout(timer); clearTimeout(guard);
+                activeExec.delete(child);
                 release();
                 const tail = decOut.end(), tailErr = decErr.end();
                 if (tail) send({ t: 'out', d: tail });
@@ -967,8 +986,11 @@ server.listen(opts.port, '127.0.0.1', () => {
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
+        // ⚠️ 走っている exec を置き去りにしない。Windows では libuv が
+        //    SILENT_BREAKAWAY_OK を立てるので、サーバが死んでも孫は回収されない。
+        for (const child of activeExec) killTree(child).catch(() => {});
         server.close(() => process.exit(0));
         // ソケットが残っていても確実に終わらせる
-        setTimeout(() => process.exit(0), 500).unref();
+        setTimeout(() => process.exit(0), 800).unref();
     });
 }
