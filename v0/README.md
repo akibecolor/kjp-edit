@@ -6,11 +6,24 @@
 任意コマンドの実行（`--allow-exec`）はそれぞれ明示的に有効化します。
 
 ```bash
-node v0/server.mjs                    # カレントのリポジトリを見る
-node v0/server.mjs --repo /path/to/r  # 別のリポジトリ
-node v0/server.mjs --port 7749 --limit 300 --base main
+node scripts/serve.mjs                # ← 普段はこれ（手順は docs/daily-use.md）
+node scripts/serve.mjs --status       # 動いているものを一覧 / --stop で止める
+node scripts/autostart.mjs install    # ログオン時に自動起動（既定は読み取り専用）
 ```
 → http://127.0.0.1:7749
+
+`serve.mjs` は**二重起動しない**（同じリポジトリなら URL を出して終わる）、
+サブディレクトリからでも**リポジトリのルートを自動で見つける**、
+ポートが埋まっていたら**空きを探して必ず表示する**、`--exec` では
+**トークンを `~/.kjp-edit/token` に永続化する**（毎回貼り直さない）。
+
+素のサーバを直接叩く場合:
+
+```bash
+node v0/server.mjs                    # カレントのリポジトリを見る
+node v0/server.mjs --repo /path/to/r  # 別のリポジトリ（サブディレクトリでもルートに正規化される）
+node v0/server.mjs --port 7749 --limit 300 --base main
+```
 
 ```bash
 node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
@@ -85,8 +98,11 @@ UI は縦に積む折り畳みパネルで、各セクションは畳んだま�
 ```bash
 tailscale serve --bg 7749
 # トンネル経由の Host は 127.0.0.1 ではなくなるので、明示的に許可する
-node v0/server.mjs --allow-host box.your-tailnet.ts.net
+node scripts/serve.mjs --allow-host box.your-tailnet.ts.net
 ```
+
+手順とスマホ側の確認項目は [../docs/daily-use.md](../docs/daily-use.md) にあります
+（**実機での確認はまだしていません**）。
 
 **`--allow-host` を指定しない限り、ループバック以外の Host は 403 です。**
 これは DNS rebinding を防ぐためで、`127.0.0.1` バインドと CORS では防げません
@@ -180,7 +196,8 @@ node v0/server.mjs --allow-exec --token "$TOKEN"
 
 | | |
 |---|---|
-| `--allow-exec` | 既定オフ。**24文字以上の `--token` が無いと起動しません**（有効化を必ず意識的な操作にするため） |
+| `--allow-exec` | 既定オフ。**24文字以上の `--token` か `--token-file` が無いと起動しません**（有効化を必ず意識的な操作にするため） |
+| `--token-file` | 無ければ 0600 で生成し、あれば読む（再起動でトークンが変わらない）。**リポジトリの中を指すと起動を拒否します**（コミットされるため）。`scripts/serve.mjs --exec` は `~/.kjp-edit/token` を自動で渡します |
 | cwd | 既知の worktree のみ |
 | shell | 使いません（`argv` 配列で受けます） |
 | 監査 | `<GIT_DIR>/kjp-exec-audit.jsonl` に start / exit を追記 |

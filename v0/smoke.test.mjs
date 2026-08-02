@@ -1158,6 +1158,106 @@ test('🔒 --exec-timeout に数値でない値を渡したら起動を拒否す
     }
 });
 
+// ---------------------------------------------------------------------------
+// L1 運用（毎日使うための足回り）
+// ---------------------------------------------------------------------------
+
+test('--repo にサブディレクトリを渡すとリポジトリのルートに正規化される', async () => {
+    const sub = join(repo, 'sub-dir-for-test');
+    await mkdir(sub, { recursive: true });
+    const child = spawn(process.execPath, [SERVER, '--repo', sub, '--port', '0'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    try {
+        const { url, banner } = await new Promise((res, rej) => {
+            const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+                if (m && /repo:/.test(buf)) { clearTimeout(t); res({ url: m[0], banner: buf }); }
+            });
+            child.on('error', rej);
+        });
+        assert.match(banner, /ルートに解決しました/, `正規化のログが無い: ${banner}`);
+        const s = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        // ⚠️ ルートに正規化しないと merge-tree が cwd 相対で `../shared.txt` を返し、
+        //    isSafeRepoPath が弾いて UI から開けなくなる（レビュー指摘）
+        for (const c of s.conflicts ?? []) {
+            for (const f of c.files) {
+                assert.ok(!f.startsWith('..'), `衝突パスが cwd 相対になっている: ${f}`);
+            }
+        }
+        assert.ok(s.worktrees.length >= 3, 'worktree が見えていない');
+    } finally {
+        child.kill();
+        await rm(sub, { recursive: true, force: true });
+    }
+});
+
+test('🔒 --token-file: 無ければ生成し、リポジトリの中は拒否する', async () => {
+    const outside = join(repo, '..', `${repo.split(/[\\/]/).pop()}-tok`);
+    // (1) 生成される
+    let child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec', '--token-file', outside],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    try {
+        const url = await new Promise((res, rej) => {
+            const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+                if (m) { clearTimeout(t); res(m[0]); }
+            });
+            child.on('error', rej);
+        });
+        const { readFile } = await import('node:fs/promises');
+        const tok = (await readFile(outside, 'utf8')).trim();
+        assert.ok(tok.length >= 24, `短いトークンが書かれた: ${tok.length} 文字`);
+        // そのトークンで実際に通る
+        const s = await (await fetch(`${url}/api/v0/session`)).json();
+        assert.equal(s.token, tok, 'ファイルのトークンが使われていない');
+    } finally {
+        child.kill();
+    }
+    // (2) 同じファイルなら再利用される（再起動でトークンが変わらない）
+    const { readFile } = await import('node:fs/promises');
+    const first = (await readFile(outside, 'utf8')).trim();
+    child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec', '--token-file', outside],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    try {
+        await new Promise((res, rej) => {
+            const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                if (/http:\/\/127\.0\.0\.1:\d+/.test(buf)) { clearTimeout(t); res(); }
+            });
+            child.on('error', rej);
+        });
+        assert.equal((await readFile(outside, 'utf8')).trim(), first,
+            '再起動でトークンが変わった（永続化できていない）');
+    } finally {
+        child.kill();
+        await rm(outside, { force: true });
+    }
+    // (3) リポジトリの中は拒否する（コミットされるので）
+    const inside = join(repo, 'tok');
+    const bad = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec', '--token-file', inside],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    bad.stderr.setEncoding('utf8');
+    let err = '';
+    bad.stderr.on('data', d => { err += d; });
+    const code = await new Promise(r => bad.on('close', r));
+    assert.equal(code, 1, 'リポジトリ内のトークンファイルで起動してしまった');
+    assert.match(err, /リポジトリの中に置かないで/);
+});
+
 test('🔒 --audit-log でリポジトリ外に監査ログを出せる', async () => {
     const outside = join(repo, '..', `${repo.split(/[\\/]/).pop()}-audit.jsonl`);
     const { child, url } = await startExec(['--audit-log', outside]);

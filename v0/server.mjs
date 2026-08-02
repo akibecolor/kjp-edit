@@ -14,7 +14,7 @@ import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, relative } from 'node:path';
 import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
@@ -34,7 +34,7 @@ function parseArgs(argv) {
         allowWrite: false, token: null,
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
-        allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null,
+        allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -60,6 +60,7 @@ function parseArgs(argv) {
         else if (a === '--exec-timeout') opts.execTimeoutMs = num('--exec-timeout', 1, 86400) * 1000;
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
+        else if (a === '--token-file') opts.tokenFile = resolve(argv[++i]);
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
@@ -68,6 +69,7 @@ function parseArgs(argv) {
             console.log('       --exec-timeout <秒>  実行の上限時間（既定 600）');
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
+            console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
             console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
             process.exit(0);
         }
@@ -1104,9 +1106,23 @@ server.on('error', err => {
     process.exit(1);
 });
 
-// リポジトリとして開けるかを先に確認して、UI で 500 を見せずに済ませる
+// リポジトリとして開けるかを先に確認して、UI で 500 を見せずに済ませる。
+// ⚠️ ついでに**リポジトリのルートへ正規化する。**
+//    サブディレクトリを cwd にすると `merge-tree` が
+//    「cwd からの相対パス」で衝突ファイルを出すので `../shared.txt` になり、
+//    `overlaps[].path`（ルート相対）と基準が食い違う。さらに
+//    `isSafeRepoPath` が `..` を弾くので UI から開けなくなる（レビュー指摘）。
 try {
-    await git(['rev-parse', '--git-dir'], { cwd: opts.repo });
+    const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
+    if (top) {
+        if (!samePath(top, opts.repo)) {
+            console.log(`repo をリポジトリのルートに解決しました: ${opts.repo} → ${top}`);
+        }
+        opts.repo = top;
+    } else {
+        // bare リポジトリには toplevel が無い。開けることだけ確認する
+        await git(['rev-parse', '--git-dir'], { cwd: opts.repo });
+    }
 } catch (err) {
     console.error(`\n✖ git リポジトリとして開けません: ${opts.repo}`);
     console.error(`  ${err.message}\n`);
@@ -1122,6 +1138,37 @@ try {
 //       結果として「トークンを楽な場所に置く」方向へ流れる。
 //       明示的に --token を要求すれば、有効化が必ず意識的な操作になる。
 //       うっかり --allow-exec だけ付けて起動する事故も防げる。
+// 🔒 --token-file: トークンを永続化する。
+//
+// 理由: 起動ごとにランダムだと遠隔から使うたびに貼り直しになり、
+//   結果として「楽な場所に置く」方向へ流れる（--allow-exec が --token を
+//   必須にしているのと同じ理屈）。ファイルに置けば運用できる。
+// ⚠️ 代わりに「再起動で無効化される」性質を失う。だから**明示的なオプション**にし、
+//   既定では使わない。作るときは所有者のみ読める権限（0600）にする。
+// ⚠️ リポジトリの中に置かせない（コミットされる）。
+if (opts.tokenFile) {
+    const { readFile: rf, writeFile: wf, chmod } = await import('node:fs/promises');
+    const inside = await (async () => {
+        try {
+            const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
+            return top && !relative(top, opts.tokenFile).startsWith('..');
+        } catch { return false; }
+    })();
+    if (inside) {
+        console.error(`\n✖ --token-file をリポジトリの中に置かないでください（コミットされます）: ${opts.tokenFile}\n`);
+        process.exit(1);
+    }
+    try {
+        opts.token = (await rf(opts.tokenFile, 'utf8')).trim();
+        if (opts.token.length < 24) throw new Error('短すぎます');
+    } catch {
+        opts.token = randomBytes(32).toString('base64url');
+        await wf(opts.tokenFile, `${opts.token}\n`, { encoding: 'utf8', mode: 0o600 });
+        try { await chmod(opts.tokenFile, 0o600); } catch { /* Windows では効かない */ }
+        console.log(`トークンを生成して保存しました: ${opts.tokenFile}`);
+    }
+}
+
 if (opts.allowExec) {
     if (!opts.token || opts.token.length < 24) {
         console.error('\n✖ --allow-exec には 24 文字以上の --token が必要です。');
