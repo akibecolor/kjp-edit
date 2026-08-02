@@ -22,6 +22,7 @@ import {
     showBlob, fileDiff, toNFC, samePath, isSafeRef, mergePreview,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
+import { planMerge } from './mergeplan.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -348,6 +349,13 @@ async function collectFresh() {
         repo: cwd,
         base,
         generatedAt: new Date().toISOString(),
+        // 取り込み順序の提案。追加の git 呼び出しは0（衝突予測の結果だけを使う純ロジック）。
+        // ⚠️ 仮説であって保証ではない。詳細は v0/mergeplan.mjs のコメント。
+        mergePlan: planMerge(
+            worktrees.filter(w => !w.bare && !w.prunable && (w.ahead ?? 0) > 0)
+                .map(w => ({ label: w.label, ahead: w.ahead })),
+            conflicts,
+        ),
         // 衝突予測。clean=false のペアは実際にマージすると衝突する。
         // ⚠️ 候補は overlaps 由来なので rename/delete 絡みは取りこぼす（完全ではない）
         conflicts,

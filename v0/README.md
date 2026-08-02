@@ -39,6 +39,7 @@ node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
 | **統合グラフ** | 全 worktree の HEAD を含む1枚のスイムレーングラフ。HEAD は白抜きの丸で強調 |
 | **ファイル重複** | 2つ以上の worktree が触っているファイル |
 | **🔍 衝突予測** | 候補ペアを `git merge-tree` で**実際にマージしてみて**衝突するかを出す。作業ツリーには触らない |
+| **取り込み順序の提案** | 衝突グラフの独立集合を貪欲に取る。**追加の git 呼び出しは0、AI も使わない**。仮説であって保証ではない |
 | **🚨 警告** | シーケンサ乗っ取りと `MERGE_HEAD` の消失リスク |
 
 ## シーケンサ乗っ取りとは
@@ -129,6 +130,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 
 | `ndjson.mjs` | 行区切り JSON のストリーム読み。**ブラウザと unit テストで共有** |
 | `ndjson.test.mjs` | 行割れ・マルチバイト割れの回帰テスト |
+| `mergeplan.mjs` / `.test.mjs` | 取り込み順序の提案（純関数）と unit テスト9件 |
 
 ### エンドポイント
 
@@ -219,3 +221,12 @@ v0 を数日使ってから:
 （[../docs/architecture.md](../docs/architecture.md)）。
 
 MIT — [../docs/licensing.md](../docs/licensing.md)
+
+## 応答時間
+
+実測と引いた線は [../docs/performance.md](../docs/performance.md)。
+要点: **支配要因はプロセス起動**（1回 5〜7ms）。
+worktree 10本までを想定し、fresh 収集 p95 < 1000ms を目標にしている
+（実測は 3本で 195ms、7本で 244ms）。
+線を守る仕組みは「増やさないこと」そのもので、
+`stats.gitSpawns` をテストが上限で固定している。

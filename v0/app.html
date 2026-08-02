@@ -648,6 +648,28 @@ function render(s) {
     else for (const f of c.files) d.append(el('div', 'ab', `  ${f}`));
     cBox.append(d);
   }
+  // 取り込み順序の提案（純ロジック。追加の git 呼び出しは0）
+  const plan = s.mergePlan;
+  if (plan && (plan.batch.length || plan.deferred.length)) {
+    cBox.append(el('div', 'ab', '── 取り込み順序の提案 ──'));
+    if (plan.batch.length) {
+      const d = el('div', 'ab');
+      d.append(el('b', null, '① まとめて取り込める: '),
+        document.createTextNode(plan.batch.join(' → ')));
+      cBox.append(d);
+    }
+    for (const df of plan.deferred) {
+      const d = el('div', 'ab');
+      d.append(el('b', null, `② 手当が必要: ${df.label}`),
+        document.createTextNode(df.conflictsWith.length
+          ? `（${df.conflictsWith.join(', ')} と衝突）` : ''));
+      cBox.append(d);
+    }
+    cBox.append(el('div', 'note',
+      `⚠ これは仮説です。ペア単位で衝突しないことは、まとめて衝突しないことを意味しません`
+      + `（3者間で初めて起きる衝突があります）。`
+      + `未検査のペアが ${plan.untestedPairs} 組あります（検査済み ${plan.testedPairs} 組）。`));
+  }
   if (conf.length) {
     cBox.append(el('div', 'note',
       '⚠ 候補は「同じファイルを触っているペア」から作っています。'

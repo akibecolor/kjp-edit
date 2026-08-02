@@ -514,6 +514,61 @@ test('--allow-host で指定したホスト名だけは通る（トンネル用�
 // ---------------------------------------------------------------------------
 
 // 「同じファイルを触っている」は代理指標。実際に衝突するかを merge-tree で見る。
+// ---------------------------------------------------------------------------
+// 非機能要件（応答時間）の線。docs/performance.md に根拠と実測値がある。
+//
+// ⚠️ 壁時計の assert は CI のノイズで揺れるので、**精度は spawn 数で、
+//    桁違いの劣化だけを壁時計で**見る。2段構えにする理由:
+//    厳しい壁時計は flaky になり、緩い壁時計だけでは 3倍の劣化を見逃す。
+// ---------------------------------------------------------------------------
+
+test('応答時間: 収集が桁違いに遅くなっていない', async () => {
+    // 一度温めてから測る（初回は Node の JIT とファイルキャッシュで遅い）
+    await fetch(`${baseUrl}/api/v0/state?fresh=1`);
+    const runs = [];
+    for (let i = 0; i < 5; i++) {
+        const t0 = process.hrtime.bigint();
+        const res = await fetch(`${baseUrl}/api/v0/state?fresh=1`);
+        await res.json();
+        runs.push(Number(process.hrtime.bigint() - t0) / 1e6);
+    }
+    const median = [...runs].sort((a, b) => a - b)[2];
+    // 手元の実測は 3 worktree で中央 195ms。CI は遅いので 10 倍を天井にする。
+    // これは「桁違いの劣化」を捕まえるための線で、性能目標そのものではない
+    // （目標は docs/performance.md、精度の担保は gitSpawns のテスト）。
+    assert.ok(median < 2000,
+        `収集の中央値が ${median.toFixed(0)}ms（天井 2000ms）。`
+        + ' ループの中で git 呼び出しを増やしていないか確認する');
+});
+
+test('応答時間: キャッシュ経由は収集より明確に速い', async () => {
+    await fetch(`${baseUrl}/api/v0/state?fresh=1`);
+    const t0 = process.hrtime.bigint();
+    await (await fetch(`${baseUrl}/api/v0/state`)).json();
+    const cached = Number(process.hrtime.bigint() - t0) / 1e6;
+    // 手元では 1-2ms。TTL キャッシュが壊れて毎回収集していたら数百 ms になる
+    assert.ok(cached < 100,
+        `キャッシュ経由が ${cached.toFixed(0)}ms。TTL キャッシュが効いていない可能性`);
+});
+
+test('取り込み順序の提案が payload に入り、塊の中身が衝突しない', async () => {
+    const s = await state();
+    assert.ok(s.mergePlan, 'mergePlan が無い');
+    const bad = new Set((s.conflicts ?? []).filter(c => !c.clean)
+        .map(c => [c.a, c.b].sort().join('|')));
+    const b = s.mergePlan.batch;
+    for (let i = 0; i < b.length; i++) {
+        for (let j = i + 1; j < b.length; j++) {
+            assert.ok(!bad.has([b[i], b[j]].sort().join('|')),
+                `提案の塊に衝突ペアが入っている: ${b[i]} × ${b[j]}`);
+        }
+    }
+    // agent-a と agent-b は衝突するので、両方が塊に入ることは無い
+    const names = n => s.worktrees.find(w => w.branch === n).name;
+    const both = b.includes(names('agent-a')) && b.includes(names('agent-b'));
+    assert.equal(both, false, '衝突する2本が同じ塊に入っている');
+});
+
 test('衝突予測: 実際に衝突するペアを検出する', async () => {
     const s = await state();
     assert.ok(Array.isArray(s.conflicts), 'conflicts が payload に無い');
