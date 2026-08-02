@@ -11,7 +11,7 @@
 //    このサーバは認証を持たない。0.0.0.0 にバインドしないこと。
 
 import { createServer } from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -34,7 +34,7 @@ function parseArgs(argv) {
         allowWrite: false, token: null,
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
-        allowExec: false, execTimeoutMs: 10 * 60 * 1000,
+        allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -59,6 +59,7 @@ function parseArgs(argv) {
         else if (a === '--allow-exec') { opts.allowExec = true; opts.allowWrite = true; }
         else if (a === '--exec-timeout') opts.execTimeoutMs = num('--exec-timeout', 1, 86400) * 1000;
         else if (a === '--token') opts.token = argv[++i];
+        else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
@@ -66,6 +67,7 @@ function parseArgs(argv) {
             console.log('       --allow-exec         任意コマンドの実行を有効にする（既定オフ。--token 必須）');
             console.log('       --exec-timeout <秒>  実行の上限時間（既定 600）');
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
+            console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
             console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
             process.exit(0);
         }
@@ -505,9 +507,11 @@ function denyJson(res, code, message) {
 /** 長さを漏らさずトークンを比較する */
 function tokenMatches(given) {
     if (typeof given !== 'string' || !opts.token) return false;
-    const a = Buffer.from(given, 'utf8');
-    const b = Buffer.from(opts.token, 'utf8');
-    if (a.length !== b.length) return false;
+    // ⚠️ 長さ不一致で早期 return するとトークン長が timing で漏れる。
+    //    固定長にハッシュしてから比べれば長さも定数時間で守れる
+    //    （レビューで指摘。実害は小さいが直すのが安い）。
+    const a = createHash('sha256').update(given, 'utf8').digest();
+    const b = createHash('sha256').update(opts.token, 'utf8').digest();
     return timingSafeEqual(a, b);
 }
 
@@ -564,12 +568,27 @@ function requireExec(req, res) {
  * 実行の監査ログ。1行1JSON で $GIT_DIR に追記する（追跡されない場所）。
  * 何をいつ走らせたかが残らないと、後から事故を追えない。
  */
+/**
+ * ⚠️ 既定の場所（`<GIT_DIR>/kjp-exec-audit.jsonl`）は**実行した相手が消せる。**
+ *    `--audit-log <path>` でリポジトリ外に出せば消されにくくなる。
+ *    レビューで指摘された弱点で、実装では消せない（実行を許した相手は
+ *    そのマシンで何でもできる）ので、置き場所を選べるようにするのが上限。
+ * ⚠️ commonDir() を毎回叩くと exec 1回につき git が余分に起動するので
+ *    起動時に1回だけ解決して持つ。
+ */
+let auditPath = null;
+async function auditLogPath() {
+    if (auditPath) return auditPath;
+    auditPath = opts.auditLog
+        ?? join(await commonDir(opts.repo), 'kjp-exec-audit.jsonl');
+    return auditPath;
+}
+
 async function auditExec(entry) {
     try {
         const { appendFile } = await import('node:fs/promises');
-        const common = await commonDir(opts.repo);
         await appendFile(
-            join(common, 'kjp-exec-audit.jsonl'),
+            await auditLogPath(),
             `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
             'utf8',
         );
@@ -906,9 +925,18 @@ const server = createServer(async (req, res) => {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',
             });
+            // ⚠️ 40桁 hex を渡すと detached HEAD になる。ok:true だけ返すと
+            //    「そのブランチは以後進まない」ことに気付けないので警告を添える
+            //    （レビューで指摘された。エージェントの worktree が detach されると
+            //     そのブランチが止まる）。
+            const detached = !after?.shortBranch;
             res.end(JSON.stringify({
                 ok: true, worktree: wantPath,
                 branch: after?.shortBranch ?? null, head: after?.head ?? null,
+                detached,
+                warning: detached
+                    ? 'detached HEAD になりました。このままコミットしてもブランチは進みません。'
+                    : null,
             }));
             return;
         }
@@ -1037,7 +1065,10 @@ server.listen(opts.port, '127.0.0.1', () => {
         console.log('   トンネルに届く相手 = このマシンでコードを実行できる相手 になります。');
         console.log('   トンネルは必ずループバックで終端し、トンネル側で認証してください');
         console.log('   （tailscale serve など。funnel / quick tunnel は使わないこと）。');
-        console.log(`   監査ログ: <GIT_DIR>/kjp-exec-audit.jsonl / 上限 ${opts.execTimeoutMs / 1000}s`);
+        // ⚠️ 実際の置き場所を出す。既定の場所は**実行した相手が消せる**ので、
+        //    どこに書いているかを起動時に見せる（--audit-log で外に出せる）。
+        console.log(`   監査ログ: ${opts.auditLog ?? '<GIT_DIR>/kjp-exec-audit.jsonl（実行した相手が消せます）'}`);
+        console.log(`   上限 ${opts.execTimeoutMs / 1000}s / 同時 ${MAX_CONCURRENT_EXEC} 本`);
     } else if (opts.allowWrite) {
         console.log('');
         console.log('⚠️ 書き込み有効 (--allow-write)。checkout が可能です。');

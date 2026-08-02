@@ -472,24 +472,42 @@ export async function showBlob(cwd, ref, path) {
     if (!isSafeRef(ref)) throw new GitError(['blob'], 2, `ref が不正です: ${ref}`);
     if (!isSafeRepoPath(path)) throw new GitError(['blob'], 2, `path が不正です: ${path}`);
 
-    // 先にサイズを見る。大きい blob を読み込んでから捨てるのを避ける。
-    let size = 0;
+    // ⚠️ まず**不変の OID に解決してから**中身を読む。
+    //    以前は `cat-file -s <ref>:<path>` と `cat-file blob <ref>:<path>` を
+    //    別々に叩いていたので、その間にブランチが動くと size と text が
+    //    別オブジェクトのものになりえた（TOCTOU。レビューで指摘）。
+    //    OID は動かないので、解決さえ済めば競合は無い。
+    let oid;
     try {
-        size = Number((await git(['cat-file', '-s', `${ref}:${path}`], { cwd })).trim());
-    } catch (err) {
+        oid = (await git(
+            ['rev-parse', '--verify', '--end-of-options', `${ref}:${path}`], { cwd },
+        )).trim();
+    } catch {
         throw new GitError(['blob'], 2, `見つかりません: ${ref}:${path}`);
     }
-    if (size > MAX_BLOB_BYTES) {
-        // binary は「読まなかったので分からない」。false と断定すると未知を偽る
-        return { path, ref, size, tooLarge: true, binary: null, text: null };
+    if (!/^[0-9a-f]{40,64}$/i.test(oid)) {
+        throw new GitError(['blob'], 2, `OID に解決できません: ${ref}:${path}`);
     }
-    const buf = await git(['cat-file', 'blob', `${ref}:${path}`],
-        { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
+
+    let buf;
+    try {
+        buf = await git(['cat-file', 'blob', oid],
+            { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
+    } catch (err) {
+        if (!err.truncated) throw err;
+        // 上限を超えた。サイズだけ同じ OID から取る（別オブジェクトにはならない）
+        let size = null;
+        try { size = Number((await git(['cat-file', '-s', oid], { cwd })).trim()); } catch { /* 諦める */ }
+        // binary は「読まなかったので分からない」。false と断定すると未知を偽る
+        return { path, ref, oid, size, tooLarge: true, binary: null, text: null };
+    }
+    // サイズは読んだバイト数そのもの（別に問い合わせないので齟齬が起きない）
+    const size = buf.length;
     if (looksBinary(buf)) {
-        return { path, ref, size, tooLarge: false, binary: true, text: null };
+        return { path, ref, oid, size, tooLarge: false, binary: true, text: null };
     }
     return {
-        path, ref, size, tooLarge: false, binary: false,
+        path, ref, oid, size, tooLarge: false, binary: false,
         text: toNFC(buf.toString('utf8')),
     };
 }

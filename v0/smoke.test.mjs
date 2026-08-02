@@ -401,6 +401,19 @@ test('blob: 未追跡のファイルは読めない（git オブジェクト経�
     await rm(join(wt, 'secret-untracked.txt'), { force: true });
 });
 
+// TOCTOU 対策。size と text が別オブジェクトのものにならないよう、
+// 先に不変の OID へ解決してから読む。payload に oid が出ることで検証できる。
+test('blob: 不変の OID に解決してから読む（size と text が同じオブジェクト）', async () => {
+    const q = new URLSearchParams({ ref: 'agent-a', path: 'shared.txt' });
+    const d = await (await fetch(`${baseUrl}/api/v0/blob?${q}`)).json();
+    assert.match(d.oid ?? '', /^[0-9a-f]{40,64}$/, `OID が返っていない: ${JSON.stringify(d)}`);
+    // git が同じ OID を返すこと
+    const expect = (await g(['rev-parse', 'agent-a:shared.txt'], repo)).trim();
+    assert.equal(d.oid, expect);
+    // size は読んだバイト数そのもの（別問い合わせではない）
+    assert.equal(d.size, Buffer.byteLength(d.text, 'utf8'));
+});
+
 test('blob: 存在しない path は 400 で、500 にしない', async () => {
     const q = new URLSearchParams({ ref: 'agent-a', path: 'no/such/file.txt' });
     const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
@@ -1096,6 +1109,53 @@ test('🔒 --exec-timeout に数値でない値を渡したら起動を拒否す
         const code = await new Promise(r => child.on('close', r));
         assert.equal(code, 1, `不正な値で起動してしまった: ${bad}`);
         assert.match(err, /--exec-timeout/);
+    }
+});
+
+test('🔒 --audit-log でリポジトリ外に監査ログを出せる', async () => {
+    const outside = join(repo, '..', `${repo.split(/[\\/]/).pop()}-audit.jsonl`);
+    const { child, url } = await startExec(['--audit-log', outside]);
+    try {
+        await readExec(url, { worktree: repo, argv: ['git', '--version'] });
+        const { readFile } = await import('node:fs/promises');
+        const log = await readFile(outside, 'utf8');
+        // ⚠️ 生の正規表現で `git --version` を探してはいけない。
+        //    JSON の中は ["git","--version"] なのでその文字列は現れない。
+        //    行を JSON として読んで argv を比べる（最初これで自分のテストを落とした）。
+        const lines = log.split('\n').filter(Boolean).map(l => JSON.parse(l));
+        assert.ok(lines.some(e => e.argv?.join(' ') === 'git --version'),
+            `外部の監査ログに記録が無い: ${log.slice(0, 200)}`);
+        // 既定の場所には書かれていない（切り替わっていること）
+        const { existsSync } = await import('node:fs');
+        const def = join(repo, '.git', 'kjp-exec-audit.jsonl');
+        const before = existsSync(def) ? (await readFile(def, 'utf8')).length : 0;
+        await readExec(url, { worktree: repo, argv: ['git', 'rev-parse', 'HEAD'] });
+        const after = existsSync(def) ? (await readFile(def, 'utf8')).length : 0;
+        assert.equal(after, before, '既定の場所にも書かれている（切り替わっていない）');
+    } finally {
+        child.kill();
+        await rm(outside, { force: true });
+    }
+});
+
+test('checkout: hex を渡すと detached を警告する（黙って ok:true にしない）', async () => {
+    const { child, url, session } = await startWritable();
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-wt-b`);
+    try {
+        const oid = (await g(['rev-parse', 'main'], repo)).trim();
+        const r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+            body: JSON.stringify({ worktree: wt, ref: oid }),
+        });
+        const d = await r.json();
+        assert.equal(r.status, 200, `hex での checkout が失敗: ${JSON.stringify(d)}`);
+        assert.equal(d.detached, true, 'detached が報告されていない');
+        assert.match(d.warning ?? '', /detached HEAD/, '警告が無い');
+    } finally {
+        child.kill();
+        await g(['checkout', '--force', 'agent-b'], wt).catch(() => {});
     }
 });
 
