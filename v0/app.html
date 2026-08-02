@@ -1,0 +1,765 @@
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kjp-edit</title>
+<!--
+  統合 UI。`/` と `/layout` の両方がこれを返す。
+  以前は index.html（カード + グラフ + checkout + スマホ）と
+  layout-prototype.html（差分 + コンソール + 並列ペイン）に割れていて、
+  機能が揃っているのに片方ずつしか使えなかった。それを1枚にしたもの。
+
+  レイアウトは viewport で切り替える:
+    広い (>1100px): [worktree + ファイラ | 差分 / コンソール | グラフ] のドック。
+                    スプリッタで可変、ペインごとに最大化・最小化
+    狭い (<=1100px): 縦に積む。スプリッタは消える。
+                    「レイアウトの保持は諦めて縦に並べる」方針（docs/scope.md）
+
+  ⚠️ 自動更新は**差分更新**にすること。全再描画すると
+     走っているコンソールのプロセスと出力が消える。
+     コンソールペインは worktree の増減があった時だけ作り直す。
+-->
+<style>
+  :root {
+    --bg: #1e1e1e; --fg: #d4d4d4; --dim: #808080; --line: #333;
+    --card: #252526; --head: #2d2d30; --accent: #4fc1ff;
+    --danger: #f14c4c; --warn: #cca700; --ok: #4ec9b0;
+    --bar: 34px; --split: 6px; --row: 22px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #fff; --fg: #1f1f1f; --dim: #6a6a6a; --line: #dcdcdc;
+      --card: #f6f6f6; --head: #ececec; --accent: #0066bf; }
+  }
+  /* ⚠️ min-width/min-height: 0 は全体に効かせる。grid/flex アイテムの既定 auto が
+     中身の幅で列を押し広げ、overflow:auto を無効化する。 */
+  * { box-sizing: border-box; min-width: 0; min-height: 0; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 12px/1.5 ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace; }
+
+  .topbar { height: var(--bar); display: flex; align-items: center; gap: .6rem;
+    padding: 0 .6rem; background: var(--head); border-bottom: 1px solid var(--line);
+    flex-wrap: nowrap; overflow: hidden; }
+  .topbar > * { flex: 0 0 auto; }
+  .topbar b { font-size: 13px; }
+  .topbar .path { color: var(--dim); flex: 1 1 auto; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .cap { border-radius: 3px; padding: 0 .4em; font-size: 11px; border: 1px solid; }
+  .cap.w { color: var(--warn); border-color: var(--warn); }
+  .cap.x { color: var(--danger); border-color: var(--danger); }
+  .topbar button { font: inherit; font-size: 11px; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; padding: .2rem .5rem;
+    min-height: 26px; cursor: pointer; }
+
+  /* 安全に関わる警告は畳めない位置に置く */
+  #alerts:empty { display: none; }
+  #alerts { flex: 0 0 auto; max-height: 22vh; overflow: auto;
+    border-bottom: 1px solid var(--line); background: var(--bg); }
+  .alert { border-left: 3px solid var(--warn); padding: .3rem .6rem; margin: .2rem .4rem;
+    background: var(--card); font-size: 12px; overflow-wrap: anywhere; }
+  .alert.danger { border-left-color: var(--danger); }
+
+  .shell { height: calc(100% - var(--bar)); display: flex; }
+  .col, .row { display: flex; }
+  .col { flex-direction: column; }
+  .row { flex-direction: row; }
+  #left { flex: 0 0 230px; }
+  #center { flex: 1 1 auto; flex-direction: column; }
+  #right { flex: 0 0 430px; }
+  #diffs { flex: 1 1 58%; }
+  #consoles { flex: 1 1 42%; }
+
+  .split { flex: 0 0 var(--split); position: relative; }
+  .split::after { content: ''; position: absolute; inset: 0; background: var(--line); }
+  .split:hover::after, .split.dragging::after { background: var(--accent); }
+  .split.x { cursor: col-resize; } .split.y { cursor: row-resize; }
+  .split.x::after { left: 2px; right: 2px; } .split.y::after { top: 2px; bottom: 2px; }
+
+  .pane { display: flex; flex-direction: column; background: var(--card);
+    border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
+    flex: 1 1 auto; margin: 2px; }
+  .pane > header { display: flex; align-items: center; gap: .3rem; flex: 0 0 auto;
+    padding: .25rem .45rem; background: var(--head); border-bottom: 1px solid var(--line);
+    font-size: 11px; white-space: nowrap; cursor: pointer; }
+  /* ⚠️ タイトルは縮む側、タグとボタンは縮まない側。分けないと狭いペインで
+     タグがタイトル文字に重なって読めなくなる。 */
+  .pane > header .ttl { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .pane > header .grow { flex: 1 1 auto; }
+  .pane > header .tag { flex: 0 0 auto; }
+  .pane > header button { font: inherit; background: transparent; color: var(--dim);
+    border: 0; cursor: pointer; padding: 0 .3rem; border-radius: 2px;
+    flex: 0 0 auto; white-space: nowrap; min-height: 22px; }
+  .pane > header button:hover { color: var(--fg); background: rgba(127,127,127,.2); }
+  .pane > .body { flex: 1 1 auto; overflow: auto; }
+  .pane.max { position: fixed; inset: var(--bar) 0 0 0; z-index: 50; margin: 0; border-radius: 0; }
+  .pane.min { flex: 0 0 auto; }
+  .pane.min > .body { display: none; }
+
+  .tag { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
+    color: var(--dim); font-size: 10px; }
+  .tag.br { color: var(--accent); border-color: var(--accent); }
+  .tag.dirty { color: var(--warn); border-color: var(--warn); }
+  .tag.danger { color: var(--danger); border-color: var(--danger); }
+
+  /* worktree カード */
+  .cards { display: grid; gap: .4rem; padding: .4rem; }
+  .card { background: var(--bg); border: 1px solid var(--line); border-radius: 3px;
+    padding: .4rem .5rem; }
+  .card h3 { margin: 0 0 .25rem; font-size: 12px; display: flex; gap: .3rem;
+    align-items: center; flex-wrap: wrap; }
+  .ab { color: var(--dim); font-size: 11px; overflow-wrap: anywhere; }
+  .ab b { color: var(--fg); font-weight: 600; }
+  .wr { display: flex; gap: .25rem; align-items: center; margin-top: .3rem; flex-wrap: wrap; }
+  .wr select { font: inherit; font-size: 11px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; max-width: 10rem; }
+  .wr button { font: inherit; font-size: 11px; padding: .1rem .5rem; background: var(--card);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 3px;
+    cursor: pointer; flex: 0 0 auto; white-space: nowrap; }
+  .wrmsg { font-size: 11px; color: var(--dim); overflow-wrap: anywhere; }
+  .wrmsg.bad { color: var(--danger); }
+
+  /* ファイラ */
+  .tree { padding: .3rem 0; }
+  .tree div { padding: .05rem .5rem; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  .tree .d { color: var(--fg); }
+  .tree .f { color: var(--dim); cursor: pointer; }
+  .tree .f:hover { background: rgba(127,127,127,.15); }
+  .tree .st { color: var(--accent); display: inline-block; width: 1.1em; }
+
+  /* 差分 */
+  .tabs { display: flex; flex: 0 0 auto; background: var(--head);
+    border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .tabs button { font: inherit; font-size: 11px; background: transparent; border: 0;
+    border-right: 1px solid var(--line); color: var(--dim);
+    padding: .2rem .5rem; cursor: pointer; white-space: nowrap; }
+  .tabs button.on { background: var(--card); color: var(--fg); }
+  .diff { white-space: pre; font-size: 12px; }
+  .diff div { padding: 0 .5rem; }
+  .diff .h { color: var(--dim); background: rgba(127,127,127,.10); }
+  .diff .hunk { color: var(--accent); background: rgba(79,193,255,.08); }
+  .diff .add { color: #4ec9b0; background: rgba(78,201,176,.10); }
+  .diff .del { color: #f14c4c; background: rgba(241,76,76,.10); }
+  @media (prefers-color-scheme: light) {
+    .diff .add { color: #0a7a5e; } .diff .del { color: #b3261e; }
+  }
+  .note { color: var(--dim); padding: .5rem; font-size: 11px; }
+  .note.warn { color: var(--warn); }
+
+  /* コンソール */
+  .cmdbar { display: flex; gap: .25rem; padding: .25rem .3rem; flex: 0 0 auto;
+    border-bottom: 1px solid var(--line); background: var(--head);
+    align-items: center; flex-wrap: wrap; }
+  .cmdbar input { flex: 1 1 7rem; font: inherit; font-size: 11px; background: var(--bg);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: .15rem .3rem; }
+  .cmdbar select { flex: 0 1 auto; max-width: 9rem; font: inherit; font-size: 11px;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 3px; }
+  /* ボタンは縮ませない。狭いと「実/行」と縦に割れて読めなくなる */
+  .cmdbar button { font: inherit; font-size: 11px; padding: .1rem .45rem; background: var(--card);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 3px;
+    cursor: pointer; flex: 0 0 auto; white-space: nowrap; }
+  .cmdbar button:disabled { color: var(--dim); cursor: default; }
+  .argvpeek { color: var(--dim); font-size: 10px; padding: .1rem .5rem; flex: 0 0 auto;
+    border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
+  .term { padding: .3rem .5rem; white-space: pre-wrap; word-break: break-word;
+    font-size: 11px; line-height: 1.45; }
+  .term .p { color: var(--ok); } .term .w { color: var(--warn); }
+  .term .e { color: var(--danger); } .term .d { color: var(--dim); }
+
+  /* グラフ */
+  .grow { display: grid; grid-template-columns: auto auto auto 1fr;
+    align-items: center; height: var(--row); gap: .35rem; }
+  .grow:hover { background: rgba(127,127,127,.12); }
+  .grow svg { display: block; }
+  /* ⚠️ バッジを .subject の中に入れてはいけない。overflow:hidden で
+     クリップされ、狭い画面で**完全に見えなくなる**（横スクロールでも到達できない）。 */
+  .wtcell, .refcell { display: flex; gap: .2rem; align-items: center;
+    overflow: hidden; white-space: nowrap; }
+  .subject { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ref { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
+    font-size: 10px; max-width: 11em; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; flex: 0 1 auto; }
+  .ref.wt { color: var(--accent); border-color: var(--accent); }
+  .empty { color: var(--dim); padding: .5rem; }
+
+  /* ---- 狭い画面: レイアウトの保持を諦めて縦に積む ---- */
+  @media (max-width: 1100px) {
+    body { overflow: auto; }
+    /* ⚠️ block ではなく flex column にする。block だと order が効かず、
+       DOM 順のせいで**グラフが一番下**になって長いスクロールが必要になる。
+       スマホで一番見たいのは worktree の状態とグラフなので前に出す。 */
+    .shell { display: flex; flex-direction: column; height: auto; }
+    .col, .row { display: flex; flex-direction: column; }
+    #left { order: 1; } #right { order: 2; } #center { order: 3; }
+    .split { display: none; }
+    #left, #right, #center, #diffs, #consoles { flex: none; }
+    .pane { margin: .4rem; }
+    .pane > .body { max-height: 60vh; }
+    .pane.max { position: static; inset: auto; }
+    .cards { grid-template-columns: 1fr; }
+    /* ref バッジは 390px では1〜2文字に潰れて情報にならない。
+       worktree HEAD バッジ（核心情報）を残して ref は落とす。 */
+    .refcell { display: none; }
+  }
+</style>
+
+<div class="topbar">
+  <b>kjp-edit</b>
+  <span class="path" id="repo"></span>
+  <span class="cap" id="cap" hidden></span>
+  <button id="refresh">再読込</button>
+  <button id="reset">レイアウト</button>
+  <span class="path" id="at" style="flex:0 0 auto"></span>
+</div>
+
+<section id="alerts"></section>
+
+<div class="shell" id="shell">
+  <div class="col" id="left"></div>
+  <div class="split x"></div>
+  <div class="col" id="center">
+    <div class="row" id="diffs"></div>
+    <div class="split y"></div>
+    <div class="row" id="consoles"></div>
+  </div>
+  <div class="split x"></div>
+  <div class="col" id="right"></div>
+</div>
+
+<script type="module">
+// 行割れ・マルチバイト割れの処理は共有モジュール（unit テストと同じコード）
+import { parseNdjson } from './ndjson.mjs';
+
+const LANE_W = 10, ROW_H = 22, DOT_R = 3.2;
+const $ = s => document.querySelector(s);
+const el = (t, c, x) => {
+  const n = document.createElement(t);
+  if (c) n.className = c;
+  if (x !== undefined) n.textContent = x;
+  return n;
+};
+
+let session = { allowWrite: false, allowExec: false, token: null, tokenHeader: 'x-kjp-token' };
+let state = null;
+
+/* ===== スプリッタ / ペイン ===== */
+function wireSplit(sp) {
+  const dir = sp.classList.contains('x') ? 'x' : 'y';
+  sp.addEventListener('pointerdown', e => {
+    const prev = sp.previousElementSibling, next = sp.nextElementSibling;
+    if (!prev || !next) return;
+    e.preventDefault();
+    sp.classList.add('dragging');
+    sp.setPointerCapture(e.pointerId);
+    const at = ev => (dir === 'x' ? ev.clientX : ev.clientY);
+    const size = n => (dir === 'x'
+      ? n.getBoundingClientRect().width : n.getBoundingClientRect().height);
+    const start = at(e), p0 = size(prev), n0 = size(next), MIN = 60;
+    const move = ev => {
+      let d = at(ev) - start;
+      d = Math.max(-(p0 - MIN), Math.min(n0 - MIN, d));
+      prev.style.flex = `0 0 ${p0 + d}px`;
+      next.style.flex = `0 0 ${n0 - d}px`;
+    };
+    const up = () => {
+      sp.classList.remove('dragging');
+      sp.removeEventListener('pointermove', move);
+      sp.removeEventListener('pointerup', up);
+      sp.removeEventListener('pointercancel', up);
+    };
+    sp.addEventListener('pointermove', move);
+    sp.addEventListener('pointerup', up);
+    sp.addEventListener('pointercancel', up);
+  });
+}
+
+/** ペインを作る。ヘッダのクリックで開閉、⛶ で最大化。 */
+function pane(id, title, tags = []) {
+  const p = el('div', 'pane');
+  p.dataset.paneId = id;
+  const h = el('header');
+  const ttl = el('span', 'ttl', title);
+  const tagBox = el('span', 'tags');
+  tagBox.style.display = 'flex';
+  tagBox.style.gap = '.3rem';
+  for (const [cls, text] of tags) tagBox.append(el('span', `tag ${cls}`, text));
+  const bmin = el('button', null, '–'); bmin.title = '最小化';
+  const bmax = el('button', null, '⛶'); bmax.title = '最大化';
+  h.append(ttl, el('span', 'grow'), tagBox, bmin, bmax);
+  const body = el('div', 'body');
+  p.append(h, body);
+
+  h.addEventListener('click', ev => {
+    if (ev.target === bmin || ev.target === bmax) return;
+    p.classList.toggle('min');
+  });
+  bmin.addEventListener('click', ev => { ev.stopPropagation(); p.classList.toggle('min'); });
+  bmax.addEventListener('click', ev => {
+    ev.stopPropagation();
+    const was = p.classList.contains('max');
+    for (const o of document.querySelectorAll('.pane.max')) o.classList.remove('max');
+    if (!was) p.classList.add('max');
+  });
+  return { p, body, ttl, tagBox };
+}
+
+function setTags(tagBox, tags) {
+  tagBox.replaceChildren();
+  for (const [cls, text] of tags) tagBox.append(el('span', `tag ${cls}`, text));
+}
+
+$('#reset').addEventListener('click', () => {
+  for (const n of document.querySelectorAll('.col,.row,.pane')) {
+    n.style.flex = ''; n.classList.remove('max', 'min');
+  }
+});
+
+/* ===== グラフ ===== */
+function rowSvg(row) {
+  const lanes = Math.max(row.input.length, row.output.length, row.lane + 1);
+  const w = Math.max(lanes, 1) * LANE_W + LANE_W;
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width', w); svg.setAttribute('height', ROW_H);
+  const x = i => i * LANE_W + LANE_W / 2 + 2;
+  const add = (n, a) => {
+    const e = document.createElementNS(NS, n);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, v);
+    svg.appendChild(e); return e;
+  };
+  const fed = new Set();
+  row.input.forEach((node, i) => {
+    const t = node.id === row.hash ? row.lane
+      : row.output.findIndex(o => o.id === node.id);
+    if (node.id !== row.hash && t !== -1) fed.add(t);
+    add('path', {
+      d: `M ${x(i)} 0 L ${x(i)} ${ROW_H / 2 - 5} L ${x(t === -1 ? i : t)} ${ROW_H / 2}`,
+      stroke: node.color, fill: 'none', 'stroke-width': 1.5,
+    });
+  });
+  const mp = new Set(row.mergeParentLanes ?? []);
+  row.output.forEach((node, i) => {
+    const fresh = mp.has(i) && !fed.has(i);
+    const from = (i === row.firstParentLane || fresh) ? row.lane : i;
+    add('path', {
+      d: `M ${x(from)} ${ROW_H / 2} L ${x(i)} ${ROW_H / 2 + 5} L ${x(i)} ${ROW_H}`,
+      stroke: node.color, fill: 'none', 'stroke-width': 1.5,
+    });
+  });
+  for (const i of mp) {
+    if (!fed.has(i) || i === row.firstParentLane) continue;
+    add('path', {
+      d: `M ${x(row.lane)} ${ROW_H / 2} L ${x(i)} ${ROW_H / 2 + 5}`,
+      stroke: row.output[i]?.color ?? row.color, fill: 'none', 'stroke-width': 1.5,
+    });
+  }
+  const isHead = row.worktrees.length > 0;
+  add('circle', {
+    cx: x(row.lane), cy: ROW_H / 2, r: isHead ? DOT_R + 1.3 : DOT_R,
+    fill: isHead ? 'var(--card)' : row.color, stroke: row.color,
+    'stroke-width': isHead ? 2.2 : 1,
+  });
+  return svg;
+}
+
+function when(iso) {
+  const m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (m < 60) return `${m}分前`;
+  const h = Math.round(m / 60);
+  return h < 24 ? `${h}時間前` : `${Math.round(h / 24)}日前`;
+}
+
+/* ===== 差分 ===== */
+function renderDiff(text) {
+  const box = el('div', 'diff');
+  const lines = text.split('\n');
+  if (lines.length && lines.at(-1) === '') lines.pop();
+  for (const line of lines) {
+    let cls = '';
+    if (line.startsWith('@@')) cls = 'hunk';
+    else if (/^(\+\+\+|---|diff |index |new file|deleted file|similarity |rename )/.test(line)) cls = 'h';
+    else if (line.startsWith('+')) cls = 'add';
+    else if (line.startsWith('-')) cls = 'del';
+    box.append(el('div', cls, line === '' ? ' ' : line));
+  }
+  if (!lines.length) box.append(el('div', 'h', '(差分なし)'));
+  return box;
+}
+
+async function loadDiff(holder, base, ref, path) {
+  holder.replaceChildren(el('div', 'note', `読み込み中: ${path}`));
+  try {
+    const q = new URLSearchParams({ base, ref, path });
+    const res = await fetch(`/api/v0/diff?${q}`);
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+    if (d.binary) { holder.replaceChildren(el('div', 'note', 'バイナリファイル')); return; }
+    holder.replaceChildren(renderDiff(d.text ?? ''));
+  } catch (e) {
+    holder.replaceChildren(el('div', 'note warn', `取得できませんでした: ${e.message}`));
+  }
+}
+
+/* ===== コンソール ===== */
+function splitArgv(line) {
+  const out = [];
+  let cur = '', quote = null, has = false;
+  for (const ch of line) {
+    if (quote) { if (ch === quote) quote = null; else cur += ch; }
+    else if (ch === '"' || ch === "'") { quote = ch; has = true; }
+    else if (/\s/.test(ch)) { if (has || cur) { out.push(cur); cur = ''; has = false; } }
+    else cur += ch;
+  }
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+const IS_WIN = /win/i.test(navigator.platform ?? '');
+const PRESETS = [
+  'git status --short',
+  'git log --oneline -10',
+  'git diff --stat',
+  IS_WIN ? 'cmd /c npm test' : 'npm test',
+  'claude -p "この worktree の変更を要約して"',
+];
+
+async function runExec(termEl, scrollEl, wt, argv, onState) {
+  const line = (cls, s) => {
+    const atBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 24;
+    termEl.append(el('span', cls, s));
+    if (atBottom) scrollEl.scrollTop = scrollEl.scrollHeight;
+  };
+  const ac = new AbortController();
+  onState({ running: true, abort: () => ac.abort() });
+  line('d', `$ ${argv.join(' ')}\n`);
+  try {
+    const res = await fetch('/api/v0/exec', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
+      body: JSON.stringify({ worktree: wt.path, argv }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { msg = (await res.json()).error ?? msg; } catch { /* JSON でない */ }
+      line('e', `✖ ${msg}\n`);
+      return;
+    }
+    for await (const ev of parseNdjson(res.body)) {
+      if (ev.__parseError) { line('e', `(解析できない行: ${ev.__parseError.slice(0, 80)})\n`); continue; }
+      if (ev.t === 'out') line('', ev.d);
+      else if (ev.t === 'err') line('w', ev.d);
+      else if (ev.t === 'exit') {
+        const ok = ev.code === 0;
+        line(ok ? 'p' : 'e',
+          `\n${ok ? '✔' : '✖'} exit=${ev.code}${ev.signal ? ` signal=${ev.signal}` : ''}\n`);
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') line('w', '\n⚠ 中断しました（サーバ側でプロセスを停止）\n');
+    else line('e', `\n✖ ${e.message}\n`);
+  } finally {
+    onState({ running: false });
+  }
+}
+
+function consoleBody(wt) {
+  const box = el('div');
+  box.style.cssText = 'display:flex;flex-direction:column;height:100%';
+  if (!session.allowExec) {
+    box.append(el('div', 'note warn',
+      '実行は無効です。--allow-exec と 24 文字以上の --token を付けて起動すると使えます。'
+      + ' 遠隔から引ける状態は remote code execution なので既定でオフです。'));
+    return box;
+  }
+  const bar = el('div', 'cmdbar');
+  const sel = el('select');
+  for (const p of PRESETS) { const o = el('option', null, p); o.value = p; sel.append(o); }
+  const input = el('input');
+  input.value = PRESETS[0];
+  input.spellcheck = false;
+  const run = el('button', null, '実行');
+  const stop = el('button', null, '停止');
+  stop.disabled = true;
+  bar.append(sel, input, run, stop);
+
+  const peek = el('div', 'argvpeek');
+  const scroll = el('div');
+  scroll.style.cssText = 'flex:1 1 auto;overflow:auto';
+  const term = el('div', 'term');
+  scroll.append(term);
+
+  const refresh = () => {
+    const argv = splitArgv(input.value);
+    peek.textContent = argv.length
+      ? `argv: ${JSON.stringify(argv)}（shell は経由しません）`
+      : 'コマンドを入力してください';
+  };
+  input.addEventListener('input', refresh);
+  sel.addEventListener('change', () => { input.value = sel.value; refresh(); });
+  refresh();
+
+  let cur = null;
+  const onState = st => {
+    run.disabled = st.running; stop.disabled = !st.running; input.disabled = st.running;
+    cur = st.running ? st : null;
+    box.dataset.running = st.running ? '1' : '';
+  };
+  const start = () => {
+    const argv = splitArgv(input.value);
+    if (argv.length) runExec(term, scroll, wt, argv, onState);
+  };
+  run.addEventListener('click', start);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' && !run.disabled) start(); });
+  stop.addEventListener('click', () => cur?.abort?.());
+
+  box.append(bar, peek, scroll);
+  return box;
+}
+
+/* ===== checkout ===== */
+function checkoutForm(wt, s) {
+  const box = el('div', 'wr');
+  const sel = el('select');
+  // 候補は payload の localBranches だけから作る。グラフの refs から推測すると
+  // remote-tracking が混ざり、checkout すると detached HEAD になる。
+  const inUse = new Set(s.worktrees.map(w => w.branch).filter(Boolean));
+  const cands = (s.localBranches ?? []).filter(r => r && !inUse.has(r));
+  for (const r of cands.slice(0, 40)) { const o = el('option', null, r); o.value = r; sel.append(o); }
+  const btn = el('button', null, 'checkout');
+  const msg = el('span', 'wrmsg');
+  if (!cands.length) {
+    btn.disabled = true; sel.disabled = true;
+    msg.textContent = '切り替え先がありません（全ブランチが使用中）';
+  }
+  btn.addEventListener('click', async () => {
+    btn.disabled = true; msg.className = 'wrmsg'; msg.textContent = '実行中…';
+    try {
+      const res = await fetch('/api/v0/checkout', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
+        body: JSON.stringify({ worktree: wt.path, ref: sel.value }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+      msg.textContent = `→ ${d.branch ?? d.head?.slice(0, 8)}`;
+      await load(true);
+    } catch (e) {
+      msg.className = 'wrmsg bad'; msg.textContent = e.message; btn.disabled = false;
+    }
+  });
+  box.append(sel, btn, msg);
+  return box;
+}
+
+/* ===== 差分更新 =====
+   ⚠️ 走っているコンソールを壊さないため、ペインは作り直さず中身だけ差し替える。
+      コンソールは worktree の集合が変わった時だけ作り直す。 */
+const panes = new Map();     // id -> {p, body, ttl, tagBox}
+let consoleKeys = '';
+
+function ensurePane(host, id, title, tags) {
+  let obj = panes.get(id);
+  if (!obj) {
+    obj = pane(id, title, tags);
+    panes.set(id, obj);
+    host.append(obj.p);
+  } else {
+    obj.ttl.textContent = title;
+    setTags(obj.tagBox, tags);
+    if (obj.p.parentElement !== host) host.append(obj.p);
+  }
+  return obj;
+}
+
+function wtTags(wt) {
+  const tags = [['br', wt.branch ?? wt.name]];
+  if (wt.status?.dirty) tags.push(['dirty', 'dirty']);
+  if (wt.prunable) tags.push(['danger', 'prunable']);
+  if (wt.bare) tags.push(['', 'bare']);
+  const q = wt.sequencer ?? {};
+  for (const [f, l] of [['rebasing', 'rebasing'], ['merging', 'merging'],
+    ['cherryPicking', 'cherry-pick'], ['reverting', 'revert'],
+    ['bisecting', 'bisect'], ['sequencing', 'sequencer']]) {
+    if (q[f]) tags.push(['danger', l]);
+  }
+  return tags;
+}
+
+function render(s) {
+  state = s;
+  $('#repo').textContent = `${s.repo}   base: ${s.base}`;
+  $('#at').textContent = when(s.generatedAt);
+
+  // 警告（安全に関わるので畳めない位置）
+  const alerts = $('#alerts');
+  alerts.replaceChildren();
+  for (const e of s.errors ?? []) {
+    const d = el('div', 'alert');
+    d.append(el('b', null, `${e.scope}: `), document.createTextNode(e.message));
+    alerts.append(d);
+  }
+  for (const wt of s.worktrees) {
+    for (const w of wt.warnings ?? []) {
+      const d = el('div', `alert ${w.level === 'danger' ? 'danger' : ''}`);
+      d.append(el('b', null, `${wt.name}: `), document.createTextNode(w.message));
+      alerts.append(d);
+    }
+  }
+
+  // 左: worktree カード + ファイラ
+  const dirty = s.worktrees.filter(w => w.status?.dirty).length;
+  const wtPane = ensurePane($('#left'), 'worktrees',
+    `Worktrees ${s.worktrees.length}`, dirty ? [['dirty', `dirty ${dirty}`]] : []);
+  const cards = el('div', 'cards');
+  for (const wt of s.worktrees) {
+    const c = el('div', 'card');
+    const h = el('h3');
+    h.append(el('span', null, wt.name));
+    for (const [cls, text] of wtTags(wt).slice(1)) h.append(el('span', `tag ${cls}`, text));
+    if (wt.branch) h.append(el('span', 'tag br', wt.branch));
+    c.append(h);
+    const ab = el('div', 'ab');
+    ab.textContent = `+${wt.ahead} / -${wt.behind}`
+      + (wt.status ? ` · 変更 ${wt.status.changed} · 未追跡 ${wt.status.untracked}` : '')
+      + (wt.status?.unmerged ? ` · 未解決 ${wt.status.unmerged}` : '');
+    c.append(ab);
+    if (wt.prunable) c.append(el('div', 'ab', `失われています: ${wt.prunableReason ?? '理由不明'}`));
+    if (session.allowWrite && !wt.bare && !wt.prunable) c.append(checkoutForm(wt, s));
+    cards.append(c);
+  }
+  wtPane.body.replaceChildren(cards);
+
+  const filer = ensurePane($('#left'), 'filer', 'ファイラ（変更ファイル）', []);
+  const tree = el('div', 'tree');
+  for (const wt of s.worktrees) {
+    tree.append(el('div', 'd', `▾ ${wt.name}`));
+    if (!wt.files?.length) tree.append(el('div', 'f', '   (差分なし)'));
+    for (const f of (wt.files ?? []).slice(0, 12)) {
+      const d = el('div', 'f');
+      d.append(el('span', 'st', f.status), document.createTextNode(f.path.split('/').pop()));
+      d.title = f.path;
+      d.addEventListener('click', () => openDiff(wt, f.path));
+      tree.append(d);
+    }
+  }
+  filer.body.replaceChildren(tree);
+
+  // 中央上: 差分（変更のある worktree を最大2本）
+  const withFiles = s.worktrees.filter(w => w.files?.length);
+  const picks = withFiles.slice(0, 2);
+  if (!picks.length && s.worktrees.length) picks.push(s.worktrees[0]);
+  picks.forEach((wt, i) => {
+    const id = `diff-${i}`;
+    const obj = ensurePane($('#diffs'), id, '差分', [['br', wt.branch ?? wt.name]]);
+    obj.p.dataset.wt = wt.path;
+    const files = (wt.files ?? []).slice(0, 6);
+    const tabs = el('div', 'tabs');
+    const holder = el('div');
+    const prev = obj.p.dataset.sel;
+    const initial = files.find(f => f.path === prev)?.path ?? files[0]?.path;
+    files.forEach(f => {
+      const b = el('button', f.path === initial ? 'on' : null, f.path.split('/').pop());
+      b.title = f.path;
+      b.addEventListener('click', () => {
+        for (const o of tabs.children) o.classList.remove('on');
+        b.classList.add('on');
+        obj.p.dataset.sel = f.path;
+        loadDiff(holder, s.base, wt.branch ?? wt.head, f.path);
+      });
+      tabs.append(b);
+    });
+    if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
+    const wrap = el('div');
+    wrap.style.cssText = 'display:flex;flex-direction:column;height:100%';
+    wrap.append(tabs, holder);
+    obj.body.replaceChildren(wrap);
+    if (initial) { obj.p.dataset.sel = initial; loadDiff(holder, s.base, wt.branch ?? wt.head, initial); }
+    else holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
+  });
+
+  // 中央下: コンソール。**worktree の集合が変わった時だけ作り直す**
+  const live = s.worktrees.filter(w => !w.bare && !w.prunable).slice(0, 4);
+  const key = live.map(w => w.path).join('|');
+  if (key !== consoleKeys) {
+    consoleKeys = key;
+    for (const [id, obj] of panes) {
+      if (id.startsWith('console-')) { obj.p.remove(); panes.delete(id); }
+    }
+    $('#consoles').replaceChildren();
+    live.forEach((wt, i) => {
+      if (i > 0) { const sp = el('div', 'split x'); $('#consoles').append(sp); wireSplit(sp); }
+      const obj = ensurePane($('#consoles'), `console-${wt.path}`,
+        wt.branch ?? wt.name, wtTags(wt).slice(1));
+      obj.body.style.display = 'flex';
+      obj.body.replaceChildren(consoleBody(wt));
+    });
+    if (!live.length) $('#consoles').append(el('div', 'empty', '実行できる worktree がありません'));
+  } else {
+    // ペインは残したままヘッダのタグだけ更新する（走っているプロセスを壊さない）
+    for (const wt of live) {
+      const obj = panes.get(`console-${wt.path}`);
+      if (obj) setTags(obj.tagBox, wtTags(wt).slice(1));
+    }
+  }
+
+  // 右: グラフ
+  const g = ensurePane($('#right'), 'graph',
+    '統合グラフ（全 worktree の HEAD）', [['', `${s.graph.length} commits`]]);
+  const box = el('div');
+  if (!s.graph.length) box.append(el('div', 'empty', 'コミットがありません'));
+  for (const row of s.graph) {
+    const r = el('div', 'grow');
+    r.append(rowSvg(row));
+    const wtc = el('div', 'wtcell');
+    for (const n of row.worktrees) wtc.append(el('span', 'ref wt', `⌂ ${n}`));
+    r.append(wtc);
+    const rc = el('div', 'refcell');
+    for (const ref of row.refs) rc.append(el('span', 'ref', ref));
+    r.append(rc);
+    r.append(el('div', 'subject', row.subject));
+    r.title = [`${row.hash.slice(0, 8)}  ${row.subject}`,
+      row.worktrees.length ? `worktree: ${row.worktrees.join(', ')}` : null,
+      row.refs.length ? `refs: ${row.refs.join(', ')}` : null].filter(Boolean).join('\n');
+    box.append(r);
+  }
+  g.body.replaceChildren(box);
+}
+
+/** ファイラのクリックから差分ペインを開く */
+function openDiff(wt, path) {
+  const obj = [...panes.entries()].find(([id]) => id.startsWith('diff-'));
+  if (!obj || !state) return;
+  const [, o] = obj;
+  o.p.dataset.sel = path;
+  o.p.classList.remove('min');
+  const holder = o.body.querySelector('div > div:last-child');
+  if (holder) loadDiff(holder, state.base, wt.branch ?? wt.head, path);
+}
+
+/* ===== 読み込み ===== */
+async function load(force = false) {
+  try {
+    const res = await fetch(force ? '/api/v0/state?fresh=1' : '/api/v0/state');
+    const s = await res.json();
+    if (s.error) throw new Error(s.error);
+    render(s);
+  } catch (e) {
+    $('#alerts').replaceChildren(el('div', 'alert danger', String(e.message || e)));
+  }
+}
+
+for (const sp of document.querySelectorAll('.shell > .split')) wireSplit(sp);
+
+try {
+  const r = await fetch('/api/v0/session');
+  if (r.ok) session = { ...session, ...await r.json() };
+} catch { /* 観測のみで動く */ }
+const cap = $('#cap');
+if (session.allowExec) { cap.hidden = false; cap.className = 'cap x'; cap.textContent = '🚨 実行有効'; }
+else if (session.allowWrite) { cap.hidden = false; cap.className = 'cap w'; cap.textContent = '⚠️ 書き込み有効'; }
+
+$('#refresh').addEventListener('click', () => load(true));
+await load();
+// 自動更新。差分更新なので走っているコンソールは壊れない
+setInterval(() => load(), 15000);
+</script>

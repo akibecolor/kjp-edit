@@ -888,15 +888,11 @@ const server = createServer(async (req, res) => {
             res.end(js);
             return;
         }
-        // 統合画面（workbench）
-        if (url.pathname === '/layout' || url.pathname === '/layout-prototype.html') {
-            const html = await readFile(join(HERE, 'layout-prototype.html'));
-            res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-            res.end(html);
-            return;
-        }
-        if (url.pathname === '/' || url.pathname === '/index.html') {
-            const html = await readFile(join(HERE, 'index.html'));
+        // 統合 UI。以前は index.html と layout-prototype.html に割れていて、
+        // 機能が揃っているのに片方ずつしか使えなかった（/layout は互換のため残す）。
+        if (url.pathname === '/' || url.pathname === '/index.html'
+            || url.pathname === '/layout' || url.pathname === '/layout-prototype.html') {
+            const html = await readFile(join(HERE, 'app.html'));
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
             res.end(html);
             return;

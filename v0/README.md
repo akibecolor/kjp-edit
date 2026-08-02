@@ -119,10 +119,10 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `swimlanes.mjs` | レーン割当。VS Code の `scmHistory.ts`（MIT）を参考に再実装 |
 | `swimlanes.test.mjs` | 回帰テスト。実際に踏んだバグを固定 |
 | `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe`） |
-| `index.html` | 単一ページ UI。ビルド不要、フレームワークなし |
+| `app.html` | **統合 UI**（`/` と `/layout` が返す）。広い画面はドック、狭い画面は縦積み |
 | `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
 | `layout-check.mjs` | 実ブラウザで 390 / 768 / 1280px を測る。ブラウザが無ければスキップ |
-| `layout-prototype.html` | 統合画面 workbench（`/layout`）。差分・コンソール・グラフすべて本物 |
+
 | `ndjson.mjs` | 行区切り JSON のストリーム読み。**ブラウザと unit テストで共有** |
 | `ndjson.test.mjs` | 行割れ・マルチバイト割れの回帰テスト |
 
@@ -136,7 +136,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す） |
 | `POST /api/v0/checkout` | ブランチ切り替え。**`--allow-write` が必要** |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
-| `/layout` | 統合画面 workbench |
+| `/layout` | `/` の別名（互換のため） |
 
 ### 書き込み（既定オフ）
 
