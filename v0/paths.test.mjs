@@ -11,7 +11,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { samePath, isSafeRepoPath, isSafeRef } from './git.mjs';
+import { samePath, isSafeRepoPath, isSafeRef, git } from './git.mjs';
 
 test('samePath: 区切り文字の違いを吸収する', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kjp-path-'));
@@ -76,6 +76,20 @@ test('isSafeRepoPath: リポジトリ外へ抜ける表記を拒否する', () =
     ]) {
         assert.equal(isSafeRepoPath(bad), false, `拒否されるべき: ${String(bad).slice(0, 20)}`);
     }
+});
+
+// 多層防御の2層目。入口の isSafeRepoPath が `:` を弾くのとは別に、
+// git 呼び出し自体が pathspec magic を解釈しないことを実挙動で確かめる。
+// （入口のテストだけだと、この BASE_ARGS を外しても緑のまま通り抜ける）
+test('git() は pathspec magic を literal として扱う（--literal-pathspecs）', async () => {
+    // `:(exclude)*.mjs` は magic なら「.mjs 以外」を列挙し、literal なら
+    // そんな名前のファイルは無いので何も返らない。
+    const out = await git(['ls-files', '--', ':(exclude)*.mjs'], { cwd: process.cwd() });
+    assert.equal(out.trim(), '',
+        `pathspec magic が解釈されている（--literal-pathspecs が効いていない）: ${out.slice(0, 200)}`);
+    // 比較のため、素のパスは通ることを確認しておく（テストが常に空を見ていないこと）
+    const real = await git(['ls-files', '--', 'v0/git.mjs'], { cwd: process.cwd() });
+    assert.match(real, /v0\/git\.mjs/, 'そもそも ls-files が動いていない');
 });
 
 test('isSafeRef: リビジョン式とオプションを拒否し、日本語ブランチ名は通す', () => {

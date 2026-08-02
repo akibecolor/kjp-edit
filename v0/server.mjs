@@ -19,7 +19,7 @@ import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
-    showBlob, fileDiff, toNFC, samePath,
+    showBlob, fileDiff, toNFC, samePath, isSafeRef,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 
@@ -37,15 +37,26 @@ function parseArgs(argv) {
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
+        // ⚠️ 数値は必ず検証する。`--exec-timeout abc` は Number→NaN で
+        //    setTimeout(fn, NaN) が 1ms 扱いになり、**全コマンドが即殺される**
+        //    （レビューで実測）。黙って壊れるより起動を止める。
+        const num = (name, min, max) => {
+            const v = Number(argv[++i]);
+            if (!Number.isFinite(v) || v < min || v > max) {
+                console.error(`\n✖ ${name} には ${min}〜${max} の数値を指定してください（受け取った値: ${argv[i]}）\n`);
+                process.exit(1);
+            }
+            return v;
+        };
         if (a === '--repo') opts.repo = resolve(argv[++i]);
-        else if (a === '--port') opts.port = Number(argv[++i]);
-        else if (a === '--limit') opts.limit = Number(argv[++i]);
+        else if (a === '--port') opts.port = num('--port', 0, 65535);
+        else if (a === '--limit') opts.limit = num('--limit', 1, 100000);
         else if (a === '--base') opts.base = argv[++i];
         else if (a === '--layout-probe') opts.layoutProbe = true;
         else if (a === '--allow-host') opts.allowHosts.add(String(argv[++i]).toLowerCase());
         else if (a === '--allow-write') opts.allowWrite = true;
         else if (a === '--allow-exec') { opts.allowExec = true; opts.allowWrite = true; }
-        else if (a === '--exec-timeout') opts.execTimeoutMs = Number(argv[++i]) * 1000;
+        else if (a === '--exec-timeout') opts.execTimeoutMs = num('--exec-timeout', 1, 86400) * 1000;
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
@@ -227,6 +238,25 @@ async function collectFresh() {
         wt.files = await changedFiles(cwd, base, ref).catch(() => []);
     }));
 
+    // 🚨 checkout は git のフック（post-checkout）を起動する。つまりフックのある
+    //    リポジトリでは `--allow-write` は実質コード実行と同じ。capability を
+    //    分けている以上、この事実を payload に出して見えるようにする（レビューで実証）。
+    //    既定でフックを止めるとワークフローを壊すので、止めずに知らせる方を選んだ。
+    if (opts.allowWrite) {
+        try {
+            const { existsSync } = await import('node:fs');
+            const hooks = ['post-checkout', 'post-index-change']
+                .filter(h => existsSync(join(common, 'hooks', h)));
+            if (hooks.length) {
+                errors.push({
+                    scope: 'security',
+                    message: `フックが存在します（${hooks.join(', ')}）。checkout はこれを起動するので、`
+                        + '--allow-write はこのリポジトリでは実質コード実行と同じです。',
+                });
+            }
+        } catch { /* 判定できなければ黙る */ }
+    }
+
     // 全 worktree の HEAD + base を含む1枚のグラフ。
     // 解決できない ref は log() に渡さない（1本で全体が落ちるため）。
     const wanted = [...new Set([base, ...worktrees.map(w => w.ref ?? w.branch ?? w.head)])];
@@ -290,6 +320,7 @@ async function collectFresh() {
                 cherryPicking: !!w.sequencer.cherryPicking,
                 reverting: !!w.sequencer.reverting,
                 bisecting: !!w.sequencer.bisecting,
+                sequencing: !!w.sequencer.sequencing,
                 rebaseHeadName: w.sequencer.rebaseHeadName ?? null,
                 headRef: w.sequencer.headRef ?? null,
                 warnings: w.sequencer.warnings ?? [],
@@ -494,6 +525,42 @@ async function auditExec(entry) {
 const MAX_CONCURRENT_EXEC = 8;
 let runningExec = 0;
 
+/**
+ * ⚠️ 検査と予約は**同じ同期ブロック**で行う。
+ *    間に `await` を挟むとイベントループを手放すので、同時に来た要求が全部
+ *    検査を通ってしまう（上限8に対して24本走ったのをレビューで実測された）。
+ */
+function reserveExecSlot() {
+    if (runningExec >= MAX_CONCURRENT_EXEC) return false;
+    runningExec++;
+    return true;
+}
+
+/**
+ * プロセスを**木ごと**殺す。
+ *
+ * ⚠️ Windows の `child.kill()` は TerminateProcess 相当で、その1プロセスしか殺さない。
+ *    中間が `cmd.exe` だと孫が残り、しかも孫が stdout パイプを握るので
+ *    `close` イベントが永久に来ない → `runningExec` が戻らない → 8回で exec が死ぬ。
+ *    （`.cmd` は shell:false で spawn できないので、Windows で `npm test` を動かす
+ *      唯一の道が `cmd /c npm test` = まさにこの形。避けられない経路だった）
+ */
+async function killTree(child) {
+    if (!child.pid) return;
+    if (process.platform === 'win32') {
+        try {
+            const { execFile } = await import('node:child_process');
+            await new Promise(resolve => {
+                execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'],
+                    { windowsHide: true }, () => resolve());
+            });
+        } catch { /* taskkill が無い環境では下の kill に任せる */ }
+    }
+    try { child.kill('SIGKILL'); } catch { /* 既に死んでいる */ }
+    // 孫がパイプを握っていても応答を閉じられるようにする
+    try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* noop */ }
+}
+
 /** JSON ボディを読む。上限付き（無制限に読むと DoS になる）。 */
 function readJson(req, maxBytes = 64 * 1024) {
     return new Promise((resolve, reject) => {
@@ -514,7 +581,18 @@ function readJson(req, maxBytes = 64 * 1024) {
 }
 
 const server = createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://localhost');
+    // 🚨 new URL() は必ず try で囲む。**認可の手前にある同期例外はプロセスを殺す。**
+    //    `GET //[ HTTP/1.1` のような request-target は ERR_INVALID_URL を投げ、
+    //    async ハンドラの unhandled rejection でデーモンが exit 1 で落ちる。
+    //    4関門も Host 検証も通らない、認証前の1パケット DoS だった（レビューで実証）。
+    let url;
+    try {
+        url = new URL(req.url, 'http://localhost');
+    } catch {
+        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('bad request target\n');
+        return;
+    }
     // 🔒 すべての経路の手前で判定する。個別のハンドラに任せない
     //    （経路が増えたときに1つ忘れるのを防ぐ）。
     if (!hostAllowed(req) || !siteAllowed(req)) {
@@ -573,25 +651,34 @@ const server = createServer(async (req, res) => {
             if (!argv || argv.length === 0) { denyJson(res, 400, 'argv（配列）が必要です'); return; }
             if (argv.some(a => a.includes('\0'))) { denyJson(res, 400, 'argv に NUL は使えません'); return; }
 
-            const wantPath = toNFC(String(body.worktree ?? ''));
-            const worktrees = await listWorktrees(opts.repo);
-            const wt = worktrees.find(w => samePath(w.path, wantPath));
-            if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
-            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
-
-            if (runningExec >= MAX_CONCURRENT_EXEC) {
+            // 🔒 枠は await の手前で予約する（検査と予約の間に await を挟むと上限が効かない）
+            if (!reserveExecSlot()) {
                 denyJson(res, 429, `同時実行が上限（${MAX_CONCURRENT_EXEC}）に達しています`);
                 return;
             }
+            // 予約した後の失敗経路は必ず枠を返す
+            let released = false;
+            const release = () => { if (!released) { released = true; runningExec--; } };
 
-            await auditExec({ event: 'start', worktree: wt.path, argv });
-            runningExec++;
+            const wantPath = toNFC(String(body.worktree ?? ''));
+            const worktrees = await listWorktrees(opts.repo);
+            const wt = worktrees.find(w => samePath(w.path, wantPath));
+            if (!wt) { release(); denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
+            if (wt.bare) { release(); denyJson(res, 400, 'bare worktree では実行できません'); return; }
+            if (wt.prunable) { release(); denyJson(res, 409, '作業ツリーが失われています'); return; }
+
+            await auditExec({
+                event: 'start', worktree: wt.path, argv,
+                peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
+            });
             res.writeHead(200, {
                 'content-type': 'application/x-ndjson; charset=utf-8',
                 'cache-control': 'no-store',
                 // プロキシに溜め込ませない（トンネル越しで出力が止まって見えるのを防ぐ）
                 'x-accel-buffering': 'no',
             });
+            // 無音のコマンドでも「受理された」がすぐ分かるようにする
+            res.flushHeaders?.();
 
             const { spawn } = await import('node:child_process');
             const { StringDecoder } = await import('node:string_decoder');
@@ -604,8 +691,14 @@ const server = createServer(async (req, res) => {
                     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', NO_COLOR: '1' },
                 });
             } catch (err) {
-                runningExec--;
-                send({ t: 'err', d: `起動できません: ${err.message}` });
+                release();
+                // Windows で .cmd/.bat を直接 spawn すると EINVAL になる。
+                // shell を使わない方針なので `cmd /c` を明示してもらう
+                const hint = err.code === 'EINVAL' && process.platform === 'win32'
+                    ? '（Windows では .cmd/.bat は直接実行できません。'
+                        + ' argv を ["cmd","/c","npm","test"] のように指定してください）'
+                    : '';
+                send({ t: 'err', d: `起動できません: ${err.message}${hint}` });
                 send({ t: 'exit', code: null, signal: null });
                 res.end();
                 return;
@@ -617,29 +710,48 @@ const server = createServer(async (req, res) => {
             child.stdout.on('data', c => send({ t: 'out', d: decOut.write(c) }));
             child.stderr.on('data', c => send({ t: 'err', d: decErr.write(c) }));
 
+            // ⚠️ 後始末は1回だけ走らせる。`exit` と保険タイマーと切断の
+            //    どこから来ても同じ finish() に集約する。
             let finished = false;
-            const timer = setTimeout(() => {
-                send({ t: 'err', d: `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します` });
-                child.kill('SIGKILL');
-            }, opts.execTimeoutMs);
-
-            // クライアントが切れたら子プロセスを残さない（放置すると溜まる）
-            const onClose = () => { if (!finished) child.kill('SIGKILL'); };
-            req.on('aborted', onClose);
-            res.on('close', onClose);
-
-            child.on('error', err => send({ t: 'err', d: `実行エラー: ${err.message}` }));
-            child.on('close', async (code, signal) => {
+            let timer = null, guard = null;
+            const finish = async (code, signal, note) => {
+                if (finished) return;
                 finished = true;
-                clearTimeout(timer);
-                runningExec--;
+                clearTimeout(timer); clearTimeout(guard);
+                release();
                 const tail = decOut.end(), tailErr = decErr.end();
                 if (tail) send({ t: 'out', d: tail });
                 if (tailErr) send({ t: 'err', d: tailErr });
+                if (note) send({ t: 'err', d: note });
                 send({ t: 'exit', code, signal });
-                res.end();
-                await auditExec({ event: 'exit', worktree: wt.path, argv, code, signal });
-            });
+                if (!res.writableEnded) res.end();
+                await auditExec({
+                    event: 'exit', worktree: wt.path, argv, code, signal,
+                    note: note ?? null,
+                });
+            };
+
+            timer = setTimeout(async () => {
+                send({ t: 'err', d: `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します` });
+                await killTree(child);
+                // ⚠️ 孫が stdio を握っていると exit が来ないことがある。
+                //    その場合でも応答を閉じて枠を返すための保険。
+                guard = setTimeout(() => finish(null, 'SIGKILL', '⚠ 子プロセスの終了を待てませんでした'), 3000);
+            }, opts.execTimeoutMs);
+
+            // クライアントが切れたら子プロセスを残さない（放置すると溜まる）
+            const onDisconnect = async () => {
+                if (finished) return;
+                await killTree(child);
+                guard = setTimeout(() => finish(null, 'SIGKILL', '⚠ クライアント切断'), 3000);
+            };
+            req.on('aborted', onDisconnect);
+            res.on('close', onDisconnect);
+
+            child.on('error', err => send({ t: 'err', d: `実行エラー: ${err.message}` }));
+            // ⚠️ `close` ではなく `exit` を使う。`close` は stdio が EOF になるまで来ないので、
+            //    孫がパイプを握っていると永久に発火せず、枠が戻らない（レビューで実測）。
+            child.on('exit', (code, signal) => { finish(code, signal); });
             return;
         }
 
@@ -655,6 +767,12 @@ const server = createServer(async (req, res) => {
                 return;
             }
             const ref = String(body.ref ?? '');
+            // 🚨 isSafeRef を通す。`git update-ref refs/heads/--force <oid>` は作れてしまい、
+            //    `resolveRef` は `refs/heads/` を前置して照合するので通る。argv では
+            //    `--` より前なので `git checkout --force --` と解釈され、
+            //    **未コミットの変更が黙って破棄される**（レビューで実証）。
+            //    しかもこの ref は localBranches に載るので UI の候補に並ぶ。
+            if (!isSafeRef(ref)) { denyJson(res, 400, `ref が不正です: ${ref}`); return; }
             const wantPath = toNFC(String(body.worktree ?? ''));
 
             // ⚠️ cwd に任意のパスを受け取らない。既知の worktree のみ。
@@ -683,6 +801,8 @@ const server = createServer(async (req, res) => {
                 [seq.cherryPicking, 'cherry-pick 進行中'],
                 [seq.reverting, 'revert 進行中'],
                 [seq.bisecting, 'bisect 進行中'],
+                // CHERRY_PICK_HEAD が消えていても sequencer/todo は残る
+                [seq.sequencing, 'sequencer に未処理の操作が残っている'],
             ].filter(([f]) => f).map(([, label]) => label);
             if (blockers.length) {
                 denyJson(res, 409,
@@ -695,7 +815,9 @@ const server = createServer(async (req, res) => {
 
             try {
                 // optionalLocks: index の stat-cache 更新を許す（書き込み操作なので）
-                await git(['checkout', ref, '--'], { cwd: wt.path, optionalLocks: true });
+                // --end-of-options: ref がオプションとして解釈される余地を潰す（多層防御）
+                await git(['checkout', '--end-of-options', ref, '--'],
+                    { cwd: wt.path, optionalLocks: true });
             } catch (err) {
                 // git 自身が拒否した場合（未コミットの変更が消える等）もここに来る
                 denyJson(res, 409, `git が checkout を拒否しました: ${err.message}`);

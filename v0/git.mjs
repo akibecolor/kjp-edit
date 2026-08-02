@@ -13,6 +13,17 @@ const BASE_ARGS = [
     '-c', 'core.quotepath=false',
     '-c', 'i18n.logOutputEncoding=UTF-8',
     '-c', 'core.longpaths=true',
+    // 🚨 観測対象のリポジトリ設定を信頼しない。
+    //    `.git/config` に書ける相手（= 並行して動いている別のエージェント）が
+    //    `core.fsmonitor` にコマンドを書くと、**読み取り専用のはずの
+    //    `git status` がそれを実行する**。デーモンの env をそのまま継承するので
+    //    トークンの持ち出しにも使える（レビューで実証された）。
+    //    N 個のエージェントが同じ common dir を共有する前提のツールなので、
+    //    「読み取りだけなら安全」は設定を無効化して初めて成立する。
+    '-c', 'core.fsmonitor=false',
+    // pathspec magic（`:(exclude)…` `:!…` `:/…`）を無効化する。
+    // これが無いと 1ファイル指定のはずの diff が他のファイルを含んで返る。
+    '--literal-pathspecs',
     ...(process.platform === 'darwin' ? ['-c', 'core.precomposeUnicode=true'] : []),
 ];
 
@@ -395,6 +406,10 @@ export function isSafeRepoPath(p) {
     if (p.startsWith('-')) return false;
     if (p.startsWith('/') || p.startsWith('\\')) return false;
     if (/^[a-zA-Z]:/.test(p)) return false;
+    // ⚠️ pathspec magic を弾く。`:(exclude)x` `:!x` `:/x` は「1ファイル指定」を
+    //    「それ以外全部」に変えてしまう（BASE_ARGS の --literal-pathspecs でも
+    //    無効化しているが、入口でも落として二重に守る）。
+    if (p.startsWith(':')) return false;
     const parts = p.split(/[\\/]/);
     if (parts.some(s => s === '..')) return false;
     return true;
@@ -410,6 +425,11 @@ export function isSafeRef(r) {
     if (r.includes('\0') || r.startsWith('-')) return false;
     if (/[\s~^:?*[\]\\]/.test(r)) return false;
     if (r.includes('..')) return false;
+    // ⚠️ `@{…}` を弾く。`agent-a@{1}` や `main@{upstream}` は reflog を辿るので、
+    //    `reset --hard` で捨てたコミットの中身まで読めてしまう。
+    //    「コミットに入っているものに限定される」という showBlob の主張が崩れる
+    //    （レビューで実証された）。
+    if (r.includes('@{') || r === '@') return false;
     return true;
 }
 
@@ -439,7 +459,8 @@ export async function showBlob(cwd, ref, path) {
         throw new GitError(['blob'], 2, `見つかりません: ${ref}:${path}`);
     }
     if (size > MAX_BLOB_BYTES) {
-        return { path, ref, size, tooLarge: true, binary: false, text: null };
+        // binary は「読まなかったので分からない」。false と断定すると未知を偽る
+        return { path, ref, size, tooLarge: true, binary: null, text: null };
     }
     const buf = await git(['cat-file', 'blob', `${ref}:${path}`],
         { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
@@ -460,8 +481,11 @@ export async function fileDiff(cwd, base, ref, path) {
     if (!isSafeRef(base)) throw new GitError(['diff'], 2, `base が不正です: ${base}`);
     if (!isSafeRef(ref)) throw new GitError(['diff'], 2, `ref が不正です: ${ref}`);
     if (!isSafeRepoPath(path)) throw new GitError(['diff'], 2, `path が不正です: ${path}`);
+    // --no-textconv も必須。--no-ext-diff は textconv を止めないので、
+    // リポジトリ設定の `diff.<name>.textconv` からコマンドが起動しうる。
     const buf = await git([
-        'diff', '--no-color', '--no-ext-diff', `${base}...${ref}`, '--', path,
+        'diff', '--no-color', '--no-ext-diff', '--no-textconv',
+        `${base}...${ref}`, '--', path,
     ], { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
     if (looksBinary(buf)) return { path, binary: true, text: null };
     return { path, binary: false, text: toNFC(buf.toString('utf8')) };
@@ -499,6 +523,13 @@ export async function sequencerState(cwd, knownGitDir = null) {
         cherryPicking: existsSync(p('CHERRY_PICK_HEAD')),
         reverting: existsSync(p('REVERT_HEAD')),
         bisecting: existsSync(p('BISECT_LOG')),
+        // 🚨 `sequencer/todo` を見ないと取りこぼす。
+        //    `git cherry-pick A B` が衝突し、`--continue` ではなく**手で commit** すると
+        //    CHERRY_PICK_HEAD は消えるのに `sequencer/todo` に残りの pick が居座る。
+        //    その状態で checkout して `--continue` すると**残りが切り替え先に乗る**
+        //    （レビューで実証。まさにこのツールが警告している乗っ取りと同じ結果）。
+        sequencing: existsSync(p('sequencer/todo')),
+        sequencerTodo: read('sequencer/todo'),
         rebaseHeadName: read('rebase-merge/head-name'),
         warnings: [],
     };
@@ -522,6 +553,20 @@ export async function sequencerState(cwd, knownGitDir = null) {
             code: 'merge-head-present',
             message: 'MERGE_HEAD が存在する。この状態で checkout すると無警告で削除され、'
                 + '次の commit が単一親になる（マージの関係が失われる）。',
+        });
+    }
+    // 🚨 CHERRY_PICK_HEAD/REVERT_HEAD が消えていても sequencer は残る。
+    //    フラグだけ見ていると「何も進行していない」ように見えるのが危険。
+    if (state.sequencing && !state.cherryPicking && !state.reverting && !state.rebasing) {
+        const rest = (state.sequencerTodo ?? '').split('\n').filter(Boolean);
+        state.warnings.push({
+            level: 'danger',
+            code: 'sequencer-todo-left',
+            message: `sequencer に未処理の操作が ${rest.length} 件残っている`
+                + `（${rest.slice(0, 2).join(' / ')}${rest.length > 2 ? ' …' : ''}）。`
+                + ' CHERRY_PICK_HEAD / REVERT_HEAD は消えているので一見何も進行していないが、'
+                + 'この状態で checkout して --continue すると残りが切り替え先にリプレイされる。'
+                + ' 先に --continue か --quit で決着させること。',
         });
     }
     return state;

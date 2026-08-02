@@ -13,6 +13,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -907,6 +908,105 @@ test('exec: クライアントが切断したら子プロセスを殺す', async
     }
 });
 
+// 🚨 レビュアの指摘: 既存の「切断で子を殺す」テストは直接の子（node -e）しか見て
+//    いなかった。Windows では libuv の job object が node 経由の孫まで巻き込むので、
+//    その形では**永久に緑**だった。中間に cmd/sh を挟むと孫が残り、しかも孫が stdio を
+//    握って `close` が来ないので枠が戻らず、8回のタイムアウトで exec が死んでいた。
+test('🚨 exec: 中間シェルを挟んだ孫プロセスも殺し、枠を返す', async () => {
+    const { child, url } = await startExec(['--exec-timeout', '2']);
+    const beacon = join(repo, 'grandchild-beacon.txt');
+    const script = join(repo, 'grandchild.mjs');
+    try {
+        await writeFile(script,
+            'import {appendFileSync} from "node:fs";'
+            + 'setInterval(()=>{try{appendFileSync(process.argv[2],"x")}catch(e){}},100);',
+            'utf8');
+        // 中間にシェルを挟む = Windows で npm test を動かす唯一の形
+        const argv = process.platform === 'win32'
+            ? ['cmd', '/c', process.execPath, script, beacon]
+            : ['sh', '-c', `"${process.execPath}" "${script}" "${beacon}" & wait`];
+
+        const r = await readExec(url, { worktree: repo, argv });
+        // (a) 応答が完結する（exit が来る）。孫が stdio を握っていても閉じること
+        assert.equal(r.status, 200);
+        assert.equal(r.events.at(-1)?.t, 'exit',
+            `応答が完結していない（close 待ちで固まっている）: ${JSON.stringify(r.events.slice(-3))}`);
+
+        // (b) 孫が止まっている
+        const { readFileSync } = await import('node:fs');
+        await new Promise(res => setTimeout(res, 700));
+        const a = readFileSync(beacon, 'utf8').length;
+        await new Promise(res => setTimeout(res, 900));
+        const b = readFileSync(beacon, 'utf8').length;
+        assert.equal(b, a, `孫プロセスが生き残っている: ${a} → ${b}`);
+
+        // (c) 枠が返っている（返らないと8回で exec が死ぬ）
+        const ok = await readExec(url, { worktree: repo, argv: ['git', '--version'] });
+        assert.equal(ok.status, 200, '枠が返っていない（429 になった）');
+    } finally {
+        child.kill();
+        await rm(beacon, { force: true });
+        await rm(script, { force: true });
+    }
+});
+
+// 🚨 レビュアの指摘: 検査と予約の間に await があり、上限8に対して24本走った。
+test('🚨 exec: 同時実行の上限が実際に効く', async () => {
+    const { child, url } = await startExec();
+    const controllers = [];
+    try {
+        const N = 14;
+        const results = await Promise.all(Array.from({ length: N }, () => {
+            const ac = new AbortController();
+            controllers.push(ac);
+            return fetch(`${url}/api/v0/exec`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+                body: JSON.stringify({
+                    worktree: repo,
+                    argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'],
+                }),
+                signal: ac.signal,
+            }).then(res => res.status).catch(() => 0);
+        }));
+        const accepted = results.filter(s => s === 200).length;
+        const rejected = results.filter(s => s === 429).length;
+        assert.ok(accepted <= 8, `上限 8 を超えて受理された: ${accepted} 本`);
+        assert.ok(rejected >= N - 8, `429 が足りない（上限が効いていない）: 受理 ${accepted} / 拒否 ${rejected}`);
+    } finally {
+        for (const ac of controllers) ac.abort();
+        await new Promise(r => setTimeout(r, 1200));
+        child.kill();
+    }
+});
+
+test('🔒 exec: bare worktree では実行しない', async () => {
+    const { child, url } = await startExec();
+    try {
+        // bare worktree は smoke のフィクスチャに無いので、無効な worktree で
+        // 経路が閉じていることだけ確認する（bare の網羅は unit 側の責務）
+        const r = await readExec(url, { worktree: `${repo}-bare-nope`, argv: ['git', '--version'] });
+        assert.equal(r.status, 400);
+    } finally {
+        child.kill();
+    }
+});
+
+test('🔒 --exec-timeout に数値でない値を渡したら起動を拒否する', async () => {
+    for (const bad of ['abc', '0', '-5']) {
+        const child = spawn(process.execPath,
+            [SERVER, '--repo', repo, '--port', '0', '--allow-exec', '--token', EXEC_TOKEN,
+                '--exec-timeout', bad],
+            { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+        child.stderr.setEncoding('utf8');
+        let err = '';
+        child.stderr.on('data', d => { err += d; });
+        const code = await new Promise(r => child.on('close', r));
+        assert.equal(code, 1, `不正な値で起動してしまった: ${bad}`);
+        assert.match(err, /--exec-timeout/);
+    }
+});
+
 test('exec の監査ログが書かれる', async () => {
     const { child, url } = await startExec();
     try {
@@ -922,6 +1022,164 @@ test('exec の監査ログが書かれる', async () => {
         assert.ok(exit.at, 'タイムスタンプが無い');
     } finally {
         child.kill();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// 敵対的レビューで実証された穴の回帰テスト。
+// いずれも「テストが緑のまま通り抜けていた」ものなので、まず落ちる形で書く。
+// ---------------------------------------------------------------------------
+
+/** 生ソケットで任意の request-target を送る（fetch では不正な target を送れない） */
+function rawTarget(urlStr, target) {
+    const u = new URL(urlStr);
+    return new Promise((resolve, reject) => {
+        const sock = netConnect({ host: u.hostname, port: Number(u.port) }, () => {
+            sock.write(`GET ${target} HTTP/1.1\r\nHost: ${u.host}\r\nConnection: close\r\n\r\n`);
+        });
+        let buf = '';
+        sock.setEncoding('utf8');
+        sock.on('data', d => { buf += d; });
+        sock.on('close', () => resolve(buf));
+        sock.on('error', reject);
+        setTimeout(() => { sock.destroy(); resolve(buf); }, 3000);
+    });
+}
+
+// 🚨 認可の手前にある同期例外はプロセスを殺す。1パケットで無認証 DoS だった。
+test('🚨 不正な request-target でデーモンが落ちない（認証前 DoS）', async () => {
+    for (const target of ['//[', '//%zz', 'http://', 'http://[', '//[::1']) {
+        const body = await rawTarget(baseUrl, target);
+        assert.match(body, /^HTTP\/1\.1 400/, `400 が返っていない: ${target}`);
+        // 直後に正常なリクエストが通る = プロセスが生きている（これが本題）
+        const after = await fetch(`${baseUrl}/api/v0/state`);
+        assert.equal(after.status, 200, `${target} の後にデーモンが死んでいる`);
+    }
+});
+
+test('🔒 blob: reflog 経由（@{…}）で捨てたコミットを読めない', async () => {
+    for (const bad of ['agent-a@{1}', 'main@{upstream}', '@', 'HEAD@{0}']) {
+        const q = new URLSearchParams({ ref: bad, path: 'shared.txt' });
+        const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+        assert.equal(res.status, 400, `reflog 式が通った: ${bad}`);
+    }
+});
+
+test('🔒 diff: pathspec magic で他のファイルを含む差分を取れない', async () => {
+    for (const bad of [':(exclude)shared.txt', ':!shared.txt', ':/shared.txt']) {
+        const q = new URLSearchParams({ base: 'main', ref: 'agent-a', path: bad });
+        const res = await fetch(`${baseUrl}/api/v0/diff?${q}`);
+        assert.equal(res.status, 400, `pathspec magic が通った: ${bad}`);
+    }
+});
+
+// 🚨 読み取り専用でも観測対象の設定由来のコマンドが動いていた。
+test('🚨 読み取り専用の経路がリポジトリ設定のコマンドを実行しない（core.fsmonitor）', async () => {
+    const marker = join(repo, 'fsmonitor-ran.txt').replace(/\\/g, '/');
+    const hook = join(repo, 'fsmon.sh').replace(/\\/g, '/');
+    // ⚠️ フックは **シェルスクリプト**で書く。git は fsmonitor を sh 経由で起動するので、
+    //    `node <空白を含むパス> <script>` を設定すると**クォート不足で起動に失敗し、
+    //    発火しないので「守れている」と誤判定する**（実際にこの偽陽性を作った）。
+    //    実測: sh スクリプトなら発火 / -c core.fsmonitor=false で発火しない。
+    //    CLAUDE.md の「スクリプトは .mjs のみ」はプロジェクトのスクリプトの規則で、
+    //    ここは git のフック機構を再現するためのテストフィクスチャなので .sh が必要。
+    await writeFile(hook, `#!/bin/sh\nprintf ran >> "${marker}"\n`, 'utf8');
+    await g(['config', 'core.fsmonitor', hook], repo);
+    try {
+        await fetch(`${baseUrl}/api/v0/state?fresh=1`);
+        await new Promise(r => setTimeout(r, 300));
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(marker), false,
+            'core.fsmonitor のコマンドが実行された（読み取り専用のはずの経路）');
+    } finally {
+        await g(['config', '--unset', 'core.fsmonitor'], repo).catch(() => {});
+        await rm(hook, { force: true });
+        await rm(marker, { force: true });
+    }
+});
+
+test('🚨 checkout: オプション名のブランチで未コミットの変更が破棄されない', async () => {
+    const { child, url, session } = await startWritable();
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-wt-b`);
+    const file = join(wt, 'only-b.txt');
+    try {
+        // git update-ref なら `--force` という名前の ref を作れてしまう
+        const oid = (await g(['rev-parse', 'main'], repo)).trim();
+        await g(['update-ref', 'refs/heads/--force', oid], repo);
+
+        const { readFileSync } = await import('node:fs');
+        await writeFile(file, '大事な未コミットの作業\n', 'utf8');
+        const before = readFileSync(file, 'utf8');
+
+        const r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+            body: JSON.stringify({ worktree: wt, ref: '--force' }),
+        });
+        assert.equal(r.status, 400, 'オプション名の ref が通った');
+        assert.equal(readFileSync(file, 'utf8'), before,
+            '未コミットの変更が破棄された（オプション注入が成立している）');
+    } finally {
+        child.kill();
+        await g(['update-ref', '-d', 'refs/heads/--force'], repo).catch(() => {});
+        await g(['checkout', '--force', 'agent-b'], wt).catch(() => {});
+        await rm(file, { force: true }).catch(() => {});
+        await g(['checkout', '--force', 'agent-b'], wt).catch(() => {});
+    }
+});
+
+// 🚨 CHERRY_PICK_HEAD が消えても sequencer/todo は残る。
+//    これを取りこぼすと v0 自身の checkout で「残りが切り替え先にリプレイ」される。
+test('🚨 checkout: sequencer/todo が残っている状態を拒否する', async () => {
+    const { child, url, session } = await startWritable();
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-wt-a`);
+    try {
+        // ⚠️ フィクスチャの agent-b は main から1コミットしか無いので、
+        //    cherry-pick 用に2コミット持つブランチをここで作る。
+        //    1つ目が衝突して停止し、2つ目が sequencer/todo に残るのが必要な形。
+        await g(['checkout', '-q', '-b', 'seq-src', 'main'], repo);
+        // shared.txt は agent-a も追加しているので add/add で衝突する
+        await writeFile(join(repo, 'shared.txt'), 'from seq-src\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'seq: 衝突する1つ目'], repo);
+        await writeFile(join(repo, 'seq-second.txt'), 'second\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'seq: 残る2つ目'], repo);
+        await g(['checkout', '-q', 'main'], repo);
+
+        const list = (await g(['rev-list', '--reverse', 'main..seq-src'], repo))
+            .trim().split('\n').filter(Boolean);
+        assert.equal(list.length, 2, `cherry-pick 対象が2件でない: ${list.length}`);
+        await g(['cherry-pick', ...list], wt).catch(() => {});   // 衝突するので非0
+        // --continue ではなく手で commit する → CHERRY_PICK_HEAD は消えるが todo は残る
+        await g(['checkout', '--theirs', '.'], wt).catch(() => {});
+        await g(['add', '-A'], wt).catch(() => {});
+        await g(['commit', '--no-edit'], wt).catch(() => {});
+
+        const st = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        const target = st.worktrees.find(w => w.path.endsWith('-wt-a'));
+        assert.equal(target.sequencer.sequencing, true,
+            'setup 失敗: sequencer/todo が残っていない。前提が成立していない');
+        assert.ok(target.warnings.some(w => w.code === 'sequencer-todo-left'),
+            `警告が出ていない: ${JSON.stringify(target.warnings)}`);
+
+        const r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+            body: JSON.stringify({ worktree: wt, ref: 'main' }),
+        });
+        const d = await r.json();
+        assert.equal(r.status, 409, `sequencer 残留中の checkout が通った: ${JSON.stringify(d)}`);
+        assert.match(d.error, /sequencer/);
+    } finally {
+        child.kill();
+        await g(['cherry-pick', '--quit'], wt).catch(() => {});
+        await g(['reset', '--hard', 'agent-a'], wt).catch(() => {});
+        await g(['checkout', '--force', 'agent-a'], wt).catch(() => {});
+        await g(['checkout', '-q', '--force', 'main'], repo).catch(() => {});
+        await g(['branch', '-D', 'seq-src'], repo).catch(() => {});
     }
 });
 
