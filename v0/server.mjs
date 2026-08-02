@@ -25,7 +25,10 @@ import { computeSwimlanes } from './swimlanes.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
-    const opts = { repo: process.cwd(), port: 7749, limit: 300, base: null, layoutProbe: false };
+    const opts = {
+        repo: process.cwd(), port: 7749, limit: 300, base: null,
+        layoutProbe: false, allowHosts: new Set(),
+    };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--repo') opts.repo = resolve(argv[++i]);
@@ -33,9 +36,11 @@ function parseArgs(argv) {
         else if (a === '--limit') opts.limit = Number(argv[++i]);
         else if (a === '--base') opts.base = argv[++i];
         else if (a === '--layout-probe') opts.layoutProbe = true;
+        else if (a === '--allow-host') opts.allowHosts.add(String(argv[++i]).toLowerCase());
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
-            console.log('       --layout-probe  レイアウト検査用の /__probe を有効にする (layout-check.mjs が使う)');
+            console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
+            console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
             process.exit(0);
         }
     }
@@ -322,8 +327,60 @@ async function collect({ force = false } = {}) {
     return inFlight;
 }
 
+/**
+ * 🔒 DNS rebinding を止める。
+ *
+ * ⚠️ 127.0.0.1 にバインドしても、CORS を返さなくても、これは防げない。
+ *    攻撃者のページが自分のドメインの DNS を 127.0.0.1 に貼り替えると、
+ *    そのページの**オリジン自体が 127.0.0.1 になる**ので同一オリジンとして
+ *    通ってしまう。閲覧しただけのサイトからリポジトリの差分が読まれる。
+ *    止められるのは Host ヘッダの検証だけ（ブラウザは元のホスト名を送る）。
+ *
+ * 認証は後から足せるが、これは後回しにできない。読み取りだけでも成立する攻撃なので。
+ */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+function hostAllowed(req) {
+    const host = req.headers.host;
+    if (!host) return false;                 // HTTP/1.1 では Host 必須
+    // IPv6 の [::1]:port も受ける
+    const m = /^(\[[0-9a-fA-F:]+\]|[^:]+)(?::(\d+))?$/.exec(host);
+    if (!m) return false;
+    const name = m[1].toLowerCase();
+
+    if (LOOPBACK_HOSTS.has(name)) {
+        // ループバックなら、ついでにポートも一致させる
+        const port = m[2] ? Number(m[2]) : 80;
+        const actual = server.address()?.port;
+        return !actual || port === actual;
+    }
+    // ⚠️ トンネル（tailscale serve 等）を通すと Host はループバックではなくなる。
+    //    既定で通すと DNS rebinding を通すのと同じなので、
+    //    --allow-host で明示的に許可されたホスト名だけを受ける。
+    //    攻撃者は自分の持たないホスト名を Host に入れさせられないので、
+    //    オプトインでも rebinding は防げたまま。
+    return opts.allowHosts.has(name);
+}
+
+/**
+ * 🔒 別サイトからの読み出しを弾く（多層防御）。
+ * Sec-Fetch-Site を送らない古いブラウザや curl は通す（Host 検証が本線）。
+ */
+function siteAllowed(req) {
+    const site = req.headers['sec-fetch-site'];
+    if (!site) return true;
+    return site === 'same-origin' || site === 'same-site' || site === 'none';
+}
+
 const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
+    // 🔒 すべての経路の手前で判定する。個別のハンドラに任せない
+    //    （経路が増えたときに1つ忘れるのを防ぐ）。
+    if (!hostAllowed(req) || !siteAllowed(req)) {
+        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('forbidden: ループバック以外の Host / 別サイトからの参照は拒否します\n');
+        return;
+    }
     try {
         if (url.pathname === '/api/v0/state') {
             // ?fresh=1 で TTL キャッシュを無視する（手動リロード用）

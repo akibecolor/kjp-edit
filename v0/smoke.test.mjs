@@ -12,6 +12,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -403,6 +404,106 @@ test('blob: 存在しない path は 400 で、500 にしない', async () => {
     const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
     assert.equal(res.status, 400);
     assert.match((await res.json()).error, /見つかりません/);
+});
+
+// ---------------------------------------------------------------------------
+// 🔒 DNS rebinding。127.0.0.1 バインドと CORS では防げない攻撃なので、
+//    Host 検証が効いていることを固定する。認証より先に必要な保護。
+// ---------------------------------------------------------------------------
+
+/**
+ * ⚠️ fetch（undici）は Host ヘッダを上書きできない（forbidden header）。
+ *    黙って既定の Host が送られるので、fetch で書いたテストは
+ *    「攻撃が防がれた」ではなく「攻撃を送れていない」を見てしまう（実際に踏んだ）。
+ *    Host を検証するテストは生の node:http で送る。
+ */
+function rawGet(urlStr, headers = {}) {
+    const u = new URL(urlStr);
+    return new Promise((resolve, reject) => {
+        const req = httpRequest({
+            hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+            method: 'GET', headers,
+        }, res => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve({
+                status: res.statusCode,
+                body: Buffer.concat(chunks).toString('utf8'),
+            }));
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+test('🔒 Host が攻撃者のドメインのリクエストを拒否する（DNS rebinding）', async () => {
+    const port = Number(new URL(baseUrl).port);
+    for (const host of ['evil.example', 'attacker.test:1234', 'kjp.evil.example']) {
+        const res = await rawGet(`${baseUrl}/api/v0/state`, { host });
+        assert.equal(res.status, 403, `Host: ${host} が通ってしまった`);
+        assert.doesNotMatch(res.body, /worktree/, `403 なのに中身が漏れている: ${host}`);
+    }
+    // 正しい Host は通る
+    const ok = await rawGet(`${baseUrl}/api/v0/state`, { host: `127.0.0.1:${port}` });
+    assert.equal(ok.status, 200);
+    assert.match(ok.body, /worktrees/);
+});
+
+test('🔒 ループバックでもポートが違う Host は拒否する', async () => {
+    const res = await rawGet(`${baseUrl}/api/v0/state`, { host: '127.0.0.1:1' });
+    assert.equal(res.status, 403);
+});
+
+test('🔒 別サイトからの参照（Sec-Fetch-Site: cross-site）を拒否する', async () => {
+    const res = await fetch(`${baseUrl}/api/v0/state`, {
+        headers: { 'sec-fetch-site': 'cross-site' },
+    });
+    assert.equal(res.status, 403);
+    // 同一オリジンと直接ナビゲーションは通る
+    for (const site of ['same-origin', 'none']) {
+        const ok = await fetch(`${baseUrl}/api/v0/state`, { headers: { 'sec-fetch-site': site } });
+        assert.equal(ok.status, 200, `${site} が拒否されている`);
+    }
+});
+
+test('🔒 diff / blob / layout も同じ Host 検証を通る（経路ごとの取りこぼしが無い）', async () => {
+    const paths = [
+        '/api/v0/blob?ref=agent-a&path=shared.txt',
+        '/api/v0/diff?base=main&ref=agent-a&path=shared.txt',
+        '/layout',
+        '/',
+    ];
+    for (const p of paths) {
+        const res = await rawGet(`${baseUrl}${p}`, { host: 'evil.example' });
+        assert.equal(res.status, 403, `${p} が Host 検証を通っていない`);
+    }
+});
+
+test('--allow-host で指定したホスト名だけは通る（トンネル用）', async () => {
+    const child = spawn(
+        process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-host', 'box.tail-scale.ts.net'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } },
+    );
+    child.stdout.setEncoding('utf8');
+    try {
+        const url = await new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+                if (m) { clearTimeout(t); resolve(m[0]); }
+            });
+            child.on('error', reject);
+        });
+        const ok = await rawGet(`${url}/api/v0/state`, { host: 'box.tail-scale.ts.net' });
+        assert.equal(ok.status, 200, '許可したホスト名が通らない');
+        const no = await rawGet(`${url}/api/v0/state`, { host: 'evil.example' });
+        assert.equal(no.status, 403, '許可していないホスト名が通ってしまった');
+    } finally {
+        child.kill();
+    }
 });
 
 test('解決できない --base を渡してもエンドポイントは生きている', async () => {

@@ -79,8 +79,18 @@ UI は縦に積む折り畳みパネルで、各セクションは畳んだま�
 **トンネルをループバックで終端させ、トンネル側で認証してください。**
 
 ```bash
-tailscale serve --bg 7749        # Tailnet 内のみ。推奨
+tailscale serve --bg 7749
+# トンネル経由の Host は 127.0.0.1 ではなくなるので、明示的に許可する
+node v0/server.mjs --allow-host box.your-tailnet.ts.net
 ```
+
+**`--allow-host` を指定しない限り、ループバック以外の Host は 403 です。**
+これは DNS rebinding を防ぐためで、`127.0.0.1` バインドと CORS では防げません
+（攻撃者のページが自分のドメインを `127.0.0.1` に貼り替えると、
+そのページのオリジン自体が `127.0.0.1` になって同一オリジン扱いで通ってしまう。
+止められるのは Host ヘッダの検証だけ）。
+攻撃者は自分の持たないホスト名を Host に入れさせられないので、
+オプトインしても rebinding は防げたままです。
 
 **`cloudflared` の quick tunnel（`trycloudflare.com`）を使わないこと。**
 URL を知っている誰でも無認証でリポジトリの中身が読めます
