@@ -390,14 +390,21 @@ export async function verifyRefs(cwd, refs) {
 export function samePath(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     if (a === '' || b === '') return false;
+    const isWin = process.platform === 'win32';
     const norm = s => {
         let t = s;
         try {
             // 存在しないパスでは throw するので、そのときは文字列のまま比べる
             t = realpathSync.native(t);
         } catch { /* 実体が無い（prunable worktree 等）。文字列比較にフォールバック */ }
-        t = toNFC(t).replace(/[\\/]+/g, '/').replace(/\/+$/, '');
-        if (process.platform === 'win32' || process.platform === 'darwin') t = t.toLowerCase();
+        t = toNFC(t);
+        // ⚠️ バックスラッシュを区切りとして畳むのは **Windows だけ**。
+        //    POSIX では `\` は正当なファイル名の文字なので、畳むと
+        //    `a\b`（1つのファイル名）と `a/b`（2階層）を同一視してしまう。
+        //    これは allowlist の照合に使うので、緩めてよい話ではない。
+        t = isWin ? t.replace(/[\\/]+/g, '/') : t.replace(/\/+/g, '/');
+        t = t.replace(/\/+$/, '');
+        if (isWin || process.platform === 'darwin') t = t.toLowerCase();
         return t;
     };
     return norm(a) === norm(b);

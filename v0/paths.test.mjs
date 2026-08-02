@@ -16,9 +16,34 @@ import { samePath, isSafeRepoPath, isSafeRef, git } from './git.mjs';
 test('samePath: 区切り文字の違いを吸収する', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kjp-path-'));
     try {
-        assert.ok(samePath(dir, dir.replace(/\\/g, '/')));
-        assert.ok(samePath(dir, dir.replace(/\//g, '\\')));
+        assert.ok(samePath(dir, dir.replace(/\\/g, '/')), 'バックスラッシュ → スラッシュ');
         assert.ok(samePath(dir, `${dir}/`), '末尾のスラッシュ');
+        assert.ok(samePath(dir, dir.replace(/\//g, '//')), '重複したスラッシュ');
+        // ⚠️ `/` → `\` の変換は Windows でしか意味を持たない。
+        //    POSIX では `\` は正当なファイル名の文字なので、変換すると
+        //    「存在しない別のファイル名」になる（macOS CI でこれで落ちた）。
+        if (process.platform === 'win32') {
+            assert.ok(samePath(dir, dir.replace(/\//g, '\\')), 'スラッシュ → バックスラッシュ');
+        }
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+// 回帰: POSIX で `\` を区切りとして畳むと、`a\b`（1つのファイル名）と
+// `a/b`（2階層）を同一視してしまう。allowlist の照合に使うので緩めてはいけない。
+test('regression: POSIX ではバックスラッシュを区切りとして扱わない', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-path-'));
+    try {
+        const withBackslash = `${dir}/a\\b`;
+        const withSlash = `${dir}/a/b`;
+        if (process.platform === 'win32') {
+            // Windows ではどちらも同じ場所を指す
+            assert.ok(samePath(withBackslash, withSlash));
+        } else {
+            assert.equal(samePath(withBackslash, withSlash), false,
+                'POSIX で a\\b と a/b を同一視している');
+        }
     } finally {
         await rm(dir, { recursive: true, force: true });
     }
