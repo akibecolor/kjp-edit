@@ -181,3 +181,9 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
 Conventional Commits（`type(scope): summary`）。**何を変えたかではなく、
 なぜそれが正しいか・何を検証したかを本文に書く。**
 `main` に直接コミットしてよい（個人用リポジトリ）。
+
+🚨 **コミットの前に必ず `git branch --show-current` を確認する。**
+このツール自身が worktree のブランチを切り替えられるので、
+UI で checkout を押した後は**メイン worktree が別ブランチに居ることがある**。
+確認せずにコミットして `spare/candidate` に乗せ、push が no-op になった事故がある。
+push 後は `git rev-list --count origin/main..HEAD` が 0 になることも見る。
