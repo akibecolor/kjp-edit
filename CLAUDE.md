@@ -109,6 +109,12 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
   プロセスが増える（11本で 59 spawn になっていた）。ref 解決は `refMap()`、
   `$GIT_DIR` は `worktreeGitDirs()` の表引きで済ませる。
   payload の `stats.gitSpawns` をスモークテストが上限で固定している
+- 🔒 **HTTP から来た値を git に渡すときは `isSafeRepoPath()` / `isSafeRef()` を必ず通す。**
+  `..` / 絶対パス / ドライブレター / 先頭 `-`（オプション注入）/ NUL を弾く。
+  **パスは必ず `--` の後ろに置く**（無いと ref として解釈されうる）
+- 🔒 **ファイルの中身は `git cat-file` 経由で読み、`fs` で読まない。**
+  git オブジェクト経由なら「コミットに入っているもの」に限定され、
+  リポジトリ外や未追跡の `.env` に触れる経路を作らない
 
 ## パスの扱い
 

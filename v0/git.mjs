@@ -46,7 +46,12 @@ export class GitError extends Error {
  */
 export const stats = { spawns: 0 };
 
-export function git(args, { cwd, optionalLocks = false } = {}) {
+/**
+ * @param {object} [o]
+ * @param {boolean} [o.raw] Buffer のまま返す（バイナリ判定のためデコードしない）
+ * @param {number} [o.maxBytes] これを超えたら子プロセスを殺して打ち切る
+ */
+export function git(args, { cwd, optionalLocks = false, raw = false, maxBytes = 0 } = {}) {
     return new Promise((resolve, reject) => {
         const env = { ...process.env, ...BASE_ENV };
         // 書き込み操作では index の stat-cache 更新を許す (読み取りは 0 のまま)
@@ -64,13 +69,29 @@ export function git(args, { cwd, optionalLocks = false } = {}) {
         // chunk ごとの toString() は 3バイト文字を割る。
         const out = [];
         const err = [];
-        child.stdout.on('data', c => out.push(c));
+        let size = 0, truncated = false;
+        child.stdout.on('data', c => {
+            out.push(c);
+            size += c.length;
+            // 上限を超えたら読むのを止める。巨大な blob でメモリを食わないため。
+            if (maxBytes && size > maxBytes && !truncated) {
+                truncated = true;
+                child.kill('SIGKILL');
+            }
+        });
         child.stderr.on('data', c => err.push(c));
         child.on('error', reject);
         child.on('close', code => {
-            const stdout = Buffer.concat(out).toString('utf8');
+            const buf = Buffer.concat(out);
+            if (truncated) {
+                const e = new GitError(args, code ?? 0, `出力が ${maxBytes} バイトを超えました`);
+                e.truncated = true;
+                reject(e);
+                return;
+            }
             const stderr = Buffer.concat(err).toString('utf8');
-            if (code === 0) resolve(stdout);
+            // raw のときは code 0 でも Buffer を返す（デコードしない）
+            if (code === 0) resolve(raw ? buf : buf.toString('utf8'));
             else reject(new GitError(args, code, stderr));
         });
     });
@@ -320,6 +341,95 @@ export async function verifyRefs(cwd, refs) {
         } catch { /* 解決できない ref は捨てる */ }
     }
     return ok;
+}
+
+/**
+ * リポジトリ内のパスとして受け付けてよいかを検証する。
+ *
+ * ⚠️ これはネットワーク越しに来る値を git に渡す唯一の経路なので、
+ *    ここが緩いとリポジトリ外が読める。git 自身も `..` を弾くが、
+ *    多重防御として手前でも落とす。
+ *    - NUL: `-z` の解析を壊し、引数の途中で切られる
+ *    - 絶対パス / ドライブレター: リポジトリ外
+ *    - `..` セグメント: 親へ抜ける
+ *    - 先頭の `-`: git のオプションとして解釈されうる
+ */
+export function isSafeRepoPath(p) {
+    if (typeof p !== 'string' || p === '' || p.length > 4096) return false;
+    if (p.includes('\0')) return false;
+    if (p.startsWith('-')) return false;
+    if (p.startsWith('/') || p.startsWith('\\')) return false;
+    if (/^[a-zA-Z]:/.test(p)) return false;
+    const parts = p.split(/[\\/]/);
+    if (parts.some(s => s === '..')) return false;
+    return true;
+}
+
+/**
+ * ref として受け付けてよいか。
+ * `機能/新規` のような日本語ブランチ名は通す（スラッシュは正当）。
+ * `HEAD~1` のようなリビジョン式は使わないので `~` `^` ごと弾いておく。
+ */
+export function isSafeRef(r) {
+    if (typeof r !== 'string' || r === '' || r.length > 512) return false;
+    if (r.includes('\0') || r.startsWith('-')) return false;
+    if (/[\s~^:?*[\]\\]/.test(r)) return false;
+    if (r.includes('..')) return false;
+    return true;
+}
+
+const MAX_BLOB_BYTES = 512 * 1024;
+
+/** 先頭 8000 バイトに NUL があれば binary（git と同じ判定）。 */
+function looksBinary(buf) {
+    return buf.subarray(0, 8000).includes(0);
+}
+
+/**
+ * `<ref>:<path>` の中身を読む。**追跡されている内容だけ**を返す。
+ *
+ * fs で直接読まないのは、リポジトリ外や未追跡の秘密ファイル
+ * （`.env` 等）に触れる経路を作らないため。git のオブジェクト経由なら
+ * 「コミットに入っているもの」に限定される。
+ */
+export async function showBlob(cwd, ref, path) {
+    if (!isSafeRef(ref)) throw new GitError(['blob'], 2, `ref が不正です: ${ref}`);
+    if (!isSafeRepoPath(path)) throw new GitError(['blob'], 2, `path が不正です: ${path}`);
+
+    // 先にサイズを見る。大きい blob を読み込んでから捨てるのを避ける。
+    let size = 0;
+    try {
+        size = Number((await git(['cat-file', '-s', `${ref}:${path}`], { cwd })).trim());
+    } catch (err) {
+        throw new GitError(['blob'], 2, `見つかりません: ${ref}:${path}`);
+    }
+    if (size > MAX_BLOB_BYTES) {
+        return { path, ref, size, tooLarge: true, binary: false, text: null };
+    }
+    const buf = await git(['cat-file', 'blob', `${ref}:${path}`],
+        { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
+    if (looksBinary(buf)) {
+        return { path, ref, size, tooLarge: false, binary: true, text: null };
+    }
+    return {
+        path, ref, size, tooLarge: false, binary: false,
+        text: toNFC(buf.toString('utf8')),
+    };
+}
+
+/**
+ * 1ファイルの unified diff。`base...ref` の三点記法。
+ * ⚠️ `--` の後ろにパスを置く。これが無いと path が ref として解釈されうる。
+ */
+export async function fileDiff(cwd, base, ref, path) {
+    if (!isSafeRef(base)) throw new GitError(['diff'], 2, `base が不正です: ${base}`);
+    if (!isSafeRef(ref)) throw new GitError(['diff'], 2, `ref が不正です: ${ref}`);
+    if (!isSafeRepoPath(path)) throw new GitError(['diff'], 2, `path が不正です: ${path}`);
+    const buf = await git([
+        'diff', '--no-color', '--no-ext-diff', `${base}...${ref}`, '--', path,
+    ], { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
+    if (looksBinary(buf)) return { path, binary: true, text: null };
+    return { path, binary: false, text: toNFC(buf.toString('utf8')) };
 }
 
 /** ref から到達できるコミットの集合（グラフの幹を決めるのに使う）。 */

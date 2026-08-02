@@ -18,6 +18,7 @@ import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
+    showBlob, fileDiff,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 
@@ -338,6 +339,28 @@ const server = createServer(async (req, res) => {
         if (opts.layoutProbe && url.pathname === '/__probe') {
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
             res.end(probeHarness(Number(url.searchParams.get('w'))));
+            return;
+        }
+        // ファイルの中身と差分。**追跡されている内容だけ**を返す（git オブジェクト経由）。
+        // fs で読まないので、リポジトリ外や未追跡の秘密ファイルには触れない。
+        // 引数の検証は git.mjs の isSafeRef / isSafeRepoPath が持つ。
+        if (url.pathname === '/api/v0/blob' || url.pathname === '/api/v0/diff') {
+            const path = url.searchParams.get('path') ?? '';
+            const ref = url.searchParams.get('ref') ?? 'HEAD';
+            try {
+                const body = url.pathname === '/api/v0/blob'
+                    ? await showBlob(opts.repo, ref, path)
+                    : await fileDiff(opts.repo, url.searchParams.get('base') ?? 'HEAD', ref, path);
+                res.writeHead(200, {
+                    'content-type': 'application/json; charset=utf-8',
+                    'cache-control': 'no-store',
+                });
+                res.end(JSON.stringify(body));
+            } catch (err) {
+                // 不正な引数と「見つからない」を 400 で返す。500 にしない
+                res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ error: String(err && err.message || err) }));
+            }
             return;
         }
         // レイアウト検討用のプロトタイプ（読み取り専用。中身の説明はファイル冒頭）

@@ -6,8 +6,8 @@
   ⚠️ これは**レイアウトを目で判断するためのプロトタイプ**。製品ではない。
 
   本物: worktree 一覧 / ブランチ / ahead-behind / dirty / 変更ファイル / コミットグラフ
-        （/api/v0/state をそのまま使う）
-  モック: エディタの中身、コンソールの出力、ファイラのツリー展開
+        （/api/v0/state）、**エディタに出る差分**（/api/v0/diff）
+  モック: コンソールの出力、ファイラのツリー展開
 
   答えたい問い（docs/scope.md の「統合」）:
     N 個のエージェントのコンソールとエディタと1枚のグラフを、
@@ -120,10 +120,19 @@
   .code .ln { text-align: right; color: var(--dim); padding: 0 .5rem;
     user-select: none; background: rgba(127,127,127,.06); white-space: pre; }
   .code .src { padding: 0 .5rem; white-space: pre; }
-  .code .src .k { color: #c586c0; } .code .src .s { color: #ce9178; }
-  .code .src .c { color: #6a9955; } .code .src .fn { color: #dcdcaa; }
   .mocknote { color: var(--warn); padding: .3rem .5rem; font-size: 11px;
     border-bottom: 1px dashed var(--line); }
+  /* 差分（本物）。行の種類で色分けする */
+  .diff { white-space: pre; font-size: 12px; }
+  .diff div { padding: 0 .5rem; }
+  .diff .h { color: var(--dim); background: rgba(127,127,127,.10); }
+  .diff .hunk { color: var(--accent); background: rgba(79,193,255,.08); }
+  .diff .add { color: #4ec9b0; background: rgba(78,201,176,.10); }
+  .diff .del { color: #f14c4c; background: rgba(241,76,76,.10); }
+  @media (prefers-color-scheme: light) {
+    .diff .add { color: #0a7a5e; } .diff .del { color: #b3261e; }
+  }
+  .loading { color: var(--dim); padding: .5rem; }
 
   /* ---- コンソール（モック） ---- */
   .term { padding: .3rem .5rem; white-space: pre-wrap; word-break: break-word;
@@ -278,48 +287,39 @@ function rowSvg(row) {
   return svg;
 }
 
-/* ---------- モックのコード（レイアウト判断用。中身に意味は無い） ---------- */
-const MOCK_SRC = [
-  ['c', '// エディタの中身はモック。レイアウト判断用のダミー。'],
-  ['', ''],
-  ['k', 'export async function'], ['fn', ' collect'], ['', '(cwd) {'],
-  ['', '    const worktrees = '], ['k', 'await'], ['', ' listWorktrees(cwd);'],
-  ['', '    const refs = '], ['k', 'await'], ['', ' refMap(cwd);'],
-  ['', ''],
-  ['c', '    // ループの中で新しい git 呼び出しを足さない'],
-  ['k', '    for'], ['', ' (const wt of worktrees) {'],
-  ['', '        wt.status = '], ['k', 'await'], ['', ' worktreeStatus(wt.path);'],
-  ['', '    }'],
-  ['k', '    return'], ['', ' { worktrees, refs };'],
-  ['', '}'],
-];
-function mockCode(seedPath) {
-  const wrap = el('div', 'code');
-  const lnCol = el('div', 'ln'), src = el('div', 'src');
-  // 行に分ける（トークンの雑な連結。見た目だけ）
-  const lines = [];
-  let cur = [];
-  for (const [cls, text] of MOCK_SRC) {
-    if (text === '' && cls === '') { lines.push(cur); cur = []; continue; }
-    cur.push([cls, text]);
-    if (/\{$|\}$|;$|。$/.test(text)) { lines.push(cur); cur = []; }
+/* ---------- 差分（本物）。/api/v0/diff の unified diff を色分けする ---------- */
+function renderDiff(text) {
+  const box = el('div', 'diff');
+  const lines = text.split('\n');
+  // 末尾の空行は落とす（diff は必ず改行で終わる）
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  for (const line of lines) {
+    let cls = '';
+    if (line.startsWith('@@')) cls = 'hunk';
+    else if (line.startsWith('+++') || line.startsWith('---')
+      || line.startsWith('diff ') || line.startsWith('index ')
+      || line.startsWith('new file') || line.startsWith('deleted file')
+      || line.startsWith('similarity ') || line.startsWith('rename ')) cls = 'h';
+    else if (line.startsWith('+')) cls = 'add';
+    else if (line.startsWith('-')) cls = 'del';
+    box.append(el('div', cls, line === '' ? ' ' : line));
   }
-  if (cur.length) lines.push(cur);
-  // ペインが空だとレイアウトの判断材料にならないので、行数を稼ぐために繰り返す
-  const filled = [];
-  while (filled.length < 42) filled.push(...lines);
-  lnCol.textContent = Array.from({ length: filled.length }, (_, i) => i + 1).join('\n');
-  for (const line of filled) {
-    for (const [cls, text] of line) {
-      src.append(cls ? el('span', cls, text) : document.createTextNode(text));
-    }
-    src.append(document.createTextNode('\n'));
-  }
-  wrap.append(lnCol, src);
-  const box = el('div');
-  box.append(el('div', 'mocknote', `⚠ モック: ${seedPath} の中身は読んでいません`));
-  box.append(wrap);
+  if (!lines.length) box.append(el('div', 'h', '(差分なし)'));
   return box;
+}
+
+async function loadDiff(holder, base, ref, path) {
+  holder.replaceChildren(el('div', 'loading', `読み込み中: ${path}`));
+  try {
+    const q = new URLSearchParams({ base, ref, path });
+    const res = await fetch(`/api/v0/diff?${q}`);
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+    if (d.binary) { holder.replaceChildren(el('div', 'loading', 'バイナリファイル')); return; }
+    holder.replaceChildren(renderDiff(d.text ?? ''));
+  } catch (e) {
+    holder.replaceChildren(el('div', 'loading', `取得できませんでした: ${e.message}`));
+  }
 }
 
 /* ---------- モックのコンソール出力 ---------- */
@@ -382,8 +382,9 @@ function render(s) {
   if (picks.length === 0) picks.push(s.worktrees[0]);
   picks.forEach((wt, i) => {
     if (i > 0) { const sp = el('div', 'split x'); editors.append(sp); wireSplit(sp); }
-    const files = (wt.files ?? []).slice(0, 3);
-    const { p, body } = pane('エディタ', [['br', wt.branch ?? wt.name]]);
+    const files = (wt.files ?? []).slice(0, 4);
+    const ref = wt.branch ?? wt.head;
+    const { p, body } = pane('差分', [['br', wt.branch ?? wt.name]]);
     const tabs = el('div', 'tabs');
     const holder = el('div');
     files.forEach((f, k) => {
@@ -392,13 +393,14 @@ function render(s) {
       b.addEventListener('click', () => {
         for (const o of tabs.children) o.classList.remove('on');
         b.classList.add('on');
-        holder.replaceChildren(mockCode(f.path));
+        loadDiff(holder, s.base, ref, f.path);
       });
       tabs.append(b);
     });
     if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
     body.append(tabs, holder);
-    holder.append(mockCode(files[0]?.path ?? '(no file)'));
+    if (files.length) loadDiff(holder, s.base, ref, files[0].path);
+    else holder.append(el('div', 'loading', `${wt.branch ?? wt.name} は base と同じ内容です`));
     editors.append(p);
     wirePane(p);
   });

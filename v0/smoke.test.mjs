@@ -330,6 +330,81 @@ test('basename が衝突する worktree の変更が混ざらない', async () =
     }
 });
 
+// ---------------------------------------------------------------------------
+// /api/v0/diff と /api/v0/blob。ネットワーク越しの値を git に渡す唯一の経路なので、
+// 「読めるべきものが読める」と「読めてはいけないものが読めない」の両方を見る。
+// ---------------------------------------------------------------------------
+
+test('diff: 日本語＋空白のファイル名の差分が取れる', async () => {
+    const p = '日本語フォルダ/テスト ファイル-a.txt';
+    const q = new URLSearchParams({ base: 'main', ref: 'agent-a', path: p });
+    const res = await fetch(`${baseUrl}/api/v0/diff?${q}`);
+    assert.equal(res.status, 200);
+    const d = await res.json();
+    assert.equal(d.binary, false);
+    // ファイル追加なので +++ 側にパスが出る。クォートされていないこと
+    assert.match(d.text, /\+\+\+ b\/日本語フォルダ\/テスト ファイル-a\.txt/);
+    assert.match(d.text, /^\+ok$/m, `追加行が無い: ${d.text}`);
+});
+
+test('blob: 追跡されている内容が読める', async () => {
+    // ⚠️ only-a.txt を使わないこと。乗っ取り検出テストが agent-a に
+    //    コミットを積んで内容を変えるので、実行順序に依存して落ちる（実際に落ちた）。
+    //    shared.txt はどのテストも書き換えない。
+    const q = new URLSearchParams({ ref: 'agent-a', path: 'shared.txt' });
+    const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+    assert.equal(res.status, 200);
+    const d = await res.json();
+    assert.equal(d.binary, false);
+    assert.equal(d.tooLarge, false);
+    assert.equal(d.text, 'touched by a\n');
+});
+
+test('🔒 blob: リポジトリ外へ抜けようとする path を拒否する', async () => {
+    for (const bad of [
+        '../../../../../../Windows/win.ini',
+        '..\\..\\..\\Windows\\win.ini',
+        '/etc/passwd',
+        'C:/Windows/win.ini',
+        '--output=/tmp/pwned',
+    ]) {
+        const q = new URLSearchParams({ ref: 'agent-a', path: bad });
+        const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+        assert.equal(res.status, 400, `拒否されていない: ${bad}`);
+        const d = await res.json();
+        assert.ok(d.error, `error が返っていない: ${bad}`);
+        // 中身が漏れていないこと
+        assert.equal(d.text, undefined, `中身が返っている: ${bad}`);
+    }
+});
+
+test('🔒 diff: ref にオプションやリビジョン式を渡せない', async () => {
+    for (const bad of ['--output=/tmp/x', 'main~1', 'main^{tree}', 'a b', 'x..y']) {
+        const q = new URLSearchParams({ base: 'main', ref: bad, path: 'only-a.txt' });
+        const res = await fetch(`${baseUrl}/api/v0/diff?${q}`);
+        assert.equal(res.status, 400, `拒否されていない: ${bad}`);
+    }
+});
+
+test('blob: 未追跡のファイルは読めない（git オブジェクト経由なので）', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-wt-b`);
+    await writeFile(join(wt, 'secret-untracked.txt'), 'トップシークレット\n', 'utf8');
+    const q = new URLSearchParams({ ref: 'agent-b', path: 'secret-untracked.txt' });
+    const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+    assert.equal(res.status, 400, '未追跡ファイルが読めてしまっている');
+    const d = await res.json();
+    assert.match(d.error, /見つかりません/);
+    await rm(join(wt, 'secret-untracked.txt'), { force: true });
+});
+
+test('blob: 存在しない path は 400 で、500 にしない', async () => {
+    const q = new URLSearchParams({ ref: 'agent-a', path: 'no/such/file.txt' });
+    const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /見つかりません/);
+});
+
 test('解決できない --base を渡してもエンドポイントは生きている', async () => {
     // 別プロセスを立てて、存在しない ref を --base に渡す
     const child = spawn(

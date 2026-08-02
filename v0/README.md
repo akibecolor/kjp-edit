@@ -110,9 +110,23 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
 | `layout-check.mjs` | 実ブラウザで 390 / 768 / 1280px を測る。ブラウザが無ければスキップ |
 
-`/api/v0/state` は `?fresh=1` で TTL キャッシュを無視します。
-`stats.gitSpawns` に1回の収集で起動した git のプロセス数が入ります
-（定数5 + worktree 1本あたり3）。
+| `layout-prototype.html` | PC レイアウト検討用（`/layout`）。差分は本物、コンソールはモック |
+
+### エンドポイント
+
+| | |
+|---|---|
+| `/api/v0/state` | 全状態。`?fresh=1` で TTL キャッシュを無視。`stats.gitSpawns` に git の起動回数（定数5 + worktree 1本あたり3） |
+| `/api/v0/diff?base=&ref=&path=` | 1ファイルの unified diff |
+| `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`、NUL 混入は `binary` |
+| `/layout` | レイアウト検討用プロトタイプ |
+
+🔒 **`diff` / `blob` は追跡されている内容だけを返します。**
+`git cat-file` / `git diff` 経由で読むので、fs には触りません。
+つまり**リポジトリ外のファイルも、未追跡の `.env` も読めません**
+（スモークテストで固定してあります）。
+`path` は `..` / 絶対パス / ドライブレター / 先頭 `-` / NUL を拒否、
+`ref` はリビジョン式（`~` `^` `..`）と空白を拒否します。
 
 ## 実装中に踏んだバグ（回帰テスト済み）
 
