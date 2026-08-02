@@ -877,7 +877,18 @@ const server = createServer(async (req, res) => {
             }
             return;
         }
-        // レイアウト検討用のプロトタイプ（読み取り専用。中身の説明はファイル冒頭）
+        // ブラウザと unit テストで共有しているモジュール。
+        // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
+        if (url.pathname === '/ndjson.mjs') {
+            const js = await readFile(join(HERE, 'ndjson.mjs'));
+            res.writeHead(200, {
+                'content-type': 'text/javascript; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(js);
+            return;
+        }
+        // 統合画面（workbench）
         if (url.pathname === '/layout' || url.pathname === '/layout-prototype.html') {
             const html = await readFile(join(HERE, 'layout-prototype.html'));
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });

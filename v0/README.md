@@ -1,7 +1,9 @@
 # kjp-edit v0
 
-**全 worktree を1枚のグラフで見る、読み取り専用のローカルデーモン。**
+**N 個のエージェントの worktree を1画面で見るローカルデーモン。**
 依存パッケージゼロ（Node 標準ライブラリのみ）。
+**既定は読み取り専用**で、checkout（`--allow-write`）と
+任意コマンドの実行（`--allow-exec`）はそれぞれ明示的に有効化します。
 
 ```bash
 node v0/server.mjs                    # カレントのリポジトリを見る
@@ -11,7 +13,7 @@ node v0/server.mjs --port 7749 --limit 300 --base main
 → http://127.0.0.1:7749
 
 ```bash
-node --test v0/swimlanes.test.mjs     # 回帰テスト
+node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
 ```
 
 ## なぜこれを先に作ったか
@@ -101,7 +103,8 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 - 🔒 **`127.0.0.1` のみにバインド。認証は持たない。**
   外から届かせるならトンネル（`tailscale serve` 等）をループバックで終端させる。
   **`0.0.0.0` にバインドしないこと**（[../docs/architecture.md](../docs/architecture.md) D1）
-- **読み取り専用。** 書き込み操作は一切しない
+- **既定は読み取り専用。** 書き込みと実行は capability を分けて明示的に有効化する
+  （[../docs/auth-ordering.md](../docs/auth-ordering.md)）
 - **git は `spawn(gitPath, argvArray)` で shell を使わない。**
   `-z` / `core.quotepath=false` / `i18n.logOutputEncoding=UTF-8` /
   `GIT_TERMINAL_PROMPT=0` を毎回渡す
@@ -119,8 +122,9 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `index.html` | 単一ページ UI。ビルド不要、フレームワークなし |
 | `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
 | `layout-check.mjs` | 実ブラウザで 390 / 768 / 1280px を測る。ブラウザが無ければスキップ |
-
-| `layout-prototype.html` | PC レイアウト検討用（`/layout`）。差分は本物、コンソールはモック |
+| `layout-prototype.html` | 統合画面 workbench（`/layout`）。差分・コンソール・グラフすべて本物 |
+| `ndjson.mjs` | 行区切り JSON のストリーム読み。**ブラウザと unit テストで共有** |
+| `ndjson.test.mjs` | 行割れ・マルチバイト割れの回帰テスト |
 
 ### エンドポイント
 
@@ -131,7 +135,8 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`、NUL 混入は `binary` |
 | `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す） |
 | `POST /api/v0/checkout` | ブランチ切り替え。**`--allow-write` が必要** |
-| `/layout` | レイアウト検討用プロトタイプ |
+| `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
+| `/layout` | 統合画面 workbench |
 
 ### 書き込み（既定オフ）
 

@@ -1,21 +1,26 @@
 <!-- SPDX-License-Identifier: MIT -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>kjp-edit レイアウト検討用プロトタイプ</title>
+<title>kjp-edit workbench</title>
 <!--
-  ⚠️ これは**レイアウトを目で判断するためのプロトタイプ**。製品ではない。
+  統合画面（v0 の 1st 版）。[ファイラ | 差分×2 / コンソール×N | 統合グラフ]
 
-  本物: worktree 一覧 / ブランチ / ahead-behind / dirty / 変更ファイル / コミットグラフ
-        （/api/v0/state）、**エディタに出る差分**（/api/v0/diff）
-  モック: コンソールの出力、ファイラのツリー展開
+  本物:
+    - worktree / ブランチ / ahead-behind / dirty / 変更ファイル / コミットグラフ … /api/v0/state
+    - 差分 … /api/v0/diff
+    - **コンソール … /api/v0/exec（実際にコマンドを走らせ、出力をストリームする）**
+  まだモック: ファイラのツリー展開（差分ファイルの一覧は本物）
 
   答えたい問い（docs/scope.md の「統合」）:
-    N 個のエージェントのコンソールとエディタと1枚のグラフを、
+    N 個のエージェントのコンソールと差分と1枚のグラフを、
     PC の画面に同時に置いて成立するか。Zed の並列ペインが分かりにくい、を回避できるか。
 
-  ここに実エディタ（Monaco）や実ターミナル（PTY）を足さないこと。
-  v0 は読み取り専用で認証を持たない（docs/architecture.md D1）。
-  ターミナルを載せるのは別の判断が必要。
+  ⚠️ ここに実エディタ（Monaco）や PTY を足さないこと。
+     PTY は node-pty が必要で依存ゼロを破る。Claude Code は `claude -p` で
+     非対話実行できるので、エージェントを動かすのに PTY は要らない
+     （docs/auth-ordering.md）。
+  ⚠️ コンソールは `--allow-exec` が無いと動かない（既定オフ）。
+     shell は経由しないので パイプ・リダイレクト・グロブ は使えない。
 -->
 <style>
   :root {
@@ -134,11 +139,30 @@
   }
   .loading { color: var(--dim); padding: .5rem; }
 
-  /* ---- コンソール（モック） ---- */
+  /* ---- コンソール（本物: /api/v0/exec） ---- */
   .term { padding: .3rem .5rem; white-space: pre-wrap; word-break: break-word;
     font-size: 11px; line-height: 1.45; }
   .term .p { color: var(--ok); } .term .w { color: var(--warn); }
   .term .e { color: var(--danger); } .term .d { color: var(--dim); }
+  /* ⚠️ ボタンは縮ませない。ペインが狭いと「実/行」のように縦に割れて読めなくなる
+     （4ペインを 1920px に並べると1本 185px 程度になり、実測でそうなった）。
+     縮む側は入力欄だけ。溢れたら wrap で2段になる。 */
+  .cmdbar { display: flex; gap: .25rem; padding: .25rem .3rem; flex: 0 0 auto;
+    border-bottom: 1px solid var(--line); background: var(--head);
+    align-items: center; flex-wrap: wrap; }
+  .cmdbar input { flex: 1 1 7rem; min-width: 0; font: inherit; font-size: 11px;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; padding: .15rem .3rem; }
+  .cmdbar select { flex: 0 1 auto; min-width: 0; max-width: 9rem;
+    font: inherit; font-size: 11px;
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 3px; }
+  .cmdbar button { font: inherit; font-size: 11px; padding: .1rem .45rem;
+    background: var(--card); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; cursor: pointer; flex: 0 0 auto; white-space: nowrap; }
+  .cmdbar button:disabled { color: var(--dim); cursor: default; }
+  .argvpeek { color: var(--dim); font-size: 10px; padding: .1rem .5rem;
+    border-bottom: 1px dashed var(--line); white-space: pre-wrap; word-break: break-all; }
+  .disabled-note { color: var(--warn); padding: .5rem; font-size: 11px; }
 
   /* ---- グラフ（本物） ---- */
   .grow { display: grid; grid-template-columns: auto auto 1fr; align-items: center;
@@ -155,7 +179,7 @@
 </style>
 
 <div class="topbar">
-  <b>kjp-edit</b><span class="proto">レイアウト検討用プロトタイプ</span>
+  <b>kjp-edit</b><span class="proto">workbench</span>
   <span class="path" id="repo"></span>
   <button id="reset">レイアウトを戻す</button>
   <button id="unmax" hidden>最大化を解除</button>
@@ -189,6 +213,9 @@
 </div>
 
 <script type="module">
+// ストリーム処理はサーバが配る共有モジュールから読む（unit テストと同じコード）
+import { parseNdjson } from './ndjson.mjs';
+
 const LANE_W = 10, ROW_H = 22, DOT_R = 3.2;
 const $ = s => document.querySelector(s);
 const el = (t, c, x) => { const n = document.createElement(t);
@@ -322,23 +349,156 @@ async function loadDiff(holder, base, ref, path) {
   }
 }
 
-/* ---------- モックのコンソール出力 ---------- */
-function mockTerm(wt) {
-  const t = el('div', 'term');
-  const line = (cls, s) => { t.append(el('span', cls, s), document.createTextNode('\n')); };
-  line('d', `$ cd ${wt.path}`);
-  line('p', `$ claude --worktree ${wt.branch ?? 'detached'}`);
-  line('', `● ${wt.branch ?? '(detached)'} で作業中`);
-  line('d',  '  読み込み: v0/git.mjs, v0/server.mjs');
-  if (wt.status?.dirty) {
-    line('w', `⚠ 未コミットの変更 ${wt.status.changed} 件 / 未追跡 ${wt.status.untracked} 件`);
+/* ---------- コンソール（本物。/api/v0/exec を叩いて出力を流す） ---------- */
+
+/**
+ * コマンド行を argv に分ける。**shell は使わないので自分で分ける。**
+ * クォートだけ解釈する。パイプ・リダイレクト・グロブ・変数展開は扱わない
+ * （扱えるように見せると危ないので、できないことを明示する）。
+ */
+function splitArgv(line) {
+  const out = [];
+  let cur = '', quote = null, has = false;
+  for (const ch of line) {
+    if (quote) {
+      if (ch === quote) quote = null; else cur += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch; has = true;
+    } else if (/\s/.test(ch)) {
+      if (has || cur) { out.push(cur); cur = ''; has = false; }
+    } else cur += ch;
   }
-  for (const f of (wt.files ?? []).slice(0, 4)) line('', `  ${f.status}  ${f.path}`);
-  if (wt.prunable) line('e', '✖ 作業ツリーが失われています');
-  else if (wt.sequencer?.rebasing) line('e', '✖ rebase 進行中');
-  else line('p', `✔ ${wt.ahead} commit ahead / ${wt.behind} behind`);
-  line('d', '⚠ ここはモック出力。実ターミナルは載せていない');
-  return t;
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+const IS_WIN = /win/i.test(navigator.platform ?? '');
+const PRESETS = [
+  'git status --short',
+  'git log --oneline -10',
+  'git diff --stat',
+  IS_WIN ? 'cmd /c npm test' : 'npm test',
+  'claude -p "この worktree の変更を要約して"',
+];
+
+/**
+ * ndjson を読みながら出力を流す。
+ *
+ * ⚠️ 罠が2つある。どちらも「たまに文字化けする」形で出るので気付きにくい:
+ *   1. **JSON の行が chunk 境界で割れる。** 末尾の不完全な行は次の chunk まで持ち越す
+ *   2. **マルチバイト文字が chunk 境界で割れる。** TextDecoder に stream:true を渡す
+ *      （サーバ側も同じ理由で StringDecoder を使っている）
+ */
+async function runExec(termEl, wt, argv, onState) {
+  const line = (cls, s) => {
+    const atBottom = termEl.parentElement.scrollTop + termEl.parentElement.clientHeight
+      >= termEl.parentElement.scrollHeight - 24;
+    termEl.append(el('span', cls, s));
+    if (atBottom) termEl.parentElement.scrollTop = termEl.parentElement.scrollHeight;
+  };
+  const ac = new AbortController();
+  onState({ running: true, abort: () => ac.abort() });
+  line('d', `$ ${argv.join(' ')}\n`);
+  try {
+    const res = await fetch('/api/v0/exec', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        [session.tokenHeader]: session.token ?? '',
+      },
+      body: JSON.stringify({ worktree: wt.path, argv }),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { msg = (await res.json()).error ?? msg; } catch { /* JSON でない */ }
+      line('e', `✖ ${msg}\n`);
+      return;
+    }
+    // ⚠️ 行割れとマルチバイト割れの処理は ndjson.mjs に切り出してある。
+    //    ここに書き直さないこと（ブラウザの中だとテストできない）。
+    for await (const ev of parseNdjson(res.body)) {
+      if (ev.__parseError) { line('e', `(解析できない行: ${ev.__parseError.slice(0, 80)})\n`); continue; }
+      if (ev.t === 'out') line('', ev.d);
+      else if (ev.t === 'err') line('w', ev.d);
+      else if (ev.t === 'exit') {
+        const ok = ev.code === 0;
+        line(ok ? 'p' : 'e',
+          `\n${ok ? '✔' : '✖'} exit=${ev.code}${ev.signal ? ` signal=${ev.signal}` : ''}\n`);
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') line('w', '\n⚠ 中断しました（サーバ側でプロセスを停止）\n');
+    else line('e', `\n✖ ${e.message}\n`);
+  } finally {
+    onState({ running: false });
+  }
+}
+
+/** コンソールペインの中身。--allow-exec が無ければ理由を出す。 */
+function consoleBody(wt) {
+  const box = el('div');
+  box.style.display = 'flex';
+  box.style.flexDirection = 'column';
+  box.style.height = '100%';
+
+  if (!session.allowExec) {
+    box.append(el('div', 'disabled-note',
+      '実行は無効です。有効にするには --allow-exec と 24 文字以上の --token を付けて起動します。'
+      + ' 遠隔から引ける状態は remote code execution なので既定でオフです。'));
+    box.append(el('div', 'term',
+      `worktree: ${wt.path}\nブランチ: ${wt.branch ?? '(detached)'}\n`
+      + `${wt.ahead} ahead / ${wt.behind} behind`
+      + `${wt.status?.dirty ? ` · 未コミット ${wt.status.changed} 件` : ''}\n`));
+    return box;
+  }
+
+  const bar = el('div', 'cmdbar');
+  const sel = el('select');
+  for (const p of PRESETS) { const o = el('option', null, p); o.value = p; sel.append(o); }
+  const input = el('input');
+  input.value = PRESETS[0];
+  input.spellcheck = false;
+  const run = el('button', null, '実行');
+  const stop = el('button', null, '停止');
+  stop.disabled = true;
+  bar.append(sel, input, run, stop);
+
+  const peek = el('div', 'argvpeek');
+  const scroll = el('div');
+  scroll.style.flex = '1 1 auto';
+  scroll.style.overflow = 'auto';
+  const term = el('div', 'term');
+  scroll.append(term);
+
+  const refreshPeek = () => {
+    const argv = splitArgv(input.value);
+    peek.textContent = argv.length
+      ? `argv: ${JSON.stringify(argv)}（shell は経由しません）`
+      : 'コマンドを入力してください';
+  };
+  input.addEventListener('input', refreshPeek);
+  sel.addEventListener('change', () => { input.value = sel.value; refreshPeek(); });
+  refreshPeek();
+
+  let current = null;
+  const onState = st => {
+    run.disabled = st.running;
+    stop.disabled = !st.running;
+    input.disabled = st.running;
+    current = st.running ? st : null;
+  };
+  const start = () => {
+    const argv = splitArgv(input.value);
+    if (!argv.length) return;
+    runExec(term, wt, argv, onState);
+  };
+  run.addEventListener('click', start);
+  input.addEventListener('keydown', e => { if (e.key === 'Enter' && !run.disabled) start(); });
+  stop.addEventListener('click', () => current?.abort?.());
+
+  box.append(bar, peek, scroll);
+  return box;
 }
 
 /* ---------- 組み立て ---------- */
@@ -408,18 +568,23 @@ function render(s) {
   // コンソール: worktree 1本につき1枚、横に並べる（N 並列の本体）
   const consoles = $('#consoles');
   consoles.replaceChildren();
-  const live = s.worktrees.filter(w => !w.bare);
+  // prunable は実体が無いので exec も checkout もできない。並べない。
+  const live = s.worktrees.filter(w => !w.bare && !w.prunable);
   live.slice(0, 4).forEach((wt, i) => {
     if (i > 0) { const sp = el('div', 'split x'); consoles.append(sp); wireSplit(sp); }
     const tags = [['br', wt.branch ?? wt.name]];
     if (wt.status?.dirty) tags.push(['dirty', 'dirty']);
-    if (wt.prunable) tags.push(['danger', 'prunable']);
     if (wt.sequencer?.rebasing) tags.push(['danger', 'rebasing']);
-    const { p, body } = pane(`コンソール ${i + 1}`, tags);
-    body.append(mockTerm(wt));
+    if (wt.sequencer?.sequencing) tags.push(['danger', 'sequencer']);
+    const { p, body } = pane(wt.branch ?? wt.name, tags);
+    body.style.display = 'flex';
+    body.append(consoleBody(wt));
     consoles.append(p);
     wirePane(p);
   });
+  if (!live.length) {
+    consoles.append(el('div', 'empty', '実行できる worktree がありません'));
+  }
 
   // グラフ（本物）
   const g = $('#graph');
@@ -441,6 +606,19 @@ function render(s) {
 
 for (const sp of document.querySelectorAll('.shell > .split')) wireSplit(sp);
 for (const p of document.querySelectorAll('.pane')) wirePane(p);
+
+// 書き込み/実行の可否とトークンを先に取る。取れなくても観測は動かす。
+let session = { allowWrite: false, allowExec: false, token: null, tokenHeader: 'x-kjp-token' };
+try {
+  const r = await fetch('/api/v0/session');
+  if (r.ok) session = { ...session, ...await r.json() };
+} catch { /* 観測のみで動く */ }
+if (session.allowExec) {
+  const b = el('span', 'proto', '🚨 実行有効');
+  b.style.color = 'var(--danger)';
+  b.style.borderColor = 'var(--danger)';
+  $('#repo').before(b);
+}
 
 try {
   const res = await fetch('/api/v0/state?fresh=1');
