@@ -264,7 +264,11 @@ test('1回の収集で git を起動する回数が worktree 本数に比例し�
     // origin/HEAD / log）+ 1本あたり 3（status / rev-list / diff）
     // + 衝突予測の候補ペア数（merge-tree 1回ずつ）。
     // 1本あたり1プロセス分だけ余裕を持たせる。
-    const budget = worktrees * 4 + 6 + (s.stats.conflictPairs ?? 0);
+    // ⚠️ 以前は worktrees*4 で1本あたり1 spawn ぶん緩かった（doc の式は 3N）。
+    //    「ループの中で git を増やす回帰」を捕まえる精度が甘くなるので式に寄せる。
+    //    +1 は merge driver の列挙（候補ペアがあるときだけ走る）。
+    const pairs = s.stats.conflictPairs ?? 0;
+    const budget = worktrees * 3 + 6 + pairs + (pairs ? 1 : 0);
     assert.ok(
         gitSpawns <= budget,
         `worktree ${worktrees} 本で ${gitSpawns} プロセス起動（上限 ${budget}）。`
