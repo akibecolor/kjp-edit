@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, symlink } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -60,6 +60,39 @@ test('regression: 8.3 短縮名 / シンボリックリンクを解決して比�
         // 表記が違っても（短縮名 vs 長い名、/var vs /private/var）同じ場所とみなす
         assert.ok(samePath(dir, real),
             `短縮名/リンクが解決されていない: ${dir} vs ${real}`);
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+// ⚠️ 上のテストは**手元の Windows では realpath が no-op なので何も検証できない**
+//    （tmpdir が短縮名にならない。突然変異テストで survive した）。
+//    シンボリックリンク（Windows では junction）を自分で作れば、
+//    どのプラットフォームでも realpath が必要な状況を作れる。
+test('regression: シンボリックリンク越しでも同じ場所とみなす', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-link-'));
+    const target = join(dir, 'target');
+    const link = join(dir, 'link');
+    let made = false;
+    try {
+        await mkdir(target);
+        try {
+            // Windows では junction なら管理者権限が要らない
+            await symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+            made = true;
+        } catch (e) {
+            // 権限やファイルシステムの都合で作れない環境ではスキップする。
+            // 黙って通すのではなく、何を検証できなかったかを出す
+            console.log(`  – シンボリックリンクを作れないのでスキップ: ${e.code ?? e.message}`);
+        }
+        if (made) {
+            assert.ok(samePath(link, target),
+                `リンクが解決されていない: ${link} vs ${target}`);
+            // 別の場所を指すリンクは一致しない（allowlist が緩まないこと）
+            const other = join(dir, 'other');
+            await mkdir(other);
+            assert.equal(samePath(link, other), false);
+        }
     } finally {
         await rm(dir, { recursive: true, force: true });
     }

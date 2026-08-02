@@ -1154,6 +1154,13 @@ test('🔒 blob: reflog 経由（@{…}）で捨てたコミットを読めな�
         const q = new URLSearchParams({ ref: bad, path: 'shared.txt' });
         const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
         assert.equal(res.status, 400, `reflog 式が通った: ${bad}`);
+        // ⚠️ 400 だけを見てはいけない。**拒否理由**を確認する。
+        //    reflog に該当エントリが無い / そのパスが古いコミットに無い場合も
+        //    「見つかりません」で 400 になるので、検証を外しても緑のまま通り抜ける
+        //    （突然変異テストで実際に survive した）。
+        const d = await res.json();
+        assert.match(d.error, /ref が不正です/,
+            `入口の検証ではなく git 側の失敗で 400 になっている: ${bad} → ${d.error}`);
     }
 });
 

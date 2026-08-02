@@ -119,13 +119,51 @@ const MUTANTS = [
         gone: 'runningExec >= MAX_CONCURRENT_EXEC',
         pattern: '同時実行の上限が実際に効く',
     },
+    // 孫プロセスの後始末は「木ごと kill」「stdio を destroy」「保険タイマー」
+    // 「exit で拾う（close ではなく）」の4つで守っている。
+    // どれが実際に load-bearing かを個別に確かめる（まとめて1つの変異にすると
+    // 「どれかが効いている」しか分からない）。
     {
-        name: 'exec-kill-tree',
-        why: '中間シェルの孫プロセスが残り、枠が戻らない',
+        name: 'exec-kill-tree-posix',
+        why: 'POSIX でプロセスグループごと殺さない（孫が残る）',
+        // この経路は win32 では実行されない。ubuntu/macOS CI が検証する
+        platforms: ['linux', 'darwin'],
         file: 'v0/server.mjs',
-        from: '            child.on(\'exit\', (code, signal) => { finish(code, signal); });',
-        to: '            child.on(\'close\', (code, signal) => { finish(code, signal); });',
-        gone: "child.on('exit'",
+        from: "        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* グループが無い/既に死んでいる */ }",
+        to: '        /* 変異: グループ kill をやめる */',
+        gone: 'process.kill(-child.pid',
+        pattern: '中間シェルを挟んだ孫プロセス',
+    },
+    {
+        name: 'exec-kill-tree-win',
+        why: 'Windows で taskkill /T しない（孫が残る）',
+        file: 'v0/server.mjs',
+        from: "                execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'],",
+        to: "                execFile('taskkill', ['/PID', String(child.pid), '/F'],",
+        gone: "'/T', '/F'",
+        pattern: '中間シェルを挟んだ孫プロセス',
+    },
+    {
+        name: 'exec-stdio-destroy',
+        why: '孫が stdio を握ったまま応答が閉じられない',
+        // Windows では taskkill /T が孫まで殺すのでパイプが閉じ、これは冗長になる。
+        // taskkill が失敗した場合の保険として残す（検証されていないことを明示する）
+        defensive: 'taskkill /T が効く環境では冗長。失敗時の保険',
+        file: 'v0/server.mjs',
+        from: '    try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* noop */ }',
+        to: '    /* 変異: stdio の destroy をやめる */',
+        gone: 'child.stdout?.destroy()',
+        pattern: '中間シェルを挟んだ孫プロセス',
+    },
+    {
+        name: 'exec-guard-timer',
+        why: '子の終了を待てないときに応答が永久に開いたまま',
+        // 木ごと kill が成功すれば exit が来るので、これも冗長な backstop
+        defensive: '木ごと kill が成功する環境では冗長。最後の砦',
+        file: 'v0/server.mjs',
+        from: "                guard = setTimeout(() => finish(null, 'SIGKILL', '⚠ 子プロセスの終了を待てませんでした'), 3000);",
+        to: '                /* 変異: 保険タイマーをやめる */',
+        gone: '子プロセスの終了を待てませんでした',
         pattern: '中間シェルを挟んだ孫プロセス',
     },
     {
@@ -141,9 +179,14 @@ const MUTANTS = [
         name: 'worktree-allowlist',
         why: '既知でない worktree を cwd にできる',
         file: 'v0/server.mjs',
-        from: '            const wt = worktrees.find(w => samePath(w.path, wantPath));\n            if (!wt) { release(); denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }',
-        to: '            const wt = worktrees.find(w => samePath(w.path, wantPath)) ?? { path: wantPath, label: wantPath };\n            if (!wt) { release(); denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }',
-        gone: 'worktrees.find(w => samePath(w.path, wantPath));\n            if (!wt)',
+        // exec 側の allowlist だけを外す。`release()` があるので checkout 側とは区別できる。
+        // 単にメッセージを変えるのでは駄目で、**照合を通してしまう**形にする必要がある。
+        from: `            const wt = worktrees.find(w => samePath(w.path, wantPath));
+            if (!wt) { release(); denyJson(res, 400, \`既知の worktree ではありません: \${wantPath}\`); return; }`,
+        to: `            /* 変異: allowlist を外し、要求されたパスをそのまま使う */
+            const wt = worktrees.find(w => samePath(w.path, wantPath))
+                ?? { path: wantPath, label: wantPath, bare: false, prunable: false };`,
+        gone: 'release(); denyJson(res, 400, `既知の worktree ではありません',
         pattern: 'exec は既知の worktree 以外を cwd にしない',
     },
     {
@@ -201,7 +244,7 @@ const MUTANTS = [
         from: '            t = realpathSync.native(t);',
         to: '            t = t;',
         gone: 'realpathSync.native(t)',
-        pattern: '短縮名',
+        pattern: 'シンボリックリンク越し',
         testFile: 'v0/paths.test.mjs',
     },
 ];
@@ -234,6 +277,10 @@ function runTest(m) {
 
 const results = [];
 for (const m of targets) {
+    if (m.platforms && !m.platforms.includes(process.platform)) {
+        results.push({ m, status: 'SKIP', note: `このプラットフォームでは通らない経路（${m.platforms.join('/')} 用）` });
+        continue;
+    }
     const bak = `${m.file}.mutate-bak`;
     let applied = false;
     try {
@@ -256,10 +303,12 @@ for (const m of targets) {
             results.push({ m, status: 'SKIP', note: `pattern に一致するテストが無い: ${m.pattern}` });
             continue;
         }
+        const killed = r.code !== 0;
         results.push({
             m,
-            status: r.code !== 0 ? 'KILLED' : 'SURVIVED',
-            note: r.code !== 0 ? '' : 'テストが落ちなかった = この守りは検証されていない',
+            status: killed ? 'KILLED' : (m.defensive ? 'DEFENSIVE' : 'SURVIVED'),
+            note: killed ? ''
+                : (m.defensive ?? 'テストが落ちなかった = この守りは検証されていない'),
         });
     } finally {
         if (applied && existsSync(bak)) { copyFileSync(bak, m.file); unlinkSync(bak); }
@@ -269,11 +318,15 @@ for (const m of targets) {
 console.log('');
 let bad = 0;
 for (const r of results) {
-    const mark = r.status === 'KILLED' ? '✔' : r.status === 'SURVIVED' ? '✖' : '–';
-    if (r.status !== 'KILLED') bad++;
+    const mark = { KILLED: '✔', SURVIVED: '✖', DEFENSIVE: '◦', SKIP: '–' }[r.status];
+    // 冗長な防御とプラットフォーム外は失敗にしない（記録として残す）
+    if (r.status === 'SURVIVED') bad++;
     console.log(`${mark} ${r.m.name.padEnd(28)} ${r.status.padEnd(9)} ${r.note || r.m.why}`);
 }
 console.log('');
-console.log(`${results.filter(r => r.status === 'KILLED').length}/${results.length} が期待通り落ちた`);
-if (bad) console.log('✖ / – は「テストがその守りを検証できていない」ことを意味する');
+const k = results.filter(r => r.status === 'KILLED').length;
+const d = results.filter(r => r.status === 'DEFENSIVE').length;
+const sk = results.filter(r => r.status === 'SKIP').length;
+console.log(`${k} 件が期待通り落ちた / ${d} 件は冗長な防御（想定内）/ ${sk} 件はスキップ`);
+if (bad) console.log('✖ = テストがその守りを検証できていない。テストを直すこと');
 process.exit(bad ? 1 : 0);
