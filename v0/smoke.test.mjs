@@ -651,38 +651,34 @@ test('🚨 checkout はシーケンサ停止中を拒否する（git は通し�
     const stem = repo.split(/[\\/]/).pop();
     const wt = join(repo, '..', `${stem}-wt-a`);
     try {
-        // 停止する rebase を作る（乗っ取りテストと同じ手口）
-        await new Promise((resolve, reject) => {
-            const c = spawn('git', ['rebase', '-i', 'HEAD~2'], {
-                cwd: wt, shell: false, windowsHide: true,
-                env: {
-                    ...process.env, ...isolatedConfig(),
-                    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com',
-                    GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com',
-                    GIT_SEQUENCE_EDITOR: `${JSON.stringify(process.execPath)} -e `
-                        + JSON.stringify(
-                            'const f=process.argv[1],fs=require("fs");'
-                            + 'const l=fs.readFileSync(f,"utf8").split("\\n");'
-                            + 'l.splice(1,0,"break");fs.writeFileSync(f,l.join("\\n"));'),
-                },
-            });
-            c.on('error', reject);
-            c.on('close', () => resolve());
-        });
+        // ⚠️ setup に `rebase -i` + GIT_SEQUENCE_EDITOR を使わないこと。
+        //    エディタと todo の書き換えに依存するので CI で停止しないことがあり、
+        //    「ガードが効かなかった」と「setup が失敗した」の区別が付かなくなる
+        //    （実際に windows CI だけで落ちた）。
+        //    衝突するマージなら外部エディタを介さず決定的に MERGE_HEAD が残る。
+        //    agent-a と agent-b は shared.txt を別内容で追加しているので add/add 衝突になる。
+        await g(['merge', 'agent-b'], wt).catch(() => {});   // 衝突するので非0 で正常
+
+        // 前提条件そのものを検証する。これが無いと assert が何を見たのか分からない。
+        const st = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        const target = st.worktrees.find(w => w.path.endsWith('-wt-a'));
+        assert.ok(target, 'agent-a の worktree が payload に無い');
+        assert.equal(target.sequencer.merging, true,
+            'setup 失敗: MERGE_HEAD が残っていない。テストの前提が成立していない');
 
         const r = await fetch(`${url}/api/v0/checkout`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
             body: JSON.stringify({ worktree: wt, ref: 'main' }),
         });
-        assert.equal(r.status, 409, 'rebase 中の checkout が通ってしまった');
         const d = await r.json();
-        assert.match(d.error, /rebase 進行中/);
-        assert.match(d.error, /リプレイ/, '危険の説明が入っていない');
+        assert.equal(r.status, 409, `マージ未コミット中の checkout が通ってしまった: ${JSON.stringify(d)}`);
+        assert.match(d.error, /マージ未コミット/);
+        assert.match(d.error, /MERGE_HEAD/, '危険の説明が入っていない');
     } finally {
         child.kill();
-        await g(['rebase', '--abort'], wt).catch(() => {});
-        await g(['checkout', '-q', 'agent-a'], wt).catch(() => {});
+        await g(['merge', '--abort'], wt).catch(() => {});
+        await g(['checkout', '-q', '--force', 'agent-a'], wt).catch(() => {});
     }
 });
 
