@@ -1243,6 +1243,12 @@ test('🚨 読み取り専用の経路がリポジトリ設定のコマンドを
     //    CLAUDE.md の「スクリプトは .mjs のみ」はプロジェクトのスクリプトの規則で、
     //    ここは git のフック機構を再現するためのテストフィクスチャなので .sh が必要。
     await writeFile(hook, `#!/bin/sh\nprintf ran >> "${marker}"\n`, 'utf8');
+    // ⚠️ 実行ビットを立てる。**Linux では実行できないフックは起動しない**ので、
+    //    立て忘れると「発火しないから守れている」という偽陽性になる
+    //    （ubuntu CI の突然変異テストで survive して発覚。Windows は exec ビットの
+    //     概念が無いので手元では気付けなかった。プラットフォーム固有の偽陽性）。
+    const { chmod } = await import('node:fs/promises');
+    await chmod(hook, 0o755);
     await g(['config', 'core.fsmonitor', hook], repo);
     try {
         await fetch(`${baseUrl}/api/v0/state?fresh=1`);

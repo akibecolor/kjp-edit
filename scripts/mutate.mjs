@@ -137,6 +137,8 @@ const MUTANTS = [
     {
         name: 'exec-kill-tree-win',
         why: 'Windows で taskkill /T しない（孫が残る）',
+        // taskkill は win32 にしか無い。POSIX では通らない経路
+        platforms: ['win32'],
         file: 'v0/server.mjs',
         from: "                execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'],",
         to: "                execFile('taskkill', ['/PID', String(child.pid), '/F'],",
