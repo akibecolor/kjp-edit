@@ -290,6 +290,15 @@ async function collectFresh() {
             warnings: w.sequencer.warnings ?? [],
             files: w.files,
         })),
+        // ローカルブランチ名。**checkout の候補はこれだけから作る。**
+        // ⚠️ グラフの `%D` から推測してはいけない。short name では
+        //    remote-tracking（`origin/main`）とスラッシュ入りのローカルブランチ
+        //    （`機能/新規`）を形で区別できない。remote-tracking を checkout すると
+        //    detached HEAD になる。refMap は完全な refname を持っているので確実。
+        localBranches: [...refs.keys()]
+            .filter(k => k.startsWith('refs/heads/'))
+            .map(k => k.slice('refs/heads/'.length))
+            .sort((a, b) => a.localeCompare(b)),
         graph,
         overlaps,
         errors,

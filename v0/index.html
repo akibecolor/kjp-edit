@@ -243,16 +243,14 @@ let session = { allowWrite: false, token: null, tokenHeader: 'x-kjp-token' };
 function checkoutForm(wt, s) {
   const box = el('div', 'wr');
   const sel = el('select');
-  // ⚠️ 他の worktree がチェックアウト済みのブランチを候補に出さない。
-  //    git は「既に別の worktree にある」ブランチの checkout を拒否するので、
-  //    出すと必ず失敗する選択肢になる。
+  // ⚠️ 候補は payload の localBranches だけから作る。グラフの refs から
+  //    推測すると remote-tracking（origin/main）が混ざり、それを checkout すると
+  //    detached HEAD になる。short name では `origin/main` と `機能/新規` を
+  //    形で区別できないので、サーバ側の完全な refname に頼る。
+  // ⚠️ 他の worktree がチェックアウト済みのブランチも出さない。
+  //    git は拒否するので、出すと必ず失敗する選択肢になる。
   const inUse = new Set(s.worktrees.map(w => w.branch).filter(Boolean));
-  const localBranches = s.graph
-    .flatMap(r => r.refs)
-    .map(r => r.replace(/^HEAD -> /, '').trim())
-    .filter(r => r && !r.startsWith('origin/') && !r.startsWith('tag: '));
-  const cands = [...new Set([...localBranches, s.base])]
-    .filter(r => r && !inUse.has(r));
+  const cands = (s.localBranches ?? []).filter(r => r && !inUse.has(r));
 
   for (const r of cands.slice(0, 30)) {
     const o = el('option', null, r);

@@ -511,6 +511,20 @@ test('--allow-host で指定したホスト名だけは通る（トンネル用�
 //    docs/auth-ordering.md の 1〜4 段。
 // ---------------------------------------------------------------------------
 
+test('localBranches はローカルブランチだけで、remote-tracking を含まない', async () => {
+    const s = await state();
+    assert.ok(Array.isArray(s.localBranches), 'localBranches が無い');
+    // 日本語ブランチ名（スラッシュ入り）が入っている
+    assert.ok(s.localBranches.includes('機能/新規'),
+        `機能/新規 が無い: ${JSON.stringify(s.localBranches)}`);
+    assert.ok(s.localBranches.includes('main'));
+    // ⚠️ remote-tracking が混ざると checkout 候補に出て detached HEAD になる
+    for (const r of s.localBranches) {
+        assert.doesNotMatch(r, /^refs\//, `完全な refname が漏れている: ${r}`);
+        assert.ok(!r.startsWith('origin/'), `remote-tracking が混ざっている: ${r}`);
+    }
+});
+
 test('🔒 --allow-write なしでは checkout の経路が存在しない', async () => {
     const res = await fetch(`${baseUrl}/api/v0/checkout`, {
         method: 'POST',
