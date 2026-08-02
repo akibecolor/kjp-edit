@@ -78,11 +78,67 @@ test('結果は決定的（入力順を変えても同じ）', () => {
 
 test('候補が0本でも落ちない', () => {
     const r = planMerge([], []);
-    assert.deepEqual(r, { batch: [], deferred: [], untestedPairs: 0, testedPairs: 0 });
+    assert.deepEqual(r, {
+        batch: [], deferred: [], unknown: [], untestedPairs: 0, testedPairs: 0,
+    });
+});
+
+// 🚨 未検査のペアを「衝突しない」と扱わない。以前は辺が無いだけで batch に入れていたので、
+//    実際に衝突する2本が「まとめて取り込める」と提示された（レビューで実測）。
+test('regression: 未検査のペアは batch に同居させず unknown に落とす', () => {
+    // 誰も検査していない → 最初の1本だけが batch、残りは unknown
+    const r = planMerge([c('a', 3), c('b', 2), c('c', 1)], []);
+    assert.equal(r.batch.length, 1, `未検査なのに複数が batch に入った: ${r.batch}`);
+    assert.deepEqual(r.unknown.map(u => u.label).sort(), ['b', 'c']);
+    assert.deepEqual(r.unknown[0].untestedWith, r.batch);
+});
+
+test('検査済みで clean なら batch に同居できる', () => {
+    const r = planMerge([c('a', 3), c('b', 2), c('c', 1)], [
+        pair('a', 'b', true), pair('a', 'c', true), pair('b', 'c', true),
+    ]);
+    assert.deepEqual(r.batch.sort(), ['a', 'b', 'c']);
+    assert.deepEqual(r.unknown, []);
 });
 
 test('同じ次数なら ahead が多い方を先に取る', () => {
-    // 誰も衝突しない → 全部入るが、batch の順序は ahead の多い順
-    const r = planMerge([c('few', 1), c('many', 9), c('mid', 5)], []);
+    // 全ペアを clean として検査済みにしておく（そうしないと unknown に落ちる）
+    const r = planMerge([c('few', 1), c('many', 9), c('mid', 5)], [
+        pair('few', 'many', true), pair('few', 'mid', true), pair('many', 'mid', true),
+    ]);
     assert.deepEqual(r.batch, ['many', 'mid', 'few']);
+});
+
+// 🚨 deferred 同士の衝突が見えないと「a を入れて b と c を手当」と読めるが、
+//    b と c も衝突する、という2周目の驚きが起きる（レビューで指摘）。
+test('regression: deferred 同士の衝突も報告する', () => {
+    // 三角形（3本が互いに衝突）
+    const r = planMerge([c('a'), c('b'), c('c')], [
+        pair('a', 'b', false), pair('a', 'c', false), pair('b', 'c', false),
+    ]);
+    assert.equal(r.batch.length, 1);
+    const b = r.deferred.find(d => d.label !== r.batch[0]);
+    assert.ok(b, `deferred が無い: ${JSON.stringify(r)}`);
+    assert.equal(b.conflictsWith.length, 2, `全隣接が出ていない: ${b.conflictsWith}`);
+    assert.equal(b.conflictsWithDeferred.length, 1,
+        `deferred 同士の衝突が見えない: ${JSON.stringify(b)}`);
+});
+
+// 🚨 ラベルは衝突しうる（`x/same/dup` と `y/same/dup` はどちらも `same/dup`）。
+test('regression: 重複ラベルを batch に2回出さない', () => {
+    const r = planMerge([c('dup', 1), c('dup', 2), c('x', 1)], [pair('dup', 'x', true)]);
+    assert.equal(new Set(r.batch).size, r.batch.length, `重複がある: ${r.batch}`);
+});
+
+test('自己ペア（a × a）は無視する', () => {
+    const r = planMerge([c('a'), c('b')], [pair('a', 'a', true), pair('a', 'b', true)]);
+    assert.equal(r.testedPairs, 1, '自己ペアを数えている');
+    assert.deepEqual(r.batch.sort(), ['a', 'b']);
+});
+
+// 不明（clean === null。読み切れなかった等）は「安全」側に置かない
+test('clean が null のペアは衝突側として扱う', () => {
+    const r = planMerge([c('a'), c('b')], [{ a: 'a', b: 'b', clean: null }]);
+    assert.equal(r.batch.length, 1);
+    assert.equal(r.deferred.length, 1);
 });

@@ -169,6 +169,15 @@ const MUTANTS = [
         pattern: '中間シェルを挟んだ孫プロセス',
     },
     {
+        name: 'merge-driver',
+        why: '衝突予測が custom merge driver を実行する（任意コード実行）',
+        file: 'v0/git.mjs',
+        from: "    const kill = driverNames.flatMap(n => ['-c', `merge.${n}.driver=false`]);",
+        to: '    const kill = [];',
+        gone: 'driver=false',
+        pattern: 'custom merge driver を実行しない',
+    },
+    {
         name: 'blob-reflog',
         why: 'reflog 経由で捨てたコミットの中身が読める',
         file: 'v0/git.mjs',

@@ -600,6 +600,48 @@ test('衝突予測: 実際に衝突するペアを検出する', async () => {
     }
 });
 
+// 🚨 core.fsmonitor と同じクラスの穴。コミット済みの .gitattributes と
+//    .git/config の merge driver で、/api/v0/state を1回叩くだけで
+//    任意コマンドが走っていた（--allow-write 不要）。
+test('🚨 衝突予測が custom merge driver を実行しない', async () => {
+    const marker = join(repo, 'driver-ran.txt').replace(/\\/g, '/');
+    const hook = join(repo, 'driver.sh').replace(/\\/g, '/');
+    const stem = repo.split(/[\\/]/).pop();
+    try {
+        // フックは sh スクリプト + 実行ビット（Linux では exec ビットが無いと起動しない）
+        await writeFile(hook, `#!/bin/sh\nprintf ran >> "${marker}"\nexit 1\n`, 'utf8');
+        const { chmod } = await import('node:fs/promises');
+        await chmod(hook, 0o755);
+        // .gitattributes を **コミットする**（in-tree の属性が読まれる）
+        await writeFile(join(repo, '.gitattributes'), 'shared.txt merge=evil\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: merge driver のテスト用'], repo);
+        await g(['config', 'merge.evil.name', 'demo'], repo);
+        await g(['config', 'merge.evil.driver', `${hook} %A %O %B`], repo);
+
+        // agent-a と agent-b は shared.txt を別内容で持つので driver が呼ばれる状況
+        const s = await state();
+        await new Promise(r => setTimeout(r, 400));
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(marker), false,
+            'merge driver が実行された（読み取り経路から任意コード実行）');
+        // 無効化したことを利用者に伝えている
+        assert.ok(s.errors.some(e => /merge driver/.test(e.message)),
+            `driver を無効化した旨が errors に無い: ${JSON.stringify(s.errors)}`);
+    } finally {
+        await g(['config', '--unset', 'merge.evil.driver'], repo).catch(() => {});
+        await g(['config', '--unset', 'merge.evil.name'], repo).catch(() => {});
+        await rm(hook, { force: true });
+        await rm(marker, { force: true });
+        await rm(join(repo, '.gitattributes'), { force: true });
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: merge driver のテスト後片付け'], repo).catch(() => {});
+        // 他のテストのために base を元に戻す（main が2コミット進んだ）
+        await g(['worktree', 'prune'], repo).catch(() => {});
+        void stem;
+    }
+});
+
 test('衝突予測: 作業ツリーと ref に触らない', async () => {
     const stem = repo.split(/[\\/]/).pop();
     const before = await Promise.all([

@@ -19,7 +19,7 @@ import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
-    showBlob, fileDiff, toNFC, samePath, isSafeRef, mergePreview,
+    showBlob, fileDiff, toNFC, samePath, isSafeRef, mergePreview, mergeDriverNames,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
@@ -238,7 +238,20 @@ async function collectFresh() {
         const ab = await aheadBehind(cwd, base, ref).catch(() => ({ ahead: 0, behind: 0 }));
         wt.ahead = ab.ahead;
         wt.behind = ab.behind;
-        wt.files = await changedFiles(cwd, base, ref).catch(() => []);
+        // ⚠️ 失敗を黙って飲まない。無関係な履歴（merge base 無し）はここで分かる。
+        //    飲むと files=[] になって overlaps に出ず、しかし ahead>0 なので
+        //    「まとめて取り込める塊」に並んでしまう。git merge は門前払いするのに
+        //    「安全に取り込める」と提示されていた（レビューで実測）。
+        wt.files = await changedFiles(cwd, base, ref).catch(e => {
+            if (/no merge base|unrelated histories/i.test(e.message ?? '')) {
+                wt.noMergeBase = true;
+                errors.push({
+                    scope: wt.label,
+                    message: `base（${base}）と共通の履歴がありません。git merge は拒否します。`,
+                });
+            }
+            return [];
+        });
     }));
 
     // 🚨 checkout は git のフック（post-checkout）を起動する。つまりフックのある
@@ -294,10 +307,20 @@ async function collectFresh() {
     // ファイル重複の検出（クロスエージェントレビューの最小版）。
     // path をキーにするので同名 worktree でも別扱いになる。
     const byFile = new Map();
+    // 候補ペアの生成にだけ使う索引。rename の**旧パス**も入れる。
+    // ⚠️ 旧パスを入れないと rename/rename が候補にならない
+    //    （agent-9 が `a→b`、agent-10 が `a→c` にすると新パスが重ならないので
+    //     「同じファイルを触っていない」と判定され、実際は衝突するのに検査されない。
+    //     レビューで実証された）。表示用の overlaps には出さない。
+    const byFileForPairs = new Map();
     for (const wt of worktrees) {
         for (const f of wt.files) {
             if (!byFile.has(f.path)) byFile.set(f.path, new Map());
             byFile.get(f.path).set(wt.path, wt.label);
+            for (const p of [f.path, f.from].filter(Boolean)) {
+                if (!byFileForPairs.has(p)) byFileForPairs.set(p, new Map());
+                byFileForPairs.get(p).set(wt.path, wt.label);
+            }
         }
     }
     const overlaps = [...byFile.entries()]
@@ -313,37 +336,89 @@ async function collectFresh() {
     // ⚠️ この絞り込みは**取りこぼす**: rename と delete の組み合わせは
     //    別パスでも衝突しうる。完全な検出ではないことを payload にも出す。
     const MAX_PAIRS = 12;
-    const pairCandidates = new Map();     // "a\0b" -> {a, b}
-    for (const o of overlaps) {
-        const owners = o.worktrees;
-        for (let i = 0; i < owners.length; i++) {
-            for (let j = i + 1; j < owners.length; j++) {
-                const [a, b] = [owners[i], owners[j]].sort((x, y) => x.localeCompare(y));
-                pairCandidates.set(`${a}\0${b}`, { a, b });
+    // ⚠️ **path をキーにする。**ラベルは衝突しうる（`x/same/dup` と `y/same/dup` は
+    //    どちらも `same/dup` になる）。ラベルでキーにすると自分自身とのペアが生まれ、
+    //    `merge-tree main main` が exit 0 を返して「本当は衝突する2本」が
+    //    clean と報告される（レビューで実証）。
+    const byPath = new Map(worktrees.map(w => [w.path, w]));
+    // 同じコミットを指す worktree（detached のコピー等）は1つに畳む。
+    // 畳まないと無意味なペアが上限の枠を食い潰す（実測で12枠のうち8枠）。
+    const repFor = new Map();             // path -> 代表 path
+    const byOid = new Map();
+    for (const w of worktrees) {
+        const oid = w.head ?? w.path;
+        if (!byOid.has(oid)) byOid.set(oid, w.path);
+        repFor.set(w.path, byOid.get(oid));
+    }
+
+    const pairCandidates = new Map();     // "pa\0pb" -> {pa, pb}
+    for (const owners of byFileForPairs.values()) {
+        if (owners.size < 2) continue;
+        const paths = [...owners.keys()].map(p => repFor.get(p) ?? p);
+        const uniq = [...new Set(paths)];
+        for (let i = 0; i < uniq.length; i++) {
+            for (let j = i + 1; j < uniq.length; j++) {
+                const [pa, pb] = [uniq[i], uniq[j]].sort((x, y) => x.localeCompare(y));
+                pairCandidates.set(`${pa}\0${pb}`, { pa, pb });
             }
         }
     }
-    const byLabel = new Map(worktrees.map(w => [w.label, w]));
-    const wanted2 = [...pairCandidates.values()];
-    // 並行に走らせる（順次だとペア数だけ待ち時間が積む）
-    const conflicts = (await Promise.all(wanted2.slice(0, MAX_PAIRS).map(async ({ a, b }) => {
-        const wa = byLabel.get(a), wb = byLabel.get(b);
+    // ⚠️ 先頭から MAX_PAIRS 本を取ると **owners[0] と全員のペアで枠が埋まる**
+    //    （二重ループの構造上そうなる）。実測で「w2〜w8 同士のペアが1つも
+    //    検査されない」状態になり、その結果 batch に実際に衝突するペアが
+    //    3組入った。ラウンドロビンで各 worktree に最低1本を配る。
+    const allPairs = [...pairCandidates.values()];
+    const picked = [];
+    const seenCount = new Map();
+    for (const round of [0, 1, 2, 3]) {
+        for (const p of allPairs) {
+            if (picked.length >= MAX_PAIRS) break;
+            if (picked.includes(p)) continue;
+            const ca = seenCount.get(p.pa) ?? 0, cb = seenCount.get(p.pb) ?? 0;
+            if (ca > round || cb > round) continue;
+            picked.push(p);
+            seenCount.set(p.pa, ca + 1);
+            seenCount.set(p.pb, cb + 1);
+        }
+        if (picked.length >= MAX_PAIRS) break;
+    }
+
+    // 🚨 custom merge driver を潰す。潰さないと merge-tree が任意コマンドを実行する。
+    //    ペアが無いときは列挙もしない（プロセスを増やさない）。
+    let drivers = [];
+    if (picked.length) {
+        drivers = await mergeDriverNames(cwd);
+        if (drivers.length) {
+            errors.push({
+                scope: 'conflicts',
+                message: `custom merge driver（${drivers.join(', ')}）を無効化して衝突予測しました。`
+                    + ' 実際のマージでは driver が働くので、ここで衝突と出ても解決されることがあります。',
+            });
+        }
+    }
+
+    const conflicts = (await Promise.all(picked.map(async ({ pa, pb }) => {
+        const wa = byPath.get(pa), wb = byPath.get(pb);
         const refA = wa?.ref ?? wa?.branch ?? wa?.head;
         const refB = wb?.ref ?? wb?.branch ?? wb?.head;
-        if (!refA || !refB) return null;
+        if (!refA || !refB || pa === pb) return null;
         try {
-            const r = await mergePreview(cwd, refA, refB);
-            return { a, b, clean: r.clean, files: r.conflicts };
+            const r = await mergePreview(cwd, refA, refB, drivers);
+            // clean が null（読み切れなかった）は「分からない」として扱う
+            return { a: wa.label, b: wb.label, aPath: pa, bPath: pb,
+                clean: r.clean, files: r.conflicts, truncated: !!r.truncated };
         } catch (e) {
-            errors.push({ scope: `${a} × ${b}`, message: `衝突予測に失敗: ${e.message}` });
+            errors.push({ scope: `${wa?.label} × ${wb?.label}`, message: `衝突予測に失敗: ${e.message}` });
             return null;
         }
-    }))).filter(Boolean).sort((x, y) => Number(x.clean) - Number(y.clean));
+    }))).filter(Boolean).sort((x, y) => Number(x.clean === true) - Number(y.clean === true));
+
     // 上限で切ったことを黙って隠さない
-    if (wanted2.length > MAX_PAIRS) {
+    if (allPairs.length > picked.length) {
         errors.push({
             scope: 'conflicts',
-            message: `衝突予測は ${MAX_PAIRS} ペアで打ち切りました（候補 ${wanted2.length} ペア）。`,
+            message: `衝突予測は ${picked.length} ペアで打ち切りました（候補 ${allPairs.length} ペア）。`
+                + ' 検査していないペアは「衝突しない」ではなく「不明」です。',
         });
     }
 
@@ -354,7 +429,8 @@ async function collectFresh() {
         // 取り込み順序の提案。追加の git 呼び出しは0（衝突予測の結果だけを使う純ロジック）。
         // ⚠️ 仮説であって保証ではない。詳細は v0/mergeplan.mjs のコメント。
         mergePlan: planMerge(
-            worktrees.filter(w => !w.bare && !w.prunable && (w.ahead ?? 0) > 0)
+            // merge base が無いものは候補にしない（マージできないので）
+            worktrees.filter(w => !w.bare && !w.prunable && !w.noMergeBase && (w.ahead ?? 0) > 0)
                 .map(w => ({ label: w.label, ahead: w.ahead })),
             conflicts,
         ),
@@ -366,6 +442,7 @@ async function collectFresh() {
             branch: w.shortBranch, head: w.head,
             detached: w.detached, bare: w.bare, locked: w.locked,
             prunable: w.prunable, prunableReason: w.prunableReason ?? null,
+            noMergeBase: !!w.noMergeBase,
             ahead: w.ahead, behind: w.behind, status: w.status,
             // sequencer の全状態を渡す。UI が rebase/merge 中を出せなかったのは
             // warnings しか払い出していなかったため（レビューで発覚）。

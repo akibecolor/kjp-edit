@@ -546,24 +546,85 @@ export async function fileDiff(cwd, base, ref, path) {
  *    で、**空トークンがセクション区切り**。NUL をレコード区切りとして
  *    素朴に split すると情報メッセージ側のパスを衝突パスと混同する。
  */
-export async function mergePreview(cwd, refA, refB) {
+const MAX_MERGE_TREE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 観測対象リポジトリで定義されている custom merge driver の名前を列挙する。
+ *
+ * 🚨 これを無効化しないと `merge-tree` が**任意コマンドを実行する。**
+ *    コミット済みの `.gitattributes`（`*.txt merge=evil`）と
+ *    `.git/config` の `[merge "evil"] driver = ...` の2つで、
+ *    `/api/v0/state` を1回叩くだけでデーモンの env ごとコードが走る
+ *    （`--allow-write` も不要。レビューでビーコン付きで実証された）。
+ *    `core.fsmonitor` と同じクラスの穴。
+ */
+export async function mergeDriverNames(cwd) {
+    try {
+        const out = await git(
+            ['config', '--get-regexp', '^merge\\..*\\.driver$'],
+            { cwd, allowExit: [0, 1] },   // 1 = 該当なし
+        );
+        return [...new Set(out.split('\n')
+            .map(l => /^merge\.(.+)\.driver\s/.exec(l.trim())?.[1])
+            .filter(Boolean))];
+    } catch {
+        return [];   // 判定できなければ空（呼び出し側が保守的に扱う）
+    }
+}
+
+/**
+ * 2つの ref を**実際にマージしてみて**衝突するかを調べる。作業ツリーには触らない。
+ *
+ * @param {string[]} [driverNames] 無効化する merge driver の名前（mergeDriverNames の結果）
+ */
+export async function mergePreview(cwd, refA, refB, driverNames = []) {
     if (!isSafeRef(refA) || !isSafeRef(refB)) {
         throw new GitError(['merge-tree'], 2, `ref が不正です: ${refA} / ${refB}`);
     }
-    const r = await git(
-        ['merge-tree', '--write-tree', '-z', '--name-only',
-            '--end-of-options', refA, refB],
-        { cwd, allowExit: [0, 1], withCode: true },
-    );
-    // 0 = きれいにマージできる / 1 = 衝突 / それ以外は git() が投げている
+    // 🚨 driver を潰す。潰すと保守的に「衝突」側へ倒れるので、
+    //    呼び出し側は driver があったことを利用者に伝える必要がある。
+    const kill = driverNames.flatMap(n => ['-c', `merge.${n}.driver=false`]);
+    let r;
+    try {
+        r = await git(
+            [...kill, 'merge-tree', '--write-tree', '-z', '--name-only',
+                '--end-of-options', refA, refB],
+            {
+                cwd, allowExit: [0, 1], withCode: true,
+                // 巨大な衝突（両側が数千ファイルを触る）で無制限に読まない
+                maxBytes: MAX_MERGE_TREE_BYTES,
+            },
+        );
+    } catch (err) {
+        if (err.truncated) {
+            // 読み切れなかった。衝突の有無を断定しない
+            return { clean: null, conflicts: [], truncated: true };
+        }
+        throw err;
+    }
+    // 0 = きれいにマージできる
     if (r.code === 0) return { clean: true, conflicts: [] };
 
+    // 🚨 exit 1 は「衝突」と「そもそもマージできない」の**両方**を意味する。
+    //    `merge-tree main no-such-ref` は exit 1 で stdout 0 バイトになるので、
+    //    区別しないと `{clean:false, conflicts:[]}` という**嘘**を返す
+    //    （「衝突している。ただし衝突ファイルは0件」。レビューで実証）。
+    //    tree OID が出ているかどうかで判別する。
     const parts = r.stdout.split('\0');
-    parts.shift();                       // 先頭は tree OID
+    const oid = parts.shift() ?? '';
+    if (!/^[0-9a-f]{40,64}$/i.test(oid.trim())) {
+        throw new GitError(['merge-tree', refA, refB], r.code,
+            r.stderr || 'マージできません（tree が出力されていない）');
+    }
     const conflicts = [];
     for (const p of parts) {
         if (p === '') break;             // 空トークンでセクション終わり
         conflicts.push(toNFC(p));
+    }
+    // 衝突と言うなら必ず1件以上あるはず。0件なら判定できていない
+    if (conflicts.length === 0) {
+        throw new GitError(['merge-tree', refA, refB], r.code,
+            r.stderr || '衝突と報告されたが衝突ファイルが0件');
     }
     return { clean: false, conflicts };
 }

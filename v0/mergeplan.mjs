@@ -25,47 +25,76 @@
  *            untestedPairs: number, testedPairs: number}}
  */
 export function planMerge(candidates, conflicts) {
-    const labels = candidates.map(c => c.label);
+    // ⚠️ ラベルは衝突しうるので重複を潰す（`x/same/dup` と `y/same/dup` は
+    //    どちらも `same/dup`。潰さないと batch に同じラベルが2回出る）。
+    const labels = [...new Set(candidates.map(c => c.label))];
     const known = new Set(labels);
 
-    // 衝突グラフ（検査済みで clean=false のペアだけが辺）
-    const adj = new Map(labels.map(l => [l, new Set()]));
+    // 衝突グラフ。辺は3種類に分ける:
+    //   conflict = 検査済みで衝突する / clean = 検査済みで衝突しない / 未知 = 検査していない
+    const conflictAdj = new Map(labels.map(l => [l, new Set()]));
+    const cleanAdj = new Map(labels.map(l => [l, new Set()]));
     let tested = 0;
     for (const c of conflicts ?? []) {
         if (!known.has(c.a) || !known.has(c.b)) continue;
+        if (c.a === c.b) continue;                 // 自己ペアは無意味
         tested++;
-        if (c.clean) continue;
-        adj.get(c.a).add(c.b);
-        adj.get(c.b).add(c.a);
+        // clean が true 以外（false / null=不明）は「安全ではない」側に置く
+        if (c.clean === true) {
+            cleanAdj.get(c.a).add(c.b);
+            cleanAdj.get(c.b).add(c.a);
+        } else {
+            conflictAdj.get(c.a).add(c.b);
+            conflictAdj.get(c.b).add(c.a);
+        }
     }
 
-    // 検査していないペアの数。断定しないための材料
     const totalPairs = labels.length * (labels.length - 1) / 2;
     const untestedPairs = Math.max(0, totalPairs - tested);
 
     // 次数が小さい順 → ahead が多い順 → 名前順（決定的にする）
     const aheadOf = new Map(candidates.map(c => [c.label, c.ahead ?? 0]));
     const order = [...labels].sort((x, y) =>
-        adj.get(x).size - adj.get(y).size
+        conflictAdj.get(x).size - conflictAdj.get(y).size
         || (aheadOf.get(y) ?? 0) - (aheadOf.get(x) ?? 0)
         || x.localeCompare(y));
 
+    // 🚨 batch に入れる条件は「**取得済みの全メンバーとのペアが検査済みかつ clean**」。
+    //    以前は「衝突する辺が無い」だけで入れていたので、未検査のペアが
+    //    同じ塊に同居し、実際に衝突する2本が「まとめて取り込める」と提示された
+    //    （レビューで実測。12本の塊に衝突ペアが3組）。
+    //    未検査の辺を持つものは unknown に落とす。
     const batch = [];
-    const taken = new Set();
+    const taken = [];
+    const unknown = [];
     for (const l of order) {
-        // 既に取ったものと衝突しないなら同じ塊に入れられる
-        let ok = true;
-        for (const t of taken) if (adj.get(l).has(t)) { ok = false; break; }
-        if (ok) { batch.push(l); taken.add(l); }
+        const conflictsWithTaken = taken.filter(t => conflictAdj.get(l).has(t));
+        if (conflictsWithTaken.length) continue;   // 後で deferred に回す
+        const untestedWithTaken = taken.filter(t => !cleanAdj.get(l).has(t));
+        if (untestedWithTaken.length) {
+            unknown.push({ label: l, untestedWith: untestedWithTaken.slice(0, 8) });
+            continue;
+        }
+        batch.push(l);
+        taken.push(l);
     }
 
+    const inBatch = new Set(batch);
+    const inUnknown = new Set(unknown.map(u => u.label));
     const deferred = order
-        .filter(l => !taken.has(l))
-        .map(l => ({
-            label: l,
-            // 衝突相手のうち、先に取り込む塊に入っているものを挙げる
-            conflictsWith: [...adj.get(l)].filter(o => taken.has(o)).sort(),
-        }));
+        .filter(l => !inBatch.has(l) && !inUnknown.has(l))
+        .map(l => {
+            const all = [...conflictAdj.get(l)].sort();
+            return {
+                label: l,
+                // ⚠️ 塊に入っている相手だけを挙げると、**deferred 同士の衝突が見えなくなる**。
+                //    「a を入れて b と c を手当」と読めるが b と c も衝突する、という
+                //    2周目の驚きが起きる（レビューで指摘）。両方を返す。
+                conflictsWith: all,
+                conflictsWithBatch: all.filter(o => inBatch.has(o)),
+                conflictsWithDeferred: all.filter(o => !inBatch.has(o)),
+            };
+        });
 
-    return { batch, deferred, untestedPairs, testedPairs: tested };
+    return { batch, deferred, unknown, untestedPairs, testedPairs: tested };
 }

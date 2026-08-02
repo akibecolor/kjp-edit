@@ -641,11 +641,16 @@ function render(s) {
       '同じファイルを触っている worktree のペアがありません。'));
   }
   for (const c of conf) {
-    const d = el('div', c.clean ? 'ab' : 'alert danger');
+    // clean は true / false / null（読み切れず不明）の3値
+    const mark = c.clean === true ? '✔' : c.clean === false ? '✖' : '?';
+    const d = el('div', c.clean === true ? 'ab' : 'alert danger');
     d.style.margin = '.2rem 0';
-    d.append(el('b', null, `${c.clean ? '✔' : '✖'} ${c.a} × ${c.b}`));
-    if (c.clean) d.append(document.createTextNode(' — きれいにマージできます'));
-    else for (const f of c.files) d.append(el('div', 'ab', `  ${f}`));
+    d.append(el('b', null, `${mark} ${c.a} × ${c.b}`));
+    if (c.clean === true) d.append(document.createTextNode(' — きれいにマージできます'));
+    else if (c.clean === null) {
+      d.append(document.createTextNode(
+        c.truncated ? ' — 差分が大きすぎて判定できませんでした' : ' — 判定できませんでした'));
+    } else for (const f of c.files) d.append(el('div', 'ab', `  ${f}`));
     cBox.append(d);
   }
   // 取り込み順序の提案（純ロジック。追加の git 呼び出しは0）
@@ -656,13 +661,26 @@ function render(s) {
       const d = el('div', 'ab');
       d.append(el('b', null, '① まとめて取り込める: '),
         document.createTextNode(plan.batch.join(' → ')));
+      d.append(el('div', 'note', '（この塊は全ペアを検査済みで、どれも衝突しません）'));
       cBox.append(d);
     }
     for (const df of plan.deferred) {
       const d = el('div', 'ab');
-      d.append(el('b', null, `② 手当が必要: ${df.label}`),
-        document.createTextNode(df.conflictsWith.length
-          ? `（${df.conflictsWith.join(', ')} と衝突）` : ''));
+      d.append(el('b', null, `② 手当が必要: ${df.label}`));
+      // ⚠️ deferred 同士の衝突も出す。塊との衝突だけ見せると
+      //    「順に手当すれば済む」と誤読される（2周目で驚く）
+      const withBatch = df.conflictsWithBatch ?? df.conflictsWith ?? [];
+      const withDef = df.conflictsWithDeferred ?? [];
+      if (withBatch.length) d.append(document.createTextNode(`（①の ${withBatch.join(', ')} と衝突）`));
+      if (withDef.length) {
+        d.append(el('div', 'ab', `  ⚠ ${withDef.join(', ')} とも衝突します（手当同士がぶつかります）`));
+      }
+      cBox.append(d);
+    }
+    for (const u of plan.unknown ?? []) {
+      const d = el('div', 'ab');
+      d.append(el('b', null, `③ 不明: ${u.label}`),
+        document.createTextNode(`（${u.untestedWith.join(', ')} との組み合わせを検査していません）`));
       cBox.append(d);
     }
     cBox.append(el('div', 'note',
