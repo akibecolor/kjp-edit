@@ -68,6 +68,18 @@ const MUTANTS = [
         pattern: 'core.fsmonitor',
     },
     {
+        name: 'token-file-inside-repo',
+        why: '表記の違い（8.3 短縮名 / symlink / /private/var）でリポジトリ内判定が外れ、'
+            + '実行トークンがコミットされる',
+        file: 'v0/git.mjs',
+        // 祖先を realpath して継ぎ足す部分を消す = 素の文字列比較に戻す
+        from: '        if (resolveAncestor) {\n',
+        to: '        if (false) {\n',
+        gone: 'if (resolveAncestor) {',
+        pattern: 'まだ無いファイルでも別表記',
+        testFile: 'v0/paths.test.mjs',
+    },
+    {
         name: 'literal-pathspecs',
         why: 'pathspec magic で1ファイル指定が全体になる',
         file: 'v0/git.mjs',
@@ -242,9 +254,9 @@ const MUTANTS = [
         name: 'mergeplan-independent-set',
         why: '提案の塊に衝突するペアが入る',
         file: 'v0/mergeplan.mjs',
-        from: '        for (const t of taken) if (adj.get(l).has(t)) { ok = false; break; }',
-        to: '        // 変異: 隣接チェックをやめる',
-        gone: 'if (adj.get(l).has(t))',
+        from: '        if (conflictsWithTaken.length) continue;',
+        to: '        if (false) continue;',
+        gone: 'if (conflictsWithTaken.length) continue;',
         pattern: '塊の中身は互いに衝突しない',
         testFile: 'v0/mergeplan.test.mjs',
     },
@@ -254,7 +266,8 @@ const MUTANTS = [
         file: 'v0/git.mjs',
         from: '            t = realpathSync.native(t);',
         to: '            t = t;',
-        gone: 'realpathSync.native(t)',
+        // ⚠️ normPath 側にも同じ式があるので、インデントまで含めて一意にする
+        gone: '            t = realpathSync.native(t);',
         pattern: 'シンボリックリンク越し',
         testFile: 'v0/paths.test.mjs',
     },
@@ -308,10 +321,17 @@ for (const m of targets) {
             continue;
         }
         const r = await runTest(m);
-        // テストが1件も走っていないなら pattern が合っていない
-        const ran = /^ℹ tests (\d+)/m.exec(r.out);
-        if (!ran || Number(ran[1]) === 0) {
-            results.push({ m, status: 'SKIP', note: `pattern に一致するテストが無い: ${m.pattern}` });
+        // ⚠️ `ℹ tests N` で判定してはいけない。`--test-name-pattern` に外れたテストも
+        //    N に数えられて `skipped` になるだけなので、**1件も走っていないのに
+        //    「落ちなかった → SURVIVED」と誤報する**（pattern をテスト名ではなく
+        //    assert のメッセージに書いていて、実際にこれで誤報が出た）。
+        //    実際に走った本数は pass + fail で数える。
+        const n = k => Number(new RegExp(`^ℹ ${k} (\\d+)`, 'm').exec(r.out)?.[1] ?? 0);
+        if (n('pass') + n('fail') === 0) {
+            results.push({
+                m, status: 'SKIP',
+                note: `pattern に一致するテストが無い（テスト名に含まれる文字列を書く）: ${m.pattern}`,
+            });
             continue;
         }
         const killed = r.code !== 0;

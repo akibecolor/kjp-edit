@@ -1253,9 +1253,23 @@ test('🔒 --token-file: 無ければ生成し、リポジトリの中は拒否�
     bad.stderr.setEncoding('utf8');
     let err = '';
     bad.stderr.on('data', d => { err += d; });
-    const code = await new Promise(r => bad.on('close', r));
-    assert.equal(code, 1, 'リポジトリ内のトークンファイルで起動してしまった');
-    assert.match(err, /リポジトリの中に置かないで/);
+    // ⚠️ 素の `await close` にしない。拒否されないと**サーバは正常に listen し続けて
+    //    永久に閉じない** → node --test がハングし、SIGKILL されて要約が出ず、
+    //    「smoke (0 pass, 0 fail)」だけが残って原因が消える（実際にそうなった）。
+    //    失敗は失敗として観測できる形にする。
+    const code = await Promise.race([
+        new Promise(r => bad.on('close', r)),
+        new Promise(r => setTimeout(() => r('timeout'), 15000)),
+    ]);
+    try {
+        assert.equal(code, 1,
+            `リポジトリ内のトークンファイルで起動してしまった（${code}）`
+            + ' — containsPath が表記の違いで外れている可能性');
+        assert.match(err, /リポジトリの中に置かないで/);
+    } finally {
+        bad.kill();
+        await rm(inside, { force: true });
+    }
 });
 
 test('🔒 --audit-log でリポジトリ外に監査ログを出せる', async () => {

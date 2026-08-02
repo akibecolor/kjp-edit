@@ -11,7 +11,7 @@ import { mkdtemp, rm, mkdir, symlink } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { samePath, isSafeRepoPath, isSafeRef, git } from './git.mjs';
+import { samePath, containsPath, isSafeRepoPath, isSafeRef, git } from './git.mjs';
 
 test('samePath: 区切り文字の違いを吸収する', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kjp-path-'));
@@ -158,5 +158,52 @@ test('isSafeRef: リビジョン式とオプションを拒否し、日本語ブ
     for (const bad of ['--output=x', 'main~1', 'main^', 'main^{tree}', 'a b',
         'x..y', 'a:b', 'a?b', 'a*b', 'a[b', 'a\\b', 'a\0b', '', null]) {
         assert.equal(isSafeRef(bad), false, `拒否されるべき: ${String(bad)}`);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// containsPath — `--token-file` をリポジトリの外に強制するのに使う。
+// 外れると**実行トークンがコミットされる**ので、素の relative() では駄目。
+// ---------------------------------------------------------------------------
+
+test('containsPath: 中と外を区別する', () => {
+    assert.ok(containsPath('/a/b', '/a/b/c'), '子');
+    assert.ok(containsPath('/a/b', '/a/b'), '自分自身');
+    assert.ok(!containsPath('/a/b', '/a/bc'), '接頭辞が同じだけの兄弟');
+    assert.ok(!containsPath('/a/b', '/a'), '親');
+    assert.ok(!containsPath('/a/b', '/x/y'), '無関係');
+    assert.ok(!containsPath('', '/a'), '空');
+    assert.ok(!containsPath('/a', null), '非文字列');
+});
+
+// 🚨 これが CI の Windows と macOS だけを落とした本体。
+//    まだ存在しないファイル（これから作るトークン）を含む判定では、
+//    realpath できないので表記の違いがそのまま残る:
+//      macOS  /var/folders/... と /private/var/folders/...
+//      Windows は Users/RUNNER~1（8.3 短縮名）と Users/runneradmin
+//    そのため「リポジトリの中なのに外と判定」→ 拒否されず、コミットされる。
+//    存在する最も近い祖先を realpath して継ぎ足すことで一致させる。
+test('🚨 containsPath: まだ無いファイルでも別表記のリポジトリの中と判定できる', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-contains-'));
+    try {
+        const target = join(dir, 'repo');
+        const link = join(dir, 'link');
+        await mkdir(target);
+        try {
+            await symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+        } catch {
+            return; // 権限が無い環境（realpath の検証はできないが他は上のテストで見ている）
+        }
+        // link 経由の「まだ作っていない」ファイルは、実体 target の中にある
+        const notYet = join(link, 'sub', 'token');
+        assert.ok(containsPath(target, notYet),
+            'realpath を祖先まで遡らないと外れる（トークンがコミットされる）');
+        // 実体側の表記でも当然一致する
+        assert.ok(containsPath(target, join(target, 'token')));
+        // 外は外のまま（緩めていないことの確認）
+        assert.ok(!containsPath(target, join(dir, 'token')),
+            'リポジトリの隣は「外」でなければならない');
+    } finally {
+        await rm(dir, { recursive: true, force: true });
     }
 });

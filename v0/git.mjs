@@ -8,6 +8,7 @@
 
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import { join, sep } from 'node:path';
 
 const BASE_ARGS = [
     '-c', 'core.quotepath=false',
@@ -387,6 +388,60 @@ export async function verifyRefs(cwd, refs) {
  *
  * allowlist との比較にしか使わないので、緩めても既知の worktree にしか一致しない。
  */
+/**
+ * パスを比較用に畳む。
+ *
+ * @param {string} s
+ * @param {boolean} [resolveAncestor]
+ *   実体が無いとき、**存在する最も近い祖先を realpath して継ぎ足す**。
+ *   これが無いと「まだ作っていないファイル」を含む比較が黙って外れる:
+ *   macOS の `/var` → `/private/var`、Windows の `RUNNER~1` → `runneradmin`
+ *   （CI の Windows と macOS だけ落ちた原因はこれ。手元では temp のパスが
+ *   短くて 8.3 短縮名にならないので再現しなかった）
+ */
+function normPath(s, resolveAncestor = false) {
+    const isWin = process.platform === 'win32';
+    let t = s;
+    try {
+        t = realpathSync.native(t);
+    } catch {
+        // 実体が無い（prunable worktree、これから作るファイル）
+        if (resolveAncestor) {
+            const parts = t.split(/[\\/]+/);
+            const tail = [];
+            while (parts.length > 1) {
+                tail.unshift(parts.pop());
+                try { t = join(realpathSync.native(parts.join(sep) || sep), ...tail); break; }
+                catch { /* もう1つ上を試す */ }
+            }
+        }
+    }
+    t = toNFC(t);
+    // ⚠️ バックスラッシュを区切りとして畳むのは **Windows だけ**。
+    //    POSIX では `\` は正当なファイル名の文字なので、畳むと
+    //    `a\b`（1つのファイル名）と `a/b`（2階層）を同一視してしまう。
+    //    これは allowlist の照合に使うので、緩めてよい話ではない。
+    t = isWin ? t.replace(/[\\/]+/g, '/') : t.replace(/\/+/g, '/');
+    t = t.replace(/\/+$/, '');
+    if (isWin || process.platform === 'darwin') t = t.toLowerCase();
+    return t;
+}
+
+/**
+ * `child` が `parent` の中（または parent 自身）か。
+ *
+ * ⚠️ **素の `path.relative()` で判定しない。** 実体が同じでも表記が違うと
+ *    外れる。`--token-file` をリポジトリの外に強制するのに使っているので、
+ *    外れると**実行トークンがコミットされる**（漏洩事故になる）。
+ */
+export function containsPath(parent, child) {
+    if (typeof parent !== 'string' || typeof child !== 'string') return false;
+    if (parent === '' || child === '') return false;
+    const p = normPath(parent, true);
+    const c = normPath(child, true);
+    return c === p || c.startsWith(`${p}/`);
+}
+
 export function samePath(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     if (a === '' || b === '') return false;

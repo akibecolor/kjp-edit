@@ -19,7 +19,7 @@ import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
-    showBlob, fileDiff, toNFC, samePath, isSafeRef, mergePreview, mergeDriverNames,
+    showBlob, fileDiff, toNFC, samePath, containsPath, isSafeRef, mergePreview, mergeDriverNames,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
@@ -1151,7 +1151,9 @@ if (opts.tokenFile) {
     const inside = await (async () => {
         try {
             const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
-            return top && !relative(top, opts.tokenFile).startsWith('..');
+            // ⚠️ relative() では駄目。表記が違うと外れて、トークンがコミットされる
+            //    （macOS の /var→/private/var、Windows の RUNNER~1 で実際に外れた）
+            return top !== '' && containsPath(top, opts.tokenFile);
         } catch { return false; }
     })();
     if (inside) {

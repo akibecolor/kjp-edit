@@ -30,14 +30,19 @@ function run(args, { timeout = 300_000 } = {}) {
         const out = [];
         child.stdout.on('data', c => out.push(c));
         child.stderr.on('data', c => out.push(c));
-        const t = setTimeout(() => child.kill('SIGKILL'), timeout);
+        const started = Date.now();
+        let timedOut = false;
+        const t = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeout);
         child.on('error', e => {
             clearTimeout(t);
-            resolve({ code: 1, output: String(e.message) });
+            resolve({ code: 1, output: String(e.message), ms: Date.now() - started, timedOut });
         });
         child.on('close', code => {
             clearTimeout(t);
-            resolve({ code: code ?? 1, output: Buffer.concat(out).toString('utf8') });
+            resolve({
+                code: code ?? 1, output: Buffer.concat(out).toString('utf8'),
+                ms: Date.now() - started, timedOut,
+            });
         });
     });
 }
@@ -114,6 +119,23 @@ function summarizeTests(output) {
     return { failing, ...counts };
 }
 
+/**
+ * テスト1本ぶんの失敗表示を作る。
+ *
+ * ⚠️ **要約が取れなかったときは生の末尾を出す。** `node --test` は
+ * クラッシュや SIGKILL では `ℹ pass N` を出さないので、そのまま整形すると
+ * 「smoke (0 pass, 0 fail)」だけが残り、**原因が完全に消える**
+ * （CI で失敗したのに手元では再現せず、これで1往復無駄にした）。
+ */
+function testDetail(r, s) {
+    if (s.failing.length) return s.failing.slice(0, 5).map(f => `${f.name} — ${f.cause}`);
+    const head = r.timedOut
+        ? [`⏱ ${(r.ms / 1000).toFixed(1)}s で SIGKILL（上限に達した）`]
+        : [`終了コード ${r.code}（テストの要約が出ていない = 途中で落ちた）`];
+    const tail = r.output.split('\n').map(l => l.trim()).filter(Boolean).slice(-8);
+    return [...head, ...tail];
+}
+
 const steps = [];
 let failed = false;
 
@@ -147,9 +169,9 @@ let failed = false;
     const s = summarizeTests(r.output);
     const ok = r.code === 0;
     steps.push({
-        name: `unit (${s.pass} pass, ${s.fail} fail)`,
+        name: `unit (${s.pass} pass, ${s.fail} fail) ${(r.ms / 1000).toFixed(1)}s`,
         ok,
-        detail: s.failing.slice(0, 5).map(f => `${f.name} — ${f.cause}`),
+        detail: ok ? [] : testDetail(r, s),
     });
     if (!ok) failed = true;
 }
@@ -160,9 +182,9 @@ if (!quick && !failed) {
     const s = summarizeTests(r.output);
     const ok = r.code === 0;
     steps.push({
-        name: `smoke (${s.pass} pass, ${s.fail} fail)`,
+        name: `smoke (${s.pass} pass, ${s.fail} fail) ${(r.ms / 1000).toFixed(1)}s`,
         ok,
-        detail: s.failing.slice(0, 5).map(f => `${f.name} — ${f.cause}`),
+        detail: ok ? [] : testDetail(r, s),
     });
     if (!ok) failed = true;
 } else if (quick) {
@@ -176,7 +198,7 @@ if (!quick && !failed) {
     const skipped = /skipped/.test(r.output);
     const ok = r.code === 0;
     steps.push({
-        name: 'layout',
+        name: `layout ${(r.ms / 1000).toFixed(1)}s`,
         ok,
         skipped,
         detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),

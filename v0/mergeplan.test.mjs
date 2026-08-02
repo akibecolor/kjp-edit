@@ -51,6 +51,27 @@ test('塊の中身は互いに衝突しない（不変条件）', () => {
         }
     }
     assert.ok(r.batch.length >= 2, `独立集合が小さすぎる: ${r.batch}`);
+
+    // ⚠️ 塊に入らなかったものは **deferred（衝突が分かっている）** と
+    //    **unknown（未検査）** を区別して返さないといけない。
+    //    衝突が分かっているものを「未検査」と出すのは UI 上の嘘になり、
+    //    「じゃあ検査すればいける」と読める（実際そうならない）。
+    //    batch の条件は「全ペアが検査済みかつ clean」なので、
+    //    衝突チェックを外しても塊自体は汚れない = 上のループでは捕まらない。
+    //    振り分けを固定することで初めてこの守りが検証される。
+    const deferredLabels = r.deferred.map(d => d.label);
+    const unknownLabels = r.unknown.map(u => u.label);
+    for (const l of ['a', 'b', 'c', 'd']) {
+        if (r.batch.includes(l)) continue;
+        assert.ok(deferredLabels.includes(l),
+            `衝突が分かっている ${l} が deferred に無い（unknown: ${unknownLabels}）`);
+    }
+    for (const d of r.deferred) {
+        assert.ok((d.conflictsWith?.length ?? 0)
+            + (d.conflictsWithBatch?.length ?? 0)
+            + (d.conflictsWithDeferred?.length ?? 0) > 0,
+        `deferred なのに衝突相手が空: ${d.label}`);
+    }
 });
 
 // ⚠️ 検査していないペアを「衝突しない」と断定しないための材料。
