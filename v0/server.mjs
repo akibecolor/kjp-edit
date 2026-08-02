@@ -19,7 +19,7 @@ import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
-    showBlob, fileDiff, toNFC, samePath, isSafeRef,
+    showBlob, fileDiff, toNFC, samePath, isSafeRef, mergePreview,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 
@@ -302,10 +302,55 @@ async function collectFresh() {
         .map(([path, owners]) => ({ path, worktrees: [...owners.values()] }))
         .sort((a, b) => b.worktrees.length - a.worktrees.length || a.path.localeCompare(b.path));
 
+    // 🔍 衝突予測。「同じファイルを触っている」だけでは実際に衝突するか分からないので、
+    //    候補ペアだけ実際にマージしてみる。
+    //
+    // ⚠️ 全ペア（N²）は走らせない。overlaps に出たペアだけに絞る
+    //    （ループの中で git を増やさない、という規則）。
+    // ⚠️ この絞り込みは**取りこぼす**: rename と delete の組み合わせは
+    //    別パスでも衝突しうる。完全な検出ではないことを payload にも出す。
+    const MAX_PAIRS = 12;
+    const pairCandidates = new Map();     // "a\0b" -> {a, b}
+    for (const o of overlaps) {
+        const owners = o.worktrees;
+        for (let i = 0; i < owners.length; i++) {
+            for (let j = i + 1; j < owners.length; j++) {
+                const [a, b] = [owners[i], owners[j]].sort((x, y) => x.localeCompare(y));
+                pairCandidates.set(`${a}\0${b}`, { a, b });
+            }
+        }
+    }
+    const byLabel = new Map(worktrees.map(w => [w.label, w]));
+    const wanted2 = [...pairCandidates.values()];
+    // 並行に走らせる（順次だとペア数だけ待ち時間が積む）
+    const conflicts = (await Promise.all(wanted2.slice(0, MAX_PAIRS).map(async ({ a, b }) => {
+        const wa = byLabel.get(a), wb = byLabel.get(b);
+        const refA = wa?.ref ?? wa?.branch ?? wa?.head;
+        const refB = wb?.ref ?? wb?.branch ?? wb?.head;
+        if (!refA || !refB) return null;
+        try {
+            const r = await mergePreview(cwd, refA, refB);
+            return { a, b, clean: r.clean, files: r.conflicts };
+        } catch (e) {
+            errors.push({ scope: `${a} × ${b}`, message: `衝突予測に失敗: ${e.message}` });
+            return null;
+        }
+    }))).filter(Boolean).sort((x, y) => Number(x.clean) - Number(y.clean));
+    // 上限で切ったことを黙って隠さない
+    if (wanted2.length > MAX_PAIRS) {
+        errors.push({
+            scope: 'conflicts',
+            message: `衝突予測は ${MAX_PAIRS} ペアで打ち切りました（候補 ${wanted2.length} ペア）。`,
+        });
+    }
+
     return {
         repo: cwd,
         base,
         generatedAt: new Date().toISOString(),
+        // 衝突予測。clean=false のペアは実際にマージすると衝突する。
+        // ⚠️ 候補は overlaps 由来なので rename/delete 絡みは取りこぼす（完全ではない）
+        conflicts,
         worktrees: worktrees.map(w => ({
             name: w.label, basename: w.name, path: w.path,
             branch: w.shortBranch, head: w.head,
@@ -342,7 +387,12 @@ async function collectFresh() {
         errors,
         // 1回の収集で git を何回起動したか。worktree 本数に対する伸び方を
         // スモークテストで固定する（コメントだけでは回帰を防げない）。
-        stats: { gitSpawns: stats.spawns - spawnsBefore, worktrees: worktrees.length },
+        stats: {
+            gitSpawns: stats.spawns - spawnsBefore,
+            worktrees: worktrees.length,
+            // 衝突予測は候補ペアの数だけ git を起動する（worktree 本数とは別軸）
+            conflictPairs: conflicts.length,
+        },
     };
 }
 

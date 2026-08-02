@@ -63,7 +63,16 @@ export const stats = { spawns: 0 };
  * @param {boolean} [o.raw] Buffer のまま返す（バイナリ判定のためデコードしない）
  * @param {number} [o.maxBytes] これを超えたら子プロセスを殺して打ち切る
  */
-export function git(args, { cwd, optionalLocks = false, raw = false, maxBytes = 0 } = {}) {
+/**
+ * @param {number[]} [o.allowExit] 成功として扱う終了コード（既定は [0]）。
+ *   `merge-tree` は**衝突を 1 で返す**ので、それを失敗にしないために要る。
+ * @param {boolean} [o.withCode] `{ code, stdout, stderr }` を返す。
+ *   終了コードで結果が変わるコマンド（merge-tree）向け。
+ */
+export function git(args, {
+    cwd, optionalLocks = false, raw = false, maxBytes = 0,
+    allowExit = [0], withCode = false,
+} = {}) {
     return new Promise((resolve, reject) => {
         const env = { ...process.env, ...BASE_ENV };
         // 書き込み操作では index の stat-cache 更新を許す (読み取りは 0 のまま)
@@ -102,9 +111,14 @@ export function git(args, { cwd, optionalLocks = false, raw = false, maxBytes = 
                 return;
             }
             const stderr = Buffer.concat(err).toString('utf8');
-            // raw のときは code 0 でも Buffer を返す（デコードしない）
-            if (code === 0) resolve(raw ? buf : buf.toString('utf8'));
-            else reject(new GitError(args, code, stderr));
+            if (!allowExit.includes(code)) {
+                reject(new GitError(args, code, stderr));
+                return;
+            }
+            const value = raw ? buf : buf.toString('utf8');
+            // ⚠️ 終了コードを見たい呼び出し元には {code, stdout} を返す。
+            //    モジュール変数に最後の code を置くのは並行呼び出しで壊れる。
+            resolve(withCode ? { code, stdout: value, stderr } : value);
         });
     });
 }
@@ -489,6 +503,44 @@ export async function fileDiff(cwd, base, ref, path) {
     ], { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
     if (looksBinary(buf)) return { path, binary: true, text: null };
     return { path, binary: false, text: toNFC(buf.toString('utf8')) };
+}
+
+/**
+ * 2つの ref を**実際にマージしてみて**衝突するかを調べる。作業ツリーには触らない。
+ *
+ * これが要る理由: 「同じファイルを触っている」は代理指標にすぎず、
+ * 実際に衝突するかは分からない。N 本の worktree が並行に動く前提のツールでは
+ * 「本当にぶつかるのはどれか」が判断の中心になる。
+ *
+ * ⚠️ `--write-tree` は**オブジェクトDB に loose object を書く**。
+ *    ref / index / 作業ツリーには触らないので他のエージェントからは観測できないが、
+ *    「書き込みは一切しない」とは言えない（gc で回収される）。
+ * ⚠️ 衝突は **exit 1** で返る。失敗と区別するため withCode を使う。
+ * ⚠️ `-z` の出力は
+ *      <tree OID> NUL (衝突パス NUL)* NUL (件数 NUL パス NUL 種別 NUL 説明 NUL)*
+ *    で、**空トークンがセクション区切り**。NUL をレコード区切りとして
+ *    素朴に split すると情報メッセージ側のパスを衝突パスと混同する。
+ */
+export async function mergePreview(cwd, refA, refB) {
+    if (!isSafeRef(refA) || !isSafeRef(refB)) {
+        throw new GitError(['merge-tree'], 2, `ref が不正です: ${refA} / ${refB}`);
+    }
+    const r = await git(
+        ['merge-tree', '--write-tree', '-z', '--name-only',
+            '--end-of-options', refA, refB],
+        { cwd, allowExit: [0, 1], withCode: true },
+    );
+    // 0 = きれいにマージできる / 1 = 衝突 / それ以外は git() が投げている
+    if (r.code === 0) return { clean: true, conflicts: [] };
+
+    const parts = r.stdout.split('\0');
+    parts.shift();                       // 先頭は tree OID
+    const conflicts = [];
+    for (const p of parts) {
+        if (p === '') break;             // 空トークンでセクション終わり
+        conflicts.push(toNFC(p));
+    }
+    return { clean: false, conflicts };
 }
 
 /** ref から到達できるコミットの集合（グラフの幹を決めるのに使う）。 */

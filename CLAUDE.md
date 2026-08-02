@@ -108,6 +108,10 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
   `%D` が空だと NUL が3連続して分割が1つずれる（`log()`）。
   `status --porcelain=v2 -z` の rename は `<path>` NUL `<origPath>` の**2トークン**
   （`worktreeStatus()`）。**改行を含みえないフィールドなら改行を区切りにする**
+- **`git merge-tree` は衝突を exit 1 で返す。** 失敗と区別するため `withCode` を使う。
+  `-z` の出力は「tree OID → 衝突パス群 → **空トークン** → 情報メッセージ」で、
+  NUL を素朴にレコード区切りにすると情報メッセージ側のパスを衝突パスと混同する。
+  `--write-tree` は **loose object を書く**（ref/index/作業ツリーには触らない）
 - **`git for-each-ref` に `-z` は無い**（`unknown switch 'z'` で 129 終了）。
   refname は改行を含みえないので `--format=%(refname)%00%(objectname)` +
   改行区切りで安全にパースできる

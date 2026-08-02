@@ -37,7 +37,8 @@ node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
 |---|---|
 | **Worktree カード** | ブランチ、base からの ahead/behind、dirty 状態、変更ファイル一覧 |
 | **統合グラフ** | 全 worktree の HEAD を含む1枚のスイムレーングラフ。HEAD は白抜きの丸で強調 |
-| **ファイル重複** | 2つ以上の worktree が触っているファイル（クロスエージェントレビューの最小版） |
+| **ファイル重複** | 2つ以上の worktree が触っているファイル |
+| **🔍 衝突予測** | 候補ペアを `git merge-tree` で**実際にマージしてみて**衝突するかを出す。作業ツリーには触らない |
 | **🚨 警告** | シーケンサ乗っ取りと `MERGE_HEAD` の消失リスク |
 
 ## シーケンサ乗っ取りとは
@@ -103,7 +104,10 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 - 🔒 **`127.0.0.1` のみにバインド。認証は持たない。**
   外から届かせるならトンネル（`tailscale serve` 等）をループバックで終端させる。
   **`0.0.0.0` にバインドしないこと**（[../docs/architecture.md](../docs/architecture.md) D1）
-- **既定は読み取り専用。** 書き込みと実行は capability を分けて明示的に有効化する
+- **既定は読み取り専用。** ただし衝突予測の `git merge-tree --write-tree` は
+  **オブジェクトDB に loose object を書く**（ref / index / 作業ツリーには触らない。gc で回収される）。
+  「書き込みは一切しない」とは言わない
+- 書き込みと実行は capability を分けて明示的に有効化する
   （[../docs/auth-ordering.md](../docs/auth-ordering.md)）
 - **git は `spawn(gitPath, argvArray)` で shell を使わない。**
   `-z` / `core.quotepath=false` / `i18n.logOutputEncoding=UTF-8` /

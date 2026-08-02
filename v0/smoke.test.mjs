@@ -261,9 +261,10 @@ test('1回の収集で git を起動する回数が worktree 本数に比例し�
     assert.ok(s.stats, 'payload に stats が無い');
     const { gitSpawns, worktrees } = s.stats;
     // 実測: 定数 5（worktree list / for-each-ref / git-common-dir /
-    // origin/HEAD / log）+ 1本あたり 3（status / rev-list / diff）。
+    // origin/HEAD / log）+ 1本あたり 3（status / rev-list / diff）
+    // + 衝突予測の候補ペア数（merge-tree 1回ずつ）。
     // 1本あたり1プロセス分だけ余裕を持たせる。
-    const budget = worktrees * 4 + 6;
+    const budget = worktrees * 4 + 6 + (s.stats.conflictPairs ?? 0);
     assert.ok(
         gitSpawns <= budget,
         `worktree ${worktrees} 本で ${gitSpawns} プロセス起動（上限 ${budget}）。`
@@ -511,6 +512,42 @@ test('--allow-host で指定したホスト名だけは通る（トンネル用�
 // 🔒 書き込み（checkout）。関門の4条件すべてと、シーケンサ停止中の拒否を固定する。
 //    docs/auth-ordering.md の 1〜4 段。
 // ---------------------------------------------------------------------------
+
+// 「同じファイルを触っている」は代理指標。実際に衝突するかを merge-tree で見る。
+test('衝突予測: 実際に衝突するペアを検出する', async () => {
+    const s = await state();
+    assert.ok(Array.isArray(s.conflicts), 'conflicts が payload に無い');
+    const names = n => s.worktrees.find(w => w.branch === n).name;
+    const pair = s.conflicts.find(c =>
+        [c.a, c.b].sort().join('|') === [names('agent-a'), names('agent-b')].sort().join('|'));
+    assert.ok(pair, `agent-a × agent-b のペアが無い: ${JSON.stringify(s.conflicts)}`);
+    // 両方が shared.txt を別内容で追加しているので add/add で衝突する
+    assert.equal(pair.clean, false, 'きれいにマージできると判定されている');
+    assert.ok(pair.files.includes('shared.txt'),
+        `衝突ファイルに shared.txt が無い: ${JSON.stringify(pair.files)}`);
+    // 日本語＋空白のパスがクォートされずに返る（別名なので衝突しない）
+    for (const f of pair.files) {
+        assert.ok(!f.includes('\\3'), `8進エスケープが残っている: ${f}`);
+        assert.ok(!f.startsWith('"'), `クォートが残っている: ${f}`);
+    }
+});
+
+test('衝突予測: 作業ツリーと ref に触らない', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const before = await Promise.all([
+        g(['status', '--porcelain'], repo),
+        g(['rev-parse', 'agent-a', 'agent-b', 'main'], repo),
+        g(['status', '--porcelain'], join(repo, '..', `${stem}-wt-a`)),
+    ]);
+    await state();   // 衝突予測を走らせる
+    const after = await Promise.all([
+        g(['status', '--porcelain'], repo),
+        g(['rev-parse', 'agent-a', 'agent-b', 'main'], repo),
+        g(['status', '--porcelain'], join(repo, '..', `${stem}-wt-a`)),
+    ]);
+    assert.deepEqual(after, before,
+        'merge-tree が作業ツリーか ref を変えている（--write-tree は object だけを書くはず）');
+});
 
 test('localBranches はローカルブランチだけで、remote-tracking を含まない', async () => {
     const s = await state();

@@ -629,6 +629,32 @@ function render(s) {
   }
   wtPane.body.replaceChildren(cards);
 
+  // 衝突予測。「同じファイルを触っている」は代理指標なので、実際にマージしてみた結果を出す
+  const conf = s.conflicts ?? [];
+  const bad = conf.filter(c => !c.clean);
+  const cPane = ensurePane($('#left'), 'conflicts', '衝突予測',
+    bad.length ? [['danger', `${bad.length} ペア`]] : [['', conf.length ? 'なし' : '候補なし']]);
+  const cBox = el('div');
+  cBox.style.padding = '.4rem';
+  if (!conf.length) {
+    cBox.append(el('div', 'note',
+      '同じファイルを触っている worktree のペアがありません。'));
+  }
+  for (const c of conf) {
+    const d = el('div', c.clean ? 'ab' : 'alert danger');
+    d.style.margin = '.2rem 0';
+    d.append(el('b', null, `${c.clean ? '✔' : '✖'} ${c.a} × ${c.b}`));
+    if (c.clean) d.append(document.createTextNode(' — きれいにマージできます'));
+    else for (const f of c.files) d.append(el('div', 'ab', `  ${f}`));
+    cBox.append(d);
+  }
+  if (conf.length) {
+    cBox.append(el('div', 'note',
+      '⚠ 候補は「同じファイルを触っているペア」から作っています。'
+      + ' rename と delete の組み合わせは別パスでも衝突しうるので、これは完全な検出ではありません。'));
+  }
+  cPane.body.replaceChildren(cBox);
+
   const filer = ensurePane($('#left'), 'filer', 'ファイラ（変更ファイル）', []);
   const tree = el('div', 'tree');
   for (const wt of s.worktrees) {
