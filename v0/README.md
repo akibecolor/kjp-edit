@@ -153,6 +153,35 @@ git はこれを exit 0 で通しますが、続きの `rebase --continue` は
 （`--allow-write` / POST / `Sec-Fetch-Site: same-origin` / `X-Kjp-Token`）。
 順序と理由は [../docs/auth-ordering.md](../docs/auth-ordering.md)。
 
+### 実行（既定オフ、書き込みとは別の capability）
+
+```bash
+TOKEN=$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")
+node v0/server.mjs --allow-exec --token "$TOKEN"
+```
+
+`POST /api/v0/exec` に `{worktree, argv}` を送ると、出力が行区切り JSON で流れます
+（`{"t":"out"|"err","d":"..."}` … `{"t":"exit","code":0}`）。
+
+**PTY は使っていません。** Node 標準に PTY は無く、`node-pty` は依存を増やします。
+そして **Claude Code は `claude -p "..."` で非対話実行できる**ので、
+エージェントを遠隔から動かすのに PTY は不要です。
+
+| | |
+|---|---|
+| `--allow-exec` | 既定オフ。**24文字以上の `--token` が無いと起動しません**（有効化を必ず意識的な操作にするため） |
+| cwd | 既知の worktree のみ |
+| shell | 使いません（`argv` 配列で受けます） |
+| 監査 | `<GIT_DIR>/kjp-exec-audit.jsonl` に start / exit を追記 |
+| 上限 | 既定 600 秒（`--exec-timeout`）／同時 8 本 |
+| 切断 | クライアントが切れたら子プロセスを殺します |
+
+🚨 **これは定義上そのまま remote code execution です。**
+機能と脆弱性を分けるのは実装ではなく**誰が引けるか**だけです。
+**トンネルは必ずループバックで終端し、トンネル側で認証してください。**
+`tailscale funnel` / `trycloudflare.com` / 広い `--allow-host` のどれか1つで、
+「トンネルに届く相手 = このマシンでコードを実行できる相手」になります。
+
 🔒 **`diff` / `blob` は追跡されている内容だけを返します。**
 `git cat-file` / `git diff` 経由で読むので、fs には触りません。
 つまり**リポジトリ外のファイルも、未追跡の `.env` も読めません**

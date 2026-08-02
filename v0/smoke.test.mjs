@@ -696,6 +696,235 @@ test('🚨 checkout はシーケンサ停止中を拒否する（git は通し�
     }
 });
 
+// ---------------------------------------------------------------------------
+// 🔒 実行（/api/v0/exec）。「遠隔から実行できる」は定義上そのまま RCE なので、
+//    扉（capability + token + method + Sec-Fetch-Site + Host）を全部固定する。
+// ---------------------------------------------------------------------------
+
+const EXEC_TOKEN = 'test-token-for-exec-0123456789abcdef';
+
+/** 実行有効のサーバを立てる。呼び出し側が kill する。 */
+async function startExec(extra = []) {
+    const child = spawn(
+        process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec', '--token', EXEC_TOKEN, ...extra],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } },
+    );
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    const url = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('起動しなかった')), 15000);
+        let buf = '';
+        child.stdout.on('data', d => {
+            buf += d;
+            const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+            if (m) { clearTimeout(t); resolve(m[0]); }
+        });
+        child.on('error', reject);
+    });
+    return { child, url };
+}
+
+/** ndjson を全部読んでイベント配列にする */
+async function readExec(url, bodyObj, headers = {}) {
+    const res = await fetch(`${url}/api/v0/exec`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN, ...headers },
+        body: JSON.stringify(bodyObj),
+    });
+    if (!res.ok) return { status: res.status, error: (await res.json()).error, events: [] };
+    const text = await res.text();
+    const events = text.split('\n').filter(Boolean).map(l => JSON.parse(l));
+    return { status: res.status, events };
+}
+
+test('🔒 --allow-exec なしでは exec の経路が存在しない', async () => {
+    const res = await fetch(`${baseUrl}/api/v0/exec`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ worktree: repo, argv: ['git', 'status'] }),
+    });
+    assert.equal(res.status, 403);
+    assert.match((await res.json()).error, /--allow-exec/);
+});
+
+test('🔒 --allow-exec は 24 文字以上の --token 無しでは起動を拒否する', async () => {
+    for (const extra of [[], ['--token', 'short']]) {
+        const child = spawn(process.execPath,
+            [SERVER, '--repo', repo, '--port', '0', '--allow-exec', ...extra],
+            { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+        child.stderr.setEncoding('utf8');
+        let err = '';
+        child.stderr.on('data', d => { err += d; });
+        const code = await new Promise(r => child.on('close', r));
+        assert.equal(code, 1, `起動してしまった: token=${extra[1] ?? 'なし'}`);
+        assert.match(err, /--token/);
+    }
+});
+
+test('🔒 exec の関門: token / method / Sec-Fetch-Site / Host', async () => {
+    const { child, url } = await startExec();
+    try {
+        const body = JSON.stringify({ worktree: repo, argv: ['git', '--version'] });
+        const J = { 'content-type': 'application/json' };
+
+        let r = await fetch(`${url}/api/v0/exec`, { method: 'POST', headers: J, body });
+        assert.equal(r.status, 403, 'トークン無しが通った');
+
+        r = await fetch(`${url}/api/v0/exec`,
+            { method: 'POST', headers: { ...J, 'x-kjp-token': 'wrong-but-long-enough-value-xx' }, body });
+        assert.equal(r.status, 403, '誤ったトークンが通った');
+
+        r = await fetch(`${url}/api/v0/exec`, { headers: { 'x-kjp-token': EXEC_TOKEN } });
+        assert.equal(r.status, 405, 'GET が通った');
+
+        r = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { ...J, 'x-kjp-token': EXEC_TOKEN, 'sec-fetch-site': 'cross-site' },
+            body,
+        });
+        assert.equal(r.status, 403, 'cross-site が通った');
+
+        const raw = await rawGet(`${url}/api/v0/exec`, { host: 'evil.example' });
+        assert.equal(raw.status, 403, 'Host 検証を通っていない');
+    } finally {
+        child.kill();
+    }
+});
+
+test('🔒 exec は既知の worktree 以外を cwd にしない', async () => {
+    const { child, url } = await startExec();
+    try {
+        for (const bad of [tmpdir(), '', `${repo}-nope`]) {
+            const r = await readExec(url, { worktree: bad, argv: ['git', '--version'] });
+            assert.equal(r.status, 400, `既知でない worktree が通った: ${bad}`);
+        }
+        // argv の検証
+        for (const bad of [null, [], 'git status', ['git\0x']]) {
+            const r = await readExec(url, { worktree: repo, argv: bad });
+            assert.equal(r.status, 400, `不正な argv が通った: ${JSON.stringify(bad)}`);
+        }
+    } finally {
+        child.kill();
+    }
+});
+
+test('exec が出力を流し、終了コードを返す', async () => {
+    const { child, url } = await startExec();
+    try {
+        const ok = await readExec(url, { worktree: repo, argv: ['git', '--version'] });
+        assert.equal(ok.status, 200);
+        const out = ok.events.filter(e => e.t === 'out').map(e => e.d).join('');
+        assert.match(out, /git version/);
+        const exit = ok.events.at(-1);
+        assert.equal(exit.t, 'exit');
+        assert.equal(exit.code, 0);
+
+        // 非 0 の終了コードも伝わる
+        const bad = await readExec(url, { worktree: repo, argv: ['git', 'rev-parse', 'no-such-ref'] });
+        assert.equal(bad.status, 200);
+        assert.notEqual(bad.events.at(-1).code, 0, '失敗の終了コードが伝わっていない');
+        assert.ok(bad.events.some(e => e.t === 'err'), 'stderr が流れていない');
+    } finally {
+        child.kill();
+    }
+});
+
+test('exec: 3バイト文字が chunk 境界で割れない', async () => {
+    const { child, url } = await startExec();
+    try {
+        // 日本語を大量に出力させ、UTF-8 の境界越えを起こす
+        const script = 'process.stdout.write("あいうえお漢字テスト".repeat(4000))';
+        const r = await readExec(url, {
+            worktree: repo, argv: [process.execPath, '-e', script],
+        });
+        assert.equal(r.status, 200);
+        const out = r.events.filter(e => e.t === 'out').map(e => e.d).join('');
+        assert.equal(out, 'あいうえお漢字テスト'.repeat(4000));
+        assert.ok(!out.includes('�'), '置換文字が混ざっている（chunk 境界で割れた）');
+    } finally {
+        child.kill();
+    }
+});
+
+test('exec: 上限時間を超えたら停止する', async () => {
+    const { child, url } = await startExec(['--exec-timeout', '1']);
+    try {
+        const r = await readExec(url, {
+            worktree: repo, argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'],
+        });
+        assert.equal(r.status, 200);
+        const exit = r.events.at(-1);
+        assert.equal(exit.t, 'exit');
+        assert.ok(r.events.some(e => e.t === 'err' && /上限時間/.test(e.d)),
+            `上限で止めた形跡が無い: ${JSON.stringify(r.events)}`);
+    } finally {
+        child.kill();
+    }
+});
+
+// ⚠️ 取り残した子プロセスはこのプロジェクトが実際に事故を起こした種類
+//    （検証用サーバを残してポートを塞いだ / chrome を53個残した）。
+//    クライアントが切れたら殺すことをテストで固定する。
+test('exec: クライアントが切断したら子プロセスを殺す', async () => {
+    const { child, url } = await startExec();
+    const beacon = join(repo, 'exec-beacon.txt');
+    try {
+        // 100ms ごとにファイルへ追記し続ける子プロセス
+        const script = 'const fs=require("fs");'
+            + 'setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);'
+            + 'process.stdout.write("started\\n");';
+        const ac = new AbortController();
+        const res = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo, argv: [process.execPath, '-e', script, beacon],
+            }),
+            signal: ac.signal,
+        });
+        // 最初の出力を待って、走り始めたことを確認する
+        const reader = res.body.getReader();
+        await reader.read();
+        await new Promise(r => setTimeout(r, 400));
+
+        const { readFileSync } = await import('node:fs');
+        const before = readFileSync(beacon, 'utf8').length;
+        assert.ok(before > 0, '子プロセスが動いていない（テストの前提が崩れている）');
+
+        // 切断する
+        ac.abort();
+        await new Promise(r => setTimeout(r, 900));
+        const afterAbort = readFileSync(beacon, 'utf8').length;
+        await new Promise(r => setTimeout(r, 900));
+        const later = readFileSync(beacon, 'utf8').length;
+
+        assert.equal(later, afterAbort,
+            `切断後もファイルが増え続けている（子プロセスが残っている）: ${afterAbort} → ${later}`);
+    } finally {
+        child.kill();
+        await rm(beacon, { force: true });
+    }
+});
+
+test('exec の監査ログが書かれる', async () => {
+    const { child, url } = await startExec();
+    try {
+        await readExec(url, { worktree: repo, argv: ['git', '--version'] });
+        const { readFile } = await import('node:fs/promises');
+        const log = await readFile(join(repo, '.git', 'kjp-exec-audit.jsonl'), 'utf8');
+        const lines = log.split('\n').filter(Boolean).map(l => JSON.parse(l));
+        assert.ok(lines.some(e => e.event === 'start' && e.argv.join(' ') === 'git --version'),
+            '開始が記録されていない');
+        const exit = lines.find(e => e.event === 'exit' && e.argv.join(' ') === 'git --version');
+        assert.ok(exit, '終了が記録されていない');
+        assert.equal(exit.code, 0);
+        assert.ok(exit.at, 'タイムスタンプが無い');
+    } finally {
+        child.kill();
+    }
+});
+
 test('解決できない --base を渡してもエンドポイントは生きている', async () => {
     // 別プロセスを立てて、存在しない ref を --base に渡す
     const child = spawn(

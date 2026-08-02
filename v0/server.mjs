@@ -31,6 +31,9 @@ function parseArgs(argv) {
         layoutProbe: false, allowHosts: new Set(),
         // 🔒 書き込みは既定オフ。経路そのものを存在させない
         allowWrite: false, token: null,
+        // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
+        //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
+        allowExec: false, execTimeoutMs: 10 * 60 * 1000,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -41,12 +44,16 @@ function parseArgs(argv) {
         else if (a === '--layout-probe') opts.layoutProbe = true;
         else if (a === '--allow-host') opts.allowHosts.add(String(argv[++i]).toLowerCase());
         else if (a === '--allow-write') opts.allowWrite = true;
+        else if (a === '--allow-exec') { opts.allowExec = true; opts.allowWrite = true; }
+        else if (a === '--exec-timeout') opts.execTimeoutMs = Number(argv[++i]) * 1000;
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
             console.log('       --allow-write        checkout 等の書き込み操作を有効にする（既定オフ）');
-            console.log('       --token <s>          書き込み用トークン（既定は起動時にランダム生成）');
+            console.log('       --allow-exec         任意コマンドの実行を有効にする（既定オフ。--token 必須）');
+            console.log('       --exec-timeout <秒>  実行の上限時間（既定 600）');
+            console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
             process.exit(0);
         }
@@ -447,6 +454,46 @@ function requireMutation(req, res) {
     return true;
 }
 
+/**
+ * 🔒 実行の関門。書き込みの関門に加えて --allow-exec を要求する。
+ *
+ * ⚠️ 「遠隔から実行できる」は定義上そのまま remote code execution。
+ *    機能と脆弱性を分けるのは実装ではなく**誰が引けるか**だけ。
+ *    だから allowlist で安全を装わない。`git` を許すだけで
+ *    `git -c alias.x='!sh -c ...' x` から任意コードが動くので、
+ *    ゆるい allowlist は気休めにしかならない。**扉を守る方に賭ける。**
+ */
+function requireExec(req, res) {
+    if (!opts.allowExec) {
+        denyJson(res, 403, '実行は無効です。--allow-exec を付けて起動してください');
+        return false;
+    }
+    return requireMutation(req, res);
+}
+
+/**
+ * 実行の監査ログ。1行1JSON で $GIT_DIR に追記する（追跡されない場所）。
+ * 何をいつ走らせたかが残らないと、後から事故を追えない。
+ */
+async function auditExec(entry) {
+    try {
+        const { appendFile } = await import('node:fs/promises');
+        const common = await commonDir(opts.repo);
+        await appendFile(
+            join(common, 'kjp-exec-audit.jsonl'),
+            `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+            'utf8',
+        );
+    } catch (err) {
+        // 監査に失敗しても実行は続ける。ただし黙らない
+        console.error(`⚠ 監査ログを書けませんでした: ${err.message}`);
+    }
+}
+
+/** 同時実行数の上限。無制限だとマシンを埋められる。 */
+const MAX_CONCURRENT_EXEC = 8;
+let runningExec = 0;
+
 /** JSON ボディを読む。上限付き（無制限に読むと DoS になる）。 */
 function readJson(req, maxBytes = 64 * 1024) {
     return new Promise((resolve, reject) => {
@@ -504,9 +551,95 @@ const server = createServer(async (req, res) => {
             });
             res.end(JSON.stringify({
                 allowWrite: opts.allowWrite,
+                allowExec: opts.allowExec,
                 tokenHeader: TOKEN_HEADER,
                 token: opts.allowWrite && sameOrigin ? opts.token : null,
             }));
+            return;
+        }
+
+        // 🔒 任意コマンドの実行。出力を行区切り JSON で流す。
+        //    PTY は使わない（Node 標準に PTY は無く、node-pty は依存を増やす）。
+        //    Claude Code は `claude -p "..."` で非対話実行できるので、
+        //    エージェントを遠隔から動かすのに PTY は要らない。
+        //    対話 TUI をそのまま覗きたくなった時点で PTY を検討する。
+        if (url.pathname === '/api/v0/exec') {
+            if (!requireExec(req, res)) return;
+            let body;
+            try { body = await readJson(req); } catch (err) { denyJson(res, 400, err.message); return; }
+
+            // ⚠️ argv 配列で受ける。shell は使わない（引用の崩れと二重解釈を避ける）
+            const argv = Array.isArray(body.argv) ? body.argv.map(String) : null;
+            if (!argv || argv.length === 0) { denyJson(res, 400, 'argv（配列）が必要です'); return; }
+            if (argv.some(a => a.includes('\0'))) { denyJson(res, 400, 'argv に NUL は使えません'); return; }
+
+            const wantPath = toNFC(String(body.worktree ?? ''));
+            const worktrees = await listWorktrees(opts.repo);
+            const wt = worktrees.find(w => samePath(w.path, wantPath));
+            if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
+            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
+
+            if (runningExec >= MAX_CONCURRENT_EXEC) {
+                denyJson(res, 429, `同時実行が上限（${MAX_CONCURRENT_EXEC}）に達しています`);
+                return;
+            }
+
+            await auditExec({ event: 'start', worktree: wt.path, argv });
+            runningExec++;
+            res.writeHead(200, {
+                'content-type': 'application/x-ndjson; charset=utf-8',
+                'cache-control': 'no-store',
+                // プロキシに溜め込ませない（トンネル越しで出力が止まって見えるのを防ぐ）
+                'x-accel-buffering': 'no',
+            });
+
+            const { spawn } = await import('node:child_process');
+            const { StringDecoder } = await import('node:string_decoder');
+            const send = obj => { if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`); };
+
+            let child;
+            try {
+                child = spawn(argv[0], argv.slice(1), {
+                    cwd: wt.path, shell: false, windowsHide: true,
+                    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', NO_COLOR: '1' },
+                });
+            } catch (err) {
+                runningExec--;
+                send({ t: 'err', d: `起動できません: ${err.message}` });
+                send({ t: 'exit', code: null, signal: null });
+                res.end();
+                return;
+            }
+
+            // ⚠️ chunk ごとに toString() すると3バイト文字が割れる。
+            //    StringDecoder が境界を持ち越す（CLAUDE.md の git 呼び出し規則と同じ理由）。
+            const decOut = new StringDecoder('utf8'), decErr = new StringDecoder('utf8');
+            child.stdout.on('data', c => send({ t: 'out', d: decOut.write(c) }));
+            child.stderr.on('data', c => send({ t: 'err', d: decErr.write(c) }));
+
+            let finished = false;
+            const timer = setTimeout(() => {
+                send({ t: 'err', d: `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します` });
+                child.kill('SIGKILL');
+            }, opts.execTimeoutMs);
+
+            // クライアントが切れたら子プロセスを残さない（放置すると溜まる）
+            const onClose = () => { if (!finished) child.kill('SIGKILL'); };
+            req.on('aborted', onClose);
+            res.on('close', onClose);
+
+            child.on('error', err => send({ t: 'err', d: `実行エラー: ${err.message}` }));
+            child.on('close', async (code, signal) => {
+                finished = true;
+                clearTimeout(timer);
+                runningExec--;
+                const tail = decOut.end(), tailErr = decErr.end();
+                if (tail) send({ t: 'out', d: tail });
+                if (tailErr) send({ t: 'err', d: tailErr });
+                send({ t: 'exit', code, signal });
+                res.end();
+                await auditExec({ event: 'exit', worktree: wt.path, argv, code, signal });
+            });
             return;
         }
 
@@ -661,8 +794,25 @@ try {
 }
 
 // 🔒 ループバックのみ。--port 0 で OS に空きポートを選ばせる（テスト用）
-// 🔒 書き込みを有効にしたときだけトークンを用意する。
-//    --token が無ければ起動ごとにランダム。プロセスを再起動すれば無効化される。
+// 🔒 --allow-exec は自動生成トークンを許さない。
+//
+// 理由: 実行を遠隔から使うなら、再起動で変わるトークンでは運用できず、
+//       結果として「トークンを楽な場所に置く」方向へ流れる。
+//       明示的に --token を要求すれば、有効化が必ず意識的な操作になる。
+//       うっかり --allow-exec だけ付けて起動する事故も防げる。
+if (opts.allowExec) {
+    if (!opts.token || opts.token.length < 24) {
+        console.error('\n✖ --allow-exec には 24 文字以上の --token が必要です。');
+        console.error('  実行を遠隔から引けるようにするので、トークンは明示的に決めてください。\n');
+        console.error('  生成例:');
+        console.error('      node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
+        console.error('');
+        console.error('  起動例:');
+        console.error('      node v0/server.mjs --allow-exec --token <生成した値>\n');
+        process.exit(1);
+    }
+}
+// 書き込みだけなら起動ごとのランダムで十分（再起動で無効化される）
 if (opts.allowWrite && !opts.token) {
     opts.token = randomBytes(32).toString('base64url');
 }
@@ -674,7 +824,15 @@ server.listen(opts.port, '127.0.0.1', () => {
     if (opts.allowHosts.size) {
         console.log(`許可した Host: ${[...opts.allowHosts].join(', ')}`);
     }
-    if (opts.allowWrite) {
+    if (opts.allowExec) {
+        console.log('');
+        console.log('🚨 実行有効 (--allow-exec)。任意のコマンドが動きます。');
+        console.log('   これは定義上そのまま remote code execution です。');
+        console.log('   トンネルに届く相手 = このマシンでコードを実行できる相手 になります。');
+        console.log('   トンネルは必ずループバックで終端し、トンネル側で認証してください');
+        console.log('   （tailscale serve など。funnel / quick tunnel は使わないこと）。');
+        console.log(`   監査ログ: <GIT_DIR>/kjp-exec-audit.jsonl / 上限 ${opts.execTimeoutMs / 1000}s`);
+    } else if (opts.allowWrite) {
         console.log('');
         console.log('⚠️ 書き込み有効 (--allow-write)。checkout が可能です。');
         console.log('   トンネルを開けている場合、そのトンネルに届く相手は');
