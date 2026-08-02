@@ -140,6 +140,12 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
   MAX_PATH 束縛で、実測で 291 文字は `ENOENT`。短いルートに解決して `git -C` を使う
 - **`CON` / `aux.ts` / `foo.` / `foo ` のようなファイル名を作らない。**
   Node は作れるが Windows の他のツールから触れず、リポジトリをクローン不能にする
+- **パスの一致判定は `===` でやらない。`samePath()` を使う。** 同じ場所が
+  3種類の別表記になる: 区切り文字（git は Windows でも `/`、`path.join` は `\`）、
+  大文字小文字（Windows/macOS）、**8.3 短縮名とシンボリックリンク**
+  （Windows CI の `os.tmpdir()` は `RUNNER~1` を返すのに git は `runneradmin`、
+  macOS の `/var` は実体 `/private/var`）。`realpathSync.native()` で実体に解決する。
+  **手元の Windows では短縮名にならないので、この種のバグは CI だけで出る**
 
 ## ライセンス
 

@@ -7,6 +7,7 @@
 // - GIT_TERMINAL_PROMPT=0 は必須。CONIN$ を直接開くのでパイプでは防げず永久にハングしうる
 
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 
 const BASE_ARGS = [
     '-c', 'core.quotepath=false',
@@ -346,20 +347,35 @@ export async function verifyRefs(cwd, refs) {
 /**
  * 同じパスを指しているか。
  *
- * ⚠️ 区切り文字を揃えずに `===` で比べてはいけない。git は Windows でも
- *    `C:/Users/...` と**スラッシュ**で返すが、クライアントが `path.join()` で
- *    作った値は `\` になる。worktree の allowlist 照合をこれで落とした。
- *    Windows / macOS は大文字小文字を区別しないので畳んで比べる
- *    （allowlist との比較なので、緩めても既知の worktree にしか一致しない）。
+ * ⚠️ 文字列を `===` で比べてはいけない。同じ場所を指す3種類の差がある:
+ *
+ *  1. **区切り文字。** git は Windows でも `C:/Users/...` と**スラッシュ**で返すが、
+ *     クライアントが `path.join()` で作った値は `\` になる
+ *  2. **大文字小文字。** Windows / macOS は区別しない
+ *  3. **8.3 短縮名とシンボリックリンク。** Windows CI の `os.tmpdir()` は
+ *     `C:\Users\RUNNER~1\...` と**短縮名**を返すのに git は `runneradmin` と
+ *     長い形を返す。macOS では `os.tmpdir()` の `/var/...` が実体 `/private/var/...`。
+ *     → `realpathSync.native()` で実体に解決してから比べる
+ *
+ * 3 を入れていなかったせいで、worktree の allowlist 照合が windows CI だけで
+ * 落ちた（手元の Windows では tmpdir が短縮名にならないので再現しなかった）。
+ *
+ * allowlist との比較にしか使わないので、緩めても既知の worktree にしか一致しない。
  */
 export function samePath(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (a === '' || b === '') return false;
     const norm = s => {
-        let t = toNFC(s).replace(/[\\/]+/g, '/').replace(/\/+$/, '');
+        let t = s;
+        try {
+            // 存在しないパスでは throw するので、そのときは文字列のまま比べる
+            t = realpathSync.native(t);
+        } catch { /* 実体が無い（prunable worktree 等）。文字列比較にフォールバック */ }
+        t = toNFC(t).replace(/[\\/]+/g, '/').replace(/\/+$/, '');
         if (process.platform === 'win32' || process.platform === 'darwin') t = t.toLowerCase();
         return t;
     };
-    return norm(a) === norm(b) && a !== '' && b !== '';
+    return norm(a) === norm(b);
 }
 
 /**
