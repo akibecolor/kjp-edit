@@ -141,7 +141,7 @@ let failed = false;
 // 2. ユニットテスト
 {
     const r = await run(
-        ['--test', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs'],
+        ['--test', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs'],
         { timeout: 60_000 },
     );
     const s = summarizeTests(r.output);
@@ -195,7 +195,7 @@ for (const s of steps) {
 }
 if (failed) {
     console.log('\n再現するには:');
-    console.log('    node --test v0/swimlanes.test.mjs v0/paths.test.mjs v0/ndjson.test.mjs v0/mergeplan.test.mjs');
+    console.log('    node --test v0/swimlanes.test.mjs v0/paths.test.mjs v0/ndjson.test.mjs v0/mergeplan.test.mjs v0/argv.test.mjs');
     console.log('    node --test v0/smoke.test.mjs');
     console.log('    node v0/layout-check.mjs');
 }

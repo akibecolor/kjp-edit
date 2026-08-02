@@ -21,19 +21,29 @@
  * @param {ReadableStream<Uint8Array>} stream
  * @returns {AsyncGenerator<object>}
  */
+/** 1行の上限。改行が来ないまま無制限に溜め込まないため。 */
+const MAX_LINE = 1024 * 1024;
+
 export async function* parseNdjson(stream) {
     const reader = stream.getReader();
     const decoder = new TextDecoder('utf-8');
     let buf = '';
+    let cancelled = true;
     try {
         for (;;) {
             const { value, done } = await reader.read();
-            if (done) break;
+            if (done) { cancelled = false; break; }
             // stream: true が罠2 の対策。境界の半端なバイトを内部に持ち越す
             buf += decoder.decode(value, { stream: true });
             const lines = buf.split('\n');
             // 罠1 の対策。最後の要素は「まだ改行が来ていない行」なので持ち越す
             buf = lines.pop() ?? '';
+            // ⚠️ 改行が来ないまま無制限に伸びるのを防ぐ。
+            //    2MB の1行で __parseError に 200万文字が入っていた（レビュー指摘）。
+            if (buf.length > MAX_LINE) {
+                yield { __parseError: `${buf.slice(0, 200)}…（1行が ${MAX_LINE} バイトを超えたので切りました）` };
+                buf = '';
+            }
             for (const line of lines) {
                 if (!line) continue;
                 yield parseLine(line);
@@ -45,14 +55,29 @@ export async function* parseNdjson(stream) {
             if (line) yield parseLine(line);
         }
     } finally {
+        // ⚠️ 呼び出し側が break したら**接続を閉じる**。
+        //    releaseLock だけだと fetch の body が開いたままで、
+        //    サーバ側は切断を検知せず子プロセスが残る（レビュー指摘）。
+        if (cancelled) {
+            try { await reader.cancel(); } catch { /* 既に閉じている */ }
+        }
         try { reader.releaseLock(); } catch { /* 既に解放済み */ }
     }
 }
 
 function parseLine(line) {
+    let v;
     try {
-        return JSON.parse(line);
+        v = JSON.parse(line);
     } catch {
         return { __parseError: line };
     }
+    // ⚠️ `null` / 数値 / 文字列 / 真偽値の行を素通しすると、
+    //    呼び出し側の `ev.__parseError` が **TypeError** になり
+    //    ストリームの読み取りが中断され、子プロセスが取り残される
+    //    （レビューで実証）。**オブジェクト以外は解析失敗として扱う。**
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+        return { __parseError: line };
+    }
+    return v;
 }

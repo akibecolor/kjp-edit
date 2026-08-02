@@ -82,6 +82,50 @@ test('壊れた行は黙って捨てず __parseError で返す', async () => {
     assert.deepEqual(events[2], { t: 'exit', code: 0 });
 });
 
+// 🚨 `null` 行を素通しすると呼び出し側の `ev.__parseError` が TypeError になり、
+//    ストリームの読み取りが中断されて**サーバ側の子プロセスが取り残される**
+//    （レビューで実証）。オブジェクト以外は解析失敗として扱う。
+test('regression: オブジェクト以外の行を素通しさせない', async () => {
+    const events = await collect([
+        enc.encode('null\n123\n"str"\ntrue\n[1,2]\n{"t":"exit","code":0}\n'),
+    ]);
+    assert.equal(events.length, 6);
+    for (let i = 0; i < 5; i++) {
+        assert.ok(typeof events[i] === 'object' && events[i] !== null,
+            `${i} 番目が非オブジェクト: ${JSON.stringify(events[i])}`);
+        assert.ok('__parseError' in events[i],
+            `${i} 番目が解析失敗として扱われていない: ${JSON.stringify(events[i])}`);
+    }
+    assert.deepEqual(events[5], { t: 'exit', code: 0 });
+});
+
+test('regression: 改行の来ない巨大な1行を切り詰める', async () => {
+    // 1.5MB の1行（改行なし）
+    const huge = 'x'.repeat(1_500_000);
+    const events = await collect([enc.encode(huge)]);
+    assert.ok(events.length >= 1);
+    assert.ok(events[0].__parseError, '解析失敗として返っていない');
+    assert.ok(events[0].__parseError.length < 1000,
+        `切り詰められていない: ${events[0].__parseError.length} 文字`);
+});
+
+// 🚨 break したときに接続を閉じないと、サーバは切断を検知せず子プロセスが残る。
+test('regression: break したらストリームを cancel する', async () => {
+    let cancelled = false;
+    const stream = new ReadableStream({
+        start(c) {
+            c.enqueue(enc.encode('{"t":"out","d":"a"}\n'));
+            c.enqueue(enc.encode('{"t":"out","d":"b"}\n'));
+        },
+        cancel() { cancelled = true; },
+    });
+    for await (const ev of parseNdjson(stream)) {
+        void ev;
+        break;                     // 1件で抜ける
+    }
+    assert.equal(cancelled, true, 'cancel が呼ばれていない（接続が開いたまま）');
+});
+
 test('空行は無視する', async () => {
     const events = await collect([enc.encode('\n\n{"t":"exit","code":0}\n\n')]);
     assert.deepEqual(events, [{ t: 'exit', code: 0 }]);

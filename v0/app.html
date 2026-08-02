@@ -14,9 +14,15 @@
     狭い (<=1100px): 縦に積む。スプリッタは消える。
                     「レイアウトの保持は諦めて縦に並べる」方針（docs/scope.md）
 
-  ⚠️ 自動更新は**差分更新**にすること。全再描画すると
-     走っているコンソールのプロセスと出力が消える。
-     コンソールペインは worktree の増減があった時だけ作り直す。
+  ⚠️ 自動更新は**id 単位の差分更新**にすること。ペインの id は worktree の path
+     （序数ではない）。以前は集合キーが変わると全ペインを作り直していたので、
+     worktree が1本増えるだけで走っているコンソールが全滅し、しかも
+     abort していなかったのでサーバ側の子プロセスが 600 秒残り、
+     4回の増減で実行枠（8）を使い切っていた（レビューで実測）。
+  ⚠️ ペインを捨てる前に必ず `abort()` する（dropPanes を通す）。
+  ⚠️ 端末描画は requestAnimationFrame でまとめる。1件ごとに scrollHeight を
+     読むと強制同期レイアウトで**総文字数に対して二次**になり、
+     12,000 行で 54 秒・単一ブロック 28.9 秒（停止も更新も効かない）になった。
 -->
 <style>
   :root {
@@ -33,10 +39,15 @@
      中身の幅で列を押し広げ、overflow:auto を無効化する。 */
   * { box-sizing: border-box; min-width: 0; min-height: 0; }
   html, body { height: 100%; }
+  /* ⚠️ flex column にする。以前は .shell の高さを calc(100% - バー) で決め打ちして
+     いたので、#alerts の高さぶんがそのまま viewport の外へ押し出され、
+     body が overflow:hidden なのでスクロールもできなかった
+     （警告7件で下端 187px が永久に見えない。レビューで実測）。 */
   body { margin: 0; background: var(--bg); color: var(--fg); overflow: hidden;
+    display: flex; flex-direction: column; height: 100%;
     font: 12px/1.5 ui-monospace, "Cascadia Code", Consolas, "Courier New", monospace; }
 
-  .topbar { height: var(--bar); display: flex; align-items: center; gap: .6rem;
+  .topbar { height: var(--bar); flex: 0 0 auto; display: flex; align-items: center; gap: .6rem;
     padding: 0 .6rem; background: var(--head); border-bottom: 1px solid var(--line);
     flex-wrap: nowrap; overflow: hidden; }
   .topbar > * { flex: 0 0 auto; }
@@ -58,7 +69,7 @@
     background: var(--card); font-size: 12px; overflow-wrap: anywhere; }
   .alert.danger { border-left-color: var(--danger); }
 
-  .shell { height: calc(100% - var(--bar)); display: flex; }
+  .shell { flex: 1 1 auto; min-height: 0; display: flex; }
   .col, .row { display: flex; }
   .col { flex-direction: column; }
   .row { flex-direction: row; }
@@ -160,6 +171,7 @@
   .cmdbar button:disabled { color: var(--dim); cursor: default; }
   .argvpeek { color: var(--dim); font-size: 10px; padding: .1rem .5rem; flex: 0 0 auto;
     border-bottom: 1px dashed var(--line); overflow-wrap: anywhere; }
+  .argvpeek.bad { color: var(--danger); }
   .term { padding: .3rem .5rem; white-space: pre-wrap; word-break: break-word;
     font-size: 11px; line-height: 1.45; }
   .term .p { color: var(--ok); } .term .w { color: var(--warn); }
@@ -175,9 +187,12 @@
   .wtcell, .refcell { display: flex; gap: .2rem; align-items: center;
     overflow: hidden; white-space: nowrap; }
   .subject { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* ⚠️ flex-shrink させない。ref が多いコミットで**全部 8px に潰れて
+     0〜1文字しか読めなくなる**（レビューで51個を実測）。
+     溢れは切り詰めて「+N」で示す方が情報が残る。 */
   .ref { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
     font-size: 10px; max-width: 11em; overflow: hidden; text-overflow: ellipsis;
-    white-space: nowrap; flex: 0 1 auto; }
+    white-space: nowrap; flex: 0 0 auto; }
   .ref.wt { color: var(--accent); border-color: var(--accent); }
   .empty { color: var(--dim); padding: .5rem; }
 
@@ -228,6 +243,8 @@
 <script type="module">
 // 行割れ・マルチバイト割れの処理は共有モジュール（unit テストと同じコード）
 import { parseNdjson } from './ndjson.mjs';
+// argv の分割も共有モジュール（app.html の中だとテストできない）
+import { splitArgv } from './argv.mjs';
 
 const LANE_W = 10, ROW_H = 22, DOT_R = 3.2;
 const $ = s => document.querySelector(s);
@@ -400,19 +417,7 @@ async function loadDiff(holder, base, ref, path) {
 }
 
 /* ===== コンソール ===== */
-function splitArgv(line) {
-  const out = [];
-  let cur = '', quote = null, has = false;
-  for (const ch of line) {
-    if (quote) { if (ch === quote) quote = null; else cur += ch; }
-    else if (ch === '"' || ch === "'") { quote = ch; has = true; }
-    else if (/\s/.test(ch)) { if (has || cur) { out.push(cur); cur = ''; has = false; } }
-    else cur += ch;
-  }
-  if (has || cur) out.push(cur);
-  return out;
-}
-
+const MAX_CONSOLE_PANES = 4, MAX_DIFF_PANES = 2;
 const IS_WIN = /win/i.test(navigator.platform ?? '');
 const PRESETS = [
   'git status --short',
@@ -422,12 +427,46 @@ const PRESETS = [
   'claude -p "この worktree の変更を要約して"',
 ];
 
+/** 端末の上限。超えたら先頭を捨てる（捨てたことは画面に出す）。 */
+const TERM_MAX_SPANS = 4000;
+
 async function runExec(termEl, scrollEl, wt, argv, onState) {
-  const line = (cls, s) => {
-    const atBottom = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 24;
-    termEl.append(el('span', cls, s));
-    if (atBottom) scrollEl.scrollTop = scrollEl.scrollHeight;
+  // ⚠️ 出力1件ごとに DOM に append して scrollHeight を読むと、
+  //    **強制同期レイアウトが総文字数に比例**して全体が二次になる。
+  //    レビューの実測で 12,000 行 = 54 秒、うち 28.9 秒が単一ブロック
+  //    （その間 停止ボタンも自動更新も効かない）。
+  //    → イベントを溜めて requestAnimationFrame で1回だけ流す。
+  //    → atBottom は毎回測らず scroll イベントで真偽値として持つ。
+  let follow = true;
+  const onScroll = () => {
+    follow = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 24;
   };
+  scrollEl.addEventListener('scroll', onScroll, { passive: true });
+
+  let queue = [], flushing = false;
+  const flush = () => {
+    flushing = false;
+    if (!queue.length) return;
+    const frag = document.createDocumentFragment();
+    for (const [cls, s] of queue) frag.append(el('span', cls, s));
+    queue = [];
+    termEl.append(frag);
+    // 上限を超えたら先頭を捨てる。「全部見えている」という誤認を防ぐため告知する
+    if (termEl.childNodes.length > TERM_MAX_SPANS) {
+      const drop = termEl.childNodes.length - TERM_MAX_SPANS;
+      for (let i = 0; i < drop; i++) termEl.firstChild?.remove();
+      if (!termEl.dataset.trimmed) {
+        termEl.dataset.trimmed = '1';
+        termEl.prepend(el('span', 'w', `⚠ 出力が多いので古い行を捨てています（直近 ${TERM_MAX_SPANS} 要素）\n`));
+      }
+    }
+    if (follow) scrollEl.scrollTop = scrollEl.scrollHeight;
+  };
+  const line = (cls, s) => {
+    queue.push([cls, s]);
+    if (!flushing) { flushing = true; requestAnimationFrame(flush); }
+  };
+
   const ac = new AbortController();
   onState({ running: true, abort: () => ac.abort() });
   line('d', `$ ${argv.join(' ')}\n`);
@@ -458,11 +497,19 @@ async function runExec(termEl, scrollEl, wt, argv, onState) {
     if (e.name === 'AbortError') line('w', '\n⚠ 中断しました（サーバ側でプロセスを停止）\n');
     else line('e', `\n✖ ${e.message}\n`);
   } finally {
+    flush();                       // 溜まっている分を出し切る
+    scrollEl.removeEventListener('scroll', onScroll);
     onState({ running: false });
   }
 }
 
-function consoleBody(wt) {
+/**
+ * @param {object} paneObj ペインオブジェクト。走っている実行を中断できるよう
+ *   `abort` を持たせる。⚠️ これが無いとペインを捨てた時に中断できず、
+ *   サーバ側の子プロセスが --exec-timeout（既定600秒）まで残り、
+ *   4回で MAX_CONCURRENT_EXEC を食い尽くす（レビューで実測）。
+ */
+function consoleBody(wt, paneObj) {
   const box = el('div');
   box.style.cssText = 'display:flex;flex-direction:column;height:100%';
   if (!session.allowExec) {
@@ -488,11 +535,17 @@ function consoleBody(wt) {
   const term = el('div', 'term');
   scroll.append(term);
 
+  let parsed = { argv: [], warning: null };
   const refresh = () => {
-    const argv = splitArgv(input.value);
-    peek.textContent = argv.length
-      ? `argv: ${JSON.stringify(argv)}（shell は経由しません）`
-      : 'コマンドを入力してください';
+    parsed = splitArgv(input.value);
+    peek.className = parsed.warning ? 'argvpeek bad' : 'argvpeek';
+    peek.textContent = parsed.warning
+      ? `⚠ ${parsed.warning}（実行できません）`
+      : parsed.argv.length
+        ? `argv: ${JSON.stringify(parsed.argv)}（shell は経由しません）`
+        : 'コマンドを入力してください';
+    // 空入力や壊れた入力では押せないようにする（押して無反応は壊れて見える）
+    if (!box.dataset.running) run.disabled = !parsed.argv.length || !!parsed.warning;
   };
   input.addEventListener('input', refresh);
   sel.addEventListener('change', () => { input.value = sel.value; refresh(); });
@@ -500,13 +553,17 @@ function consoleBody(wt) {
 
   let cur = null;
   const onState = st => {
-    run.disabled = st.running; stop.disabled = !st.running; input.disabled = st.running;
-    cur = st.running ? st : null;
     box.dataset.running = st.running ? '1' : '';
+    stop.disabled = !st.running;
+    input.disabled = st.running;
+    run.disabled = st.running || !parsed.argv.length || !!parsed.warning;
+    cur = st.running ? st : null;
+    // ペイン側から中断できるようにする（ペインを捨てる前に呼ばれる）
+    paneObj.abort = st.running ? st.abort : null;
   };
   const start = () => {
-    const argv = splitArgv(input.value);
-    if (argv.length) runExec(term, scroll, wt, argv, onState);
+    if (parsed.warning || !parsed.argv.length) return;
+    runExec(term, scroll, wt, parsed.argv, onState);
   };
   run.addEventListener('click', start);
   input.addEventListener('keydown', e => { if (e.key === 'Enter' && !run.disabled) start(); });
@@ -517,6 +574,13 @@ function consoleBody(wt) {
 }
 
 /* ===== checkout ===== */
+// checkout の選択を worktree ごとに覚えておく。
+// ⚠️ カードは毎回作り直すので、覚えないと 15 秒の自動更新で選択が先頭へ戻る。
+//    書き込み操作なので「選んだ直後に更新が挟まると別ブランチに checkout する」
+//    という誤爆になる（--allow-write はフックを起動する＝実質コード実行。
+//    レビューで実測）。
+const checkoutSel = new Map();     // wt.path -> 選択中のブランチ
+
 function checkoutForm(wt, s) {
   const box = el('div', 'wr');
   const sel = el('select');
@@ -524,9 +588,18 @@ function checkoutForm(wt, s) {
   // remote-tracking が混ざり、checkout すると detached HEAD になる。
   const inUse = new Set(s.worktrees.map(w => w.branch).filter(Boolean));
   const cands = (s.localBranches ?? []).filter(r => r && !inUse.has(r));
-  for (const r of cands.slice(0, 40)) { const o = el('option', null, r); o.value = r; sel.append(o); }
+  const MAX_CANDS = 40;
+  for (const r of cands.slice(0, MAX_CANDS)) { const o = el('option', null, r); o.value = r; sel.append(o); }
+  // 前回の選択を復元する（自動更新で先頭へ戻らないように）
+  const remembered = checkoutSel.get(wt.path);
+  if (remembered && cands.includes(remembered)) sel.value = remembered;
+  sel.addEventListener('change', () => checkoutSel.set(wt.path, sel.value));
   const btn = el('button', null, 'checkout');
   const msg = el('span', 'wrmsg');
+  if (cands.length > MAX_CANDS) {
+    // 打ち切りを黙って隠さない
+    msg.textContent = `候補 ${cands.length} 本のうち ${MAX_CANDS} 本を表示`;
+  }
   if (!cands.length) {
     btn.disabled = true; sel.disabled = true;
     msg.textContent = '切り替え先がありません（全ブランチが使用中）';
@@ -541,7 +614,11 @@ function checkoutForm(wt, s) {
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
-      msg.textContent = `→ ${d.branch ?? d.head?.slice(0, 8)}`;
+      // detached になったら黙って成功にしない（そのブランチは以後進まない）
+      msg.textContent = d.detached
+        ? `→ detached (${d.head?.slice(0, 8)}) ⚠ ${d.warning ?? ''}`
+        : `→ ${d.branch ?? d.head?.slice(0, 8)}`;
+      if (d.detached) msg.className = 'wrmsg bad';
       await load(true);
     } catch (e) {
       msg.className = 'wrmsg bad'; msg.textContent = e.message; btn.disabled = false;
@@ -554,8 +631,7 @@ function checkoutForm(wt, s) {
 /* ===== 差分更新 =====
    ⚠️ 走っているコンソールを壊さないため、ペインは作り直さず中身だけ差し替える。
       コンソールは worktree の集合が変わった時だけ作り直す。 */
-const panes = new Map();     // id -> {p, body, ttl, tagBox}
-let consoleKeys = '';
+const panes = new Map();     // id -> {p, body, ttl, tagBox, abort?, holder?}
 
 function ensurePane(host, id, title, tags) {
   let obj = panes.get(id);
@@ -569,6 +645,40 @@ function ensurePane(host, id, title, tags) {
     if (obj.p.parentElement !== host) host.append(obj.p);
   }
   return obj;
+}
+
+/**
+ * 不要になったペインを片付ける。
+ * ⚠️ **捨てる前に必ず abort する。** 中断せずに DOM を捨てると、
+ *    サーバは切断を検知できず（res.on('close') が発火しない）、
+ *    子プロセスが --exec-timeout まで走り続けて実行枠を食い潰す
+ *    （レビューで実測: 4回の worktree 増減で 8枠が尽きる）。
+ */
+function dropPanes(prefix, keepIds) {
+  for (const [id, obj] of [...panes]) {
+    if (!id.startsWith(prefix) || keepIds.has(id)) continue;
+    try { obj.abort?.(); } catch { /* 既に終わっている */ }
+    obj.p.remove();
+    panes.delete(id);
+  }
+}
+
+/** ホスト内のペインを望む順序に並べ替え、間にスプリッタを入れる */
+function arrangeRow(host, ids) {
+  // スプリッタは作り直してよい（状態を持たないので）
+  for (const sp of [...host.querySelectorAll(':scope > .split')]) sp.remove();
+  let first = true;
+  for (const id of ids) {
+    const obj = panes.get(id);
+    if (!obj) continue;
+    if (!first) {
+      const sp = el('div', 'split x');
+      host.append(sp);
+      wireSplit(sp);
+    }
+    host.append(obj.p);        // append は既存要素を移動する
+    first = false;
+  }
 }
 
 function wtTags(wt) {
@@ -710,62 +820,77 @@ function render(s) {
   }
   filer.body.replaceChildren(tree);
 
-  // 中央上: 差分（変更のある worktree を最大2本）
+  // 中央上: 差分。
+  // ⚠️ ペインの id は**序数ではなく worktree path**。序数だと払い出し順が変わった
+  //    ときに「ヘッダは agent-a なのに中身は agent-b」になり、同名ファイルなら
+  //    黙って別 worktree の内容に差し替わる（レビューで実測）。
   const withFiles = s.worktrees.filter(w => w.files?.length);
-  const picks = withFiles.slice(0, 2);
+  const picks = withFiles.slice(0, MAX_DIFF_PANES);
   if (!picks.length && s.worktrees.length) picks.push(s.worktrees[0]);
-  picks.forEach((wt, i) => {
-    const id = `diff-${i}`;
+  const diffIds = new Set(picks.map(w => `diff-${w.path}`));
+  dropPanes('diff-', diffIds);
+  for (const wt of picks) {
+    const id = `diff-${wt.path}`;
     const obj = ensurePane($('#diffs'), id, '差分', [['br', wt.branch ?? wt.name]]);
     obj.p.dataset.wt = wt.path;
+    obj.wt = wt;
     const files = (wt.files ?? []).slice(0, 6);
     const tabs = el('div', 'tabs');
     const holder = el('div');
-    const prev = obj.p.dataset.sel;
+    obj.holder = holder;         // ⚠️ DOM を後から探さない（S1: セレクタが wrap を掴んでいた）
+    // 復元キーは worktree+path。path だけだと同名ファイルで別 worktree に引き継がれる
+    const prev = obj.selWt === wt.path ? obj.sel : null;
     const initial = files.find(f => f.path === prev)?.path ?? files[0]?.path;
-    files.forEach(f => {
+    const openIn = path => {
+      for (const o of tabs.children) o.classList.toggle('on', o.title === path);
+      obj.sel = path; obj.selWt = wt.path;
+      loadDiff(holder, s.base, wt.branch ?? wt.head, path);
+    };
+    obj.openIn = openIn;
+    for (const f of files) {
       const b = el('button', f.path === initial ? 'on' : null, f.path.split('/').pop());
       b.title = f.path;
-      b.addEventListener('click', () => {
-        for (const o of tabs.children) o.classList.remove('on');
-        b.classList.add('on');
-        obj.p.dataset.sel = f.path;
-        loadDiff(holder, s.base, wt.branch ?? wt.head, f.path);
-      });
+      b.addEventListener('click', () => openIn(f.path));
       tabs.append(b);
-    });
+    }
     if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
     const wrap = el('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;height:100%';
     wrap.append(tabs, holder);
     obj.body.replaceChildren(wrap);
-    if (initial) { obj.p.dataset.sel = initial; loadDiff(holder, s.base, wt.branch ?? wt.head, initial); }
+    if (initial) { obj.sel = initial; obj.selWt = wt.path; loadDiff(holder, s.base, wt.branch ?? wt.head, initial); }
     else holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
-  });
+  }
+  arrangeRow($('#diffs'), picks.map(w => `diff-${w.path}`));
+  if (withFiles.length > MAX_DIFF_PANES) {
+    $('#diffs').append(el('div', 'note',
+      `他 ${withFiles.length - MAX_DIFF_PANES} 本の差分は表示していません（上限 ${MAX_DIFF_PANES}）。ファイラから開けます。`));
+  }
 
-  // 中央下: コンソール。**worktree の集合が変わった時だけ作り直す**
-  const live = s.worktrees.filter(w => !w.bare && !w.prunable).slice(0, 4);
-  const key = live.map(w => w.path).join('|');
-  if (key !== consoleKeys) {
-    consoleKeys = key;
-    for (const [id, obj] of panes) {
-      if (id.startsWith('console-')) { obj.p.remove(); panes.delete(id); }
-    }
-    $('#consoles').replaceChildren();
-    live.forEach((wt, i) => {
-      if (i > 0) { const sp = el('div', 'split x'); $('#consoles').append(sp); wireSplit(sp); }
-      const obj = ensurePane($('#consoles'), `console-${wt.path}`,
-        wt.branch ?? wt.name, wtTags(wt).slice(1));
+  // 中央下: コンソール。**id 単位の差分更新**にする。
+  // ⚠️ 以前は集合キー（path を | で連結）が変わると全ペインを作り直していた。
+  //    worktree が1本増えると（アルファベット順で中間に挿入されるので）必ず全滅し、
+  //    しかも abort していなかったので子プロセスが残った（レビューで実測）。
+  const allLive = s.worktrees.filter(w => !w.bare && !w.prunable);
+  const live = allLive.slice(0, MAX_CONSOLE_PANES);
+  const liveIds = new Set(live.map(w => `console-${w.path}`));
+  dropPanes('console-', liveIds);
+  for (const wt of live) {
+    const id = `console-${wt.path}`;
+    const existed = panes.has(id);
+    const obj = ensurePane($('#consoles'), id, wt.branch ?? wt.name, wtTags(wt).slice(1));
+    // 既にあるペインは中身を作り直さない（走っている実行を壊さないため）
+    if (!existed) {
       obj.body.style.display = 'flex';
-      obj.body.replaceChildren(consoleBody(wt));
-    });
-    if (!live.length) $('#consoles').append(el('div', 'empty', '実行できる worktree がありません'));
-  } else {
-    // ペインは残したままヘッダのタグだけ更新する（走っているプロセスを壊さない）
-    for (const wt of live) {
-      const obj = panes.get(`console-${wt.path}`);
-      if (obj) setTags(obj.tagBox, wtTags(wt).slice(1));
+      obj.body.replaceChildren(consoleBody(wt, obj));
     }
+  }
+  arrangeRow($('#consoles'), live.map(w => `console-${w.path}`));
+  if (!live.length) {
+    $('#consoles').append(el('div', 'empty', '実行できる worktree がありません'));
+  } else if (allLive.length > MAX_CONSOLE_PANES) {
+    $('#consoles').append(el('div', 'note',
+      `他 ${allLive.length - MAX_CONSOLE_PANES} 本のコンソールは表示していません（上限 ${MAX_CONSOLE_PANES}）。`));
   }
 
   // 右: グラフ
@@ -791,15 +916,29 @@ function render(s) {
   g.body.replaceChildren(box);
 }
 
-/** ファイラのクリックから差分ペインを開く */
+/**
+ * ファイラのクリックから差分を開く。
+ * ⚠️ **その worktree のペインを探す。** 以前は最初に見つかった差分ペインへ
+ *    無条件に書き込んでいたので、「ヘッダは agent-a なのに中身は agent-b」に
+ *    なっていた（レビューで実測。観測ツールとして最悪の誤り）。
+ *    該当ペインが無い場合は開かず、理由を出す。
+ */
 function openDiff(wt, path) {
-  const obj = [...panes.entries()].find(([id]) => id.startsWith('diff-'));
-  if (!obj || !state) return;
-  const [, o] = obj;
-  o.p.dataset.sel = path;
-  o.p.classList.remove('min');
-  const holder = o.body.querySelector('div > div:last-child');
-  if (holder) loadDiff(holder, state.base, wt.branch ?? wt.head, path);
+  if (!state) return;
+  const obj = panes.get(`diff-${wt.path}`);
+  if (!obj?.openIn) {
+    // 上限で表示していない worktree のファイルを押した場合
+    const first = [...panes.keys()].find(id => id.startsWith('diff-'));
+    const note = panes.get(first);
+    if (note?.holder) {
+      note.holder.replaceChildren(el('div', 'note warn',
+        `${wt.branch ?? wt.name} の差分ペインは表示されていません（上限 ${MAX_DIFF_PANES}）。`
+        + ' このファイルは開けません。'));
+    }
+    return;
+  }
+  obj.p.classList.remove('min');
+  obj.openIn(path);
 }
 
 /* ===== 読み込み ===== */

@@ -1053,8 +1053,8 @@ const server = createServer(async (req, res) => {
         }
         // ブラウザと unit テストで共有しているモジュール。
         // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
-        if (url.pathname === '/ndjson.mjs') {
-            const js = await readFile(join(HERE, 'ndjson.mjs'));
+        if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs') {
+            const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',
                 'cache-control': 'no-store',
