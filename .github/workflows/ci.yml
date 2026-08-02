@@ -14,7 +14,11 @@ jobs:
       fail-fast: false
       matrix:
         # Windows が主環境。Linux も回して差異を早く見つける。
-        os: [windows-2022, ubuntu-24.04]
+        # macOS を入れる理由: toNFC（NFD→NFC 正規化）と samePath の realpath は
+        # macOS 固有の挙動（os.tmpdir() の /var が実体 /private/var、
+        # 既定で大文字小文字を区別しない、HFS+/APFS が NFD でファイル名を返す）を
+        # 前提にしているのに、一度も実行されていなかった。
+        os: [windows-2022, ubuntu-24.04, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
