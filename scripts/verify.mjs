@@ -163,7 +163,7 @@ let failed = false;
 // 2. ユニットテスト
 {
     const r = await run(
-        ['--test', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs'],
+        ['--test', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs'],
         { timeout: 60_000 },
     );
     const s = summarizeTests(r.output);

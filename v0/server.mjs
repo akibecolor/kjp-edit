@@ -23,6 +23,7 @@ import {
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
+import { collectAgents, transcriptRoot } from './transcript.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -35,6 +36,12 @@ function parseArgs(argv) {
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
+        // 🔒 エージェントの活動観測。**リポジトリ外（~/.claude/projects/）を読む**ので
+        //    読み取り側の不変条件（git cat-file 経由のみ）を破る。だから別 capability。
+        //    さらに自由文（発話・コマンド行）は**もう一段別のフラグ**にする。
+        //    理由: --watch-agents だけなら「payload に自由文が1文字も無い」を
+        //    テストで固定できる。その不変条件が守りの背骨になる（docs/agent-observation.md）。
+        watchAgents: false, allowTranscriptText: false,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -61,6 +68,9 @@ function parseArgs(argv) {
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
         else if (a === '--token-file') opts.tokenFile = resolve(argv[++i]);
+        else if (a === '--watch-agents') opts.watchAgents = true;
+        // ⚠️ text は watch を含意させる（片方だけ指定して静かに無効、を作らない）
+        else if (a === '--allow-transcript-text') { opts.allowTranscriptText = true; opts.watchAgents = true; }
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
@@ -70,6 +80,8 @@ function parseArgs(argv) {
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
+            console.log('       --watch-agents       エージェントの活動を観測する（既定オフ。リポジトリ外を読む）');
+            console.log('       --allow-transcript-text  発話とコマンド行も出す（既定オフ。--watch-agents を含む）');
             console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
             process.exit(0);
         }
@@ -435,10 +447,27 @@ async function collectFresh() {
         });
     }
 
+    // 🔒 エージェントの活動観測。git の spawn は増やさない（fs のみ）。
+    //    既定では経路そのものが存在しない（agents は null のまま）。
+    let agents = null;
+    if (opts.watchAgents) {
+        const r = await collectAgents(
+            worktrees.filter(w => !w.bare && !w.prunable).map(w => ({ path: w.path, label: w.label })),
+            { allowText: opts.allowTranscriptText },
+        );
+        agents = r.agents;
+        errors.push(...r.errors);
+    }
+
     return {
         repo: cwd,
         base,
         generatedAt: new Date().toISOString(),
+        // エージェントの活動。--watch-agents が無ければ null（フィールドは残すが中身は無い）。
+        // ⚠️ 自由文が入るのは allowTranscriptText のときの text[] と recent[].command だけ。
+        //    抽出は許可リスト方式（v0/transcript.mjs）
+        agents,
+        agentsText: opts.allowTranscriptText,
         // 取り込み順序の提案。追加の git 呼び出しは0（衝突予測の結果だけを使う純ロジック）。
         // ⚠️ 仮説であって保証ではない。詳細は v0/mergeplan.mjs のコメント。
         mergePlan: planMerge(
@@ -811,6 +840,8 @@ const server = createServer(async (req, res) => {
             res.end(JSON.stringify({
                 allowWrite: opts.allowWrite,
                 allowExec: opts.allowExec,
+                watchAgents: opts.watchAgents,
+                allowTranscriptText: opts.allowTranscriptText,
                 tokenHeader: TOKEN_HEADER,
                 token: opts.allowWrite && sameOrigin ? opts.token : null,
             }));
@@ -1213,6 +1244,21 @@ server.listen(opts.port, '127.0.0.1', () => {
         console.log('   ブランチを切り替えられます。読み取りだけで良いなら外してください。');
     } else {
         console.log('読み取り専用（書き込みは --allow-write で有効化）');
+    }
+    // 🔒 読み取りの範囲を広げる変更なので、有効なときは必ず言う。
+    //    「いつリポジトリ外を読み始めたか」を後から思い出せない状態を作らない。
+    if (opts.watchAgents) {
+        console.log('');
+        console.log('⚠️ 活動観測 有効 (--watch-agents)。エージェントのセッション記録を読みます。');
+        console.log(`   読む場所: ${transcriptRoot()}（リポジトリの外）`);
+        if (opts.allowTranscriptText) {
+            console.log('🚨 発話とコマンド行も出します (--allow-transcript-text)。');
+            console.log('   トンネルに届く相手が、エージェントとの会話とコマンド行を読めます。');
+        } else {
+            console.log('   画面に出すのは状態・ツール名・パス・件数だけです（自由文は出しません）。');
+        }
+        console.log('   ツールの結果（読んだファイルの中身・コマンド出力）は');
+        console.log('   どちらのフラグでも出しません（docs/agent-observation.md の T5）。');
     }
     console.log('停止: Ctrl+C');
 });

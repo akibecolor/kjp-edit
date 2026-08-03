@@ -80,6 +80,72 @@ const MUTANTS = [
         testFile: 'v0/paths.test.mjs',
     },
     {
+        name: 'transcript-type-allowlist',
+        why: '走査するレコード種別の許可リストを外すと、'
+            + 'file-history-snapshot / attachment / last-prompt から自由文が漏れる',
+        file: 'v0/transcript.mjs',
+        from: '        if (!SCAN_TYPES.has(r.type)) continue;',
+        to: '        /* 変異: 種別の許可リストを外す */',
+        gone: 'SCAN_TYPES.has(r.type)',
+        pattern: '知らないレコード種別は',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-t5',
+        why: 'ツール結果と thinking を出す（読んだファイルの中身とコマンド出力が漏れる）',
+        // ⚠️ 現在の実装では冗長。ブロックの抽出も許可リストで、
+        //    `text` と `tool_use` 以外は素通りするので、この行を外しても漏れない。
+        //    それでも残す理由: **意図を明示する行**であり、将来 `text` の扱いを
+        //    一般化したときに最初に効く砦になる。冗長であることを記録しておく。
+        defensive: 'ブロックの抽出も許可リスト（text / tool_use のみ）なので現状は二重。意図の明示として残す',
+        file: 'v0/transcript.mjs',
+        from: "            if (b.type === 'tool_result' || b.type === 'thinking') continue;",
+        to: '            /* 変異: T5 の除外をやめる */',
+        gone: "b.type === 'tool_result'",
+        pattern: 'ツール結果と thinking は出さない',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-iso-strict',
+        why: 'timestamp の形の検証を Date.parse だけに戻すと自由文が通る'
+            + '（Date.parse は "INJECT-SECRET-12345" を西暦 12345 年として受け入れる）',
+        file: 'v0/transcript.mjs',
+        from: '    if (typeof v !== \'string\' || !ISO_RE.test(v)) return null;',
+        to: '    if (typeof v !== \'string\') return null;',
+        gone: 'ISO_RE.test(v)',
+        pattern: '壊れた timestamp は落とす',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-text-capability',
+        why: '--allow-transcript-text なしで発話が payload に載る',
+        file: 'v0/server.mjs',
+        from: '            { allowText: opts.allowTranscriptText },',
+        to: '            { allowText: true },',
+        gone: 'allowText: opts.allowTranscriptText',
+        pattern: '自由文は payload に1文字も入らない',
+    },
+    {
+        name: 'transcript-enum-value',
+        why: 'mode / ツール名をそのまま払い出すと、形式が変わったとき自由文が通る',
+        file: 'v0/transcript.mjs',
+        from: '    return typeof v === \'string\' && v.length <= max && /^[A-Za-z0-9_.:-]+$/.test(v) ? v : null;',
+        to: '    return typeof v === \'string\' ? v : null;',
+        gone: 'v.length <= max',
+        pattern: '列挙値として通らない形の mode',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-outside-repo',
+        why: 'リポジトリ外のパスをそのまま出す（他プロジェクトのパスが漏れる）',
+        file: 'v0/git.mjs',
+        from: '    if (!c.startsWith(`${p}/`)) return null;',
+        to: '    if (false) return null;',
+        gone: '!c.startsWith(',
+        pattern: 'リポジトリ外のパスは出さず',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
         name: 'literal-pathspecs',
         why: 'pathspec magic で1ファイル指定が全体になる',
         file: 'v0/git.mjs',

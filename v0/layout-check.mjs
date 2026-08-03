@@ -52,7 +52,8 @@ if (!browser) {
 
 // サーバを起動して URL を得る
 const server = spawn(process.execPath,
-    [SERVER, '--repo', repo, '--port', '0', '--layout-probe'],
+    // 活動観測のペインも狭い画面の検査対象に含める（記録が無くても行は出る）
+    [SERVER, '--repo', repo, '--port', '0', '--layout-probe', '--watch-agents'],
     { shell: false, windowsHide: true });
 server.stdout.setEncoding('utf8');
 server.stderr.setEncoding('utf8');

@@ -428,18 +428,43 @@ function normPath(s, resolveAncestor = false) {
 }
 
 /**
+ * `child` が `parent` の中なら**元の表記のまま**の相対パスを返す。
+ * parent 自身なら `''`、外なら `null`。
+ *
+ * ⚠️ **素の `path.relative()` で判定も計算もしない。** 表記が違うと
+ *    （8.3 短縮名 / symlink / 大文字小文字）`../../..` を返すので、
+ *    「中にあるファイルのパスを見失う」形で静かに壊れる。
+ * ⚠️ **正規化した文字列をそのまま返してはいけない。** normPath は
+ *    Windows / macOS で小文字化するが、**git のパスは大文字小文字を区別する**
+ *    （`v0/Git.mjs` と `v0/git.mjs` は別物）。小文字化したものを返すと
+ *    `git cat-file` が引けない。だから「要素数だけ正規形で決め、
+ *    値は元の表記から取る」。
+ */
+export function relativeInside(parent, child) {
+    if (typeof parent !== 'string' || typeof child !== 'string') return null;
+    if (parent === '' || child === '') return null;
+    const p = normPath(parent, true);
+    const c = normPath(child, true);
+    if (p === '' || c === '') return null;
+    if (c === p) return '';
+    if (!c.startsWith(`${p}/`)) return null;
+    const depth = c.slice(p.length + 1).split('/').length;
+    const isWin = process.platform === 'win32';
+    const orig = toNFC(child)
+        .replace(isWin ? /[\\/]+/g : /\/+/g, '/')
+        .replace(/\/+$/, '')
+        .split('/');
+    return orig.slice(Math.max(0, orig.length - depth)).join('/');
+}
+
+/**
  * `child` が `parent` の中（または parent 自身）か。
  *
- * ⚠️ **素の `path.relative()` で判定しない。** 実体が同じでも表記が違うと
- *    外れる。`--token-file` をリポジトリの外に強制するのに使っているので、
+ * ⚠️ `--token-file` をリポジトリの外に強制するのに使っているので、
  *    外れると**実行トークンがコミットされる**（漏洩事故になる）。
  */
 export function containsPath(parent, child) {
-    if (typeof parent !== 'string' || typeof child !== 'string') return false;
-    if (parent === '' || child === '') return false;
-    const p = normPath(parent, true);
-    const c = normPath(child, true);
-    return c === p || c.startsWith(`${p}/`);
+    return relativeInside(parent, child) !== null;
 }
 
 export function samePath(a, b) {

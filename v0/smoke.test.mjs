@@ -1159,6 +1159,168 @@ test('🔒 --exec-timeout に数値でない値を渡したら起動を拒否す
 });
 
 // ---------------------------------------------------------------------------
+// L2 エージェントの活動観測
+//
+// 🚨 この機能は「出してはいけないものを出さない」ことが本体なので、
+//    サーバ経路の端から端まで（記録ファイル → payload）で漏れないことを固定する。
+//    抽出ロジック単体のテストは v0/transcript.test.mjs。
+// ---------------------------------------------------------------------------
+
+const AGENT_SECRET = 'SMOKE-TRANSCRIPT-SECRET-98765';
+
+/**
+ * 偽の `~/.claude/projects/` を作る。
+ *
+ * ⚠️ `os.homedir()` は POSIX で `HOME`、Windows で `USERPROFILE` を見るので、
+ *    子プロセスの env を差し替えれば**オプションを増やさずに**隔離できる。
+ *    検査用の経路をサーバに足さないための選択（`--layout-probe` を
+ *    既定オフにしているのと同じ理屈）。
+ */
+async function fakeHome(cwdForRecords) {
+    const home = await mkdtemp(join(tmpdir(), 'kjp-home-'));
+    const dir = join(home, '.claude', 'projects', 'fake-project');
+    await mkdir(dir, { recursive: true });
+    const rows = [
+        { type: 'assistant', timestamp: new Date().toISOString(), sessionId: 'sm1', cwd: cwdForRecords,
+            message: { content: [{ type: 'text', text: `発話 ${AGENT_SECRET}` }] } },
+        { type: 'assistant', timestamp: new Date().toISOString(), sessionId: 'sm1', cwd: cwdForRecords,
+            message: { content: [{ type: 'thinking', thinking: `内心 ${AGENT_SECRET}` }] } },
+        { type: 'user', timestamp: new Date().toISOString(), sessionId: 'sm1', cwd: cwdForRecords,
+            toolUseResult: { stdout: AGENT_SECRET, stderr: '' },
+            message: { content: [{ type: 'tool_result', content: `出力 ${AGENT_SECRET}` }] } },
+        { type: 'file-history-snapshot', messageId: 'm1', snapshot: { 'shared.txt': AGENT_SECRET } },
+        { type: 'last-prompt', lastPrompt: AGENT_SECRET, sessionId: 'sm1' },
+        { type: 'assistant', timestamp: new Date().toISOString(), sessionId: 'sm1', cwd: cwdForRecords,
+            message: { content: [{ type: 'tool_use', name: 'Bash',
+                input: { command: `echo ${AGENT_SECRET}`, description: AGENT_SECRET } }] } },
+        { type: 'assistant', timestamp: new Date().toISOString(), sessionId: 'sm1', cwd: cwdForRecords,
+            message: { content: [{ type: 'tool_use', name: 'Edit',
+                input: { file_path: join(cwdForRecords, 'shared.txt'), new_string: AGENT_SECRET } }] } },
+    ];
+    await writeFile(join(dir, 'sm1.jsonl'), `${rows.map(r => JSON.stringify(r)).join('\n')}\n`, 'utf8');
+    // ⚠️ .jsonl 以外は開かないことの確認材料
+    await writeFile(join(dir, 'notes.txt'), AGENT_SECRET, 'utf8');
+    return home;
+}
+
+/** 偽 home を持たせたサーバを起動して payload を取る */
+async function stateWithFakeHome(extraArgs, home) {
+    const child = spawn(process.execPath, [SERVER, '--repo', repo, '--port', '0', ...extraArgs], {
+        shell: false, windowsHide: true,
+        env: {
+            ...process.env, ...isolatedConfig(),
+            HOME: home, USERPROFILE: home,
+        },
+    });
+    child.stdout.setEncoding('utf8');
+    let banner = '';
+    try {
+        const url = await Promise.race([
+            new Promise((res, rej) => {
+                child.stdout.on('data', d => {
+                    banner += d;
+                    const m = banner.match(/http:\/\/127\.0\.0\.1:\d+/);
+                    if (m) res(m[0]);
+                });
+                child.on('error', rej);
+            }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error(`起動しなかった: ${banner}`)), 20000)),
+        ]);
+        const body = await (await fetch(`${url}/api/v0/state?fresh=1`)).text();
+        return { body, json: JSON.parse(body), banner };
+    } finally {
+        child.kill();
+    }
+}
+
+test('--watch-agents なしでは活動観測の経路が存在しない', async () => {
+    const home = await fakeHome(repo);
+    try {
+        const { json, body } = await stateWithFakeHome([], home);
+        assert.equal(json.agents, null, '経路が無いのに agents が入っている');
+        assert.equal(json.agentsText, false);
+        assert.ok(!body.includes(AGENT_SECRET));
+    } finally {
+        await rm(home, { recursive: true, force: true });
+    }
+});
+
+test('🚨 --watch-agents: 活動は見えるが自由文は payload に1文字も入らない', async () => {
+    const home = await fakeHome(repo);
+    try {
+        const { json, body, banner } = await stateWithFakeHome(['--watch-agents'], home);
+        // 起動時に必ず告知する（いつリポジトリ外を読み始めたか分かるように）
+        assert.match(banner, /活動観測 有効/);
+        assert.match(banner, /リポジトリの外/);
+        assert.ok(json.agents.length >= 1, 'agents が空');
+        // worktree に紐づいていること（path と name が payload の worktree と一致する）
+        const wtPaths = new Set(json.worktrees.map(w => w.path));
+        for (const a of json.agents) {
+            assert.ok(wtPaths.has(a.path), `agents の要素が worktree に紐づいていない: ${a.path}`);
+        }
+        const main = json.agents.find(a => (a.toolCounts?.Bash ?? 0) > 0);
+        assert.ok(main, `活動が対応付けられていない: ${JSON.stringify(json.agents)}`);
+        assert.equal(main.toolCounts.Bash, 1);
+        assert.equal(main.toolCounts.Edit, 1);
+        assert.equal(main.state, 'active');
+        assert.ok(main.talk >= 1, '発話の件数は数える');
+        assert.deepEqual(main.text, [], '本文は入れない');
+        // 🚨 これが本体
+        assert.ok(!body.includes(AGENT_SECRET),
+            `自由文が payload に漏れている:\n${body.slice(0, 800)}`);
+        // パスは出す（差分と同じ情報なので新しく漏れるものではない）
+        assert.ok(main.recent.some(r => r.path === 'shared.txt'),
+            `パスが出ていない: ${JSON.stringify(main.recent)}`);
+    } finally {
+        await rm(home, { recursive: true, force: true });
+    }
+});
+
+test('🚨 --allow-transcript-text でも T5（ツール結果・thinking）は出さない', async () => {
+    const home = await fakeHome(repo);
+    try {
+        const { json, body, banner } = await stateWithFakeHome(['--allow-transcript-text'], home);
+        assert.match(banner, /発話とコマンド行も出します/);
+        assert.equal(json.agentsText, true);
+        const main = json.agents.find(a => (a.toolCounts?.Bash ?? 0) > 0);
+        // 出て良いのは text（発話1件）と Bash の command だけ = 2箇所
+        const hits = body.split(AGENT_SECRET).length - 1;
+        assert.equal(hits, 2, `漏れているものがある（期待 2 箇所、実際 ${hits}）`);
+        assert.equal(main.text.length, 1);
+        assert.equal(main.recent.find(r => r.tool === 'Bash').command, `echo ${AGENT_SECRET}`);
+        // Edit の new_string は出さない
+        assert.equal(main.recent.find(r => r.tool === 'Edit').command, undefined);
+    } finally {
+        await rm(home, { recursive: true, force: true });
+    }
+});
+
+test('活動観測は git の起動回数を増やさない（fs だけで読む）', async () => {
+    const home = await fakeHome(repo);
+    try {
+        const off = await stateWithFakeHome([], home);
+        const on = await stateWithFakeHome(['--watch-agents'], home);
+        assert.equal(on.json.stats.gitSpawns, off.json.stats.gitSpawns,
+            '活動観測で git の起動が増えている');
+    } finally {
+        await rm(home, { recursive: true, force: true });
+    }
+});
+
+test('記録の場所が無ければ理由を errors に出し、観測は無効にしない', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'kjp-nohome-'));
+    try {
+        const { json } = await stateWithFakeHome(['--watch-agents'], home);
+        assert.deepEqual(json.agents, []);
+        const e = (json.errors ?? []).find(x => x.scope === 'agents');
+        assert.ok(e, `理由が出ていない: ${JSON.stringify(json.errors)}`);
+        assert.match(e.message, /読めません/);
+    } finally {
+        await rm(home, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
 // L1 運用（毎日使うための足回り）
 // ---------------------------------------------------------------------------
 

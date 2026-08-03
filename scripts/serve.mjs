@@ -48,6 +48,8 @@ if (has('--help') || has('-h')) {
   --write        checkout を有効にする
   --exec         任意コマンドの実行も有効にする（🚨 遠隔コード実行になる）
   --allow-host   トンネル経由のホスト名を許可する（既定はループバックのみ）
+  --watch        エージェントの活動を観測する（リポジトリ外の記録を読む）
+  --agents-text  発話とコマンド行も出す（--watch を含む。トンネル越しに読まれます）
 
   状態は ${STATE_DIR} に置く（トークン・実行の監査ログ）。`);
     process.exit(0);
@@ -173,6 +175,10 @@ if (wantExec) {
 for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--allow-host') args.push('--allow-host', argv[i + 1] ?? '');
 }
+// 🔒 活動観測は読み取りの範囲を広げる（リポジトリ外を読む）ので、
+//    書き込み・実行とは別に明示させる。既定では付けない。
+if (has('--agents-text')) args.push('--allow-transcript-text');
+else if (has('--watch')) args.push('--watch-agents');
 
 // ---- 起動 ----
 const child = spawn(process.execPath, args, {

@@ -153,7 +153,10 @@
   @media (prefers-color-scheme: light) {
     .diff .add { color: #0a7a5e; } .diff .del { color: #b3261e; }
   }
-  .note { color: var(--dim); padding: .5rem; font-size: 11px; }
+  /* ⚠️ overflow-wrap が無いと `--allow-transcript-text` のような長い語で
+     行が箱より広くなり、狭い画面で**注意書き自体が読めなくなる**（実測）。
+     省略の告知が読めないのは、告知が無いのと同じ。 */
+  .note { color: var(--dim); padding: .5rem; font-size: 11px; overflow-wrap: anywhere; }
   .note.warn { color: var(--warn); }
 
   /* コンソール */
@@ -695,6 +698,109 @@ function wtTags(wt) {
   return tags;
 }
 
+/**
+ * エージェントの活動。
+ *
+ * ⚠️ **`--watch-agents` が無いときはペインを作らない。** 空の枠を出すと
+ *    「観測しているのに何も出ていない（=止まっている）」と読めてしまう。
+ *    無効なときは「機能が無効」であることを1行で言う（黙って消えない）。
+ * ⚠️ 出せるのはサーバが払い出したものだけ。自由文は
+ *    --allow-transcript-text のときだけ text[] と recent[].command に入る
+ *    （抽出は許可リスト方式。v0/transcript.mjs）。
+ */
+function renderAgents(s) {
+  if (!s.agents) {
+    dropPanes('agents', new Set());
+    return;
+  }
+  const live = s.agents.filter(a => a.state === 'active').length;
+  const tags = live ? [['', `稼働 ${live}`]] : [['', '稼働なし']];
+  // ⚠️ 見出しは短くする。左カラムは狭く、`text-overflow: ellipsis` で
+  //    「エージェントの活…」になって読めなかった（実測）
+  const p = ensurePane($('#left'), 'agents', 'エージェント', tags);
+  const box = el('div');
+  box.style.padding = '.4rem';
+  const wtByPath = new Map(s.worktrees.map(w => [w.path, w]));
+  for (const a of s.agents) {
+    // ⚠️ 差分として開けるのは base との差分にあるファイルだけ。
+    //    「触った」と「差分がある」は別なので、開けないパスをリンクにしない
+    //    （押しても何も起きない、という行き止まりを作らない）
+    const wt = wtByPath.get(a.path);
+    const openable = new Set((wt?.files ?? []).map(f => f.path));
+    const d = el('div', 'ab');
+    d.style.margin = '.25rem 0';
+    const head = el('div');
+    head.append(el('b', null, a.name));
+    const label = { active: '稼働中', idle: '待機', stale: '古い記録', none: '記録なし' }[a.state] ?? a.state;
+    head.append(el('span', `tag ${a.state === 'active' ? 'br' : ''}`, label));
+    // ⚠️ 経過時間を必ず添える。「待機」だけでは 1分と3日を区別できない
+    // ⚠️ 経過時間・権限・サブは1つの span にまとめる。別々にすると
+    //    狭い画面で「/ 権限」と「auto」が別行に割れて読めなくなる（実測）
+    const meta = [
+      a.lastActivityAt ? when(a.lastActivityAt) : null,
+      a.permissionMode ? `権限 ${a.permissionMode}` : null,
+      a.sidechains ? `サブ ${a.sidechains}` : null,
+    ].filter(Boolean);
+    if (meta.length) head.append(el('span', 'note', ` ${meta.join(' / ')}`));
+    d.append(head);
+    if (a.state === 'none') {
+      d.append(el('div', 'note', 'この worktree でエージェントを走らせた記録がありません。'));
+      box.append(d);
+      continue;
+    }
+    const counts = Object.entries(a.toolCounts ?? {});
+    if (counts.length) {
+      d.append(el('div', 'note',
+        counts.map(([k, v]) => `${k} ${v}`).join(' · ')
+        + (a.talk ? ` · 発話 ${a.talk}` : '')));
+    }
+    // ⚠️ 連続する同じ内容を畳む。`Bash` を5行並べても情報量は1行ぶんで、
+    //    そのぶん**古い活動が押し出されて見えなくなる**（実測でそうなった）
+    const runs = [];
+    for (const r of a.recent ?? []) {
+      const last = runs[runs.length - 1];
+      if (last && last.tool === r.tool && last.path === r.path
+          && last.outside === r.outside && last.command === r.command) {
+        last.n++;
+        continue;
+      }
+      runs.push({ ...r, n: 1 });
+    }
+    for (const r of runs.slice(0, 6)) {
+      const line = el('div', 'ab');
+      line.style.margin = '0';
+      const what = r.path ?? (r.outside ? '(リポジトリ外)' : '');
+      line.append(el('span', 'tag', r.n > 1 ? `${r.tool} ×${r.n}` : r.tool));
+      if (what) {
+        if (r.path && wt && openable.has(r.path)) {
+          const link = el('span', 'f');
+          link.textContent = r.path;
+          link.style.display = 'inline';
+          link.addEventListener('click', () => openDiff(wt, r.path));
+          line.append(link);
+        } else line.append(el('span', 'note', what));
+      }
+      if (r.sidechain) line.append(el('span', 'note', ' (サブ)'));
+      if (r.command) line.append(el('div', 'note', `$ ${r.command}`));
+      d.append(line);
+    }
+    for (const t of a.text ?? []) {
+      const q = el('div', 'note');
+      q.textContent = `${t.role === 'assistant' ? '◂' : '▸'} ${t.text}`;
+      d.append(q);
+    }
+    if (a.tailOnly) d.append(el('div', 'note', `⚠ 記録の末尾 ${Math.round((a.bytesRead ?? 0) / 1024)}KB だけを読んでいます`));
+    box.append(d);
+  }
+  // ⚠️ 何を出していないかは必ず言う（黙って省略しない）。ただし1行は短く保つ
+  box.append(el('div', 'note', s.agentsText
+    ? '発話とコマンド行を出しています。'
+    : '発話とコマンド行は出していません。'));
+  box.append(el('div', 'note',
+    'ツールの結果（読んだファイルの中身・コマンド出力）は出しません。'));
+  p.body.replaceChildren(box);
+}
+
 function render(s) {
   state = s;
   $('#repo').textContent = `${s.repo}   base: ${s.base}`;
@@ -804,6 +910,8 @@ function render(s) {
       + ' rename と delete の組み合わせは別パスでも衝突しうるので、これは完全な検出ではありません。'));
   }
   cPane.body.replaceChildren(cBox);
+
+  renderAgents(s);
 
   const filer = ensurePane($('#left'), 'filer', 'ファイラ（変更ファイル）', []);
   const tree = el('div', 'tree');

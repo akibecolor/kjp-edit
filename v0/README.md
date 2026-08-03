@@ -7,6 +7,7 @@
 
 ```bash
 node scripts/serve.mjs                # ← 普段はこれ（手順は docs/daily-use.md）
+node scripts/serve.mjs --watch        # + エージェントの活動を観測する
 node scripts/serve.mjs --status       # 動いているものを一覧 / --stop で止める
 node scripts/autostart.mjs install    # ログオン時に自動起動（既定は読み取り専用）
 ```
@@ -54,6 +55,7 @@ node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
 | **🔍 衝突予測** | 候補ペアを `git merge-tree` で**実際にマージしてみて**衝突するかを出す。作業ツリーには触らない |
 | **取り込み順序の提案** | 衝突グラフの独立集合を貪欲に取る。**追加の git 呼び出しは0、AI も使わない**。仮説であって保証ではない |
 | **🚨 警告** | シーケンサ乗っ取りと `MERGE_HEAD` の消失リスク |
+| **エージェントの活動**（`--watch-agents`） | 稼働中 / 待機 / 記録なし、直近のツールと触ったパス、件数。**既定オフ**（リポジトリ外の記録を読むため） |
 
 ## シーケンサ乗っ取りとは
 
@@ -198,6 +200,33 @@ node v0/server.mjs --allow-exec --token "$TOKEN"
 |---|---|
 | `--allow-exec` | 既定オフ。**24文字以上の `--token` か `--token-file` が無いと起動しません**（有効化を必ず意識的な操作にするため） |
 | `--token-file` | 無ければ 0600 で生成し、あれば読む（再起動でトークンが変わらない）。**リポジトリの中を指すと起動を拒否します**（コミットされるため）。`scripts/serve.mjs --exec` は `~/.kjp-edit/token` を自動で渡します |
+
+### エージェントの活動観測（既定オフ、書き込み・実行とも別の capability）
+
+```bash
+node v0/server.mjs --watch-agents            # 状態・ツール名・パス・件数
+node v0/server.mjs --allow-transcript-text   # + 発話とコマンド行
+```
+
+Claude Code のセッション記録（`~/.claude/projects/`）を読みます。
+**これは読み取りの範囲を広げる変更**（`git cat-file` 経由のみ、という
+不変条件を破る）なので、`--allow-write` に相乗りさせず別のフラグにしています。
+
+| | |
+|---|---|
+| 読む場所 | `~/.claude/projects/` のみ。`.jsonl` 以外は開かない |
+| 読む量 | 最新1本の**末尾 256KB だけ**（実測で 24MB の記録があった） |
+| git の起動 | **増えません**（fs だけ。スモークテストで固定） |
+| 既定で出るもの | 状態・経過時間・ツール名・件数・**worktree 相対のパス**・`permissionMode` |
+| `--allow-transcript-text` で増えるもの | 発話（切り詰め）と `Bash` / `PowerShell` のコマンド行 |
+| **どちらでも出さないもの** | **ツールの結果**（読んだファイルの中身・コマンド出力）、`thinking`、`Edit`/`Write` の内容、`message` 外の自由文 |
+
+🚨 **抽出は許可リスト方式です。** ツールの結果には入口が5つあり
+（`tool_result` / `toolUseResult` / `file-history-snapshot` /
+`file-history-delta` / `attachment`）、形式は Claude Code の内部形式なので
+フィールドは増えます。除外方式だと増えた瞬間に黙って漏れます。
+判断の経緯と T5 を開けるための条件は
+[../docs/agent-observation.md](../docs/agent-observation.md)。
 | cwd | 既知の worktree のみ |
 | shell | 使いません（`argv` 配列で受けます） |
 | 監査 | `<GIT_DIR>/kjp-exec-audit.jsonl` に start / exit を追記 |
