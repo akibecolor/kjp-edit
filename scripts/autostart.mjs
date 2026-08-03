@@ -73,7 +73,9 @@ if (cmd === 'status') {
     }
     const caps = [/--exec/.test(v) && '実行', /--write/.test(v) && '書き込み']
         .filter(Boolean).join('+') || '読み取り専用';
-    console.log(`登録されています（ログオン時 / ${caps}）`);
+    const host = /--allow-host\s+(\S+)/.exec(v)?.[1];
+    console.log(`登録されています（ログオン時 / ${caps}`
+        + `${host ? ` / Host 許可: ${host}` : ''}）`);
     console.log(`  中身: ${v}`);
     console.log('  解除するには: node scripts/autostart.mjs uninstall');
     process.exit(0);
@@ -102,6 +104,20 @@ if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
 const serveArgs = ['--repo', repo, '--port', port];
 if (has('--exec')) serveArgs.push('--exec');
 else if (has('--write')) serveArgs.push('--write');
+// ⚠️ トンネル用のホスト名も引き継ぐ。これが無いと**再起動後だけ 403 になる**
+//    （手元では気付かず、スマホから見たときに初めて分かる形の壊れ方をする）。
+//    許可は明示的なオプトインのままにする（既定はループバックのみ）。
+for (let i = 0; i < argv.length; i++) {
+    if (argv[i] !== '--allow-host') continue;
+    const h = argv[i + 1];
+    // ホスト名として妥当なものだけ。Run キーの値は1つの文字列なので、
+    // 空白や引用符を混ぜられると別の引数に化ける
+    if (!h || !/^[A-Za-z0-9._-]+$/.test(h)) {
+        console.error(`\n✖ --allow-host にはホスト名を指定してください（受け取った値: ${h ?? '(無し)'}）\n`);
+        process.exit(1);
+    }
+    serveArgs.push('--allow-host', h);
+}
 
 // Run キーの値は1つの文字列。空白を含むパスをクォートする。
 const value = [process.execPath, SERVE, ...serveArgs]

@@ -46,12 +46,22 @@ node scripts/serve.mjs --stop       # 止める
 
 ```bash
 node scripts/autostart.mjs status
-node scripts/autostart.mjs install --repo C:/Users/akico/Documents/kjp-editor
+node scripts/autostart.mjs install --repo C:/Users/akico/Documents/kjp-editor \
+    --allow-host fractal2.tail73c198.ts.net
 node scripts/autostart.mjs uninstall
 ```
 
 **既定は読み取り専用で登録する。** `--write` / `--exec` を明示しない限り
 capability は付けない（ログオンのたびに立ち上がるものに黙って権限を持たせない）。
+
+⚠️ **`--allow-host` を渡し忘れると「再起動後だけ 403」になる。**
+手元のループバックでは正常に見えるので気付けず、**スマホから見たときに初めて
+分かる形で壊れる**。登録内容は `status` で確認できる（`Host 許可: …` が出る）。
+
+登録した文字列が Windows に実行されたときに本当に効くかは実測した
+（`CreateProcess` と同じ解釈で起動し、ループバック 200 /
+許可した Host 200 / 無関係な Host 403）。**`cmd /c` で試すと Node の
+引数クォートが二重にかかって別物になる**ので、そこで判定しないこと。
 
 ⚠️ **`schtasks /SC ONLOGON` は使えない。** 管理者権限を要求され
 「アクセスが拒否されました」で失敗する（実測）。代わりに **HKCU の Run キー**を使う
@@ -67,34 +77,61 @@ Windows 以外は未対応（手順だけ出す）。
 
 ## 別端末（スマホ）から見る
 
-**⚠️ この節は実機で未検証。** 私（アシスタント）の環境からはあなたのスマホに
-届かないので、ここだけは手を動かしてもらう必要がある。
+**実機（Android / Chrome）で確認済み。** この環境の実値:
+
+| | |
+|---|---|
+| tailnet | `tail73c198.ts.net`（aki.color@gmail.com） |
+| 母艦 | `fractal2.tail73c198.ts.net` / 100.73.18.61 |
+| 開くアドレス | `https://fractal2.tail73c198.ts.net/` |
 
 ### 手順
 
-1. 母艦とスマホの両方に Tailscale を入れてログインする（同じ Tailnet に入れる）
+1. 母艦とスマホの**両方に Tailscale アプリ**を入れ、**同じアカウント**でログインする
 2. 母艦で:
 
 ```bash
 tailscale serve --bg 7749
-tailscale status            # 母艦のホスト名（box.xxxx.ts.net）を確認
+tailscale serve status      # ← 開くべき https URL がそのまま出る（一番確実）
 ```
 
 3. **そのホスト名を明示的に許可して起動し直す**:
 
 ```bash
-node scripts/serve.mjs --allow-host box.xxxx.ts.net
+node scripts/serve.mjs --allow-host fractal2.tail73c198.ts.net
 ```
 
-4. スマホのブラウザで `https://box.xxxx.ts.net/` を開く
+4. スマホのブラウザでそのアドレスを開く
 
-### 確認してほしいこと
+### つまずいた点（実際に踏んだ）
 
-- [ ] 開ける（403 にならない）
-- [ ] worktree カードとグラフが出る
-- [ ] `⌂ <worktree名>` のバッジが読める（潰れていない）
-- [ ] 横スクロールが出ない
-- [ ] 折り畳みの開閉が指で操作できる
+- **`tailscale serve` は tailnet 側で機能を有効化しないと動かない。**
+  `Serve is not enabled on your tailnet` と有効化 URL を出して**待ち続ける**
+  （プロセスが残るので、有効化してから実行し直す）
+- 🚨 **ブラウザで Tailscale の Web にログインしても、その端末は tailnet に参加しない。**
+  管理コンソールを操作できるだけ。**アプリを入れて接続トグルを ON** にしないと
+  `*.ts.net` は名前解決すらできない（`serve` は tailnet only）。
+  「有効化ページは開けたのにアプリで見れない」で1往復した。
+  参加できているかは母艦の `tailscale status` の peer で確認する
+- **アカウントが違うと別の tailnet になる。** 同じ tailnet に入らない
+
+### 確認したこと（実機）
+
+- [x] 開ける（403 にならない）
+- [x] worktree カード3枚とグラフ（48 commits）が出る
+- [x] `⌂ kjp-editor` のバッジと `main` / `agent-a` / `agent-b` が読める
+- [x] 横スクロールが出ない（長い件名は `…` で切れる）
+- [x] 折り畳みの開閉が指で操作できる
+
+母艦側からは経路そのものも実測した:
+
+| | |
+|---|---|
+| ループバック | 200 |
+| 許可した Host | 200 |
+| 🔒 無関係な Host（`attacker.example.com`） | **403** |
+| 🔒 許可 Host に前置き（`evil-fractal2.…`） | **403** |
+| 実トンネル越し `https://fractal2.tail73c198.ts.net` | 200 |
 
 ### なぜ `--allow-host` が必要か
 
