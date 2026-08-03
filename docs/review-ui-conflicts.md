@@ -136,22 +136,33 @@ BLOCKING 3 と合わせて「固まって止められない → タブを閉じ�
 
 ---
 
-## 残っている弱点（未対応・記録のみ）
+## 残っている弱点
 
-- **`--name-only` の衝突パスに合成パスが混ざる**（`link~fileB`, `thing~dirA`）。
-  `/api/v0/diff` にも `blob` にも存在しないので UI から開けない
-- **submodule は false positive**（merge-tree はチェックアウトしていない submodule を
-  判断できず衝突扱いにする）。stderr の hint を捨てているので「分からない」が
-  「衝突する」として出る
-- `--repo` にサブディレクトリを渡すと `conflicts[].files` が cwd 相対（`../shared.txt`）になり、
-  `overlaps[].path`（リポジトリルート相対）と基準が違う
+**issue で追っている**（ここに内容を二重管理しない）:
+
+| | issue |
+|---|---|
+| `--name-only` の衝突パスに合成パスが混ざる（`link~fileB`, `thing~dirA`）。`/api/v0/diff` にも `blob` にも存在しないので UI から開けない | [#1](https://github.com/akibecolor/kjp-edit/issues/1) |
+| **submodule は false positive**（merge-tree はチェックアウトしていない submodule を判断できず衝突扱いにする）。stderr の hint を捨てているので「分からない」が「衝突する」として出る | [#2](https://github.com/akibecolor/kjp-edit/issues/2) |
+| **`docs/performance.md` はサーバ側の収集しか測っていない。** クライアント描画の線が無い（BLOCKING 4 はどのテストにも掛からなかった） | [#3](https://github.com/akibecolor/kjp-edit/issues/3) |
+| ファイラのラベルが実体と合っていない（並べているのは `base...HEAD` の**コミット済み**差分だが、カードの「変更 N・未追跡 N」は未コミット） | [#4](https://github.com/akibecolor/kjp-edit/issues/4) |
+
+### 仕様として許容（直さない）
+
 - **貪欲は最大独立集合ではない**（n=3〜6 の全 33864 グラフで検証: 不変条件違反 0、
-  最大より小さいケース 1585、差は常に1本）。仕様として許容だが、
-  そもそも実測で辺の 87% が未知なので最適性を論じる意味は薄い
-- **`docs/performance.md` はサーバ側の収集しか測っていない。** クライアント描画の線が無い
-  （BLOCKING 4 はどのテストにも掛からなかった）
-- ファイラのラベルが実体と合っていない（並べているのは `base...HEAD` の**コミット済み**差分だが、
-  カードの「変更 N・未追跡 N」は未コミット）
+  最大より小さいケース 1585、差は常に1本）。そもそも実測で辺の 87% が未知なので
+  最適性を論じる意味は薄い
+
+### 解決済み
+
+- ~~`--repo` にサブディレクトリを渡すと `conflicts[].files` が cwd 相対（`../shared.txt`）になり、
+  `overlaps[].path`（リポジトリルート相対）と基準が違う~~
+  → **L1 で修正**（`--repo` を `rev-parse --show-toplevel` でリポジトリのルートに正規化）。
+  スモークテストで「衝突パスが `..` で始まらないこと」を固定した
+
+⚠️ **解決済みを残したままにしない。** 直った項目が混ざっていると、
+残りの項目も信用できなくなる（このリポジトリは「主張ではなく証拠を示す」方針なので、
+記録の鮮度は守りの一部）。
 
 ---
 

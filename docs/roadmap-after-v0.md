@@ -19,17 +19,36 @@
 
 ## ローンチ前（これが揃えばローンチ）
 
-| | 内容 | 規模 |
+**進行中の課題は GitHub issue で追う。**
+この表は「どの塊が終わったか」だけを持つ（個別の内容を二重管理しない）。
+
+| | 内容 | 状態 |
 |---|---|---|
-| **L1 運用** | 自動起動 / ポート衝突とリポジトリ選択を扱うランチャ / トークンの永続化 / **実機のスマホからトンネル越しに確認**（未実施） | 半日 |
-| **L2 エージェント活動の観測** | セッション記録の読み取り。設計は `docs/agent-observation.md`。**「N 個を1画面で見る」の最後の欠け** | 1日 |
-| **L3 残っている弱点** | 合成パス（`thing~dirA`）が開けない / submodule の false positive / クライアント描画の性能線が無い / ファイラのラベルが実体と合っていない | 半日 |
+| **L1 運用** | ランチャ（`scripts/serve.mjs`）/ 自動起動（`scripts/autostart.mjs`）/ トークンの永続化 / スマホ実機での確認 | **完了**（`docs/daily-use.md`。実機確認済み） |
+| **L2 エージェント活動の観測** | セッション記録の読み取り。`--watch-agents` / `--allow-transcript-text` | **完了**（`docs/agent-observation.md`） |
+| **L3 残っている弱点** | [#1](https://github.com/akibecolor/kjp-edit/issues/1) 合成パス / [#2](https://github.com/akibecolor/kjp-edit/issues/2) submodule の false positive / [#3](https://github.com/akibecolor/kjp-edit/issues/3) クライアント描画の性能線 / [#4](https://github.com/akibecolor/kjp-edit/issues/4) ファイラのラベル | 未着手 |
+| **ローンチ判定** | [#5](https://github.com/akibecolor/kjp-edit/issues/5) 数日使って「自分はこれを実際に見るか」に答える | 観察中 |
 
 ---
 
 ## ローンチ後（後回し。**不要ではない**）
 
 優先度の低い順ではなく、**着手条件つき**で並べる。
+それぞれ issue にしてある（着手条件を issue 側に書いた）:
+
+| | issue |
+|---|---|
+| 未追跡ファイル（`.env`）の編集 | [#11](https://github.com/akibecolor/kjp-edit/issues/11) |
+| ビューア | [#12](https://github.com/akibecolor/kjp-edit/issues/12) |
+| checkout 以外の git 操作 | [#13](https://github.com/akibecolor/kjp-edit/issues/13) |
+| PTY | [#14](https://github.com/akibecolor/kjp-edit/issues/14) |
+| Theia に進むか | [#15](https://github.com/akibecolor/kjp-edit/issues/15) |
+
+その他: [#6](https://github.com/akibecolor/kjp-edit/issues/6) T5 を出せるようにする前提（認可）、
+[#7](https://github.com/akibecolor/kjp-edit/issues/7) 自動起動が観測フラグを引き継がない、
+[#8](https://github.com/akibecolor/kjp-edit/issues/8) 自動起動の macOS / Linux 対応、
+[#9](https://github.com/akibecolor/kjp-edit/issues/9) 待機の理由が記録から読めるか、
+[#10](https://github.com/akibecolor/kjp-edit/issues/10) `isSidechain` の未確認。
 
 ### エディタの編集機能
 
