@@ -191,6 +191,17 @@ const MUTANTS = [
         pattern: '併用は起動を拒否する',
     },
     {
+        name: 'auth-cookie-is-exec-token',
+        why: 'Cookie に実行トークンをそのまま入れる。'
+            + 'Cookie はポートで分離されないので、同じブラウザで開いた他のローカル'
+            + 'サービスに実行トークンが渡り、任意コマンドを実行できる',
+        file: 'v0/server.mjs',
+        from: '    return secretMatches(readCookie(req, AUTH_COOKIE), cookieSecret())',
+        to: '    return tokenMatches(readCookie(req, AUTH_COOKIE))',
+        gone: 'secretMatches(readCookie(req, AUTH_COOKIE)',
+        pattern: 'Cookie の値は実行トークンと別で',
+    },
+    {
         name: 'auth-cookie-samesite',
         why: 'Cookie の SameSite / HttpOnly を外す（CSRF と JS からの読み取りに開く）',
         file: 'v0/server.mjs',

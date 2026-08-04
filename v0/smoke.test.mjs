@@ -1683,12 +1683,84 @@ test('🔒 --require-auth: トークンが無い / 違うと 401、Cookie とヘ
         assert.equal((await authGet(s.port, '/api/v0/state',
             { 'x-kjp-token': 'wrong-value-0123456789abc' })).code, 401, '誤ったトークンが通った');
         assert.equal((await authGet(s.port, '/api/v0/state', { 'x-kjp-token': token })).code, 200);
-        assert.equal((await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${token}` })).code, 200);
+
+        // 🚨 **Cookie には生のトークンを入れない**（ポート分離が無いので
+        //    他のローカルサービスに渡る）。ブートストラップが焼いた値だけが通る
+        const raw = await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${token}` });
+        assert.equal(raw.code, 401, 'Cookie に生のトークンを入れて通ってしまった');
+        const baked = /kjp_auth=([^;]+)/.exec((await authGet(s.port, `/?token=${token}`)).setCookie)?.[1];
+        assert.ok(baked, 'Cookie が焼かれていない');
+        assert.equal((await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${baked}` })).code, 200,
+            '焼かれた Cookie で読めない');
 
         // 401 の本文でトークンの手掛かりを与えない
         const deny = await authGet(s.port, '/api/v0/state');
         assert.ok(!deny.body.includes(token), '401 の本文にトークンが混ざっている');
     } finally { s.child.kill(); }
+});
+
+// 🚨 Cookie はポートで分離されない（RFC 6265）。127.0.0.1 に焼いた Cookie は
+//    127.0.0.1 の**他のポート全部**に送られるので、同じブラウザで別のローカル
+//    サーバを開くとその中身が渡る。**実行トークンをそこに入れていた**ので、
+//    受け取った相手は X-Kjp-Token に詰めるだけで任意コマンドを実行できた。
+test('🚨 Cookie の値は実行トークンと別で、実行には使えない', async () => {
+    const s = await startAuthServer(['--require-auth', '--allow-exec', '--token', EXEC_TOKEN]);
+    try {
+        const boot = await authGet(s.port, '/?token=' + EXEC_TOKEN);
+        assert.equal(boot.code, 302);
+        const cookieVal = /kjp_auth=([^;]+)/.exec(boot.setCookie)?.[1];
+        assert.ok(cookieVal, 'Cookie が焼かれていない');
+        assert.notEqual(decodeURIComponent(cookieVal), EXEC_TOKEN,
+            'Cookie に実行トークンがそのまま入っている（他のローカルサービスに渡る）');
+
+        // Cookie では読み取りは通る
+        assert.equal((await authGet(s.port, '/api/v0/state',
+            { cookie: 'kjp_auth=' + cookieVal })).code, 200, 'Cookie で読めない');
+
+        // 🚨 攻撃の実際の形: 他のローカルサービスは **Cookie を受け取っている**ので、
+        //    Cookie と「Cookie の値をヘッダに詰めたもの」の両方を送れる。
+        //    入口の認証は Cookie で通るが、**実行の関門で止まらなければならない。**
+        const asHeader = await fetch('http://127.0.0.1:' + s.port + '/api/v0/exec', {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                cookie: 'kjp_auth=' + cookieVal,
+                'x-kjp-token': decodeURIComponent(cookieVal),
+            },
+            body: JSON.stringify({ worktree: repo, argv: ['git', 'status'] }),
+        });
+        assert.equal(asHeader.status, 403,
+            `Cookie の値で実行できてしまった（分離できていない）: ${asHeader.status}`);
+        // Cookie を持っていない相手は入口で 401（こちらも通してはいけない）
+        const noCookie = await fetch('http://127.0.0.1:' + s.port + '/api/v0/exec', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': decodeURIComponent(cookieVal) },
+            body: JSON.stringify({ worktree: repo, argv: ['git', 'status'] }),
+        });
+        assert.equal(noCookie.status, 401);
+
+        // 🚨 /api/v0/session も Cookie だけでは実行トークンを渡さない…わけではない。
+        //    ここは「認証済みなら渡す」で正しい（同一オリジンのブラウザに渡すため）。
+        //    ただし**他のローカルサービスは Cookie を持っていても Sec-Fetch-Site を
+        //    偽装できるので**、ここが渡すことは受け入れたリスクとして記録する。
+        const sess = await authGet(s.port, '/api/v0/session', { cookie: 'kjp_auth=' + cookieVal });
+        assert.equal(sess.code, 200);
+    } finally { s.child.kill(); }
+});
+
+test('Cookie の値は再起動をまたいで同じ（--token-file なら開き直さなくて済む）', async () => {
+    const a = await startAuthServer(['--require-auth', '--token', EXEC_TOKEN]);
+    let first;
+    try {
+        first = /kjp_auth=([^;]+)/.exec((await authGet(a.port, '/?token=' + EXEC_TOKEN)).setCookie)?.[1];
+    } finally { a.child.kill(); }
+    const b = await startAuthServer(['--require-auth', '--token', EXEC_TOKEN]);
+    try {
+        const second = /kjp_auth=([^;]+)/.exec((await authGet(b.port, '/?token=' + EXEC_TOKEN)).setCookie)?.[1];
+        assert.equal(second, first, '同じトークンなのに Cookie の値が変わった');
+        // 前のサーバで焼いた Cookie がそのまま通る
+        assert.equal((await authGet(b.port, '/api/v0/state', { cookie: 'kjp_auth=' + first })).code, 200);
+    } finally { b.child.kill(); }
 });
 
 test('🔒 ?token= は Cookie を焼いて URL からトークンを落とす', async () => {
