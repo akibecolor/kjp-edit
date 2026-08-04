@@ -709,11 +709,18 @@ test('🔒 --allow-write なしでは session がトークンを返さない', a
     assert.equal(d.token, null);
 });
 
-/** 書き込み有効のサーバを立てる。呼び出し側が kill する。 */
+/**
+ * 書き込み有効のサーバを立てる。呼び出し側が kill する。
+ *
+ * ⚠️ **トークンは `--token` で渡して固定する。** 以前は
+ *    `/api/v0/session` を無認証で叩いて貰っていたが、その経路は塞いだ
+ *    （Cookie を持つ相手が実行トークンを取り戻せる穴だった。4回目のレビュー）。
+ */
+const WRITE_TOKEN = 'smoke-write-token-0123456789abcdef';
 async function startWritable(extra = []) {
     const child = spawn(
         process.execPath,
-        [SERVER, '--repo', repo, '--port', '0', '--allow-write', ...extra],
+        [SERVER, '--repo', repo, '--port', '0', '--allow-write', '--token', WRITE_TOKEN, ...extra],
         { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } },
     );
     child.stdout.setEncoding('utf8');
@@ -727,7 +734,11 @@ async function startWritable(extra = []) {
         });
         child.on('error', reject);
     });
-    const s = await (await fetch(`${url}/api/v0/session`)).json();
+    // トークン本体を提示して capability を確認する（Cookie では返らない）
+    const s = await (await fetch(`${url}/api/v0/session`, {
+        headers: { 'x-kjp-token': WRITE_TOKEN },
+    })).json();
+    assert.equal(s.token, WRITE_TOKEN, 'トークンを提示したのに返ってこない');
     return { child, url, session: s };
 }
 
@@ -1277,16 +1288,31 @@ async function startSession(url, argv, extra = {}) {
     const dec = new TextDecoder();
     let buf = '';
     const seen = [];
-    /** 条件を満たすレコードが来るまで読む */
+    /**
+     * 条件を満たすレコードが来るまで読む。
+     *
+     * 🚨 **上限は `Promise.race` で掛ける。** 経過時間をループの先頭で見るだけでは、
+     *    `rd.read()` が返らないときに**一度も判定に戻らずハングする**。
+     *    ハングすると `node --test` ごと SIGKILL され、要約が出ないので
+     *    「落ちた」ではなく「テストが1件も走っていない」に見える
+     *    （変異テストが SKIP と誤報し、守りが検証されない）。
+     */
     const until = async (pred, limitMs = 15000) => {
         const t0 = Date.now();
         while (!seen.some(pred)) {
-            if (Date.now() - t0 > limitMs) {
+            const left = limitMs - (Date.now() - t0);
+            if (left <= 0) {
                 throw new Error(`条件を満たすレコードが来ない。見えたもの: ${JSON.stringify(seen)}`);
             }
-            const { value, done } = await rd.read();
-            if (done) break;
-            buf += dec.decode(value, { stream: true });
+            const r = await Promise.race([
+                rd.read(),
+                new Promise(res => setTimeout(() => res({ timeout: true }), left)),
+            ]);
+            if (r.timeout) {
+                throw new Error(`${limitMs}ms 待っても条件を満たさない。見えたもの: ${JSON.stringify(seen)}`);
+            }
+            if (r.done) break;
+            buf += dec.decode(r.value, { stream: true });
             const parts = buf.split('\n');
             buf = parts.pop();
             for (const l of parts) if (l.trim()) seen.push(JSON.parse(l));
@@ -1439,6 +1465,75 @@ test('🔒 exec: 標準入力の経路も --allow-exec なしでは存在しな�
         });
         assert.equal(r.status, 403);
     } finally { s.child.kill(); }
+});
+
+// 🚨 4回目のレビュー（BLOCKING）: spawn の失敗は **'error' イベント**で来て
+//    'exit' は来ない。以前は finish() を呼ぶ経路が無く、セッションが永久に
+//    running のままで枠も返らなかった（起動していないプロセスを「実行中」と表示）。
+test('🚨 exec: 起動できないコマンドでもセッションが終端し、枠が返る', async () => {
+    const { child, url } = await startExec();
+    try {
+        // 存在しないコマンド。Windows では拡張子なしの `npm` も同じ経路
+        const s = await startSession(url, ['no-such-command-xyz-9c1f']);
+        // exit が来ること（来なければ「実行中」の嘘が残る）
+        await s.until(r => r.t === 'exit');
+        const exit = s.seen.find(r => r.t === 'exit');
+        assert.equal(exit.code, null);
+        assert.ok(s.seen.some(r => r.t === 'err' && /ENOENT|起動できません|実行エラー/.test(r.d)),
+            `理由が出ていない: ${JSON.stringify(s.seen)}`);
+
+        // 台帳でも done になっていること
+        const st = JSON.parse((await (await fetch(`${url}/api/v0/state?fresh=1`)).text()));
+        const one = st.execSessions.find(x => x.id === s.id);
+        assert.equal(one.state, 'done', '起動していないプロセスが running のまま');
+        s.abort();
+
+        // 🚨 枠が返ること。上限を超える回数投げても最後まで受理される
+        for (let i = 0; i < 10; i++) {
+            const r = await fetch(`${url}/api/v0/exec`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+                body: JSON.stringify({ worktree: repo, argv: ['no-such-command-xyz-9c1f'] }),
+            });
+            assert.equal(r.status, 200, `${i + 1} 回目で枠が尽きた（枠が返っていない）`);
+            await r.text();
+        }
+    } finally { child.kill(); }
+});
+
+// 🚨 4回目のレビュー（BLOCKING）: stdin の書き込み失敗は非同期の 'error' で来る。
+//    listener が無いと uncaughtException で**デーモンが落ちる**（走っている
+//    全セッションが消え、監査に exit が1件も残らない）。
+test('🚨 exec: 相手が終わった直後に標準入力へ送ってもデーモンが落ちない', async () => {
+    const { child, url } = await startExec();
+    let died = null;
+    child.on('exit', code => { died = code; });
+    try {
+        // すぐ終わるが stdin は読まないプロセス
+        const s = await startSession(url, [process.execPath, '-e',
+            'process.stdout.write("done\\n")']);
+        await s.until(r => r.t === 'exit');
+        s.abort();
+
+        // 終了後に書く（409 が返るべき。落ちてはいけない）
+        const after = await sendInput(url, s.id, { data: 'x'.repeat(40 * 1024) });
+        assert.ok([409, 200].includes(after.status), `想定外の応答: ${after.status}`);
+
+        // 走っている相手に大量に書いて、途中で相手が終わる形も試す
+        const s2 = await startSession(url, [process.execPath, '-e',
+            'setTimeout(()=>process.exit(0),150)']);
+        for (let i = 0; i < 6; i++) {
+            await sendInput(url, s2.id, { data: `${'y'.repeat(60 * 1024)}\n` }).catch(() => {});
+            await new Promise(r => setTimeout(r, 60));
+        }
+        s2.abort();
+
+        // 🚨 サーバが生きていること（ここが本体）
+        await new Promise(r => setTimeout(r, 500));
+        assert.equal(died, null, `デーモンが落ちた（exit=${died}）`);
+        const alive = await fetch(`${url}/api/v0/state?fresh=1`);
+        assert.equal(alive.status, 200, 'サーバが応答しない');
+    } finally { child.kill(); }
 });
 
 test('🔒 exec: 不正なセッション id と知らない id を弾く', async () => {
@@ -1706,8 +1801,10 @@ test('🔒 --require-auth: トークンが無い / 違うと 401、Cookie とヘ
 test('🚨 Cookie の値は実行トークンと別で、実行には使えない', async () => {
     const s = await startAuthServer(['--require-auth', '--allow-exec', '--token', EXEC_TOKEN]);
     try {
+        // ⚠️ **リダイレクトしない**（ページの JS が ?token= を読んで
+        //    sessionStorage に入れ、URL から消す）。Cookie は同時に焼かれる。
         const boot = await authGet(s.port, '/?token=' + EXEC_TOKEN);
-        assert.equal(boot.code, 302);
+        assert.equal(boot.code, 200, 'リダイレクトすると JS がトークンを見られない');
         const cookieVal = /kjp_auth=([^;]+)/.exec(boot.setCookie)?.[1];
         assert.ok(cookieVal, 'Cookie が焼かれていない');
         assert.notEqual(decodeURIComponent(cookieVal), EXEC_TOKEN,
@@ -1739,12 +1836,20 @@ test('🚨 Cookie の値は実行トークンと別で、実行には使えな�
         });
         assert.equal(noCookie.status, 401);
 
-        // 🚨 /api/v0/session も Cookie だけでは実行トークンを渡さない…わけではない。
-        //    ここは「認証済みなら渡す」で正しい（同一オリジンのブラウザに渡すため）。
-        //    ただし**他のローカルサービスは Cookie を持っていても Sec-Fetch-Site を
-        //    偽装できるので**、ここが渡すことは受け入れたリスクとして記録する。
+        // 🚨 **これが4回目のレビューの BLOCKING 本体。**
+        //    以前は /api/v0/session が Cookie 認証の要求に実行トークンを返していた。
+        //    Cookie はポートで分離されないので、他のポートを開いた相手が
+        //    **リクエスト1本多いだけで任意コード実行に到達していた。**
+        //    `sameOrigin` は `!site || ...` なので Sec-Fetch-Site を送らない
+        //    非ブラウザは素通りで、偽装すら要らなかった。
         const sess = await authGet(s.port, '/api/v0/session', { cookie: 'kjp_auth=' + cookieVal });
         assert.equal(sess.code, 200);
+        assert.equal(JSON.parse(sess.body).token, null,
+            'Cookie だけの要求に実行トークンを渡している（1本で RCE に到達する）');
+        // トークン本体を提示した要求には渡す（ブラウザは ?token= で1回受け取る）
+        const withTok = await authGet(s.port, '/api/v0/session', { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(JSON.parse(withTok.body).token, EXEC_TOKEN,
+            'トークンを持っている要求にも渡していない（UI が書き込めなくなる）');
     } finally { s.child.kill(); }
 });
 
@@ -1763,19 +1868,34 @@ test('Cookie の値は再起動をまたいで同じ（--token-file なら開き
     } finally { b.child.kill(); }
 });
 
-test('🔒 ?token= は Cookie を焼いて URL からトークンを落とす', async () => {
+test('🔒 ?token= は読み取り用の Cookie を焼き、ページ本体を返す', async () => {
     const s = await startAuthServer(['--require-auth']);
     try {
         const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
         const boot = await authGet(s.port, `/?token=${token}`);
-        assert.equal(boot.code, 302, 'ブートストラップがリダイレクトしていない');
+        // 🚨 **リダイレクトしない。** 302 で URL からトークンを落としていたので、
+        //    ページの JS がトークンを一度も見られず、書き込み用のトークンを
+        //    /api/v0/session から取り戻す作りになっていた。それが
+        //    「Cookie を持つ相手が実行に到達する」穴の原因（4回目のレビュー）。
+        //    今はページが ?token= を読んで sessionStorage に入れ、URL から消す。
+        assert.equal(boot.code, 200, 'リダイレクトすると JS がトークンを見られない');
         assert.match(boot.setCookie, /HttpOnly/, 'Cookie が HttpOnly でない');
         assert.match(boot.setCookie, /SameSite=Strict/, 'Cookie が SameSite=Strict でない');
         // ⚠️ Secure を付けると http のループバックで保存されず、ローカルで動かなくなる
         assert.ok(!/Secure/.test(boot.setCookie), 'Secure が付いている');
-        // 履歴・Referer にトークンを残さない
-        assert.ok(!(boot.location ?? '').includes('token'),
-            `リダイレクト先に token が残っている: ${boot.location}`);
+        // 焼かれるのは読み取り用の別の秘密（実行トークンではない）
+        const cookieVal = decodeURIComponent(/kjp_auth=([^;]+)/.exec(boot.setCookie)?.[1] ?? '');
+        assert.notEqual(cookieVal, token, 'Cookie に実行トークンが入っている');
+        // ページ側がトークンを sessionStorage に入れて URL から消すことの確認。
+        // ⚠️ 文字列の有無だけを見ると、実装を消しても他所に同じ語があれば緑になる。
+        //    **?token= を読んだ直後に保存する形**を確かめる。
+        assert.match(boot.body, /sessionStorage\.setItem\(TOKEN_KEY, t\)/,
+            'トークンを sessionStorage に保持していない'
+            + '（Cookie 経由でしか取り戻せなくなり、他ポートの相手が実行に到達する）');
+        assert.match(boot.body, /history\.replaceState\(null, '', /,
+            'URL からトークンを消していない（履歴と Referer に残る）');
+        // Cookie ではなく sessionStorage を使う理由がコードに書かれていること
+        assert.match(boot.body, /ポート/, '分離の根拠が書かれていない');
     } finally { s.child.kill(); }
 });
 
@@ -2044,9 +2164,14 @@ test('🔒 --token-file: 無ければ生成し、リポジトリの中は拒否�
         const { readFile } = await import('node:fs/promises');
         const tok = (await readFile(outside, 'utf8')).trim();
         assert.ok(tok.length >= 24, `短いトークンが書かれた: ${tok.length} 文字`);
-        // そのトークンで実際に通る
-        const s = await (await fetch(`${url}/api/v0/session`)).json();
+        // そのトークンで実際に通る（提示した要求にだけ返る）
+        const s = await (await fetch(`${url}/api/v0/session`, {
+            headers: { 'x-kjp-token': tok },
+        })).json();
         assert.equal(s.token, tok, 'ファイルのトークンが使われていない');
+        // 提示しなければ返らない（Cookie 経由の取り戻しを塞いだ）
+        const anon = await (await fetch(`${url}/api/v0/session`)).json();
+        assert.equal(anon.token, null, '無認証でトークンを払い出している');
     } finally {
         child.kill();
     }

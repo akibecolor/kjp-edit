@@ -95,10 +95,13 @@ test('🚨 --allow-transcript-text でもツール結果と thinking は出さ�
     const json = JSON.stringify(s);
     // 出て良いのは「発話」と「コマンド行」だけ。件数で確かめる
     const hits = json.split(SECRET).length - 1;
-    assert.equal(hits, 3,
-        `漏れているものがある（期待: text 2件 + command 1件 = 3。実際 ${hits}）:\n${json}`);
-    // 新しい順なので assistant（後に書かれた方）が先
-    assert.deepEqual(s.text.map(t => t.role), ['assistant', 'user']);
+    // ⚠️ 期待値は **2**。`user` の文字列 content は出さなくなった
+    //    （ツールの結果と形で区別できないので T5 が漏れる。4回目のレビュー）。
+    //    出て良いのは `text` ブロック1件 + Bash の command 1件だけ。
+    assert.equal(hits, 2,
+        `漏れているものがある（期待: text 1件 + command 1件 = 2。実際 ${hits}）:\n${json}`);
+    assert.deepEqual(s.text.map(t => t.role), ['assistant'],
+        '文字列 content の user を出している（T5 が漏れる）');
     assert.equal(s.recent.find(r => r.tool === 'Bash').command, `echo ${SECRET}`);
     // thinking / tool_result / snapshot / backup / attachment /
     // lastPrompt / customTitle / queue-operation / description /
@@ -111,6 +114,27 @@ test('🚨 --allow-transcript-text でもツール結果と thinking は出さ�
     ]) {
         assert.ok(!json.includes(probe), `${name} が payload に入っている`);
     }
+});
+
+// 🚨 4回目のレビュー（BLOCKING）: `user` の content は文字列でも来るが、
+//    それは「プロンプト」だけでなく**ツールの結果（コマンド出力）でも文字列**。
+//    形から区別できないので出すと T5 が漏れる。しかも同じ画面に
+//    「ツールの結果は出しません」と書いてある = 嘘になる。
+test('🚨 文字列の content は allowText でも本文を出さない（T5 が漏れる）', () => {
+    const lines = [
+        // 実物では tool_result が文字列 content で来ることがある
+        { type: 'user', timestamp: ago(200), cwd: WT, sessionId: 's',
+            toolUseResult: { stdout: SECRET, stderr: '' },
+            message: { content: `コマンドの出力です ${SECRET}` } },
+        // 本物のプロンプトも同じ形で来る（区別できない）
+        { type: 'user', timestamp: ago(100), cwd: WT, sessionId: 's',
+            message: { content: `お願い ${SECRET}` } },
+    ].map(r => JSON.stringify(r));
+    const s = summarize(lines, { worktreePath: WT, now: NOW, allowText: true });
+    assert.ok(!JSON.stringify(s).includes(SECRET),
+        '文字列 content から本文が漏れている（ツール結果と区別できない）');
+    assert.equal(s.talk, 2, '件数は数えるべき（何も見えないのでは観測にならない）');
+    assert.deepEqual(s.text, []);
 });
 
 test('🚨 Edit / Write の中身は allowText でも出さない（command だけが自由文）', () => {

@@ -190,6 +190,91 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // 4回目のレビュー（並列・独立）で見つかった BLOCKING 4件。
+    // docs/review-4-parallel.md / issue #19-#22
+    {
+        name: 'session-token-to-cookie-auth',
+        why: 'Cookie 認証の要求に実行トークンを返す。Cookie はポートで分離されないので、'
+            + '他ポートを開いた相手がリクエスト1本多いだけで任意コード実行に到達する（実測）',
+        file: 'v0/server.mjs',
+        from: '                token: opts.allowWrite && sameOrigin && presentedToken(req, url)\n                    ? opts.token : null,',
+        to: '                token: opts.allowWrite && sameOrigin ? opts.token : null,',
+        // ⚠️ `presentedToken(` は関数定義側にも出るので、呼び出しの形で一意にする
+        gone: 'sameOrigin && presentedToken',
+        pattern: 'Cookie の値は実行トークンと別で',
+    },
+    // spawn 失敗（'exit' が来ない）と孫が stdio を握る場合（'close' が来ない）を
+    // **2つのハンドラで両側から**塞いでいる。どちらが load-bearing かを個別に測る。
+    // ⚠️ `close` 側と `error` 側は**どちらも単独で ENOENT を終端できる**ので、
+    //    片方ずつ外しても落ちない（実測で確認）。それは「テストの穴」ではなく
+    //    「守りが二重」なので、**両方を外す変異**で守り全体を測る。
+    //    2つある理由は失敗の形が2つあること: spawn 失敗は 'exit' が来ない、
+    //    孫が stdio を握ると 'close' が来ない。
+    {
+        name: 'exec-spawn-terminate',
+        why: "spawn の非同期失敗（ENOENT）を終端する経路が両方無くなると、"
+            + 'セッションが永久に running になり枠も返らない'
+            + '（起動していないプロセスを「実行中」と表示する嘘）',
+        file: 'v0/server.mjs',
+        from: `            child.on('close', () => {
+                if (execRegistry.finish(session, { code: null, signal: null,`,
+        to: `            child.on('close', () => {
+                if (false && execRegistry.finish(session, { code: null, signal: null,`,
+        also: [{
+            from: '                if (execRegistry.finish(session, { code: null, signal: null })) {',
+            to: '                if (false) {',
+        }],
+        gone: "child.on('close', () => {\n                if (execRegistry.finish",
+        pattern: '起動できないコマンドでもセッションが終端し',
+    },
+    {
+        name: 'exec-exit-finish',
+        why: "'exit' で終端しない。正常終了の終了コードが取れなくなる"
+            + "（'close' の保険に落ちて code:null になる）",
+        file: 'v0/server.mjs',
+        from: '                if (execRegistry.finish(session, { code, signal })) {',
+        to: '                if (false) {',
+        gone: 'execRegistry.finish(session, { code, signal })',
+        pattern: 'exec が出力を流し、終了コードを返す',
+    },
+    {
+        name: 'exec-spawn-error-note',
+        why: 'spawn 失敗の理由を出さない（何が起きたか分からない）',
+        // 終端そのものは 'close' が担うので、この行は理由の告知が本体。
+        // 冗長ではなく役割が違うことを記録しておく。
+        defensive: '終端は close が担う。この行は「なぜ起動できなかったか」の告知',
+        file: 'v0/server.mjs',
+        from: '                if (execRegistry.finish(session, { code: null, signal: null })) {',
+        to: '                if (false) {',
+        gone: 'execRegistry.finish(session, { code: null, signal: null })) {',
+        pattern: '起動できないコマンドでもセッションが終端し',
+    },
+    {
+        name: 'stdin-error-listener',
+        why: 'child.stdin の error を拾わない（EPIPE で uncaught → デーモンが落ちる）',
+        file: 'v0/server.mjs',
+        from: "            child.stdin?.on('error', err => {",
+        to: '            if (false) (err => {',
+        gone: "child.stdin?.on('error'",
+        pattern: '相手が終わった直後に標準入力へ送っても',
+    },
+    {
+        name: 'transcript-string-content',
+        why: 'user の文字列 content から本文を出す'
+            + '（ツールの結果と形で区別できないので T5 が漏れる）',
+        file: 'v0/transcript.mjs',
+        from: "            if (typeof content === 'string' && r.type === 'user') out.talk++;",
+        to: "            if (typeof content === 'string' && r.type === 'user') {\n"
+            + '                out.talk++;\n'
+            + '                if (allowText && out.text.length < limits.maxText) {\n'
+            + '                    const t = clip(content, limits.textChars);\n'
+            + "                    if (t) out.text.push({ at, role: 'user', text: t });\n"
+            + '                }\n'
+            + '            }',
+        gone: "if (typeof content === 'string' && r.type === 'user') out.talk++;",
+        pattern: '文字列の content は allowText でも本文を出さない',
+        testFile: 'v0/transcript.test.mjs',
+    },
     {
         name: 'auth-cookie-is-exec-token',
         why: 'Cookie に実行トークンをそのまま入れる。'
@@ -205,19 +290,32 @@ const MUTANTS = [
         name: 'auth-cookie-samesite',
         why: 'Cookie の SameSite / HttpOnly を外す（CSRF と JS からの読み取りに開く）',
         file: 'v0/server.mjs',
-        from: "                + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000',",
-        to: "                + '; Path=/; Max-Age=31536000',",
+        from: "            + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000');",
+        to: "            + '; Path=/; Max-Age=31536000');",
         gone: 'HttpOnly; SameSite=Strict',
-        pattern: 'Cookie を焼いて URL からトークンを落とす',
+        pattern: '読み取り用の Cookie を焼き、ページ本体を返す',
     },
     {
+        // ⚠️ リダイレクトをやめたので、URL からトークンを消すのは**ページ側**の仕事に移った
+        //    （4回目のレビュー: 302 だと JS がトークンを見られず、Cookie から
+        //     取り戻す作りになって RCE の穴になっていた）。変異先も app.html に移す。
         name: 'auth-token-not-in-url',
-        why: 'リダイレクトで token を落とさない（履歴と Referer に残る）',
-        file: 'v0/server.mjs',
-        from: "        clean.searchParams.delete('token');",
-        to: '        /* 変異: URL からトークンを落とさない */',
-        gone: "clean.searchParams.delete('token')",
-        pattern: 'Cookie を焼いて URL からトークンを落とす',
+        why: 'ページが URL からトークンを消さない（履歴と Referer に残る）',
+        file: 'v0/app.html',
+        from: "    history.replaceState(null, '', `${u.pathname}${u.search}${u.hash}`);",
+        to: '    /* 変異: URL からトークンを落とさない */',
+        gone: 'history.replaceState',
+        pattern: '読み取り用の Cookie を焼き、ページ本体を返す',
+    },
+    {
+        name: 'auth-token-in-session-storage',
+        why: 'トークンを sessionStorage に持たない。'
+            + 'Cookie 経由でしか取り戻せなくなり、他ポートの相手が実行に到達する',
+        file: 'v0/app.html',
+        from: '    try { sessionStorage.setItem(TOKEN_KEY, t); } catch { /* 使えない環境 */ }',
+        to: '    /* 変異: トークンを保持しない */',
+        gone: 'sessionStorage.setItem(TOKEN_KEY, t)',
+        pattern: '読み取り用の Cookie を焼き、ページ本体を返す',
     },
     {
         name: 'transcript-type-allowlist',
@@ -503,15 +601,38 @@ function runTest(m) {
  *    シグナルと uncaught をここで拾って復元する。
  */
 const pending = new Map();   // file -> bak
+
+/**
+ * 控えから戻す。
+ *
+ * ⚠️ **Windows では一時的に失敗する。** テストが終わった直後は
+ *    まだ別プロセスがファイルを開いていることがあり、`copyFileSync` が
+ *    `UNKNOWN (-4094)`（共有違反）で落ちる。**1回で諦めると
+ *    変異が残ったままになる**ので短い間隔で数回試す（実際に踏んだ）。
+ */
+function restoreFile(file, bak) {
+    let last = null;
+    for (let i = 0; i < 20; i++) {
+        try {
+            copyFileSync(bak, file);
+            unlinkSync(bak);
+            return true;
+        } catch (e) {
+            last = e;
+            // 同期的に少し待つ（ここでイベントループを回すと復元が遅れる）
+            const until = Date.now() + 100;
+            while (Date.now() < until) { /* 短いスピン */ }
+        }
+    }
+    console.error(`✖ ${file} を復元できません: ${last?.message}`);
+    console.error(`   手で戻してください: copy "${bak}" "${file}"`);
+    return false;
+}
+
 function restoreAll(why) {
     for (const [file, bak] of pending) {
-        try {
-            if (existsSync(bak)) { copyFileSync(bak, file); unlinkSync(bak); }
-            console.error(`⚠ ${why}: ${file} を復元しました`);
-        } catch (e) {
-            console.error(`✖ ${why}: ${file} を復元できません: ${e.message}`);
-            console.error(`   手で戻してください: copy ${bak} ${file}`);
-        }
+        if (!existsSync(bak)) continue;
+        if (restoreFile(file, bak)) console.error(`⚠ ${why}: ${file} を復元しました`);
     }
     pending.clear();
 }
@@ -559,7 +680,20 @@ for (const m of targets) {
         copyFileSync(m.file, bak);
         applied = true;
         pending.set(m.file, bak);
-        writeFileSync(m.file, src.replace(m.from, m.to), 'utf8');
+        // ⚠️ `also` は「同じ守りが二重になっていて、片方ずつでは測れない」場合に
+        //    複数箇所を同時に外すための追加。**単独で落ちない = テストの穴**とは
+        //    限らないので、二重の守りは束ねて測る（実際に exec の終端で必要になった）。
+        let mutated = src.replace(m.from, m.to);
+        for (const extra of m.also ?? []) {
+            if (!mutated.includes(extra.from)) {
+                results.push({ m, status: 'SKIP', note: `also の対象が見つからない: ${extra.from.slice(0, 40)}` });
+                mutated = null;
+                break;
+            }
+            mutated = mutated.replace(extra.from, extra.to);
+        }
+        if (mutated === null) continue;
+        writeFileSync(m.file, mutated, 'utf8');
         if (readFileSync(m.file, 'utf8').includes(m.gone)) {
             results.push({ m, status: 'SKIP', note: '書き換えが効いていない（gone の判定が甘い）' });
             continue;
@@ -586,7 +720,7 @@ for (const m of targets) {
                 : (m.defensive ?? 'テストが落ちなかった = この守りは検証されていない'),
         });
     } finally {
-        if (applied && existsSync(bak)) { copyFileSync(bak, m.file); unlinkSync(bak); }
+        if (applied && existsSync(bak)) restoreFile(m.file, bak);
         pending.delete(m.file);
     }
 }

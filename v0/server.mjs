@@ -740,6 +740,17 @@ function tokenMatches(given) {
  * その要求が認証済みか。`--require-auth` が無いときは常に true
  * （ループバック限定の従来の使い方を壊さないため）。
  */
+/**
+ * 🔒 その要求が**トークン本体**を提示しているか（Cookie では真にならない）。
+ *
+ * トークンを見せてよい相手を「既に持っている相手」に限るための判定。
+ * Cookie は他ポートに漏れるので、Cookie 認証は読み取りまでで打ち止めにする。
+ */
+function presentedToken(req, url) {
+    return tokenMatches(req.headers[TOKEN_HEADER])
+        || tokenMatches(url.searchParams.get('token'));
+}
+
 function authed(req, url) {
     if (!opts.requireAuth) return true;
     // 🚨 Cookie は**読み取り用の別の秘密**とだけ照合する。
@@ -1045,23 +1056,23 @@ const server = createServer(async (req, res) => {
             + '起動時に表示された ?token=... 付きの URL を開いてください\n');
         return;
     }
-    // ?token=... で来たら Cookie を焼いて、**URL からトークンを落として**やり直させる。
-    //    履歴・Referer・共有リンクにトークンを残さないため。
+    // ?token=... で来たら**読み取り用の Cookie を焼く**（応答は普通に返す）。
+    //
+    // 🚨 **リダイレクトしない。** 以前は 302 で URL からトークンを落としていたが、
+    //    それだとページの JS がトークンを一度も見られないので、書き込み・実行に
+    //    必要なトークンを `/api/v0/session` から取り戻す作りになり、
+    //    **Cookie を持つ相手（= 他ポートの誰か）が実行に到達する**穴になっていた
+    //    （レビューで実測。リクエスト1本多いだけで RCE）。
+    //    今はページ側が `?token=` を読んで **sessionStorage に入れ、
+    //    `history.replaceState` で URL から消す**。
+    //    sessionStorage は**ポートを含むオリジン単位**なので他ポートから読めない
+    //    （Cookie との決定的な違い。これが分離の根拠）。
+    // 🚨 実行トークンではなく**読み取り用の別の秘密**を焼く。
     if (opts.requireAuth && url.searchParams.get('token')) {
-        const clean = new URL(url.href);
-        clean.searchParams.delete('token');
-        res.writeHead(302, {
-            location: `${clean.pathname}${clean.search}` || '/',
-            // ⚠️ Secure は付けない（ループバックは http なので保存されなくなる）。
-            //    経路の暗号化はトンネル側（tailscale serve）の責任。
-            // 🚨 実行トークンではなく**読み取り用の別の秘密**を焼く。
-            //    Cookie はポートで分離されないので、他のローカルサービスに渡る。
-            'set-cookie': `${AUTH_COOKIE}=${encodeURIComponent(cookieSecret())}`
-                + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000',
-            'cache-control': 'no-store',
-        });
-        res.end();
-        return;
+        // ⚠️ Secure は付けない（ループバックは http なので保存されなくなる）。
+        //    経路の暗号化はトンネル側（tailscale serve）の責任。
+        res.setHeader('set-cookie', `${AUTH_COOKIE}=${encodeURIComponent(cookieSecret())}`
+            + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000');
     }
     try {
         if (url.pathname === '/api/v0/state') {
@@ -1102,7 +1113,19 @@ const server = createServer(async (req, res) => {
                 allowTranscriptText: opts.allowTranscriptText,
                 requireAuth: opts.requireAuth,
                 tokenHeader: TOKEN_HEADER,
-                token: opts.allowWrite && sameOrigin ? opts.token : null,
+                // 🚨 **Cookie で認証した要求にトークンを渡してはいけない。**
+                //    Cookie はポートで分離されないので、127.0.0.1 の他のポートを
+                //    開いた相手にも Cookie は届く。ここが渡していたので、
+                //    「Cookie が漏れても実行はできない」という前の修正は
+                //    **リクエスト1本多いだけで破られていた**（レビューで実測）。
+                //    しかも `sameOrigin` は `!site || ...` なので
+                //    **Sec-Fetch-Site を送らない非ブラウザは素通り**する。
+                // ⚠️ トークンを見せてよいのは「既にトークンを持っている」要求だけ。
+                //    ブラウザは `?token=` で1回渡され、sessionStorage に持つ
+                //    （sessionStorage は**ポートを含むオリジン単位**なので
+                //     他のポートからは読めない。Cookie との決定的な違い）。
+                token: opts.allowWrite && sameOrigin && presentedToken(req, url)
+                    ? opts.token : null,
             }));
             return;
         }
@@ -1180,6 +1203,16 @@ const server = createServer(async (req, res) => {
             execRegistry.attachChild(session, child);
             startExecSweeper();
 
+            // 🚨 **stdin の書き込み失敗は非同期の 'error' で来る。**
+            //    listener が無いと uncaughtException になり**デーモンが落ちる**
+            //    （走っている全セッションが消え、監査に exit が1件も残らない。
+            //     レビューで実測）。相手が入力待ちを終えた直後に送るだけで起きる。
+            child.stdin?.on('error', err => {
+                // EPIPE は「相手が読むのをやめた」だけなので、セッションは殺さない
+                execRegistry.emit(session, 'err',
+                    `⚠ 標準入力に書けませんでした: ${err.code ?? err.message}`);
+            });
+
             // ⚠️ chunk ごとに toString() すると3バイト文字が割れる。
             //    StringDecoder が境界を持ち越す（CLAUDE.md の git 呼び出し規則と同じ理由）。
             const decOut = new StringDecoder('utf8'), decErr = new StringDecoder('utf8');
@@ -1191,7 +1224,36 @@ const server = createServer(async (req, res) => {
                 const s = decErr.write(c);
                 if (s) execRegistry.emit(session, 'err', s);
             });
-            child.on('error', err => execRegistry.emit(session, 'err', `実行エラー: ${err.message}`));
+            // 🚨 **spawn の失敗は同期例外ではなく 'error' イベントで来る。**
+            //    存在しないコマンド（Windows なら拡張子なしの `npm` も）は
+            //    ENOENT で 'error' + 'close' だけを出し、**'exit' は来ない**。
+            //    以前はここで emit するだけだったので `finish()` を呼ぶ経路が無く、
+            //    セッションが**永久に running のまま**になっていた（レビューで実測）:
+            //      - `/api/v0/state` が「起動していないプロセスを実行中」と表示する（嘘）
+            //      - 枠が返らないのでミスタイプ8回で実行が死ぬ
+            //      - 回復時の記録が「上限時間を超えたので停止」= 起動すらしていない
+            //        プロセスを殺したという主張になる
+            child.on('error', async err => {
+                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);
+                if (execRegistry.finish(session, { code: null, signal: null })) {
+                    await auditExec({
+                        event: 'exit', session: session.id, worktree: wt.path, argv,
+                        code: null, signal: null, note: `spawn 失敗: ${err.message}`,
+                    });
+                }
+            });
+            // ⚠️ `close` は保険。`exit` を主にする理由（孫がパイプを握ると
+            //    `close` が来ない）は変わらないが、**逆に `exit` が来ない経路がある**
+            //    ので両方拾う。finish は1回しか効かないので二重にはならない。
+            child.on('close', () => {
+                if (execRegistry.finish(session, { code: null, signal: null,
+                    note: '⚠ 終了コードを取れませんでした（stdio が閉じました）' })) {
+                    auditExec({
+                        event: 'exit', session: session.id, worktree: wt.path, argv,
+                        code: null, signal: null, note: 'close で終端',
+                    }).catch(() => {});
+                }
+            });
             // ⚠️ `close` ではなく `exit` を使う。`close` は stdio が EOF になるまで来ないので、
             //    孫がパイプを握っていると永久に発火せず、枠が戻らない（レビューで実測）。
             child.on('exit', async (code, signal) => {

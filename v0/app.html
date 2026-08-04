@@ -1307,9 +1307,44 @@ async function load(force = false) {
 
 for (const sp of document.querySelectorAll('.shell > .split')) wireSplit(sp);
 
+/**
+ * 🔒 トークンの受け取り。
+ *
+ * **`?token=` を1回だけ読んで sessionStorage に入れ、URL から消す。**
+ * sessionStorage は**ポートを含むオリジン単位**なので、`127.0.0.1:3000` など
+ * 他のポートのページからは読めない。Cookie はポートで分離されないので、
+ * トークンを Cookie 経由で受け渡すと**他のポートの誰かが実行に到達する**
+ * （レビューで実測。リクエスト1本多いだけで RCE だった）。
+ *
+ * ⚠️ URL から消すのは履歴と Referer にトークンを残さないため。
+ * ⚠️ タブを閉じると消える。書き込み・実行をまた使うには
+ *    起動時に表示された `?token=` 付きの URL を開き直す（読み取りは Cookie で続く）。
+ */
+const TOKEN_KEY = 'kjp_token';
+{
+  const u = new URL(location.href);
+  const t = u.searchParams.get('token');
+  if (t) {
+    try { sessionStorage.setItem(TOKEN_KEY, t); } catch { /* 使えない環境 */ }
+    u.searchParams.delete('token');
+    history.replaceState(null, '', `${u.pathname}${u.search}${u.hash}`);
+  }
+  let held = null;
+  try { held = sessionStorage.getItem(TOKEN_KEY); } catch { /* noop */ }
+  if (held) session.token = held;
+}
+
 try {
-  const r = await fetch('/api/v0/session');
-  if (r.ok) session = { ...session, ...await r.json() };
+  // ⚠️ **トークンを持っているなら送る。** サーバは「トークン本体を提示した
+  //    要求」にだけ capability 用のトークンを返す（Cookie では返さない）。
+  const r = await fetch('/api/v0/session', {
+    headers: session.token ? { [session.tokenHeader]: session.token } : {},
+  });
+  if (r.ok) {
+    const got = await r.json();
+    // サーバが null を返しても、手元に持っているトークンは捨てない
+    session = { ...session, ...got, token: got.token ?? session.token };
+  }
 } catch { /* 観測のみで動く */ }
 const cap = $('#cap');
 if (session.allowExec) { cap.hidden = false; cap.className = 'cap x'; cap.textContent = '🚨 実行有効'; }

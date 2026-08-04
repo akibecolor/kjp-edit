@@ -167,14 +167,14 @@ export function summarize(lines, { worktreePath, allowText = false, now = Date.n
 
         const content = r.message?.content;
         if (!Array.isArray(content)) {
-            // content が文字列のこともある（実測: user）。**本文は allowText でのみ出す。**
-            if (typeof content === 'string' && r.type === 'user') {
-                out.talk++;
-                if (allowText && out.text.length < limits.maxText) {
-                    const t = clip(content, limits.textChars);
-                    if (t) out.text.push({ at, role: 'user', text: t });
-                }
-            }
+            // 🚨 **文字列の content から本文を出してはいけない。**
+            //    `user` レコードの content は「あなたのプロンプト」だけでなく
+            //    **ツールの結果（コマンド出力）でも文字列で来る**。
+            //    形から区別できないので、出すと T5 が漏れる
+            //    — しかも同じ画面に「ツールの結果は出しません」と書いてある
+            //    （レビューで実測。このリポジトリが最も重いとする「嘘」の型）。
+            //    件数だけ数えて、本文は allowText でも出さない。
+            if (typeof content === 'string' && r.type === 'user') out.talk++;
             continue;
         }
 

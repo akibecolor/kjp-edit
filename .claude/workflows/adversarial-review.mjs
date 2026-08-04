@@ -23,8 +23,7 @@
 export const meta = {
     name: 'adversarial-review',
     description: '独立したレビュアーを並列で走らせ、指摘を敵対的に検証して報告する',
-    whenToUse: '実装をまとめてコミットした後、次の機能に進む前。特に認証・実行・'
-        + 'リポジトリ外の読み取りに触ったとき',
+    whenToUse: '実装をまとめてコミットした後、次の機能に進む前。特に認証・実行・リポジトリ外の読み取りに触ったとき',
     phases: [
         { title: 'Review', detail: '観点ごとに独立して読む（互いの結果を見ない）' },
         { title: 'Verify', detail: '各指摘を別のエージェントが反証しようとする' },
