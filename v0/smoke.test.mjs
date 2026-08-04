@@ -1033,14 +1033,24 @@ test('exec: 上限時間を超えたら停止する', async () => {
 // ⚠️ 取り残した子プロセスはこのプロジェクトが実際に事故を起こした種類
 //    （検証用サーバを残してポートを塞いだ / chrome を53個残した）。
 //    クライアントが切れたら殺すことをテストで固定する。
-test('exec: クライアントが切断したら子プロセスを殺す', async () => {
-    const { child, url } = await startExec();
+// 🚨 #17 で挙動を**意図的に変えた**。以前は「切断で必ず殺す」だったが、
+//    モバイルブラウザはタブを積極的に停止するので、スマホから投げた
+//    `npm test` がその瞬間に死んでいた。今は「切断では殺さず、猶予を過ぎたら殺す」。
+//    ここでは新しい契約の3点すべてを固定する:
+//      1. 切断しても走り続ける
+//      2. 再購読で切断中の出力が貰える
+//      3. 猶予を過ぎたら確実に死ぬ（取り残しの経路を作っていない）
+test('🚨 exec: 切断しても走り続け、再購読で追いつき、猶予を過ぎたら死ぬ', async () => {
+    // 猶予を2秒にして決定的に測る（既定は5分）
+    const { child, url } = await startExec(['--exec-detached-grace', '2']);
     const beacon = join(repo, 'exec-beacon.txt');
+    const { readFileSync } = await import('node:fs');
+    const size = () => { try { return readFileSync(beacon, 'utf8').length; } catch { return 0; } };
     try {
-        // 100ms ごとにファイルへ追記し続ける子プロセス
-        const script = 'const fs=require("fs");'
-            + 'setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);'
-            + 'process.stdout.write("started\\n");';
+        // 100ms ごとにファイルへ追記し、同時に標準出力にも書き続ける
+        const script = 'const fs=require("fs");let i=0;'
+            + 'setInterval(()=>{i++;try{fs.appendFileSync(process.argv[1],"x")}catch(e){};'
+            + 'process.stdout.write("tick"+i+"\\n")},100);';
         const ac = new AbortController();
         const res = await fetch(`${url}/api/v0/exec`, {
             method: 'POST',
@@ -1050,28 +1060,266 @@ test('exec: クライアントが切断したら子プロセスを殺す', async
             }),
             signal: ac.signal,
         });
-        // 最初の出力を待って、走り始めたことを確認する
+        // 1行目は必ず session（再接続先の id を知る唯一の手段）
         const reader = res.body.getReader();
-        await reader.read();
-        await new Promise(r => setTimeout(r, 400));
+        const dec = new TextDecoder();
+        let buf = '';
+        let sessionId = null, lastSeq = 0;
+        while (sessionId === null) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            for (const line of buf.split('\n').slice(0, -1)) {
+                if (!line.trim()) continue;
+                const r = JSON.parse(line);
+                if (r.t === 'session') sessionId = r.id;
+                if (typeof r.n === 'number') lastSeq = Math.max(lastSeq, r.n);
+            }
+            buf = buf.slice(buf.lastIndexOf('\n') + 1);
+        }
+        assert.ok(sessionId, '1行目に session が来ない（再接続先の id を知る手段が無い）');
+        assert.match(sessionId, /^[0-9a-f]{16}$/);
 
-        const { readFileSync } = await import('node:fs');
-        const before = readFileSync(beacon, 'utf8').length;
-        assert.ok(before > 0, '子プロセスが動いていない（テストの前提が崩れている）');
-
-        // 切断する
+        // 走り始めたことを確認して切断する
+        while (size() === 0) await new Promise(r => setTimeout(r, 50));
         ac.abort();
-        await new Promise(r => setTimeout(r, 900));
-        const afterAbort = readFileSync(beacon, 'utf8').length;
-        await new Promise(r => setTimeout(r, 900));
-        const later = readFileSync(beacon, 'utf8').length;
+        const atAbort = size();
 
-        assert.equal(later, afterAbort,
-            `切断後もファイルが増え続けている（子プロセスが残っている）: ${afterAbort} → ${later}`);
+        // 1. 切断しても走り続ける（ファイルが増え続ける）
+        await new Promise(r => setTimeout(r, 700));
+        const afterAbort = size();
+        assert.ok(afterAbort > atAbort,
+            `切断で殺されている（${atAbort} → ${afterAbort}）。#17 の目的が失われている`);
+
+        // 2. 再購読で切断中の出力が貰える
+        const re = await fetch(`${url}/api/v0/exec/${sessionId}/stream`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({ from: lastSeq }),
+        });
+        assert.equal(re.status, 200, '再購読できない');
+        const rr = re.body.getReader();
+        let rbuf = '';
+        const got = [];
+        while (got.length < 3) {
+            const { value, done } = await rr.read();
+            if (done) break;
+            rbuf += dec.decode(value, { stream: true });
+            for (const line of rbuf.split('\n').slice(0, -1)) {
+                if (line.trim()) got.push(JSON.parse(line));
+            }
+            rbuf = rbuf.slice(rbuf.lastIndexOf('\n') + 1);
+        }
+        assert.equal(got[0].t, 'session');
+        assert.equal(got[0].state, 'running', '再購読したのに running でない');
+        const outs = got.filter(r => r.t === 'out');
+        assert.ok(outs.length > 0, '切断中の出力が再生されない');
+        assert.ok(outs.every(r => r.n > lastSeq),
+            `既に見た分が重複して送られている: ${JSON.stringify(outs.map(r => r.n))}`);
+        try { await rr.cancel(); } catch { /* 既に閉じている */ }
+
+        // 3. 猶予（2秒）を過ぎたら死ぬ。ここが効かないと取り残しが戻る
+        const beforeGrace = size();
+        // 猶予 2s + sweep の周期 1s + 余裕
+        for (let i = 0; i < 60; i++) {
+            await new Promise(r => setTimeout(r, 200));
+            const a = size();
+            await new Promise(r => setTimeout(r, 400));
+            if (size() === a && a > beforeGrace) break;
+        }
+        const s1 = size();
+        await new Promise(r => setTimeout(r, 800));
+        assert.equal(size(), s1,
+            `猶予を過ぎても子プロセスが生きている（${s1} → ${size()}）。取り残しの経路が戻っている`);
     } finally {
         child.kill();
         await rm(beacon, { force: true });
     }
+});
+
+test('🚨 exec: 明示的な kill で止まり、監査に残る', async () => {
+    const { child, url } = await startExec();
+    const beacon = join(repo, 'exec-kill-beacon.txt');
+    const { readFileSync } = await import('node:fs');
+    const size = () => { try { return readFileSync(beacon, 'utf8').length; } catch { return 0; } };
+    try {
+        const script = 'const fs=require("fs");'
+            + 'setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);'
+            + 'process.stdout.write("go\\n");';
+        const ac = new AbortController();
+        const res = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo, argv: [process.execPath, '-e', script, beacon], keepAlive: true,
+            }),
+            signal: ac.signal,
+        });
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        const first = JSON.parse(dec.decode((await reader.read()).value).split('\n')[0]);
+        assert.equal(first.t, 'session');
+        assert.equal(first.keepAlive, true, 'keepAlive が反映されていない');
+        assert.equal(first.detachedGraceMs, null, 'keepAlive なのに猶予が出ている');
+
+        while (size() === 0) await new Promise(r => setTimeout(r, 50));
+        ac.abort();
+
+        // keepAlive なので切断だけでは死なない
+        await new Promise(r => setTimeout(r, 600));
+        const a = size();
+        await new Promise(r => setTimeout(r, 600));
+        assert.ok(size() > a, 'keepAlive なのに切断で死んでいる');
+
+        // 明示的に止める
+        const k = await fetch(`${url}/api/v0/exec/${first.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        assert.equal(k.status, 200);
+        assert.equal((await k.json()).ok, true);
+
+        await new Promise(r => setTimeout(r, 600));
+        const s1 = size();
+        await new Promise(r => setTimeout(r, 600));
+        assert.equal(size(), s1, `kill が効いていない（${s1} → ${size()}）`);
+
+        // 監査に残る（何を止めたか後から辿れる）
+        const { readFile: rf } = await import('node:fs/promises');
+        const auditRaw = await rf(join(repo, '.git', 'kjp-exec-audit.jsonl'), 'utf8');
+        const events = auditRaw.trim().split('\n').map(l => JSON.parse(l))
+            .filter(e => e.session === first.id);
+        const kinds = events.map(e => e.event);
+        for (const want of ['start', 'detach', 'kill']) {
+            assert.ok(kinds.includes(want), `監査に ${want} が無い: ${kinds.join(',')}`);
+        }
+    } finally {
+        child.kill();
+        await rm(beacon, { force: true });
+    }
+});
+
+// 🚨 切断で殺さなくなったので、**サーバ終了時の後始末が唯一の最後の砦**になった。
+//    ここが効かないと、サーバを止めるたびに孫が残る。
+//
+// ⚠️ Windows では検証できない。`child.kill('SIGTERM')` は TerminateProcess に
+//    なるので `process.on('SIGTERM')` ハンドラが**そもそも走らない**
+//    （= Windows ではこの守り自体が効かない。既知の限界として記録する）。
+test('🚨 exec: サーバを SIGTERM で止めたら孫プロセスも残さない', {
+    skip: process.platform === 'win32'
+        ? 'Windows は SIGTERM が TerminateProcess になりハンドラが走らない（既知の限界）'
+        : false,
+}, async () => {
+    const { child, url } = await startExec();
+    const beacon = join(repo, 'shutdown-beacon.txt');
+    const { readFileSync } = await import('node:fs');
+    const size = () => { try { return readFileSync(beacon, 'utf8').length; } catch { return 0; } };
+    try {
+        // 中間に sh を挟む。直接の子だけを殺す実装では孫が残る形
+        const inner = 'const fs=require("fs");'
+            + 'setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);';
+        const ac = new AbortController();
+        const res = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: ['sh', '-c', `${process.execPath} -e '${inner}' "$1"`, 'sh', beacon],
+            }),
+            signal: ac.signal,
+        });
+        await res.body.getReader().read();
+        while (size() === 0) await new Promise(r => setTimeout(r, 50));
+
+        // サーバを止める（切断ではなく、サーバ自身の終了）
+        child.kill('SIGTERM');
+        await Promise.race([
+            new Promise(r => child.on('exit', r)),
+            new Promise(r => setTimeout(r, 5000)),
+        ]);
+        await new Promise(r => setTimeout(r, 700));
+        const s1 = size();
+        await new Promise(r => setTimeout(r, 700));
+        assert.equal(size(), s1,
+            `サーバを止めても孫が走り続けている（${s1} → ${size()}）`);
+        ac.abort();
+    } finally {
+        child.kill('SIGKILL');
+        await rm(beacon, { force: true });
+    }
+});
+
+test('🔒 exec: 不正なセッション id と知らない id を弾く', async () => {
+    const { child, url } = await startExec();
+    try {
+        const call = (id, path = 'stream') => fetch(`${url}/api/v0/exec/${id}/${path}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: '{}',
+        });
+        // 形が違うもの（長さ違い・大文字）は 400 で弾く
+        for (const bad of ['xyz', '0123456789ABCDEF', '0123456789abcde', '0123456789abcdef0']) {
+            const r = await call(bad);
+            assert.equal(r.status, 400, `不正な id が通った: ${bad}`);
+        }
+        // パス走査は経路に届く前に消える。`..` も `%2e%2e` も new URL() が
+        // デコードして正規化するので `/api/v0/stream` になり、どのルートにも当たらない。
+        // **「400 で弾いた」ではなく「そもそも届いていない」**ので 404 を期待する。
+        for (const bad of ['..', '%2e%2e', '%2E%2E']) {
+            const r = await call(bad);
+            assert.ok(r.status !== 200, `パス走査が通った: ${bad} → ${r.status}`);
+            assert.equal(r.status, 404, `${bad} の扱いが変わった（正規化に頼っている前提が崩れた）`);
+        }
+        // 形は正しいが存在しない
+        const r = await call('0123456789abcdef');
+        assert.equal(r.status, 404);
+        // 🔒 トークン無しでは経路そのものが無い
+        const noTok = await fetch(`${url}/api/v0/exec/0123456789abcdef/kill`, { method: 'POST' });
+        assert.equal(noTok.status, 403, 'トークン無しで kill できてしまった');
+    } finally { child.kill(); }
+});
+
+test('実行セッションの一覧が state に出る（見えない取り残しを作らない）', async () => {
+    const { child, url } = await startExec();
+    try {
+        const ac = new AbortController();
+        const res = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                // ⚠️ 秘密を argv に書かない。argv は「何を止めるか」の判断に必要なので
+                //    一覧に**意図的に出している**。検査したいのは「出力が漏れないこと」
+                argv: [process.execPath, '-e',
+                    'process.stdout.write(["SECRET","EXEC","OUT","777"].join("-")+"\\n");'
+                    + 'setInterval(()=>{},1000)'],
+            }),
+            signal: ac.signal,
+        });
+        const reader = res.body.getReader();
+        await reader.read();
+        await new Promise(r => setTimeout(r, 300));
+
+        const st = await (await fetch(`${url}/api/v0/state?fresh=1`)).text();
+        const s = JSON.parse(st);
+        assert.ok(Array.isArray(s.execSessions), 'execSessions が出ていない');
+        assert.equal(s.execSessions.length, 1);
+        const one = s.execSessions[0];
+        assert.equal(one.state, 'running');
+        assert.equal(one.subscribers, 1);
+        assert.ok(one.argv.includes(process.execPath), 'argv が出ていない（何を止めるか判断できない）');
+        // ⚠️ 一覧に出力の中身を入れない（state は認証だけで読めるので）
+        assert.ok(!st.includes('SECRET-EXEC-OUT-777'), '一覧に出力の中身が漏れている');
+        ac.abort();
+    } finally { child.kill(); }
+});
+
+test('--allow-exec なしでは execSessions が null（経路の存在も見せない）', async () => {
+    const s = await startAuthServer([]);
+    try {
+        const st = JSON.parse((await authGet(s.port, '/api/v0/state?fresh=1')).body);
+        assert.equal(st.execSessions, null);
+    } finally { s.child.kill(); }
 });
 
 // 🚨 レビュアの指摘: 既存の「切断で子を殺す」テストは直接の子（node -e）しか見て

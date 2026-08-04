@@ -79,6 +79,89 @@ const MUTANTS = [
         pattern: 'まだ無いファイルでも別表記',
         testFile: 'v0/paths.test.mjs',
     },
+    // #17: 「切断で殺す」をやめた代わりの制約。**外すと取り残しが戻る。**
+    {
+        name: 'exec-detached-grace',
+        why: '切断後の猶予を無くす（購読者がいなくても永久に走り続け、取り残しが溜まる）',
+        file: 'v0/execsession.mjs',
+        from: `                if (!s.keepAlive && s.lastDetachedAt !== null
+                    && now - s.lastDetachedAt >= this.limits.detachedGraceMs) {
+                    kill.push({ session: s, reason: 'detached' });
+                }`,
+        to: '                /* 変異: 切断後の猶予をやめる */',
+        gone: "reason: 'detached'",
+        pattern: '切断後は猶予が過ぎたら殺す',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-absolute-timeout',
+        why: '絶対上限を外す（keepAlive のセッションが無限に走る）',
+        file: 'v0/execsession.mjs',
+        from: `                if (now - s.createdAt >= this.execTimeoutMs) {
+                    kill.push({ session: s, reason: 'timeout' });
+                    continue;
+                }`,
+        to: '                /* 変異: 絶対上限をやめる */',
+        gone: "reason: 'timeout'",
+        pattern: '絶対上限（--exec-timeout）は keepAlive でも効く',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-retain-evict',
+        why: '終了したセッションを台帳から消さない（メモリに溜まり続ける）',
+        file: 'v0/execsession.mjs',
+        from: '            if (now - doneAt >= this.limits.retainMs && !s.subscribers.size) evict.push(s);',
+        to: '            /* 変異: 終了後の掃除をやめる */',
+        gone: 'evict.push(s)',
+        pattern: '保持期間のあいだ残り、過ぎたら台帳から消える',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-slot-reserve-sync',
+        why: '同時セッションの上限が効かない（8に対して24本走った実測がある）',
+        file: 'v0/execsession.mjs',
+        from: '        if (this.reserved >= this.limits.maxConcurrent) return null;',
+        to: '        /* 変異: 上限の検査をやめる */',
+        gone: 'this.reserved >= this.limits.maxConcurrent',
+        pattern: '同時セッションの上限が効き',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-ring-missing',
+        why: 'リングバッファで捨てた件数を告知しない（出力が完全だと誤解される）',
+        file: 'v0/execsession.mjs',
+        from: '        const missing = Math.max(0, firstKept - 1 - n);',
+        to: '        const missing = 0;',
+        gone: 'firstKept - 1 - n',
+        pattern: '上限で捨てたら missing で告知できる',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-session-id-validation',
+        why: 'セッション id の形を検証しない（HTTP から来た値をそのまま台帳に引く）',
+        file: 'v0/execsession.mjs',
+        from: '    return typeof v === \'string\' && ID_RE.test(v);',
+        to: '    return typeof v === \'string\';',
+        gone: 'ID_RE.test(v)',
+        pattern: '形の違うものを弾く',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-kill-on-shutdown',
+        why: 'サーバ終了時に子プロセスを置き去りにする'
+            + '（Windows では libuv が SILENT_BREAKAWAY_OK を立てるので孫が回収されない）',
+        file: 'v0/server.mjs',
+        from: `        for (const s of execRegistry.running) {
+            if (s.child) killTree(s.child).catch(() => {});
+        }`,
+        to: '        /* 変異: 終了時の後始末をやめる */',
+        gone: 'execRegistry.running',
+        // ⚠️ Windows では検証できない。child.kill('SIGTERM') は TerminateProcess に
+        //    なるので process.on('SIGTERM') が走らない（= この守り自体が効かない）。
+        //    ubuntu / macOS CI が検証する。
+        platforms: ['linux', 'darwin'],
+        pattern: 'サーバを SIGTERM で止めたら孫プロセスも残さない',
+    },
     {
         name: 'read-auth-gate',
         why: '読み取り経路の認証を外す（トンネルに届く相手が誰でも差分を読める）',
@@ -228,23 +311,11 @@ const MUTANTS = [
         gone: '!opts.allowExec',
         pattern: '--allow-exec なしでは exec の経路が存在しない',
     },
-    {
-        name: 'exec-slot-reserve',
-        why: '同時実行の上限が効かない（検査と予約の間に await）',
-        file: 'v0/server.mjs',
-        from: `function reserveExecSlot() {
-    if (runningExec >= MAX_CONCURRENT_EXEC) return false;
-    runningExec++;
-    return true;
-}`,
-        to: `function reserveExecSlot() {
-    return true;
-}`,
-        gone: 'runningExec >= MAX_CONCURRENT_EXEC',
-        pattern: '同時実行の上限が実際に効く',
-    },
-    // 孫プロセスの後始末は「木ごと kill」「stdio を destroy」「保険タイマー」
-    // 「exit で拾う（close ではなく）」の4つで守っている。
+    // ⚠️ `exec-slot-reserve` はここにあったが #17 で消した。
+    //    `reserveExecSlot()` が `execRegistry.create()` に移ったため
+    //    （守りが弱くなったのではなく、**後継が `exec-slot-reserve-sync`**）。
+    // 孫プロセスの後始末は「木ごと kill」「stdio を destroy」
+    // 「exit で拾う（close ではなく）」で守っている。
     // どれが実際に load-bearing かを個別に確かめる（まとめて1つの変異にすると
     // 「どれかが効いている」しか分からない）。
     {
@@ -281,17 +352,10 @@ const MUTANTS = [
         gone: 'child.stdout?.destroy()',
         pattern: '中間シェルを挟んだ孫プロセス',
     },
-    {
-        name: 'exec-guard-timer',
-        why: '子の終了を待てないときに応答が永久に開いたまま',
-        // 木ごと kill が成功すれば exit が来るので、これも冗長な backstop
-        defensive: '木ごと kill が成功する環境では冗長。最後の砦',
-        file: 'v0/server.mjs',
-        from: "                guard = setTimeout(() => finish(null, 'SIGKILL', '⚠ 子プロセスの終了を待てませんでした'), 3000);",
-        to: '                /* 変異: 保険タイマーをやめる */',
-        gone: '子プロセスの終了を待てませんでした',
-        pattern: '中間シェルを挟んだ孫プロセス',
-    },
+    // ⚠️ `exec-guard-timer`（exit が来なくても枠を返す保険タイマー）も #17 で消した。
+    //    **順序を変えたことで不要になった。** 以前は killTree → exit 待ち →
+    //    来なければ保険、という順だったが、今は台帳の sweep と明示的な kill が
+    //    どちらも「先に finish() してから killTree」する。枠は exit を待たずに戻る。
     {
         name: 'merge-driver',
         why: '衝突予測が custom merge driver を実行する（任意コード実行）',
@@ -314,14 +378,14 @@ const MUTANTS = [
         name: 'worktree-allowlist',
         why: '既知でない worktree を cwd にできる',
         file: 'v0/server.mjs',
-        // exec 側の allowlist だけを外す。`release()` があるので checkout 側とは区別できる。
+        // exec 側の allowlist だけを外す。`bail()` があるので checkout 側とは区別できる。
         // 単にメッセージを変えるのでは駄目で、**照合を通してしまう**形にする必要がある。
         from: `            const wt = worktrees.find(w => samePath(w.path, wantPath));
-            if (!wt) { release(); denyJson(res, 400, \`既知の worktree ではありません: \${wantPath}\`); return; }`,
+            if (!wt) { bail(400, \`既知の worktree ではありません: \${wantPath}\`); return; }`,
         to: `            /* 変異: allowlist を外し、要求されたパスをそのまま使う */
             const wt = worktrees.find(w => samePath(w.path, wantPath))
                 ?? { path: wantPath, label: wantPath, bare: false, prunable: false };`,
-        gone: 'release(); denyJson(res, 400, `既知の worktree ではありません',
+        gone: 'bail(400, `既知の worktree ではありません',
         pattern: 'exec は既知の worktree 以外を cwd にしない',
     },
     {

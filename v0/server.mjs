@@ -24,6 +24,7 @@ import {
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
 import { collectAgents, transcriptRoot } from './transcript.mjs';
+import { ExecRegistry, isSessionId } from './execsession.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -36,6 +37,11 @@ function parseArgs(argv) {
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
+        // 🚨 切断で子プロセスを殺すのをやめた代わりの制約（#17）。
+        //    猶予は「スマホがタブを止めて戻ってくる」までを吸収する長さにする。
+        //    終了後の保持は「出力を読みに戻れる」ための時間。
+        execDetachedGraceMs: 5 * 60 * 1000,
+        execRetainMs: 10 * 60 * 1000,
         // 🔒 エージェントの活動観測。**リポジトリ外（~/.claude/projects/）を読む**ので
         //    読み取り側の不変条件（git cat-file 経由のみ）を破る。だから別 capability。
         //    さらに自由文（発話・コマンド行）は**もう一段別のフラグ**にする。
@@ -69,6 +75,8 @@ function parseArgs(argv) {
         else if (a === '--allow-write') opts.allowWrite = true;
         else if (a === '--allow-exec') { opts.allowExec = true; opts.allowWrite = true; }
         else if (a === '--exec-timeout') opts.execTimeoutMs = num('--exec-timeout', 1, 86400) * 1000;
+        else if (a === '--exec-detached-grace') opts.execDetachedGraceMs = num('--exec-detached-grace', 1, 86400) * 1000;
+        else if (a === '--exec-retain') opts.execRetainMs = num('--exec-retain', 1, 86400) * 1000;
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
         else if (a === '--token-file') opts.tokenFile = resolve(argv[++i]);
@@ -478,6 +486,10 @@ async function collectFresh() {
         //    抽出は許可リスト方式（v0/transcript.mjs）
         agents,
         agentsText: opts.allowTranscriptText,
+        // 実行セッションの一覧。**切断しても走り続ける**ようにした代わりに、
+        // 「今何が走っているか」を見せる窓がどこかに必要（見えない取り残しを作らない）。
+        // ⚠️ 出力の中身は含めない（argv と状態だけ）。
+        execSessions: opts.allowExec ? execRegistry.list() : null,
         // 取り込み順序の提案。追加の git 呼び出しは0（衝突予測の結果だけを使う純ロジック）。
         // ⚠️ 仮説であって保証ではない。詳細は v0/mergeplan.mjs のコメント。
         mergePlan: planMerge(
@@ -775,18 +787,6 @@ async function auditExec(entry) {
 
 /** 同時実行数の上限。無制限だとマシンを埋められる。 */
 const MAX_CONCURRENT_EXEC = 8;
-let runningExec = 0;
-
-/**
- * ⚠️ 検査と予約は**同じ同期ブロック**で行う。
- *    間に `await` を挟むとイベントループを手放すので、同時に来た要求が全部
- *    検査を通ってしまう（上限8に対して24本走ったのをレビューで実測された）。
- */
-function reserveExecSlot() {
-    if (runningExec >= MAX_CONCURRENT_EXEC) return false;
-    runningExec++;
-    return true;
-}
 
 /**
  * プロセスを**木ごと**殺す。
@@ -821,11 +821,115 @@ async function killTree(child) {
 }
 
 /**
- * 走っている子プロセス。**サーバ終了時に置き去りにしないため**に持つ。
- * （Windows では libuv が SILENT_BREAKAWAY_OK を立てるので、
- *   サーバが死んでも孫は回収されない）
+ * 実行セッションの台帳（#17）。
+ *
+ * 🚨 **クライアント切断で子プロセスを殺すのをやめた。** モバイルブラウザは
+ *    タブを積極的に停止するので、スマホから投げた `npm test` がその瞬間に死んでいた。
+ *    代わりに寿命を明示的に管理する（v0/execsession.mjs に方針を集約）。
+ *
+ * ⚠️ サーバ終了時に置き去りにしないのは変わらず必要
+ *    （Windows では libuv が SILENT_BREAKAWAY_OK を立てるので、
+ *      サーバが死んでも孫は回収されない）。
  */
-const activeExec = new Set();
+const execRegistry = new ExecRegistry({
+    execTimeoutMs: opts.execTimeoutMs,
+    limits: {
+        maxConcurrent: MAX_CONCURRENT_EXEC,
+        detachedGraceMs: opts.execDetachedGraceMs,
+        retainMs: opts.execRetainMs,
+    },
+});
+
+/**
+ * セッションを購読して ndjson で流す。
+ *
+ * 🚨 **切断しても子プロセスを殺さない。** 購読をやめるだけ。
+ *    殺すかどうかは台帳の sweep が決める（猶予を過ぎたら / 絶対上限を過ぎたら）。
+ *    これが #17 の本体で、以前はここで killTree していた。
+ *
+ * ⚠️ 1行目に必ず `{t:'session', id, ...}` を出す。これが無いと
+ *    クライアントは再接続先の id を知る手段が無い（POST の応答本文は
+ *    ストリームなので、ヘッダやボディの先頭以外に置き場所がない）。
+ * ⚠️ 取りこぼし（リングバッファの上限で捨てた分）は `missing` として告知する。
+ *    黙って間を抜くと、利用者は出力が完全だと誤解する。
+ */
+function streamSession(req, res, s, from) {
+    res.writeHead(200, {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'cache-control': 'no-store',
+        // プロキシに溜め込ませない（トンネル越しで出力が止まって見えるのを防ぐ）
+        'x-accel-buffering': 'no',
+    });
+    // 無音のコマンドでも「受理された」がすぐ分かるようにする
+    res.flushHeaders?.();
+
+    const send = obj => { if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`); };
+
+    const { replay, unsubscribe } = execRegistry.subscribe(s, from, rec => {
+        send(rec);
+        // 終わったら購読側も閉じる（クライアントに「まだ続く」と思わせない）
+        if (rec.t === 'exit') { try { res.end(); } catch { /* 既に閉じている */ } }
+    });
+
+    send({
+        t: 'session',
+        id: s.id,
+        state: s.state,
+        keepAlive: s.keepAlive,
+        worktree: s.worktree,
+        seq: replay.seq,
+        detachedGraceMs: s.keepAlive ? null : opts.execDetachedGraceMs,
+    });
+    if (replay.missing > 0) {
+        send({ t: 'err', d: `⚠ 出力が上限を超えたので ${replay.missing} 件を省略しました` });
+    }
+    for (const rec of replay.records) send(rec);
+    // 再購読で、既に終わっていたら閉じる
+    if (!s.running) { try { res.end(); } catch { /* noop */ } }
+
+    let gone = false;
+    const detach = async () => {
+        if (gone) return;
+        gone = true;
+        unsubscribe();
+        // 🚨 ここで killTree しない。それが以前の挙動で、スマホでは
+        //    タブが停止した瞬間に会話やテストが死んでいた。
+        if (s.running) {
+            await auditExec({
+                event: 'detach', session: s.id,
+                graceMs: s.keepAlive ? null : opts.execDetachedGraceMs,
+            });
+        }
+    };
+    req.on('aborted', detach);
+    res.on('close', detach);
+}
+
+/** 台帳の判断に従って実際に殺す・消す。1秒ごと。 */
+let sweepTimer = null;
+function startExecSweeper() {
+    if (sweepTimer) return;
+    sweepTimer = setInterval(async () => {
+        const { kill, evict } = execRegistry.sweep();
+        for (const { session, reason } of kill) {
+            const note = reason === 'timeout'
+                ? `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します`
+                : `⚠ 切断されたまま ${opts.execDetachedGraceMs / 1000}s 経ったので停止します`;
+            // ⚠️ 先に finish しておく。kill を待つ間に sweep がもう一度回って
+            //    二重に殺しに行くのを防ぐ（finish は1回しか効かない）。
+            session.killRequested = reason;
+            execRegistry.finish(session, { code: null, signal: 'SIGKILL', note });
+            await auditExec({
+                event: 'kill', reason, session: session.id,
+                worktree: session.worktree, argv: session.argv,
+            });
+            if (session.child) await killTree(session.child);
+        }
+        for (const s of evict) execRegistry.remove(s);
+    }, 1000);
+    // ⚠️ unref しておく。これだけでイベントループを生かし続けない
+    sweepTimer.unref?.();
+}
 
 /** JSON ボディを読む。上限付き（無制限に読むと DoS になる）。 */
 function readJson(req, maxBytes = 64 * 1024) {
@@ -954,38 +1058,38 @@ const server = createServer(async (req, res) => {
             if (!argv || argv.length === 0) { denyJson(res, 400, 'argv（配列）が必要です'); return; }
             if (argv.some(a => a.includes('\0'))) { denyJson(res, 400, 'argv に NUL は使えません'); return; }
 
-            // 🔒 枠は await の手前で予約する（検査と予約の間に await を挟むと上限が効かない）
-            if (!reserveExecSlot()) {
+            // 🔒 枠は await の手前で予約する（検査と予約の間に await を挟むと上限が効かない）。
+            //    create() は同期。ここを async にしてはいけない。
+            const session = execRegistry.create({
+                worktree: '(未検証)', argv, keepAlive: body.keepAlive === true,
+            });
+            if (!session) {
                 denyJson(res, 429, `同時実行が上限（${MAX_CONCURRENT_EXEC}）に達しています`);
                 return;
             }
-            // 予約した後の失敗経路は必ず枠を返す
-            let released = false;
-            const release = () => { if (!released) { released = true; runningExec--; } };
+            // 予約した後の失敗経路は必ず枠を返す（finish が枠を返す）
+            const bail = (code, msg) => {
+                execRegistry.finish(session, { note: msg });
+                execRegistry.remove(session);
+                denyJson(res, code, msg);
+            };
 
             const wantPath = toNFC(String(body.worktree ?? ''));
             const worktrees = await listWorktrees(opts.repo);
             const wt = worktrees.find(w => samePath(w.path, wantPath));
-            if (!wt) { release(); denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
-            if (wt.bare) { release(); denyJson(res, 400, 'bare worktree では実行できません'); return; }
-            if (wt.prunable) { release(); denyJson(res, 409, '作業ツリーが失われています'); return; }
+            if (!wt) { bail(400, `既知の worktree ではありません: ${wantPath}`); return; }
+            if (wt.bare) { bail(400, 'bare worktree では実行できません'); return; }
+            if (wt.prunable) { bail(409, '作業ツリーが失われています'); return; }
+            session.worktree = wt.path;
 
             await auditExec({
-                event: 'start', worktree: wt.path, argv,
+                event: 'start', session: session.id, worktree: wt.path, argv,
+                keepAlive: session.keepAlive,
                 peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
             });
-            res.writeHead(200, {
-                'content-type': 'application/x-ndjson; charset=utf-8',
-                'cache-control': 'no-store',
-                // プロキシに溜め込ませない（トンネル越しで出力が止まって見えるのを防ぐ）
-                'x-accel-buffering': 'no',
-            });
-            // 無音のコマンドでも「受理された」がすぐ分かるようにする
-            res.flushHeaders?.();
 
             const { spawn } = await import('node:child_process');
             const { StringDecoder } = await import('node:string_decoder');
-            const send = obj => { if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`); };
 
             let child;
             try {
@@ -997,70 +1101,86 @@ const server = createServer(async (req, res) => {
                     env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', NO_COLOR: '1' },
                 });
             } catch (err) {
-                release();
                 // Windows で .cmd/.bat を直接 spawn すると EINVAL になる。
                 // shell を使わない方針なので `cmd /c` を明示してもらう
                 const hint = err.code === 'EINVAL' && process.platform === 'win32'
                     ? '（Windows では .cmd/.bat は直接実行できません。'
                         + ' argv を ["cmd","/c","npm","test"] のように指定してください）'
                     : '';
-                send({ t: 'err', d: `起動できません: ${err.message}${hint}` });
-                send({ t: 'exit', code: null, signal: null });
-                res.end();
+                execRegistry.emit(session, 'err', `起動できません: ${err.message}${hint}`);
+                execRegistry.finish(session, { code: null, signal: null });
+                // 起動できなかったことは購読者に見せたいので、ストリームで返す
+                streamSession(req, res, session, 0);
                 return;
             }
+            execRegistry.attachChild(session, child);
+            startExecSweeper();
 
             // ⚠️ chunk ごとに toString() すると3バイト文字が割れる。
             //    StringDecoder が境界を持ち越す（CLAUDE.md の git 呼び出し規則と同じ理由）。
             const decOut = new StringDecoder('utf8'), decErr = new StringDecoder('utf8');
-            child.stdout.on('data', c => send({ t: 'out', d: decOut.write(c) }));
-            child.stderr.on('data', c => send({ t: 'err', d: decErr.write(c) }));
-
-            activeExec.add(child);
-            // ⚠️ 後始末は1回だけ走らせる。`exit` と保険タイマーと切断の
-            //    どこから来ても同じ finish() に集約する。
-            let finished = false;
-            let timer = null, guard = null;
-            const finish = async (code, signal, note) => {
-                if (finished) return;
-                finished = true;
-                clearTimeout(timer); clearTimeout(guard);
-                activeExec.delete(child);
-                release();
-                const tail = decOut.end(), tailErr = decErr.end();
-                if (tail) send({ t: 'out', d: tail });
-                if (tailErr) send({ t: 'err', d: tailErr });
-                if (note) send({ t: 'err', d: note });
-                send({ t: 'exit', code, signal });
-                if (!res.writableEnded) res.end();
-                await auditExec({
-                    event: 'exit', worktree: wt.path, argv, code, signal,
-                    note: note ?? null,
-                });
-            };
-
-            timer = setTimeout(async () => {
-                send({ t: 'err', d: `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します` });
-                await killTree(child);
-                // ⚠️ 孫が stdio を握っていると exit が来ないことがある。
-                //    その場合でも応答を閉じて枠を返すための保険。
-                guard = setTimeout(() => finish(null, 'SIGKILL', '⚠ 子プロセスの終了を待てませんでした'), 3000);
-            }, opts.execTimeoutMs);
-
-            // クライアントが切れたら子プロセスを残さない（放置すると溜まる）
-            const onDisconnect = async () => {
-                if (finished) return;
-                await killTree(child);
-                guard = setTimeout(() => finish(null, 'SIGKILL', '⚠ クライアント切断'), 3000);
-            };
-            req.on('aborted', onDisconnect);
-            res.on('close', onDisconnect);
-
-            child.on('error', err => send({ t: 'err', d: `実行エラー: ${err.message}` }));
+            child.stdout.on('data', c => {
+                const s = decOut.write(c);
+                if (s) execRegistry.emit(session, 'out', s);
+            });
+            child.stderr.on('data', c => {
+                const s = decErr.write(c);
+                if (s) execRegistry.emit(session, 'err', s);
+            });
+            child.on('error', err => execRegistry.emit(session, 'err', `実行エラー: ${err.message}`));
             // ⚠️ `close` ではなく `exit` を使う。`close` は stdio が EOF になるまで来ないので、
             //    孫がパイプを握っていると永久に発火せず、枠が戻らない（レビューで実測）。
-            child.on('exit', (code, signal) => { finish(code, signal); });
+            child.on('exit', async (code, signal) => {
+                const tail = decOut.end(), tailErr = decErr.end();
+                if (tail) execRegistry.emit(session, 'out', tail);
+                if (tailErr) execRegistry.emit(session, 'err', tailErr);
+                if (execRegistry.finish(session, { code, signal })) {
+                    await auditExec({
+                        event: 'exit', session: session.id, worktree: wt.path, argv, code, signal,
+                    });
+                }
+            });
+
+            // POST はセッションを作ってそのまま購読する（1往復で流れ始める）
+            streamSession(req, res, session, 0);
             return;
+        }
+
+        // 実行セッションの再購読。**切断しても走り続けている**ので、
+        // 最後に見た通番の続きから貰えるようにする（#17）。
+        {
+            const m = /^\/api\/v0\/exec\/([^/]+)\/(stream|kill)$/.exec(url.pathname);
+            if (m) {
+                // 🔒 実行と同じ関門を通す（GET にしない。POST + トークン + 同一オリジン）
+                if (!requireExec(req, res)) return;
+                if (!isSessionId(m[1])) { denyJson(res, 400, 'セッション id が不正です'); return; }
+                const s = execRegistry.get(m[1]);
+                if (!s) { denyJson(res, 404, 'そのセッションはありません（保持期間を過ぎたか、id が違います）'); return; }
+                if (m[2] === 'kill') {
+                    await auditExec({
+                        event: 'kill', reason: 'requested', session: s.id,
+                        worktree: s.worktree, argv: s.argv,
+                    });
+                    const was = execRegistry.finish(s, {
+                        code: null, signal: 'SIGKILL', note: '⚠ 停止を要求されました',
+                    });
+                    if (s.child) await killTree(s.child);
+                    res.writeHead(200, {
+                        'content-type': 'application/json; charset=utf-8',
+                        'cache-control': 'no-store',
+                    });
+                    res.end(JSON.stringify({ ok: true, alreadyDone: !was }));
+                    return;
+                }
+                let body = {};
+                try { body = await readJson(req); } catch { /* from 無しでも良い */ }
+                const from = Number(body.from);
+                await auditExec({
+                    event: 'reattach', session: s.id, from: Number.isFinite(from) ? from : 0,
+                });
+                streamSession(req, res, s, Number.isFinite(from) ? from : 0);
+                return;
+            }
         }
 
         // 🔒 checkout。**このツールの主張そのもの**なので、git が exit 0 で通してしまう
@@ -1391,7 +1511,12 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
         // ⚠️ 走っている exec を置き去りにしない。Windows では libuv が
         //    SILENT_BREAKAWAY_OK を立てるので、サーバが死んでも孫は回収されない。
-        for (const child of activeExec) killTree(child).catch(() => {});
+        // ⚠️ 切断では殺さなくなったが、**サーバ終了時は必ず殺す。**
+        //    Windows では libuv が SILENT_BREAKAWAY_OK を立てるので、
+        //    サーバが死んでも孫は回収されない（放置すると溜まる）。
+        for (const s of execRegistry.running) {
+            if (s.child) killTree(s.child).catch(() => {});
+        }
         server.close(() => process.exit(0));
         // ソケットが残っていても確実に終わらせる
         setTimeout(() => process.exit(0), 800).unref();

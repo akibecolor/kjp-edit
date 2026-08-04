@@ -433,7 +433,11 @@ const PRESETS = [
 /** 端末の上限。超えたら先頭を捨てる（捨てたことは画面に出す）。 */
 const TERM_MAX_SPANS = 4000;
 
-async function runExec(termEl, scrollEl, wt, argv, onState) {
+/**
+ * 実行セッションを購読する。**新規実行と再購読の両方**を担う。
+ * @param {?{id: string, from: number}} attach 再購読するセッション（新規なら null）
+ */
+async function runExec(termEl, scrollEl, wt, argv, onState, { attach = null, keepAlive = false } = {}) {
   // ⚠️ 出力1件ごとに DOM に append して scrollHeight を読むと、
   //    **強制同期レイアウトが総文字数に比例**して全体が二次になる。
   //    レビューの実測で 12,000 行 = 54 秒、うち 28.9 秒が単一ブロック
@@ -471,13 +475,32 @@ async function runExec(termEl, scrollEl, wt, argv, onState) {
   };
 
   const ac = new AbortController();
-  onState({ running: true, abort: () => ac.abort() });
-  line('d', `$ ${argv.join(' ')}\n`);
+  // ⚠️ **abort はもう「停止」ではない。** #17 でサーバが切断で子を殺すのを
+  //    やめたので、abort は「見るのをやめる」だけ。止めるには kill を呼ぶ。
+  //    ここを混同すると「停止を押したのに走り続ける」ことになる。
+  let sessionId = attach?.id ?? null;
+  let lastSeq = attach?.from ?? 0;
+  const kill = async () => {
+    if (!sessionId) { ac.abort(); return; }
+    try {
+      await fetch(`/api/v0/exec/${sessionId}/kill`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
+      });
+    } catch { /* 既に終わっている */ }
+  };
+  const publish = () => onState({
+    running: true, abort: () => ac.abort(), kill, sessionId, seq: () => lastSeq,
+  });
+  publish();
+  line('d', attach ? `↻ セッション ${attach.id} に再接続\n` : `$ ${argv.join(' ')}\n`);
   try {
-    const res = await fetch('/api/v0/exec', {
+    const res = await fetch(attach ? `/api/v0/exec/${attach.id}/stream` : '/api/v0/exec', {
       method: 'POST',
       headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
-      body: JSON.stringify({ worktree: wt.path, argv }),
+      body: JSON.stringify(attach
+        ? { from: attach.from ?? 0 }
+        : { worktree: wt.path, argv, keepAlive: !!keepAlive }),
       signal: ac.signal,
     });
     if (!res.ok) {
@@ -488,6 +511,17 @@ async function runExec(termEl, scrollEl, wt, argv, onState) {
     }
     for await (const ev of parseNdjson(res.body)) {
       if (ev.__parseError) { line('e', `(解析できない行: ${ev.__parseError.slice(0, 80)})\n`); continue; }
+      // 通番を覚える。再接続で「続きから」貰うために必要
+      if (typeof ev.n === 'number' && ev.n > lastSeq) lastSeq = ev.n;
+      if (ev.t === 'session') {
+        sessionId = ev.id;
+        publish();
+        if (ev.keepAlive) line('d', '（切断しても最後まで走ります）\n');
+        else if (ev.detachedGraceMs) {
+          line('d', `（切断しても ${Math.round(ev.detachedGraceMs / 1000)} 秒は走り続けます）\n`);
+        }
+        continue;
+      }
       if (ev.t === 'out') line('', ev.d);
       else if (ev.t === 'err') line('w', ev.d);
       else if (ev.t === 'exit') {
@@ -497,7 +531,14 @@ async function runExec(termEl, scrollEl, wt, argv, onState) {
       }
     }
   } catch (e) {
-    if (e.name === 'AbortError') line('w', '\n⚠ 中断しました（サーバ側でプロセスを停止）\n');
+    // ⚠️ **「サーバ側でプロセスを停止」と書いてはいけない。** #17 で
+    //    切断では止まらなくなった。嘘を書くと、走り続けているものを
+    //    止めたと誤解する（観測ツールとして最悪の誤り）
+    if (e.name === 'AbortError') {
+      line('w', sessionId
+        ? `\n⚠ 見るのをやめました。セッション ${sessionId} はまだ走っています（止めるには「停止」）\n`
+        : '\n⚠ 中断しました\n');
+    }
     else line('e', `\n✖ ${e.message}\n`);
   } finally {
     flush();                       // 溜まっている分を出し切る
@@ -554,6 +595,11 @@ function consoleBody(wt, paneObj) {
   sel.addEventListener('change', () => { input.value = sel.value; refresh(); });
   refresh();
 
+  // 走っているセッションへの再接続口。**ここが無いと、切断しても走り続ける
+  // ようにした意味が半分無くなる**（戻ってきたのに追いつけない）。
+  const resume = el('div', 'note');
+  resume.hidden = true;
+
   let cur = null;
   const onState = st => {
     box.dataset.running = st.running ? '1' : '';
@@ -561,19 +607,79 @@ function consoleBody(wt, paneObj) {
     input.disabled = st.running;
     run.disabled = st.running || !parsed.argv.length || !!parsed.warning;
     cur = st.running ? st : null;
-    // ペイン側から中断できるようにする（ペインを捨てる前に呼ばれる）
+    // ⚠️ ペインを捨てる前に呼ばれる。**これは kill ではなく購読解除**。
+    //    サーバ側は猶予（既定5分）のあいだ走り続け、その間は再接続できる
     paneObj.abort = st.running ? st.abort : null;
+    paneObj.sessionId = st.running ? st.sessionId : null;
+    if (st.running) resume.hidden = true;
   };
-  const start = () => {
+  const start = (opts) => {
     if (parsed.warning || !parsed.argv.length) return;
-    runExec(term, scroll, wt, parsed.argv, onState);
+    runExec(term, scroll, wt, parsed.argv, onState, opts);
+  };
+
+  /**
+   * この worktree で走っているセッションを出す。
+   * ⚠️ 自動更新のたびに作り直すが、**入力欄は作り直さない**（選択が飛ぶ）。
+   *    ここは表示だけなので作り直して良い。
+   */
+  paneObj.showSessions = list => {
+    const mine = (list ?? []).filter(s => samePathish(s.worktree, wt.path)
+      && (s.state === 'starting' || s.state === 'running')
+      && s.id !== paneObj.sessionId);
+    resume.replaceChildren();
+    resume.hidden = mine.length === 0;
+    if (!mine.length) return;
+    resume.append(document.createTextNode(
+      `⚠ このworktreeで ${mine.length} 件のセッションが走っています（別の画面から実行したもの）:`));
+    for (const s of mine) {
+      const row = el('div', 'ab');
+      row.append(document.createTextNode(`${s.argv.join(' ')} — ${Math.round(s.ageMs / 1000)}秒経過`));
+      if (s.detachedMs !== null && !s.keepAlive) {
+        row.append(el('span', 'note', ` / 切断中 ${Math.round(s.detachedMs / 1000)}秒`));
+      }
+      const re = el('button', null, '再接続');
+      re.addEventListener('click', () => {
+        // 通番 0 から = 残っている分を全部再生してもらう
+        runExec(term, scroll, wt, s.argv, onState, { attach: { id: s.id, from: 0 } });
+      });
+      const kb = el('button', null, '停止');
+      kb.addEventListener('click', async () => {
+        kb.disabled = true;
+        try {
+          await fetch(`/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
+          });
+        } catch { /* 既に終わっている */ }
+      });
+      row.append(re, kb);
+      resume.append(row);
+    }
   };
   run.addEventListener('click', start);
   input.addEventListener('keydown', e => { if (e.key === 'Enter' && !run.disabled) start(); });
-  stop.addEventListener('click', () => cur?.abort?.());
+  // ⚠️ 「停止」は本当に止める（kill）。abort だけでは切断にすぎず、
+  //    サーバ側は猶予のあいだ走り続ける
+  stop.addEventListener('click', async () => {
+    await cur?.kill?.();
+    cur?.abort?.();
+  });
 
-  box.append(bar, peek, scroll);
+  box.append(bar, peek, resume, scroll);
   return box;
+}
+
+/**
+ * パスのゆるい一致。サーバは `samePath()`（realpath / 大文字小文字 / 区切り）で
+ * 厳密に照合しているが、ブラウザ側では realpath が出来ない。
+ * ⚠️ **これを認可に使わない。** 表示上「どのペインに出すか」を決めるだけ。
+ *    認可はサーバ側の allowlist が持つ。
+ */
+function samePathish(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const n = s => s.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+  return n(a) === n(b);
 }
 
 /* ===== checkout ===== */
@@ -992,6 +1098,9 @@ function render(s) {
       obj.body.style.display = 'flex';
       obj.body.replaceChildren(consoleBody(wt, obj));
     }
+    // 走っているセッションの一覧を毎回渡す。
+    // ⚠️ 別の端末や再読込の前に始めたセッションはここからしか見つけられない
+    obj.showSessions?.(s.execSessions);
   }
   arrangeRow($('#consoles'), live.map(w => `console-${w.path}`));
   if (!live.length) {
