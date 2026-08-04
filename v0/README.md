@@ -145,14 +145,24 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `git.mjs` | git の起動と解析。worktree 列挙、log、diff、シーケンサ状態検出 |
 | `swimlanes.mjs` | レーン割当。VS Code の `scmHistory.ts`（MIT）を参考に再実装 |
 | `swimlanes.test.mjs` | 回帰テスト。実際に踏んだバグを固定 |
-| `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe`） |
+| `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe` と、必ず throw する `/__throw` / `/__throw-inner`） |
 | `app.html` | **統合 UI**（`/` と `/layout` が返す）。広い画面はドック、狭い画面は縦積み |
 | `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
 | `layout-check.mjs` | 実ブラウザで 390 / 768 / 1280px を測る。ブラウザが無ければスキップ |
-
+| `render-check.mjs` | 実ブラウザ・**実時間**で端末への追記を測る（#3）。仮想時間では測れないので別プロセス |
 | `ndjson.mjs` | 行区切り JSON のストリーム読み。**ブラウザと unit テストで共有** |
 | `ndjson.test.mjs` | 行割れ・マルチバイト割れの回帰テスト |
+| `argv.mjs` | コマンド行の分割。同じ理由で共有 |
+| `chatfilter.mjs` / `.test.mjs` | 会話モード（stream-json）の出力の解釈。**同じ理由で共有** |
 | `mergeplan.mjs` / `.test.mjs` | 取り込み順序の提案（純関数）と unit テスト9件 |
+
+🚨 **ブラウザで動くロジックは `app.html` の中に置かない。**
+中に置くとテストできないので、**宣言が破れても気付けない**。
+`chatfilter.mjs` は「解釈できない行は捨てない」と書きながら
+改行で終わらない最後の行と知らない `type` を捨てていた（#44）。
+サーバはこの3本を同じ経路で配信していて、**UI の import 一覧を
+`app.html` から読んで全部 200 であることをスモークテストが固定している**
+（1本でも 404 だとモジュール全体が実行されず**ページが真っ白**になる）。
 
 ### エンドポイント
 
@@ -211,7 +221,7 @@ node v0/server.mjs --allow-exec --token "$TOKEN"
 | `--allow-exec` | 既定オフ。**24文字以上の `--token` か `--token-file` が無いと起動しません**（有効化を必ず意識的な操作にするため） |
 | `--exec-detached-grace <秒>` | 切断後に走り続ける時間（既定 300）。過ぎたら止める |
 | `--exec-retain <秒>` | 終了後にセッションを台帳に残す時間（既定 600）。出力を読みに戻れる |
-| `--token-file` | 無ければ 0600 で生成し、あれば読む（再起動でトークンが変わらない）。**リポジトリの中を指すと起動を拒否します**（コミットされるため）。`scripts/serve.mjs --exec` は `~/.kjp-edit/token` を自動で渡します |
+| `--token-file` | 無ければ 0600 で生成し、あれば読む（再起動でトークンが変わらない）。**リポジトリの中を指すと起動を拒否します** — worktree の中（エージェントの `git add -A` でコミットされる）と `.git` の中の**両方**を見ます。`scripts/serve.mjs --exec` は `~/.kjp-edit/token` を自動で渡します |
 
 ### 会話コンソール（#18） — PTY は使いません
 
@@ -328,11 +338,18 @@ Claude Code のセッション記録（`~/.claude/projects/`）を読みます�
 | | |
 |---|---|
 | 読む場所 | `~/.claude/projects/` のみ。`.jsonl` 以外は開かない |
-| 読む量 | 最新1本の**末尾 256KB だけ**（実測で 24MB の記録があった） |
+| 読む量 | 最新1本の**末尾 256KB から**（足りなければ最大 4MB まで広げます。#27 / #37） |
 | git の起動 | **増えません**（fs だけ。スモークテストで固定） |
-| 既定で出るもの | 状態・経過時間・ツール名・件数・**worktree 相対のパス**・`permissionMode` |
+| 既定で出るもの | 状態・経過時間・ツール名・件数・**worktree 相対のパス（160 文字で切る）**・`permissionMode` |
 | `--allow-transcript-text` で増えるもの | 発話（切り詰め）と `Bash` / `PowerShell` のコマンド行 |
 | **どちらでも出さないもの** | **ツールの結果**（読んだファイルの中身・コマンド出力）、`thinking`、`Edit`/`Write` の内容、`message` 外の自由文 |
+
+⚠️ **パスは自由文です。** 「`--watch-agents` だけなら自由文は1文字も通らない」とは
+言えません（#38）。ファイル名は任意の文字列で、エージェントが読んだ README や
+Web ページのインジェクションが `Read("<repo>/<秘密>")` を1回呼ばせれば、
+**失敗した read でも記録に残って画面に出ます**。160 文字で切って告知しますが、
+上限内のパスは出ます。詳細と、なぜ `git ls-files` と照合しないのかは
+`docs/agent-observation.md`。
 
 🚨 **抽出は許可リスト方式です。** ツールの結果には入口が5つあり
 （`tool_result` / `toolUseResult` / `file-history-snapshot` /

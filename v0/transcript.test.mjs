@@ -191,6 +191,45 @@ test('リポジトリ外のパスは出さず「外」と印を付ける', () =>
     assert.ok(!JSON.stringify(s).includes('secret.env'));
 });
 
+/**
+ * 🚨 **パスは自由文の通り道なので、長さで縛る。**
+ *
+ * `isSafeRepoPath` は空白・改行・任意の Unicode を 4096 文字まで通すので、
+ * `--watch-agents` だけで recent 12件 × 4096 ≒ 48KB の任意テキストが、
+ * 発話用のフラグ（`--allow-transcript-text`）を経由せずに出ていた。
+ * 引き金は実在する: 読んだ README や Web ページのインジェクションが
+ * `Read("<repo>/<秘密>")` を1回呼ばせれば、失敗した read でも tool_use として残る（#38）。
+ */
+test('🚨 長いパスは切って、切ったことを伝える（自由文の通り道を縛る）', () => {
+    const rec = tail => [JSON.stringify({
+        type: 'assistant', timestamp: ago(100), cwd: WT, sessionId: 's',
+        message: { content: [{ type: 'tool_use', name: 'Read',
+            input: { file_path: `${WT}/${tail}` } }] },
+    })];
+
+    const long = summarize(rec(`${'A'.repeat(300)}${SECRET}`), { worktreePath: WT, now: NOW });
+    const r = long.recent[0];
+    assert.ok(r.path.length <= LIMITS.pathChars + 1,
+        `パスが上限を超えて出ている: ${r.path.length} 文字`);
+    assert.equal(r.pathClipped, true, '切ったことを payload に残していない');
+    assert.ok(!JSON.stringify(long).includes(SECRET),
+        '長いパスの末尾に置いた秘密がそのまま出ている（上限が効いていない）');
+    // ⚠️ 切ったパスは**別のファイルを指すか何も指さない**。開ける扱いにしてはいけない
+    assert.ok(r.path.endsWith('…'), '省略の印が付いていない');
+
+    // 上限内なら切らない（普通のパスに省略の印を付けてしまわない）
+    const shortOne = summarize(rec('v0/git.mjs'), { worktreePath: WT, now: NOW }).recent[0];
+    assert.equal(shortOne.path, 'v0/git.mjs');
+    assert.equal(shortOne.pathClipped, false);
+
+    // 📓 **残るリスクを明示する。** 上限内のパスは出る = ファイル名に入れた文字列は出る。
+    //    `git ls-files` と照合すれば消せるが、worktree ごとに git 呼び出しが増えるので
+    //    採らない（CLAUDE.md）。`docs/agent-observation.md` にこの残りを書いた。
+    const shortSecret = summarize(rec(`${SECRET}.md`), { worktreePath: WT, now: NOW });
+    assert.ok(JSON.stringify(shortSecret).includes(SECRET),
+        '短いパスは出る前提で文書を書いている。挙動が変わったら文書も直すこと');
+});
+
 // 🚨 これが種別の許可リストの本当の理由。
 //    記録の形式は Claude Code の内部形式で、**フィールドもレコード種別も増える**。
 //    増えた種別が message.content を持っていたら、除外方式では黙って本文が漏れる。
@@ -353,6 +392,132 @@ test('collectAgents: cwd で worktree に対応付け、無関係な記録は無
         assert.equal(b.state, 'none');
         assert.equal(b.session, null);
         assert.ok(!JSON.stringify(agents).includes(SECRET), '.jsonl 以外を読んでいる');
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
+/**
+ * 🚨 **cwd が最新の1本から読めなくても諦めない（#36）。**
+ *
+ * 実データに引き金がある: cwd を1つも持たない 112B の `teleported-from` スタブが
+ * 3本あり、同じディレクトリに 182MB の実セッションが同居している。
+ * スタブが後から書かれれば mtime が最新になり、**そのプロジェクトの観測が死ぬ**。
+ * しかも `errors` は空なので告知が一切無く、UI は稼働中のエージェントに
+ * 「走らせた記録がありません」と断言する。
+ */
+test('🚨 最新の記録に cwd が無くても、次の候補と広い窓で見つける（記録なしと嘘をつかない）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-cwd-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-cwdwt-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const live = JSON.stringify({
+            type: 'assistant', timestamp: ago(20_000), cwd: wt, sessionId: 's1',
+            message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        });
+
+        // (A) 最新が cwd を持たないスタブ。実セッションは1本古い方
+        const dA = join(root, 'proj-a'); await mkdir(dA);
+        await writeFile(join(dA, 'real.jsonl'), `${live}\n`, 'utf8');
+        // ⚠️ mtime を確実に新しくする（同一 ms だと順序が決まらない）
+        await new Promise(r => setTimeout(r, 30));
+        await writeFile(join(dA, 'stub.jsonl'),
+            `${JSON.stringify({ type: 'teleported-from', sessionId: 's0' })}\n`, 'utf8');
+
+        const worktrees = [{ path: wt, label: 'agent-a' }];
+        const a = (await collectAgents(worktrees, { root, now: NOW }))
+            .agents.find(x => x.name === 'agent-a');
+        assert.equal(a.state, 'active',
+            'cwd を持たないスタブが最新だと観測が死ぬ（次の候補を試していない）');
+        assert.equal(a.toolCounts.Edit, 1);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
+test('🚨 先頭レコードが窓より大きくても cwd を見つける（黙って捨てない）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-head-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-headwt-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const dir = join(root, 'proj'); await mkdir(dir);
+        // 先頭レコードが headBytes（16KB）を超える。cwd はその**後ろ**の行にある
+        const fat = JSON.stringify({
+            type: 'file-history-snapshot', messageId: 'm', snapshot: { x: 'A'.repeat(40_000) },
+        });
+        const live = JSON.stringify({
+            type: 'assistant', timestamp: ago(5000), cwd: wt, sessionId: 's1',
+            message: { content: [{ type: 'tool_use', name: 'Read', input: {} }] },
+        });
+        await writeFile(join(dir, 's.jsonl'), `${fat}\n${live}\n`, 'utf8');
+
+        const { agents, errors } = await collectAgents([{ path: wt, label: 'agent-a' }],
+            { root, now: NOW });
+        const a = agents.find(x => x.name === 'agent-a');
+        assert.equal(a.state, 'active',
+            `先頭 16KB に cwd が入らないと丸ごと捨てている: ${JSON.stringify(errors)}`);
+        assert.equal(a.toolCounts.Read, 1);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
+/**
+ * 🚨 **窓が全部「知らない種別」でも「記録なし」と言わない（#37）。**
+ *
+ * 完全な行は取れている（`needMore:false` / `tooBigToRead:false`）ので #27 の救済に
+ * 乗らず、`lastActivityAt:null` → UI は 5秒前に Edit を書いたエージェントに
+ * 「走らせた記録がありません」と表示していた。実データで
+ * **許可リスト外の type が 304KB 連続する箇所**があり、既定の窓（256KB）を超える。
+ */
+test('🚨 末尾が全部「知らない種別」でも読み直し、駄目なら抽出できないと伝える', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-unk-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-unkwt-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const live = JSON.stringify({
+            type: 'assistant', timestamp: ago(5000), cwd: wt, sessionId: 's1',
+            message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        });
+        // 許可リスト外の行で末尾の窓（256KB）を埋める
+        const junk = JSON.stringify({
+            type: 'file-history-snapshot', messageId: 'm', snapshot: { x: 'B'.repeat(20_000) },
+        });
+        const filler = `${junk}\n`.repeat(20);   // 約 400KB
+
+        // (A) 広げれば届く → 抽出できる
+        const dA = join(root, 'proj-a'); await mkdir(dA);
+        await writeFile(join(dA, 's.jsonl'), `${live}\n${filler}`, 'utf8');
+        const a = (await collectAgents([{ path: wt, label: 'agent-a' }], { root, now: NOW }))
+            .agents.find(x => x.name === 'agent-a');
+        assert.equal(a.state, 'active',
+            '窓の外に活動があるのに「記録なし」にしている（広げて読み直していない）');
+        assert.equal(a.toolCounts.Edit, 1);
+
+        // (B) 上限まで広げても知らない種別だけ → 「抽出できなかった」と言う
+        const root2 = await mkdtemp(join(tmpdir(), 'kjp-unk2-'));
+        try {
+            const dB = join(root2, 'proj-b'); await mkdir(dB);
+            // cwd は持つが、活動として読める行が1本も無い
+            await writeFile(join(dB, 's.jsonl'),
+                `${JSON.stringify({ type: 'attachment', cwd: wt, attachment: { content: 'x' } })}\n`,
+                'utf8');
+            const r = await collectAgents([{ path: wt, label: 'agent-a' }], { root: root2, now: NOW });
+            const b = r.agents.find(x => x.name === 'agent-a');
+            assert.equal(b.state, 'none');
+            assert.equal(b.noneReason, 'no-known-records',
+                '「記録が無い」と「抽出できなかった」を区別していない');
+            assert.ok(r.errors.some(e => /抽出できませんでした/.test(e.message)),
+                `告知が無い（黙って「記録なし」になる）: ${JSON.stringify(r.errors)}`);
+        } finally {
+            await rm(root2, { recursive: true, force: true });
+        }
     } finally {
         await rm(root, { recursive: true, force: true });
         await rm(wtRoot, { recursive: true, force: true });

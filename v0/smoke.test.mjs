@@ -155,6 +155,26 @@ test('UI が返る', async () => {
     assert.match(await res.text(), /kjp-edit/);
 });
 
+/**
+ * 🚨 **UI が import しているモジュールを全部配信していること。**
+ *
+ * `app.html` は `./ndjson.mjs` などを import する（ブラウザの中だとテストできない
+ * ロジックを外に出しているため）。1本でも 404 だと**モジュール全体が実行されず
+ * ページが真っ白になる**。import を足したときに配信の許可リストへ足し忘れる形の
+ * 事故は、`chatfilter.mjs` を切り出したときに実際に起こりうる形だった（#44）。
+ * **一覧を手で書かず、`app.html` から読む**（書き忘れを検出できないので）。
+ */
+test('UI が import しているモジュールが全部配信される', async () => {
+    const html = await (await fetch(`${baseUrl}/`)).text();
+    const specs = [...html.matchAll(/from\s+'\.\/([A-Za-z0-9_.-]+\.mjs)'/g)].map(m => m[1]);
+    assert.ok(specs.length >= 3, `import が読めていない: ${specs.join(',')}`);
+    for (const spec of specs) {
+        const r = await fetch(`${baseUrl}/${spec}`);
+        assert.equal(r.status, 200, `${spec} が配信されていない（ページが真っ白になる）`);
+        assert.match(r.headers.get('content-type'), /javascript/, spec);
+    }
+});
+
 test('ループバック以外を待ち受けていない', async () => {
     // 127.0.0.1 で listen しているので、外部 IP では接続できない
     const port = Number(new URL(baseUrl).port);
@@ -1255,7 +1275,12 @@ test('🚨 exec: 切断しても走り続け、再購読で追いつき、猶予
 //    （子は絶対上限 600 秒まで走る）。しかも一覧は「接続中」と表示する（嘘）。
 //    UI で「実行→停止」を素早く押すとこの窓に落ちる。
 test('🚨 exec: 応答が届く前に切っても切断として扱い、猶予が効く', async () => {
-    const { child, url } = await startExec(['--exec-detached-grace', '2', '--exec-timeout', '60']);
+    // 🚨 **`--exec-stream-delay` で「届く前に切られた」を決定的にする。**
+    //    素の実装では `res` の 'close' がリスナ登録の前か後かが
+    //    プラットフォーム依存の競争になり、**Linux では守りを外しても緑**だった
+    //    （CI だけで SURVIVED として露出した。手元の Windows では落ちていた）。
+    const { child, url } = await startExec(['--exec-detached-grace', '2', '--exec-timeout', '60',
+        '--exec-stream-delay', '500']);
     try {
         const body = JSON.stringify({
             worktree: repo,
@@ -2211,15 +2236,29 @@ async function startAuthServer(extra) {
     let exited = null;
     child.stderr.on('data', d => { errOut += d; });
     child.on('exit', (code, signal) => { exited = `exit=${code} signal=${signal}`; });
-    const why = () => `起動しなかった\n  stdout: ${banner.trim() || '(空)'}`
+    // ⚠️ 何を待っていたのかも書く。「起動しなかった」だけでは、
+    //    プロセスが出てこなかったのかトークンの案内を待っていたのか区別できない
+    const why = () => `起動しなかった（待っていたもの: URL`
+        + `${extra.some(a => ['--require-auth', '--allow-host', '--allow-write',
+            '--allow-exec', '--token-file', '--token'].includes(a)) ? ' + ?token=' : ''}）`
+        + `\n  argv: ${extra.join(' ') || '(なし)'}`
+        + `\n  stdout: ${banner.trim() || '(空)'}`
         + `\n  stderr: ${errOut.trim() || '(空)'}\n  ${exited ?? '(まだ生きている)'}`;
+    // 🚨 **固定時間で待たない（CLAUDE.md）。** 以前は URL が出てから 400ms 待って
+    //    banner を確定させていたが、トークンの案内は**別のチャンクで来る**ので、
+    //    遅い CI では取り逃す。すると `banner()` から token が取れず、
+    //    テストは「起動しなかった」ではなく**401 の山**になって原因が分かりにくい。
+    //    認証が要る構成のときは**トークンの案内が出るまで待つ**（出るものを待つ）。
+    const wantsToken = extra.some(a => ['--require-auth', '--allow-host', '--allow-write',
+        '--allow-exec', '--token-file', '--token'].includes(a));
     const port = await Promise.race([
         new Promise((res, rej) => {
             child.stdout.on('data', d => {
                 banner += d;
                 const m = banner.match(/http:\/\/127\.0\.0\.1:(\d+)/);
-                // トークンの案内も同じ塊で出るので、少し待って banner を確定させる
-                if (m) setTimeout(() => res(Number(m[1])), 400);
+                if (!m) return;
+                if (wantsToken && !/\?token=[A-Za-z0-9_-]+/.test(banner)) return;
+                res(Number(m[1]));
             });
             child.on('error', e => rej(new Error(`${why()}\n  spawn: ${e.message}`)));
             // 起動前に落ちたら待たずに失敗させる（20秒待つ意味がない）
@@ -2438,16 +2477,13 @@ test('🔒 ?token= は読み取り用の Cookie を焼き、ページ本体を�
         // 焼かれるのは読み取り用の別の秘密（実行トークンではない）
         const cookieVal = decodeURIComponent(/kjp_auth=([^;]+)/.exec(boot.setCookie)?.[1] ?? '');
         assert.notEqual(cookieVal, token, 'Cookie に実行トークンが入っている');
-        // ページ側がトークンを sessionStorage に入れて URL から消すことの確認。
-        // ⚠️ 文字列の有無だけを見ると、実装を消しても他所に同じ語があれば緑になる。
-        //    **?token= を読んだ直後に保存する形**を確かめる。
-        assert.match(boot.body, /sessionStorage\.setItem\(TOKEN_KEY, t\)/,
-            'トークンを sessionStorage に保持していない'
-            + '（Cookie 経由でしか取り戻せなくなり、他ポートの相手が実行に到達する）');
-        assert.match(boot.body, /history\.replaceState\(null, '', /,
-            'URL からトークンを消していない（履歴と Referer に残る）');
-        // Cookie ではなく sessionStorage を使う理由がコードに書かれていること
-        assert.match(boot.body, /ポート/, '分離の根拠が書かれていない');
+        // 🚨 **ここで JS の字面を assert しない。** 以前は
+        //    `/sessionStorage\.setItem\(TOKEN_KEY, t\)/` などの**文字列一致**で見ていたが、
+        //    ページの JS を1度も走らせていないので、行を残したまま到達不能にする変更
+        //    （早期 return / `if (false && t)` で囲む / 使われない関数へ移す）が
+        //    **完全に見えなかった**（#41。`core.fsmonitor` / `pathspec magic` と同じ型の偽陽性）。
+        //    実際の挙動（sessionStorage に入る / URL から消える）は
+        //    `v0/render-check.mjs` が**実ブラウザで**測っている。
     } finally { s.child.kill(); }
 });
 
@@ -2500,6 +2536,54 @@ test('🚨 壊れた Cookie / ヘッダでデーモンが落ちない（無認�
         const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
         assert.equal((await authGet(s.port, '/api/v0/state', { 'x-kjp-token': token })).code, 200);
     } finally { s.child.kill(); }
+});
+
+/**
+ * 🚨 **最後の砦（top-level `.catch()`）そのものを測る。**
+ *
+ * 認可の手前の同期例外でデーモンが exit 1 する事故を2回起こしている
+ * （`new URL` と `decodeURIComponent`）。その2つには個別の try/catch と変異が
+ * あるのに、**汎用の砦には検査が1つも無かった**: `.catch(...)` を丸ごと消しても
+ * smoke は全緑だった（#42）。しかも `cookie-decode-crash` の `also` は
+ * `.catch(err => { throw err; }).catch(本体)` と書いていて、
+ * **直後の catch が再捕捉するので砦は外れていなかった**（記録が事実と違っていた）。
+ */
+test('🚨 ハンドラが throw しても 500 を返してデーモンが生き続ける（最後の砦）', async () => {
+    // `--layout-probe` 配下にある検査専用の経路（既定では存在しない）
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--layout-probe'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', () => { /* 例外のログが出るのは正しい挙動 */ });
+    let died = null;
+    child.on('exit', c => { died = c; });
+    const url = await new Promise((res, rej) => {
+        const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+        let buf = '';
+        child.stdout.on('data', d => {
+            buf += d;
+            const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+            if (m) { clearTimeout(t); res(m[0]); }
+        });
+        child.on('error', rej);
+    });
+    try {
+        // ⚠️ 2つの層を別々に測る。`/__throw` は**内側の try より手前**で投げるので
+        //    top-level `.catch()` だけが受け止める。`/__throw-inner` は内側。
+        for (const path of ['/__throw', '/__throw-inner', '/__throw', '/__throw-inner']) {
+            const r = await fetch(`${url}${path}`);
+            assert.equal(r.status, 500, `例外に 500 を返していない: ${path}`);
+            // 🔒 例外のメッセージを返さない（内部のパスや git の出力が入りうる）
+            assert.deepEqual(await r.json(), { error: 'internal error' },
+                `本文に内部の詳細を出している: ${path}`);
+        }
+        await new Promise(r => setTimeout(r, 400));
+        assert.equal(died, null, `例外でデーモンが落ちた（exit=${died}）`);
+        // 落ちていないなら、後続の要求は通る
+        assert.equal((await fetch(`${url}/api/v0/state?fresh=1`)).status, 200,
+            '例外の後にサーバが応答しない');
+    } finally { child.kill(); }
 });
 
 test('🔒 --no-auth と --allow-host の併用は起動を拒否する', async () => {

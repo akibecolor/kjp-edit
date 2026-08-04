@@ -83,6 +83,12 @@ const MEASURE = `(async () => {
     totalMs: Math.round(performance.now() - t0),
     maxBlockMs: Math.round(maxBlock),
     spans: term.childNodes.length,
+    // 🚨 トークンの扱いを**実際の挙動として**測る（#41）。
+    //    smoke 側は JS の字面しか見ていなかったので、行を残したまま
+    //    到達不能にする変更（早期 return / 条件で囲む）が完全に見えなかった。
+    heldToken: (() => { try { return sessionStorage.getItem('kjp_token'); } catch { return null; } })(),
+    search: location.search,
+    href: location.href,
     // ⚠️ dataset のフラグではなく**実際に見える文字**を返す。
     //    フラグだけ見ると、告知の要素を作らなくても検査が通ってしまう。
     firstText: (term.firstChild?.textContent ?? '').slice(0, 80),
@@ -224,6 +230,20 @@ try {
     // （`docs/review-ui-conflicts.md`「表示上限で省略したら必ず告知する」）。
     if (probe.spans > MAX_SPANS) {
         problems.push(`要素が ${probe.spans} 個（上限 ${MAX_SPANS}）= 古い行を捨てていない`);
+    }
+    // 🔒 トークンの扱い（#41）。ここが壊れると URL と履歴・Referer にトークンが残り、
+    //    sessionStorage に入らないので書き込み・実行が静かに使えなくなる。
+    //    ⚠️ **`?probe=1` は残り、`token=` だけが消える**のが正しい形
+    //       （他のクエリを一緒に落とすと probe が動かなくなる）。
+    if (probe.heldToken !== TOKEN) {
+        problems.push('トークンが sessionStorage に入っていない'
+            + `（Cookie 経由でしか取り戻せなくなり、他ポートの相手が実行に到達する）: ${probe.heldToken}`);
+    }
+    if (/token=/.test(probe.search) || /token=/.test(probe.href)) {
+        problems.push(`URL からトークンが消えていない（履歴と Referer に残る）: ${probe.search}`);
+    }
+    if (!/probe=1/.test(probe.search)) {
+        problems.push(`token 以外のクエリまで消している: ${probe.search}`);
     }
     if (!/捨てて/.test(probe.firstText)) {
         problems.push('古い行を捨てたのに告知が見えない（「全部見えている」と誤認させる）'

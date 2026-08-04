@@ -34,6 +34,13 @@ export const LIMITS = {
     //    ここまで広げて読み直す（#27）。無制限には広げない
     tailMaxBytes: 4 * 1024 * 1024,
     headBytes: 16 * 1024,    // cwd を知るために先頭だけ読む
+    // ⚠️ 先頭レコードが大きいと 16KB の窓に cwd が入らない。末尾側（readTailAdaptive）と
+    //    同じ扱いで広げる。**入らなかったことを「無関係な記録」と読まない**（#36）
+    headMaxBytes: 1024 * 1024,
+    // ⚠️ 最新の1本が cwd を持たないスタブ（`teleported-from` の 112B など）だと、
+    //    同じディレクトリに 182MB の実セッションが同居していても観測が死ぬ。
+    //    mtime 降順で次の候補を試す本数（#36）
+    maxCwdProbes: 8,
     maxLines: 600,           // 走査する行数の上限
     maxDirs: 60,             // projects 配下を見る上限
     maxSubagentFiles: 300,   // サブエージェントの記録を数える上限（#28）
@@ -41,6 +48,12 @@ export const LIMITS = {
     maxText: 8,              // 出す発話の件数
     textChars: 400,          // 1件あたりの文字数
     commandChars: 300,
+    // 🚨 **パスにも上限を掛ける。** `isSafeRepoPath` は空白・改行・任意の Unicode を
+    //    4096 文字まで通すので、`--watch-agents` だけで recent 12件 × 4096 ≒ 48KB の
+    //    任意テキストが、発話用のフラグ（--allow-transcript-text）を通らずに出ていた。
+    //    引き金は実在する: 読んだ README や Web ページのインジェクションが
+    //    `Read("<repo>/<秘密>")` を1回呼ばせれば、失敗した read でも tool_use として残る（#38）。
+    pathChars: 160,
     activeMs: 3 * 60 * 1000,
     idleMs: 60 * 60 * 1000,
 };
@@ -115,6 +128,28 @@ export function repoRelative(base, abs) {
     return isSafeRepoPath(rel) ? rel : null;
 }
 
+/**
+ * 記録の中のパスを、出してよい形にする。
+ *
+ * 返す形: `{ path, outside, clipped }`
+ *   - `outside: true`  … 触ってはいるが worktree の外（パスは出さない）
+ *   - `clipped: true`  … 長すぎたので切った。**切ったパスは開けない**ので
+ *                        UI はリンクにしてはいけない（`app.html` が見る）
+ *
+ * 🚨 **切ったパスをそのまま「開ける」ものとして扱わない。** 途中で切れた文字列は
+ *    別のファイルを指すか、どのファイルも指さない。省略したことを告げる。
+ * ⚠️ ここで `git ls-files` と照合して「実在する追跡対象だけ出す」ことはしない。
+ *    worktree ごとに git 呼び出しが増えるのは明示的に禁じている（CLAUDE.md）。
+ *    代わりに**長さで縛る**。パスは本質的に自由文なので、
+ *    「自由文は1文字も通さない」とは言えない（`docs/agent-observation.md` を直した）。
+ */
+export function observedPath(base, raw, max) {
+    const rel = repoRelative(base, raw);
+    if (rel === null) return { path: null, outside: true, clipped: false };
+    if (rel.length <= max) return { path: rel, outside: false, clipped: false };
+    return { path: `${rel.slice(0, max)}…`, outside: false, clipped: true };
+}
+
 // ---------------------------------------------------------------------------
 // 要約（純関数。fs を触らないので単体でテストできる）
 // ---------------------------------------------------------------------------
@@ -143,6 +178,11 @@ export function summarize(lines, { worktreePath, allowText = false, now = Date.n
         sidechains: 0,
         scanned: 0,
         dropped: 0,
+        // 🚨 **`state:'none'` の理由を分ける。** 「記録が無い」と「抽出できなかった」を
+        //    同じ値で表すと、UI が稼働中のエージェントに
+        //    「走らせた記録がありません」と断言する（#37）。
+        //    'empty' / 'no-known-records' / 'no-timestamp' / null
+        noneReason: null,
     };
 
     // 新しい順に見たいので後ろから。行数の上限で打ち切る。
@@ -195,15 +235,18 @@ export function summarize(lines, { worktreePath, allowText = false, now = Date.n
                 out.toolCounts[name] = (out.toolCounts[name] ?? 0) + 1;
                 if (out.recent.length >= limits.maxRecent) continue;
                 const input = b.input && typeof b.input === 'object' ? b.input : {};
-                let path = null;
-                let outside = false;
+                let seen = { path: null, outside: false, clipped: false };
                 for (const k of PATH_KEYS) {
                     if (typeof input[k] !== 'string') continue;
-                    path = repoRelative(worktreePath, input[k]);
-                    outside = path === null;   // 触ってはいるが外
+                    seen = observedPath(worktreePath, input[k], limits.pathChars);
                     break;
                 }
-                const entry = { at, tool: name, path, outside, sidechain: r.isSidechain === true };
+                const entry = {
+                    at, tool: name, path: seen.path, outside: seen.outside,
+                    // 省略したことを payload に残す（黙って切ると「開けるパス」に見える）
+                    pathClipped: seen.clipped,
+                    sidechain: r.isSidechain === true,
+                };
                 // T2: コマンド行は自由文。既定では出さない
                 if (allowText && COMMAND_TOOLS.has(name)) {
                     entry.command = clip(input.command, limits.commandChars);
@@ -227,6 +270,15 @@ export function summarize(lines, { worktreePath, allowText = false, now = Date.n
         out.ageMs = Math.max(0, now - Date.parse(newestTs));
         out.state = out.ageMs <= limits.activeMs ? 'active'
             : out.ageMs <= limits.idleMs ? 'idle' : 'stale';
+    } else {
+        // 🚨 なぜ何も出なかったのかを言う。実データには**許可リスト外の type が
+        //    304KB 連続する箇所**があり、既定の窓（256KB）を超える。
+        //    完全な行は取れているので #27 の救済に乗らず、
+        //    5秒前に Edit を書いたエージェントに「記録がありません」と出ていた（#37）。
+        const hadLines = window.some(l => l && l.trim());
+        out.noneReason = !hadLines ? 'empty'
+            : out.scanned === 0 ? 'no-known-records'
+                : 'no-timestamp';
     }
     return out;
 }
@@ -345,7 +397,7 @@ async function subagentActivity(sessionFile, { now, activeMs, maxFiles }) {
 }
 
 /** 先頭 n バイトから cwd を拾う（どの worktree の記録かを知るためだけ） */
-async function readCwd(file, maxBytes = LIMITS.headBytes) {
+async function readHeadCwd(file, maxBytes) {
     const fh = await open(file, 'r');
     try {
         const { size } = await fh.stat();
@@ -358,11 +410,28 @@ async function readCwd(file, maxBytes = LIMITS.headBytes) {
             if (!l.trim()) continue;
             let r;
             try { r = JSON.parse(l); } catch { continue; }
-            if (typeof r?.cwd === 'string' && r.cwd) return r.cwd;
+            if (typeof r?.cwd === 'string' && r.cwd) return { cwd: r.cwd, truncated: len < size };
         }
-        return null;
+        return { cwd: null, truncated: len < size };
     } finally {
         await fh.close();
+    }
+}
+
+/**
+ * cwd を拾う。**窓に入らなかったことを「無関係な記録」と読まない。**
+ *
+ * 🚨 先頭レコードが 16KB を超える実データがある。固定窓だと cwd がその後ろの行にあり、
+ *    どの worktree のものか判定できず**そのプロジェクトを丸ごと黙って捨てて
+ *    「記録なし」と表示していた**（errors にも何も出ない。#36）。
+ *    末尾側（`readTailAdaptive`）と同じく、足りなければ広げて読み直す。
+ */
+export async function readCwd(file, start = LIMITS.headBytes, max = LIMITS.headMaxBytes) {
+    let want = Math.min(start, max);
+    for (;;) {
+        const r = await readHeadCwd(file, want);
+        if (r.cwd || !r.truncated || want >= max) return r.cwd;
+        want = Math.min(want * 4, max);
     }
 }
 
@@ -398,28 +467,57 @@ export async function collectAgents(worktrees, {
 
     let scannedDirs = 0;
     let skippedDirs = 0;
+    let cwdlessDirs = 0;   // cwd が読めず、どの worktree のものか判定できなかった数
     for (const d of dirs) {
         if (!d.isDirectory()) continue;
         if (scannedDirs >= limits.maxDirs) { skippedDirs++; continue; }
         scannedDirs++;
         const dir = join(root, d.name);
-        // そのディレクトリの中で最新の *.jsonl を1本だけ見る
-        let newest = null;
+        // そのディレクトリの *.jsonl を新しい順に並べる
+        const files = [];
         try {
             for (const f of await readdir(dir)) {
                 if (!f.endsWith('.jsonl')) continue;   // ⚠️ それ以外は開かない
                 const p = join(dir, f);
                 const s = await stat(p);
                 if (!s.isFile()) continue;
-                if (!newest || s.mtimeMs > newest.mtimeMs) newest = { path: p, mtimeMs: s.mtimeMs };
+                files.push({ path: p, mtimeMs: s.mtimeMs });
             }
         } catch { continue; }
-        if (!newest) continue;
+        if (!files.length) continue;
+        files.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
         // まず cwd だけ拾い、担当の worktree が無ければ末尾は読まない（無駄な読み取りを避ける）
+        // 🚨 **最新の1本で諦めない。** 最新が cwd を持たないスタブ
+        //    （`teleported-from` の 112B など）だと、同じディレクトリに
+        //    182MB の実セッションが同居していても観測が死ぬ（#36）。
+        // 🚨 **広い窓と候補の本数を掛け算しない。** 素朴に「候補ごとに最大 1MB まで
+        //    広げる」と `8候補 × 1MB × 60プロジェクト = 480MB` が最悪ケースになり、
+        //    `p95 < 1000ms` を静かに超える（`docs/performance.md`）。
+        //    **まず全候補を安い窓（16KB）で試し、1本も取れなかったときだけ
+        //    最新の1本を広い窓で読み直す**。1ディレクトリあたり `8×16KB + 1MB` に収まる。
+        const candidates = files.slice(0, limits.maxCwdProbes);
+        let newest = null;
         let cwd = null;
-        try { cwd = await readCwd(newest.path, limits.headBytes); } catch { continue; }
-        if (!cwd) continue;
+        for (const cand of candidates) {
+            let c = null;
+            // 安い窓だけ（max = start にして広げない）
+            try { c = await readCwd(cand.path, limits.headBytes, limits.headBytes); }
+            catch { continue; }
+            if (c) { newest = cand; cwd = c; break; }
+        }
+        if (!cwd && candidates.length) {
+            // 先頭レコードが窓より大きい形（#36）。最新の1本だけ広げて読み直す
+            try {
+                const c = await readCwd(candidates[0].path,
+                    limits.headBytes, limits.headMaxBytes);
+                if (c) { newest = candidates[0]; cwd = c; }
+            } catch { /* 読めない */ }
+        }
+        // ⚠️ cwd が無いと**どの worktree のものか判定できない**ので、
+        //    このディレクトリ単位ではエラーを出せない（無関係なプロジェクトかもしれない）。
+        //    件数だけ数えて後でまとめて告知する（黙って消さない）。
+        if (!cwd) { cwdlessDirs++; continue; }
         // 最も深く一致する worktree を選ぶ（サブディレクトリで動かしている場合に対応）
         let owner = null;
         for (const w of worktrees) {
@@ -429,11 +527,29 @@ export async function collectAgents(worktrees, {
         if (!owner) continue;   // 他プロジェクトの記録。無視する（エラーではない）
 
         let tail;
+        let s;
         try {
             tail = await readTailAdaptive(newest.path,
                 { start: limits.tailBytes, max: limits.tailMaxBytes });
+            s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits });
+            // 🚨 **窓が全部「知らない種別」でも「記録なし」と言わない。**
+            //    実データには許可リスト外の type が 304KB 連続する箇所があり、
+            //    既定の窓（256KB）を超える。完全な行は取れているので #27 の救済に
+            //    乗らず、5秒前に Edit を書いたエージェントに
+            //    「走らせた記録がありません」と出ていた（#37）。広げて読み直す。
+            let want = tail.bytes;
+            while (s.noneReason === 'no-known-records' && tail.truncated
+                && want < limits.tailMaxBytes) {
+                want = Math.min(want * 4, limits.tailMaxBytes);
+                const wider = await readTail(newest.path, want);
+                // 適応読み（#27）で分かったことは引き継ぐ
+                wider.tooBigToRead = tail.tooBigToRead;
+                wider.bytesWanted = tail.bytesWanted;
+                wider.grew = tail.grew;
+                tail = wider;
+                s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits });
+            }
         } catch { continue; }
-        const s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits });
         s.bytesRead = tail.bytes;
         s.tailOnly = tail.truncated;
         // 🚨 読めなかったことを**必ず伝える**。黙って「記録なし」にしない（#27）
@@ -468,6 +584,15 @@ export async function collectAgents(worktrees, {
                 });
             }
         }
+        // 🚨 広げても抽出できなかったら**そう言う**。「記録なし」にしない（#37）
+        if (s.noneReason === 'no-known-records') {
+            errors.push({
+                scope: 'agents',
+                message: `${owner.label} の記録から活動を抽出できませんでした`
+                    + `（末尾 ${Math.round(tail.bytes / 1024)}KB が全部「知らない種別」です）。`
+                    + ' 「記録なし」ではなく「抽出できなかった」です。',
+            });
+        }
         if (s.tooBigToRead) {
             errors.push({
                 scope: 'agents',
@@ -489,6 +614,16 @@ export async function collectAgents(worktrees, {
         errors.push({
             scope: 'agents',
             message: `活動記録は ${limits.maxDirs} 個のプロジェクトで打ち切りました（${skippedDirs} 個未確認）。`,
+        });
+    }
+    // 🚨 cwd が読めなかったディレクトリは**どの worktree のものか判定できない**ので
+    //    worktree 単位では告知できない。まとめて件数だけ出す。
+    //    黙って捨てると、稼働中のエージェントに「記録なし」と言う経路が残る（#36）。
+    if (cwdlessDirs) {
+        errors.push({
+            scope: 'agents',
+            message: `${cwdlessDirs} 個のプロジェクトの記録から cwd が読めませんでした`
+                + '（どの worktree のものか判定できないので観測から漏れています）。',
         });
     }
 

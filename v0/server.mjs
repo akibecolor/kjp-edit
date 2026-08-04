@@ -42,6 +42,9 @@ function parseArgs(argv) {
         //    終了後の保持は「出力を読みに戻れる」ための時間。
         execDetachedGraceMs: 5 * 60 * 1000,
         execRetainMs: 10 * 60 * 1000,
+        // ⚠️ 検査専用。応答を流し始めるのを遅らせて「届く前に切られた」を
+        //    決定的に作る（既定 0 = 何もしない）。`--layout-probe` と同じ扱い。
+        execStreamDelayMs: 0,
         // 🔒 エージェントの活動観測。**リポジトリ外（~/.claude/projects/）を読む**ので
         //    読み取り側の不変条件（git cat-file 経由のみ）を破る。だから別 capability。
         //    さらに自由文（発話・コマンド行）は**もう一段別のフラグ**にする。
@@ -76,6 +79,8 @@ function parseArgs(argv) {
         else if (a === '--allow-exec') { opts.allowExec = true; opts.allowWrite = true; }
         else if (a === '--exec-timeout') opts.execTimeoutMs = num('--exec-timeout', 1, 86400) * 1000;
         else if (a === '--exec-detached-grace') opts.execDetachedGraceMs = num('--exec-detached-grace', 1, 86400) * 1000;
+        // 検査専用（`--layout-probe` と同じ扱い。ヘルプには出さない）
+        else if (a === '--exec-stream-delay') opts.execStreamDelayMs = num('--exec-stream-delay', 0, 60000);
         else if (a === '--exec-retain') opts.execRetainMs = num('--exec-retain', 1, 86400) * 1000;
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
@@ -1188,6 +1193,16 @@ const server = createServer((req, res) => {
 });
 
 async function handleRequest(req, res) {
+    // 🚨 **検査専用: 必ず throw する経路（既定では存在しない）。**
+    //    認可の手前の同期例外でデーモンが exit 1 する事故を2回起こしている
+    //    （`new URL` と `decodeURIComponent`）。その2つには個別の try/catch と変異が
+    //    あるのに、**汎用の砦である top-level `.catch()` には検査が1つも無かった**
+    //    （丸ごと消しても smoke は全緑。#42）。
+    // ⚠️ **内側の try/catch より手前に置く。** 中に置くと内側が捕まえてしまい、
+    //    砦を外しても落ちない = 砦を測れない（最初にそう書いて測り損ねた）。
+    if (opts.layoutProbe && req.url === '/__throw') {
+        throw new Error('検査用の例外（デーモンは継続しなければならない）');
+    }
     // 🚨 new URL() は必ず try で囲む。**認可の手前にある同期例外はプロセスを殺す。**
     //    `GET //[ HTTP/1.1` のような request-target は ERR_INVALID_URL を投げ、
     //    async ハンドラの unhandled rejection でデーモンが exit 1 で落ちる。
@@ -1249,6 +1264,10 @@ async function handleRequest(req, res) {
             });
             res.end(body);
             return;
+        }
+        // 検査専用: **内側の** catch を測る経路（下の `/__throw` と対）
+        if (opts.layoutProbe && url.pathname === '/__throw-inner') {
+            throw new Error('検査用の例外（内側。メッセージを返してはいけない）');
         }
         if (opts.layoutProbe && url.pathname === '/__probe') {
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -1461,6 +1480,15 @@ async function handleRequest(req, res) {
                 }
             });
 
+            // ⚠️ **検査専用の遅延。** 既定 0 で、渡さない限り何もしない。
+            //    「応答が届く前に切られた」ことを**決定的に**作るために要る:
+            //    素の実装では `res` の 'close' がリスナ登録の前か後かが
+            //    プラットフォーム依存の競争になり、**Linux では守りを外しても
+            //    テストが緑になっていた**（CI だけで露出した。SURVIVED）。
+            //    ここを遅らせれば、どの環境でも切断が先に確定する。
+            if (opts.execStreamDelayMs > 0) {
+                await new Promise(r => setTimeout(r, opts.execStreamDelayMs));
+            }
             // POST はセッションを作ってそのまま購読する（1往復で流れ始める）
             streamSession(req, res, session, 0);
             return;
@@ -1689,7 +1717,8 @@ async function handleRequest(req, res) {
         }
         // ブラウザと unit テストで共有しているモジュール。
         // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
-        if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs') {
+        if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs'
+            || url.pathname === '/chatfilter.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',
@@ -1710,9 +1739,13 @@ async function handleRequest(req, res) {
         res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
         res.end('not found\n');
     } catch (err) {
-        console.error(err);
+        // 🚨 **例外のメッセージをクライアントに返さない。** 内部のパスや git の
+        //    出力が入りうるので、認証を通っていない相手にも渡ることになる
+        //    （401 の本文にトークンの手掛かりを出さないのと同じ理由。#42 で気付いた）。
+        //    原因はサーバのログに出す。
+        console.error('⚠ 要求の処理で例外（内側で捕まえました）:', err);
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: String(err && err.message || err) }));
+        res.end(JSON.stringify({ error: 'internal error' }));
     }
 }
 

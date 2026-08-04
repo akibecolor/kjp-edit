@@ -350,16 +350,41 @@ const MUTANTS = [
         why: '壊れた Cookie（`kjp_auth=%`）1本で認可の手前に URIError が飛び、'
             + 'デーモンが exit 1 で落ちる（無認証で撃てる DoS）',
         file: 'v0/server.mjs',
-        from: '        try { return decodeURIComponent(v); } catch { return v; }',
-        to: '        return decodeURIComponent(v);',
-        gone: 'try { return decodeURIComponent(v); }',
+        from: '        try { out.push(decodeURIComponent(v)); } catch { out.push(v); }',
+        to: '        out.push(decodeURIComponent(v));',
+        gone: 'try { out.push(decodeURIComponent(v)); }',
         // ⚠️ 外側の catch-all も守っているので、単独では落ちない可能性がある。
         //    両方外して守り全体を測る。
+        // 🚨 **以前の書き方は無効だった。** `.catch(err => { throw err; }).catch(本体)` は
+        //    直後の catch が再捕捉するので catch-all は外れておらず、
+        //    「両方外して測る」というコメント自体が事実と違っていた（#42）。
+        //    catch の**中身**を rethrow に置き換える。
         also: [{
-            from: `    handleRequest(req, res).catch(err => {`,
-            to: `    Promise.resolve().then(() => handleRequest(req, res)).catch(err => { throw err; }).catch(err => {`,
+            from: "        console.error('⚠ 要求の処理で例外（デーモンは継続します）:', err);",
+            to: '        throw err;   /* 変異: catch-all を無効化 */',
         }],
         pattern: '壊れた Cookie / ヘッダでデーモンが落ちない',
+    },
+    {
+        // 🚨 #42: 汎用の砦そのものを外す。以前は検査が1つも無く、丸ごと消しても全緑だった
+        name: 'handler-catch-all',
+        why: 'ハンドラの例外を捕まえる最後の砦を外す'
+            + '（unhandled rejection でデーモンが exit 1。走っている全セッションが消える）',
+        file: 'v0/server.mjs',
+        from: "        console.error('⚠ 要求の処理で例外（デーモンは継続します）:', err);",
+        to: '        throw err;   /* 変異: 砦を無効化 */',
+        gone: 'デーモンは継続します',
+        pattern: 'ハンドラが throw しても 500 を返して',
+    },
+    {
+        name: 'handler-error-leak',
+        why: '例外のメッセージをクライアントに返す'
+            + '（内部のパスや git の出力が、認証を通っていない相手にも渡る）',
+        file: 'v0/server.mjs',
+        from: "        res.end(JSON.stringify({ error: 'internal error' }));\n    }\n}",
+        to: '        res.end(JSON.stringify({ error: String(err && err.message || err) }));\n    }\n}',
+        gone: "res.end(JSON.stringify({ error: 'internal error' }));\n    }\n}",
+        pattern: 'ハンドラが throw しても 500 を返して',
     },
     {
         name: 'exec-subscriber-backpressure',
@@ -483,9 +508,10 @@ const MUTANTS = [
             + 'Cookie はポートで分離されないので、同じブラウザで開いた他のローカル'
             + 'サービスに実行トークンが渡り、任意コマンドを実行できる',
         file: 'v0/server.mjs',
-        from: '    return secretMatches(readCookie(req, AUTH_COOKIE), cookieSecret())',
-        to: '    return tokenMatches(readCookie(req, AUTH_COOKIE))',
-        gone: 'secretMatches(readCookie(req, AUTH_COOKIE)',
+        // ⚠️ #43 で `readCookie` → `readCookies`（全部返す）にしたので字面が変わった
+        from: '    return readCookies(req, AUTH_COOKIE).some(v => secretMatches(v, cookieSecret()))',
+        to: '    return readCookies(req, AUTH_COOKIE).some(v => tokenMatches(v))',
+        gone: 'some(v => secretMatches(v, cookieSecret()))',
         pattern: 'Cookie の値は実行トークンと別で',
     },
     {
@@ -571,7 +597,7 @@ const MUTANTS = [
         from: "    history.replaceState(null, '', `${u.pathname}${u.search}${u.hash}`);",
         to: '    /* 変異: URL からトークンを落とさない */',
         gone: 'history.replaceState',
-        pattern: '読み取り用の Cookie を焼き、ページ本体を返す',
+        script: 'v0/render-check.mjs',
     },
     {
         name: 'auth-token-in-session-storage',
@@ -581,7 +607,19 @@ const MUTANTS = [
         from: '    try { sessionStorage.setItem(TOKEN_KEY, t); } catch { /* 使えない環境 */ }',
         to: '    /* 変異: トークンを保持しない */',
         gone: 'sessionStorage.setItem(TOKEN_KEY, t)',
-        pattern: '読み取り用の Cookie を焼き、ページ本体を返す',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // 🚨 **行を消さずに到達不能にする変異。** #41 の本題はこれ。
+        //    以前の smoke は JS の**字面**しか見ていなかったので、
+        //    `if (false && t)` で囲むだけの変更が完全に見えなかった。
+        name: 'auth-token-bootstrap-unreachable',
+        why: 'トークンの取り込みを到達不能にする（行は残るので字面の検査では見えない）',
+        file: 'v0/app.html',
+        from: '  const t = u.searchParams.get(\'token\');\n  if (t) {',
+        to: '  const t = u.searchParams.get(\'token\');\n  if (false && t) {',
+        gone: "get('token');\n  if (t) {",
+        script: 'v0/render-check.mjs',
     },
     // ---- 運用スクリプトの門（#45。ここには変異が1件も無かった）----
     // 🚨 これらの守りは落ちても**手元では気付けない**形で壊れる:
@@ -779,6 +817,106 @@ const MUTANTS = [
         testFile: 'v0/transcript.test.mjs',
     },
     {
+        name: 'serve-shared-modules',
+        why: 'UI が import する共有モジュールを配信しない（import が1本 404 になると'
+            + 'モジュール全体が実行されず**ページが真っ白**になる）',
+        file: 'v0/server.mjs',
+        from: "            || url.pathname === '/chatfilter.mjs') {",
+        to: '            || false) {',
+        gone: "url.pathname === '/chatfilter.mjs'",
+        pattern: 'import しているモジュールが全部配信される',
+    },
+    {
+        name: 'chat-flush-tail',
+        why: '改行で終わらない最後の行を捨てる（kill / クラッシュ / 途中で切れた場合の'
+            + '**最後の応答が丸ごと消える** #44）',
+        file: 'v0/chatfilter.mjs',
+        from: '        if (rest.trim()) line(\'\', `${rest}\\n`);',
+        to: '        /* 変異: 残りを捨てる */',
+        gone: 'if (rest.trim()) line',
+        pattern: '改行で終わらない最後の行を flush で出す',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        name: 'chat-unknown-type',
+        why: '知らない type を黙って捨てる（control_response = 入力の許可拒否や'
+            + '将来増える type が消え、「形式が変わったら黙って消える」状態に戻る #44）',
+        file: 'v0/chatfilter.mjs',
+        from: '                line(\'d\', `  （${kind} は表示していません）\\n`);',
+        to: '                /* 変異: 知らない type を捨てる */',
+        gone: 'は表示していません',
+        pattern: '知らない type を黙って捨てず',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        name: 'transcript-cwd-next-candidate',
+        why: '最新の1本で cwd が読めないと諦める（cwd を持たない 112B のスタブが最新だと、'
+            + '同じ dir の 182MB の実セッションを丸ごと捨てて「記録なし」と嘘をつく #36）',
+        file: 'v0/transcript.mjs',
+        from: '        const candidates = files.slice(0, limits.maxCwdProbes);',
+        to: '        const candidates = files.slice(0, 1);',
+        gone: 'files.slice(0, limits.maxCwdProbes)',
+        pattern: '最新の記録に cwd が無くても',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-cwd-grow',
+        why: '先頭の窓を広げない（先頭レコードが 16KB を超えるとプロジェクトを黙って捨てる #36）',
+        file: 'v0/transcript.mjs',
+        from: '        if (r.cwd || !r.truncated || want >= max) return r.cwd;',
+        to: '        return r.cwd;',
+        gone: 'if (r.cwd || !r.truncated || want >= max)',
+        pattern: '先頭レコードが窓より大きくても cwd を見つける',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-unknown-types-grow',
+        why: '窓が全部「知らない種別」でも読み直さない'
+            + '（実データに 304KB 連続する箇所があり、既定 256KB を超える #37）',
+        file: 'v0/transcript.mjs',
+        from: `            while (s.noneReason === 'no-known-records' && tail.truncated
+                && want < limits.tailMaxBytes) {`,
+        to: '            while (false) {',
+        gone: "s.noneReason === 'no-known-records' && tail.truncated",
+        pattern: '末尾が全部「知らない種別」でも読み直し',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-none-reason',
+        why: '「記録が無い」と「抽出できなかった」を同じ値で表す'
+            + '（稼働中のエージェントに「走らせた記録がありません」と断言する #37）',
+        file: 'v0/transcript.mjs',
+        from: `        out.noneReason = !hadLines ? 'empty'
+            : out.scanned === 0 ? 'no-known-records'
+                : 'no-timestamp';`,
+        to: "        out.noneReason = 'empty';",
+        gone: "out.scanned === 0 ? 'no-known-records'",
+        pattern: '末尾が全部「知らない種別」でも読み直し',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-path-clip',
+        why: 'パスに上限を掛けない（--watch-agents だけで 12件 × 4096 ≒ 48KB の任意テキストが'
+            + '発話用のフラグを経由せずに出る #38）',
+        file: 'v0/transcript.mjs',
+        from: '    if (rel.length <= max) return { path: rel, outside: false, clipped: false };',
+        to: '    return { path: rel, outside: false, clipped: false };',
+        gone: 'if (rel.length <= max)',
+        pattern: '長いパスは切って、切ったことを伝える',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-path-clip-notice',
+        why: '切ったことを告知しない（切れたパスが「開けるパス」に見え、'
+            + '「そのファイルを触った」という誤読になる）',
+        file: 'v0/transcript.mjs',
+        from: '    return { path: `${rel.slice(0, max)}…`, outside: false, clipped: true };',
+        to: '    return { path: `${rel.slice(0, max)}`, outside: false, clipped: false };',
+        gone: 'outside: false, clipped: true',
+        pattern: '長いパスは切って、切ったことを伝える',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
         name: 'transcript-iso-strict',
         why: 'timestamp の形の検証を Date.parse だけに戻すと自由文が通る'
             + '（Date.parse は "INJECT-SECRET-12345" を西暦 12345 年として受け入れる）',
@@ -924,11 +1062,11 @@ const MUTANTS = [
         file: 'v0/server.mjs',
         // exec 側の allowlist だけを外す。`bail()` があるので checkout 側とは区別できる。
         // 単にメッセージを変えるのでは駄目で、**照合を通してしまう**形にする必要がある。
-        from: `            const wt = worktrees.find(w => samePath(w.path, wantPath));
-            if (!wt) { bail(400, \`既知の worktree ではありません: \${wantPath}\`); return; }`,
-        to: `            /* 変異: allowlist を外し、要求されたパスをそのまま使う */
-            const wt = worktrees.find(w => samePath(w.path, wantPath))
-                ?? { path: wantPath, label: wantPath, bare: false, prunable: false };`,
+        from: `                wt = worktrees.find(w => samePath(w.path, wantPath));
+                if (!wt) { bail(400, \`既知の worktree ではありません: \${wantPath}\`); return; }`,
+        to: `                /* 変異: allowlist を外し、要求されたパスをそのまま使う */
+                wt = worktrees.find(w => samePath(w.path, wantPath))
+                    ?? { path: wantPath, label: wantPath, bare: false, prunable: false };`,
         gone: 'bail(400, `既知の worktree ではありません',
         pattern: 'exec は既知の worktree 以外を cwd にしない',
     },
@@ -1115,7 +1253,11 @@ for (const m of targets) {
     try {
         const src = readFileSync(m.file, 'utf8');
         if (!src.includes(m.from)) {
-            results.push({ m, status: 'SKIP', note: '書き換え対象が見つからない（コードが変わった？）' });
+            // 🚨 **これは失敗。** 字面がずれた変異は「守りを外せていない」だけで、
+            //    守りが検証されない状態が静かに続く（実際に `worktree-allowlist` が
+            //    CI で SKIP のまま残り、`samePath` の変異も同じ形で落ちていた）。
+            //    プラットフォーム外の SKIP とは意味が違うので**分けて失敗にする**。
+            results.push({ m, status: 'STALE', note: '書き換え対象が見つからない（コードが変わった）' });
             continue;
         }
         copyFileSync(m.file, bak);
@@ -1127,7 +1269,7 @@ for (const m of targets) {
         let mutated = src.replace(m.from, m.to);
         for (const extra of m.also ?? []) {
             if (!mutated.includes(extra.from)) {
-                results.push({ m, status: 'SKIP', note: `also の対象が見つからない: ${extra.from.slice(0, 40)}` });
+                results.push({ m, status: 'STALE', note: `also の対象が見つからない: ${extra.from.slice(0, 40)}` });
                 mutated = null;
                 break;
             }
@@ -1136,7 +1278,7 @@ for (const m of targets) {
         if (mutated === null) continue;
         writeFileSync(m.file, mutated, 'utf8');
         if (readFileSync(m.file, 'utf8').includes(m.gone)) {
-            results.push({ m, status: 'SKIP', note: '書き換えが効いていない（gone の判定が甘い）' });
+            results.push({ m, status: 'STALE', note: '書き換えが効いていない（gone の判定が甘い）' });
             continue;
         }
         const r = await runTest(m);
@@ -1189,7 +1331,7 @@ for (const m of targets) {
                 continue;
             }
             results.push({
-                m, status: 'SKIP',
+                m, status: 'STALE',
                 note: `pattern に一致するテストが無い（テスト名に含まれる文字列を書く）: ${m.pattern}`,
             });
             continue;
@@ -1210,10 +1352,10 @@ for (const m of targets) {
 console.log('');
 let bad = 0;
 for (const r of results) {
-    const mark = { KILLED: '✔', SURVIVED: '✖', HUNG: '✖', DEFENSIVE: '◦', SKIP: '–' }[r.status];
+    const mark = { KILLED: '✔', SURVIVED: '✖', HUNG: '✖', STALE: '✖', DEFENSIVE: '◦', SKIP: '–' }[r.status];
     // 冗長な防御とプラットフォーム外は失敗にしない（記録として残す）。
     // 🚨 **HUNG も失敗**。ハングは「落ちない検査」なので緑にしてはいけない（#32）
-    if (r.status === 'SURVIVED' || r.status === 'HUNG') bad++;
+    if (r.status === 'SURVIVED' || r.status === 'HUNG' || r.status === 'STALE') bad++;
     console.log(`${mark} ${r.m.name.padEnd(28)} ${r.status.padEnd(9)} ${r.note || r.m.why}`);
 }
 console.log('');
@@ -1221,11 +1363,19 @@ const k = results.filter(r => r.status === 'KILLED').length;
 const d = results.filter(r => r.status === 'DEFENSIVE').length;
 const sk = results.filter(r => r.status === 'SKIP').length;
 const hung = results.filter(r => r.status === 'HUNG').length;
+const stale = results.filter(r => r.status === 'STALE').length;
 console.log(`${k} 件が期待通り落ちた / ${d} 件は冗長な防御（想定内）`
-    + ` / ${sk} 件はスキップ${hung ? ` / ${hung} 件はハング` : ''}`);
+    + ` / ${sk} 件はスキップ${hung ? ` / ${hung} 件はハング` : ''}`
+    + `${stale ? ` / ${stale} 件は字面がずれている` : ''}`);
 if (bad) console.log('✖ = テストがその守りを検証できていない。テストを直すこと');
+// 🚨 **字面がずれた変異は失敗。** 「守りを外せていない」だけなので、
+//    守りが検証されない状態が静かに続く（CI で SKIP のまま残っていた）。
+if (stale) {
+    console.log(`✖ ${stale} 件は変異の from/gone/pattern がソースとずれている。`
+        + '変異を直すこと（守りは1つも検証されていない）');
+}
 // ⚠️ SKIP も無害ではない。**検証されていない守り**なので数を必ず出す
-if (sk) console.log(`– = ${sk} 件は検証されていない（プラットフォーム外か設定ミス）`);
+if (sk) console.log(`– = ${sk} 件はこのプラットフォームでは通らない経路`);
 // 🚨 終了時に残骸が無いことを確かめる。ここが残ると次回以降が汚染される。
 {
     const left = [...new Set(MUTANTS.map(m => `${m.file}.mutate-bak`))].filter(existsSync);
