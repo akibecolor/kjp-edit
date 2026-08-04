@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
-import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -115,6 +115,22 @@ before(async () => {
 
 after(async () => {
     proc?.kill();
+    // 🚨 **検査が起動した孫プロセスを掃く（仕組みで防ぐ）。**
+    //    仕込みは自死するようにしたが、それは「30秒後」であって
+    //    テストが途中で止まったときの保険にすぎない。ここで確実に落とす。
+    //    実測で6本が生き残り、beacon が計 11MB、temp に33個のディレクトリが
+    //    残っていた（レビューで指摘）。**取り残しは意志ではなく仕組みで防ぐ。**
+    if (process.platform === 'win32') {
+        const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" '
+            + '| Where-Object { $_.CommandLine -like \'*grandchild.mjs*\' '
+            + '-or $_.CommandLine -like \'*appendFileSync*\' } '
+            + '| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }';
+        await new Promise(r => spawn('powershell', ['-NoProfile', '-Command', ps],
+            { windowsHide: true, stdio: 'ignore' }).on('close', r));
+    } else {
+        await new Promise(r => spawn('pkill', ['-f', 'grandchild.mjs'],
+            { stdio: 'ignore' }).on('close', r));
+    }
     // worktree は repo の外に置いたので個別に消す
     const stem = repo.split(/[\\/]/).pop();
     for (const n of ['a', 'b', 'gone']) {
@@ -997,6 +1013,79 @@ test('🔒 exec は既知の worktree 以外を cwd にしない', async () => {
     }
 });
 
+/**
+ * 🚨 **予約した枠は、どの失敗経路でも返す。**
+ *
+ * `create()` で枠を予約した後、`listWorktrees()` が throw する経路が
+ * `bail()` を通っていなかった。throw は外側の catch-all に吸われて 500 になるだけで
+ * **finish も remove も走らない**ので、8回踏むと恒久的に 429 になっていた。
+ * さらに回収する sweeper は `attachChild` 成功後にしか起動していなかったので、
+ * **正常な exec が一度も通っていないデーモンでは回収機構が存在しない**（#35）。
+ * 記録の側も、sweeper が拾うと `signal:"SIGKILL"` / `reason:"timeout"` になり
+ * **spawn すらしていないプロセスを殺したという嘘**が監査に残っていた。
+ */
+test('🚨 exec: 準備に失敗しても枠を返す（500 を上限回踏んでも 429 にならない）', async () => {
+    const lab = await mkdtemp(join(tmpdir(), 'kjp-slot-'));
+    const r2 = join(lab, 'r');
+    const audit = join(lab, 'audit.jsonl');
+    await mkdir(r2, { recursive: true });
+    await g(['init', '-q', '-b', 'main'], r2);
+    await writeFile(join(r2, 'f.txt'), 'x\n', 'utf8');
+    await g(['add', '-A'], r2);
+    await g(['commit', '-q', '-m', 'seed'], r2);
+
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', r2, '--port', '0', '--allow-exec', '--token', EXEC_TOKEN,
+            '--audit-log', audit],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    const url = await new Promise((res, rej) => {
+        const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+        let buf = '';
+        child.stdout.on('data', d => {
+            buf += d;
+            const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+            if (m) { clearTimeout(t); res(m[0]); }
+        });
+        child.on('error', rej);
+    });
+    const post = () => fetch(`${url}/api/v0/exec`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        body: JSON.stringify({ worktree: r2, argv: ['git', '--version'] }),
+    });
+    try {
+        // ⚠️ **正常な exec を1本も通さない。** 通すと sweeper が起動してしまい、
+        //    「回収機構が過去の成功に依存している」という本題が測れなくなる。
+        const off = `${join(r2, '.git')}-off`;
+        await rename(join(r2, '.git'), off);
+        // 上限（8）より多く踏む。枠が返っていなければここで埋まりきる
+        const codes = [];
+        for (let i = 0; i < 10; i++) codes.push((await post()).status);
+        assert.ok(codes.every(c => c === 500),
+            `準備の失敗が 500 以外になった（枠切れの 429 が混ざっている）: ${codes.join(',')}`);
+        await rename(off, join(r2, '.git'));
+
+        // 枠が返っていれば、直後の正常な要求が通る
+        const ok = await post();
+        assert.equal(ok.status, 200,
+            `枠が返っていない（${ok.status}）— 500 を踏むたびに実行枠が1本死んでいる`);
+        await ok.text();   // 本文を読み切ってセッションを終わらせる
+
+        // 📓 記録の側: 「起動していないものを殺した」と言わない
+        const lines = (await (await import('node:fs/promises')).readFile(audit, 'utf8'))
+            .split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const bails = lines.filter(e => e.reason === 'never-started');
+        assert.ok(bails.length >= 10,
+            `準備の失敗が監査に残っていない: ${JSON.stringify(lines.slice(0, 3))}`);
+        assert.ok(!lines.some(e => e.event === 'kill' && e.worktree === '(未検証)'),
+            '検証前に落ちたセッションを「停止した」として記録している（嘘）');
+    } finally {
+        child.kill();
+        await rm(lab, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
 test('exec が出力を流し、終了コードを返す', async () => {
     const { child, url } = await startExec();
     try {
@@ -1039,7 +1128,7 @@ test('exec: 上限時間を超えたら停止する', async () => {
     const { child, url } = await startExec(['--exec-timeout', '1']);
     try {
         const r = await readExec(url, {
-            worktree: repo, argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'],
+            worktree: repo, argv: [process.execPath, '-e', 'setTimeout(()=>process.exit(0),30000)'],
         });
         assert.equal(r.status, 200);
         const exit = r.events.at(-1);
@@ -1158,6 +1247,60 @@ test('🚨 exec: 切断しても走り続け、再購読で追いつき、猶予
     }
 });
 
+// 🚨 5回目のレビューの BLOCKING。`streamSession` は `create()` →
+//    `await listWorktrees()` → `await auditExec()` → `spawn` の**後**に呼ばれるので、
+//    その窓（150ms 以上）で切ると `res` の 'close' は listener 登録より前に
+//    発火済みで **detach が一度も走らない**。すると `subscribers` が 1 のまま残り、
+//    `lastDetachedAt` が永久に入らず **切断後の猶予が完全に無効化**される
+//    （子は絶対上限 600 秒まで走る）。しかも一覧は「接続中」と表示する（嘘）。
+//    UI で「実行→停止」を素早く押すとこの窓に落ちる。
+test('🚨 exec: 応答が届く前に切っても切断として扱い、猶予が効く', async () => {
+    const { child, url } = await startExec(['--exec-detached-grace', '2', '--exec-timeout', '60']);
+    try {
+        const body = JSON.stringify({
+            worktree: repo,
+            argv: [process.execPath, '-e',
+                'setInterval(()=>process.stdout.write("x".repeat(1000)),20)'],
+        });
+        // ⚠️ fetch では「応答到着前に切る」を作りにくいので node:http で書く
+        const port = Number(new URL(url).port);
+        const q = httpRequest({
+            host: '127.0.0.1', port, path: '/api/v0/exec', method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        }, x => x.resume());
+        q.on('error', () => { /* こちらから切るので当然エラーになる */ });
+        q.write(body);
+        q.end();
+        await new Promise(r => setTimeout(r, 30));
+        q.destroy();
+
+        const sessions = async () => {
+            const st = JSON.parse(await (await fetch(`${url}/api/v0/state?fresh=1`)).text());
+            return st.execSessions ?? [];
+        };
+        // 切断として扱われていること（購読者0・切断中が数値）
+        let one = null;
+        for (let i = 0; i < 20 && !one; i++) {
+            await new Promise(r => setTimeout(r, 200));
+            one = (await sessions()).find(s => s.state === 'running' || s.state === 'done');
+        }
+        assert.ok(one, 'セッションが台帳に無い');
+        assert.equal(one.subscribers, 0, '購読者が残っている（detach が走っていない）');
+        assert.notEqual(one.detachedMs, null,
+            '切断中として扱われていない（猶予が永久に効かなくなる）');
+
+        // 猶予（2秒）+ sweep の周期で止まる
+        let done = null;
+        for (let i = 0; i < 32 && !done; i++) {
+            await new Promise(r => setTimeout(r, 250));
+            const list = await sessions();
+            const s = list.find(x => x.id === one.id);
+            if (!s || s.state === 'done') done = s ?? { state: 'evicted' };
+        }
+        assert.ok(done, `猶予を過ぎても止まらない: ${JSON.stringify(await sessions())}`);
+    } finally { child.kill(); }
+});
+
 test('🚨 exec: 明示的な kill で止まり、監査に残る', async () => {
     const { child, url } = await startExec();
     const beacon = join(repo, 'exec-kill-beacon.txt');
@@ -1165,7 +1308,8 @@ test('🚨 exec: 明示的な kill で止まり、監査に残る', async () => 
     const size = () => { try { return readFileSync(beacon, 'utf8').length; } catch { return 0; } };
     try {
         const script = 'const fs=require("fs");'
-            + 'setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);'
+            + 'const t=setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);'
+            + 'setTimeout(()=>{clearInterval(t);process.exit(0)},30000);'
             + 'process.stdout.write("go\\n");';
         const ac = new AbortController();
         const res = await fetch(`${url}/api/v0/exec`, {
@@ -1238,7 +1382,8 @@ test('🚨 exec: サーバを SIGTERM で止めたら孫プロセスも残さな
     try {
         // 中間に sh を挟む。直接の子だけを殺す実装では孫が残る形
         const inner = 'const fs=require("fs");'
-            + 'setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);';
+            + 'const t=setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},100);'
+            + 'setTimeout(()=>{clearInterval(t);process.exit(0)},30000);';
         const ac = new AbortController();
         const res = await fetch(`${url}/api/v0/exec`, {
             method: 'POST',
@@ -1460,11 +1605,12 @@ test('🚨 exec: 標準入力の総量と滞留に上限がある（ok:true で�
     const { child, url } = await startExec();
     try {
         // stdin を**読まない**プロセス
-        const s = await startSession(url, [process.execPath, '-e', 'setInterval(()=>{},1000)']);
+        const s = await startSession(url, [process.execPath, '-e', 'setTimeout(()=>process.exit(0),30000)']);
         let total = 0;
         let stopped = null;
         // 64KB を積み続ける。総量 4MB / 滞留 1MB のどちらかで止まるはず
-        for (let i = 0; i < 200; i++) {
+        // 4MB / 60KB ≒ 68 回で上限に当たる。200 回は無駄
+        for (let i = 0; i < 80; i++) {
             const r = await sendInput(url, s.id, { data: `${'z'.repeat(60 * 1024)}\n` });
             if (r.status === 200) {
                 const j = await r.json();
@@ -1618,8 +1764,9 @@ test('🚨 exec: 読まない購読者は切られ、応答が無制限に溜ま
         const { readFile: rf } = await import('node:fs/promises');
         const auditPath = join(repo, '.git', 'kjp-exec-audit.jsonl');
         let sawDrop = false;
-        for (let i = 0; i < 120 && !sawDrop; i++) {
-            await new Promise(r => setTimeout(r, 250));
+        // ⚠️ 上限は短くする。4MB を超えるのは数秒なので 30 秒は無駄に待つだけ
+        for (let i = 0; i < 60 && !sawDrop; i++) {
+            await new Promise(r => setTimeout(r, 200));
             try { sawDrop = /drop-subscriber/.test(await rf(auditPath, 'utf8')); } catch { /* まだ無い */ }
         }
         assert.ok(sawDrop,
@@ -1685,7 +1832,7 @@ test('実行セッションの一覧が state に出る（見えない取り残�
                 //    一覧に**意図的に出している**。検査したいのは「出力が漏れないこと」
                 argv: [process.execPath, '-e',
                     'process.stdout.write(["SECRET","EXEC","OUT","777"].join("-")+"\\n");'
-                    + 'setInterval(()=>{},1000)'],
+                    + 'setTimeout(()=>process.exit(0),30000)'],
             }),
             signal: ac.signal,
         });
@@ -1724,9 +1871,15 @@ test('🚨 exec: 中間シェルを挟んだ孫プロセスも殺し、枠を返
     const beacon = join(repo, 'grandchild-beacon.txt');
     const script = join(repo, 'grandchild.mjs');
     try {
+        // 🚨 **自死する仕込みにする。** 以前は `setInterval` だけで自分から
+        //    終わらなかったので、テストが途中で止まった（SIGKILL / Ctrl+C）ときに
+        //    **孫が無期限に生き残った**。実測で6本が動き続け、beacon が計 11MB、
+        //    temp に33個のディレクトリが残っていた（レビューで指摘）。
+        //    30秒で自死させる（この検査は数秒で終わるので影響しない）。
         await writeFile(script,
             'import {appendFileSync} from "node:fs";'
-            + 'setInterval(()=>{try{appendFileSync(process.argv[2],"x")}catch(e){}},100);',
+            + 'const t=setInterval(()=>{try{appendFileSync(process.argv[2],"x")}catch(e){}},100);'
+            + 'setTimeout(()=>{clearInterval(t);process.exit(0)},30000);',
             'utf8');
         // 中間にシェルを挟む = Windows で npm test を動かす唯一の形
         const argv = process.platform === 'win32'
@@ -1771,7 +1924,7 @@ test('🚨 exec: 同時実行の上限が実際に効く', async () => {
                 headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
                 body: JSON.stringify({
                     worktree: repo,
-                    argv: [process.execPath, '-e', 'setInterval(()=>{},1000)'],
+                    argv: [process.execPath, '-e', 'setTimeout(()=>process.exit(0),30000)'],
                 }),
                 signal: ac.signal,
             }).then(res => res.status).catch(() => 0);
@@ -2093,6 +2246,37 @@ function authGet(port, path, headers = {}) {
     });
 }
 
+// 🚨 5回目のレビューの BLOCKING。`/api/v0/session` の払い出しを
+//    「トークンを提示した要求だけ」に締めたとき、**受け渡し経路を
+//    `--require-auth` の中だけに残してしまった**。既定のループバック運用で
+//    `--allow-write` だけを付けると、トークンは生成されるが**表示も永続化もされず**、
+//    ブラウザが入手する手段が1つも無い。それでも UI は checkout を描くので
+//    「有効に見えて必ず 403」だった（推奨の起動口 `serve.mjs --write` がこれ）。
+test('🚨 --allow-write だけでも、ブラウザがトークンを入手できる経路がある', async () => {
+    const s = await startAuthServer(['--allow-write']);
+    try {
+        const m = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner());
+        assert.ok(m, '書き込みを有効にしたのにトークン付き URL が案内されない'
+            + `（UI から checkout が絶対にできない）:\n${s.banner()}`);
+        const token = m[1];
+        // 案内された URL でトークンが取れる（= ページが sessionStorage に持てる）
+        const sess = JSON.parse((await authGet(s.port, `/api/v0/session?token=${token}`)).body);
+        assert.equal(sess.token, token, '案内された URL でトークンが取れない');
+        assert.equal(sess.allowWrite, true);
+        // 提示しなければ返らない（Cookie 経由の取り戻しは塞いだまま）
+        const anon = JSON.parse((await authGet(s.port, '/api/v0/session')).body);
+        assert.equal(anon.token, null, '無認証で払い出している');
+    } finally { s.child.kill(); }
+});
+
+test('🚨 --allow-exec でもトークン付き URL が案内される', async () => {
+    const s = await startAuthServer(['--allow-exec', '--token', EXEC_TOKEN]);
+    try {
+        assert.match(s.banner(), /\?token=/,
+            `実行を有効にしたのにトークン付き URL が案内されない:\n${s.banner()}`);
+    } finally { s.child.kill(); }
+});
+
 test('既定（ループバックのみ）では読み取りに認証を要求しない', async () => {
     const s = await startAuthServer([]);
     try {
@@ -2126,6 +2310,39 @@ test('🔒 --require-auth: トークンが無い / 違うと 401、Cookie とヘ
         // 401 の本文でトークンの手掛かりを与えない
         const deny = await authGet(s.port, '/api/v0/state');
         assert.ok(!deny.body.includes(token), '401 の本文にトークンが混ざっている');
+    } finally { s.child.kill(); }
+});
+
+// 🚨 **同名 Cookie が複数来ても、正しいものが1本あれば通す。**
+//    Cookie はポートで分離されない（RFC 6265）ので、`http://127.0.0.1:3000` など
+//    任意のローカルページが `document.cookie = 'kjp_auth=junk; path=/api/v0'` を焼ける。
+//    RFC 6265 §5.4.2 は **path の長い Cookie を先に並べる**ことを要求するので、
+//    junk は `/api/v0/*` への全要求で決定論的に先頭に来る。最初の一致で return
+//    していたため、**手で Cookie を消すまで 401 のまま**になっていた（#43）。
+//    サーバが焼き直すのは `Path=/` なので上書きでは復旧できない
+//    （トンネル越しのスマホからは最も消しにくい相手）。
+test('🔒 --require-auth: 他ポートが焼いた同名 Cookie を先頭に置かれても締め出されない', async () => {
+    const s = await startAuthServer(['--require-auth']);
+    try {
+        const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
+        const baked = /kjp_auth=([^;]+)/.exec((await authGet(s.port, `/?token=${token}`)).setCookie)?.[1];
+        assert.ok(baked, 'Cookie が焼かれていない');
+
+        // ブラウザが実際に送る順（path の長い junk が先）
+        assert.equal((await authGet(s.port, '/api/v0/state',
+            { cookie: `kjp_auth=junk; kjp_auth=${baked}` })).code, 200,
+        '先頭の偽 Cookie で締め出された（最初の一致で return していた）');
+        // ページ本体も同じ関門を通る
+        assert.equal((await authGet(s.port, '/',
+            { cookie: `kjp_auth=junk; kjp_auth=${baked}` })).code, 200,
+        'ページ本体が先頭の偽 Cookie で締め出された');
+        // 対照: 正しいものが1本も無ければ通らない（「全部試す」を「素通し」にしない）
+        assert.equal((await authGet(s.port, '/api/v0/state',
+            { cookie: 'kjp_auth=junk; kjp_auth=junk2' })).code, 401,
+        '偽 Cookie だけで通ってしまった');
+        // 空の値が混ざっても落ちない（`kjp_auth=` は実際に焼かれうる）
+        assert.equal((await authGet(s.port, '/api/v0/state',
+            { cookie: `kjp_auth=; kjp_auth=${baked}` })).code, 200);
     } finally { s.child.kill(); }
 });
 
@@ -2500,6 +2717,80 @@ test('--repo にサブディレクトリを渡すとリポジトリのルート�
     } finally {
         child.kill();
         await rm(sub, { recursive: true, force: true });
+    }
+});
+
+/**
+ * 🚨 **linked worktree と bare も「リポジトリの中」。**
+ *
+ * メイン worktree の `--show-toplevel` だけを見ていたので、
+ * **このツールが存在理由にしている linked worktree** が全部素通りしていた。
+ * N 個のエージェントは常時 `git add -A` するので、置いたトークンはそのまま
+ * commit に入る（実測で `git show HEAD:token` にトークン本体が出た）。
+ * bare では `--show-toplevel` が exit 128 で落ち、catch → false で
+ * **門が丸ごと無効**だった（#39）。
+ */
+test('🔒 --token-file: linked worktree と bare の中も拒否する', async () => {
+    const lab = await mkdtemp(join(tmpdir(), 'kjp-tokgate-'));
+    /** 起動を試みて「拒否された（exit 1）」か「起動した」かを返す */
+    const tryStart = async (repoPath, tokenPath) => {
+        const child = spawn(process.execPath,
+            [SERVER, '--repo', repoPath, '--port', '0', '--allow-exec', '--token-file', tokenPath],
+            { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        let err = '', out = '';
+        child.stdout.on('data', d => { out += d; });
+        child.stderr.on('data', d => { err += d; });
+        // ⚠️ `await close` だけにしない。拒否されないとサーバは listen し続けて
+        //    **永久に閉じない**（node --test ごとハングして原因が消える）
+        const code = await Promise.race([
+            new Promise(r => child.on('close', r)),
+            new Promise(r => setTimeout(() => r('running'), 15000)),
+        ]);
+        child.kill();
+        return { code, err, out };
+    };
+
+    try {
+        const main = join(lab, 'main');
+        await mkdir(main, { recursive: true });
+        await g(['init', '-q', '-b', 'main'], main);
+        await writeFile(join(main, 'f.txt'), 'x\n', 'utf8');
+        await g(['add', '-A'], main);
+        await g(['commit', '-q', '-m', 'seed'], main);
+        const wtA = join(lab, 'wt-a');
+        await g(['worktree', 'add', '-q', '-b', 'agent-a', wtA], main);
+        const bare = join(lab, 'bare.git');
+        await g(['clone', '-q', '--bare', main, bare], lab);
+
+        // (1) linked worktree の中 → 拒否
+        const a = await tryStart(main, join(wtA, 'token'));
+        assert.equal(a.code, 1,
+            `linked worktree の中のトークンファイルで起動してしまった（${a.code}）`
+            + ' — エージェントが git add -A したらコミットに入る');
+        assert.match(a.err, /リポジトリの中に置かないで/);
+
+        // (2) bare リポジトリの中 → 拒否（rev-parse の失敗を「外」と読まない）
+        const b = await tryStart(bare, join(bare, 'token'));
+        assert.equal(b.code, 1,
+            `bare の中のトークンファイルで起動してしまった（${b.code}）`
+            + ' — --show-toplevel の失敗を catch して門が無効になっている');
+        assert.match(b.err, /リポジトリの中に置かないで/);
+
+        // (3) .git の中 → 拒否
+        //     ⚠️ `.git/token` は `git add -A` では追跡されないので「コミットされる」は
+        //        当てはまらない。それでもリポジトリを消すと一緒に消えるので置き場所として誤り。
+        //        **理由が違うことをメッセージ側で言い分けている**（門は同じ）
+        const c = await tryStart(main, join(main, '.git', 'token'));
+        assert.equal(c.code, 1, `.git の中のトークンファイルで起動してしまった（${c.code}）`);
+
+        // (4) 対照: どれの外でもある場所なら起動する（門が全部を拒否していないこと）
+        const ok = await tryStart(main, join(lab, 'token'));
+        assert.equal(ok.code, 'running',
+            `リポジトリ外のトークンファイルで起動できない（${ok.code}）: ${ok.err}`);
+    } finally {
+        await rm(lab, { recursive: true, force: true }).catch(() => {});
     }
 });
 

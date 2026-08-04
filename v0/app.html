@@ -257,6 +257,9 @@ import { parseNdjson } from './ndjson.mjs';
 // argv の分割も共有モジュール（app.html の中だとテストできない）
 import { splitArgv } from './argv.mjs';
 
+// 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
+//    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
+window.__kjpProbe = new URLSearchParams(location.search).get('probe') === '1';
 const LANE_W = 10, ROW_H = 22, DOT_R = 3.2;
 const $ = s => document.querySelector(s);
 const el = (t, c, x) => {
@@ -507,14 +510,19 @@ const TERM_MAX_SPANS = 4000;
  * 実行セッションを購読する。**新規実行と再購読の両方**を担う。
  * @param {?{id: string, from: number}} attach 再購読するセッション（新規なら null）
  */
-async function runExec(termEl, scrollEl, wt, argv, onState,
-  { attach = null, keepAlive = false, chat = false } = {}) {
-  // ⚠️ 出力1件ごとに DOM に append して scrollHeight を読むと、
-  //    **強制同期レイアウトが総文字数に比例**して全体が二次になる。
-  //    レビューの実測で 12,000 行 = 54 秒、うち 28.9 秒が単一ブロック
-  //    （その間 停止ボタンも自動更新も効かない）。
-  //    → イベントを溜めて requestAnimationFrame で1回だけ流す。
-  //    → atBottom は毎回測らず scroll イベントで真偽値として持つ。
+/**
+ * 端末への追記をまとめる書き手。**runExec と描画の計測（#3）が同じものを使う。**
+ *
+ * ⚠️ 出力1件ごとに DOM に append して `scrollHeight` を読むと、
+ *    **強制同期レイアウトが総文字数に比例**して全体が二次になる。
+ *    実測で 12,000 行 = 53.8 秒、うち 28.9 秒が単一ブロック
+ *    （その間 停止ボタンも自動更新も効かない）。
+ *    → イベントを溜めて `requestAnimationFrame` で1回だけ流す。
+ *    → `atBottom` は毎回測らず `scroll` イベントで真偽値として持つ。
+ * ⚠️ **計測がこの関数を通ることが重要。** 別経路を測ると
+ *    「速い」という主張の根拠にならない（v0/render-check.mjs）。
+ */
+function makeTermWriter(termEl, scrollEl) {
   let follow = true;
   const onScroll = () => {
     follow = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 24;
@@ -522,6 +530,8 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
   scrollEl.addEventListener('scroll', onScroll, { passive: true });
 
   let queue = [], flushing = false;
+  // 告知の要素は掴んで持つ（後から querySelector で探すと構造の変化で別物を掴む）
+  let notice = null;
   const flush = () => {
     flushing = false;
     if (!queue.length) return;
@@ -530,13 +540,17 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     queue = [];
     termEl.append(frag);
     // 上限を超えたら先頭を捨てる。「全部見えている」という誤認を防ぐため告知する
+    // 🚨 **告知を先に置き、以降は告知の次から捨てる。** 先頭から素朴に捨てると
+    //    次のトリムで**告知自身が消えて**「全部見えている」表示に戻る
+    //    （`render-check.mjs` が実測で捕まえた。先頭が "line 8000" になっていた）。
     if (termEl.childNodes.length > TERM_MAX_SPANS) {
-      const drop = termEl.childNodes.length - TERM_MAX_SPANS;
-      for (let i = 0; i < drop; i++) termEl.firstChild?.remove();
-      if (!termEl.dataset.trimmed) {
-        termEl.dataset.trimmed = '1';
-        termEl.prepend(el('span', 'w', `⚠ 出力が多いので古い行を捨てています（直近 ${TERM_MAX_SPANS} 要素）\n`));
+      if (!notice) {
+        notice = el('span', 'w', `⚠ 出力が多いので古い行を捨てています（直近 ${TERM_MAX_SPANS} 要素）
+`);
+        termEl.prepend(notice);
       }
+      const drop = termEl.childNodes.length - TERM_MAX_SPANS;
+      for (let i = 0; i < drop; i++) notice.nextSibling?.remove();
     }
     if (follow) scrollEl.scrollTop = scrollEl.scrollHeight;
   };
@@ -544,6 +558,14 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     queue.push([cls, s]);
     if (!flushing) { flushing = true; requestAnimationFrame(flush); }
   };
+  return { line, flush, dispose: () => scrollEl.removeEventListener('scroll', onScroll) };
+}
+
+async function runExec(termEl, scrollEl, wt, argv, onState,
+  { attach = null, keepAlive = false, chat = false } = {}) {
+  // 端末への追記は共通の書き手を使う（描画の計測も同じものを通る。#3）
+  const writer = makeTermWriter(termEl, scrollEl);
+  const line = writer.line;
 
   const ac = new AbortController();
   // ⚠️ **abort はもう「停止」ではない。** #17 でサーバが切断で子を殺すのを
@@ -638,8 +660,8 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     }
     else line('e', `\n✖ ${e.message}\n`);
   } finally {
-    flush();                       // 溜まっている分を出し切る
-    scrollEl.removeEventListener('scroll', onScroll);
+    writer.flush();                // 溜まっている分を出し切る
+    writer.dispose();
     onState({ running: false });
   }
 }
@@ -653,6 +675,14 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
 function consoleBody(wt, paneObj) {
   const box = el('div');
   box.style.cssText = 'display:flex;flex-direction:column;height:100%';
+  // 🚨 同じ理由で、トークンが無いなら実行のバーも出さない（必ず 403 になる）
+  if (session.allowExec && !session.token) {
+    box.append(el('div', 'note warn',
+      '⚠ 実行はトークンが無いので使えません。'
+      + ' 起動時に表示された ?token=… 付きの URL を開き直してください'
+      + '（トークンはこのタブだけが持ちます。Cookie には入れません）。'));
+    return box;
+  }
   if (!session.allowExec) {
     box.append(el('div', 'note warn',
       '実行は無効です。--allow-exec と 24 文字以上の --token を付けて起動すると使えます。'
@@ -800,6 +830,16 @@ function consoleBody(wt, paneObj) {
     await cur?.kill?.();
     cur?.abort?.();
   });
+
+  // 🚨 **描画の予算を実ブラウザで測るための入口（#3）。**
+  //    `?probe=1` のときだけ出す。コメントで「速い」と主張する代わりに、
+  //    **runExec と同じ `makeTermWriter` を通して**最長ブロック時間を測る
+  //    （v0/render-check.mjs が CDP で叩く）。
+  //    ⚠️ 直接 DOM を触る入口にすると、測っている対象が変わって根拠にならない。
+  if (window.__kjpProbe && !window.__kjpFeedTerm) {
+    const probeWriter = makeTermWriter(term, scroll);
+    window.__kjpFeedTerm = s => probeWriter.line('', s);
+  }
 
   box.append(bar, peek, resume, scroll, inbar);
   return box;
@@ -1097,7 +1137,18 @@ function render(s) {
       + (wt.status?.unmerged ? ` · 未解決 ${wt.status.unmerged}` : '');
     c.append(ab);
     if (wt.prunable) c.append(el('div', 'ab', `失われています: ${wt.prunableReason ?? '理由不明'}`));
-    if (session.allowWrite && !wt.bare && !wt.prunable) c.append(checkoutForm(wt, s));
+    // 🚨 **押せるのに必ず失敗する操作を描かない。** 書き込みは `X-Kjp-Token` を
+    //    要求するので、トークンを持っていないなら checkout は必ず 403 になる。
+    //    それでもフォームを出していたので「有効に見えて動かない」状態だった
+    //    （レビューで実測。BLOCKING）。
+    if (session.allowWrite && !wt.bare && !wt.prunable) {
+      if (session.token) c.append(checkoutForm(wt, s));
+      else if (!wt.prunable) {
+        c.append(el('div', 'note warn',
+          '⚠ checkout はトークンが無いので使えません。'
+          + ' 起動時に表示された ?token=… 付きの URL を開き直してください。'));
+      }
+    }
     cards.append(c);
   }
   wtPane.body.replaceChildren(cards);
@@ -1403,8 +1454,16 @@ try {
   }
 } catch { /* 観測のみで動く */ }
 const cap = $('#cap');
-if (session.allowExec) { cap.hidden = false; cap.className = 'cap x'; cap.textContent = '🚨 実行有効'; }
-else if (session.allowWrite) { cap.hidden = false; cap.className = 'cap w'; cap.textContent = '⚠️ 書き込み有効'; }
+// ⚠️ **「有効」と「使える」を分ける。** トークンが無いと有効でも必ず 403 になるので、
+//    バッジで区別する（「有効」だけ出して押せない状態が BLOCKING だった）
+const usable = !!session.token;
+if (session.allowExec) {
+  cap.hidden = false; cap.className = 'cap x';
+  cap.textContent = usable ? '🚨 実行有効' : '🚨 実行有効（トークン未取得）';
+} else if (session.allowWrite) {
+  cap.hidden = false; cap.className = 'cap w';
+  cap.textContent = usable ? '⚠️ 書き込み有効' : '⚠️ 書き込み有効（トークン未取得）';
+}
 
 $('#refresh').addEventListener('click', () => load(true));
 await load();

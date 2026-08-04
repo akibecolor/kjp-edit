@@ -163,7 +163,7 @@ let failed = false;
 // 2. ユニットテスト
 {
     const r = await run(
-        ['--test', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'scripts/winargs.test.mjs'],
+        ['--test', '--test-timeout=30000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs'],
         { timeout: 60_000 },
     );
     const s = summarizeTests(r.output);
@@ -178,7 +178,13 @@ let failed = false;
 
 // 3. スモークテスト（一時リポジトリを作るので時間がかかる）
 if (!quick && !failed) {
-    const r = await run(['--test', 'v0/smoke.test.mjs'], { timeout: 240_000 });
+    // ⚠️ 上限は「遅い」ことを隠すためではなく、ハングを失敗として観測するため。
+    // 🚨 **テストごとの上限（--test-timeout）も付ける。** ファイル全体の上限だけだと
+    //    1本のハングが「smoke (0 pass, 0 fail) で SIGKILL」になり、
+    //    **どのテストが原因か分からない**（実際に10分潰した）。
+    //    テストが増えたので 240s では足りなくなった（CI の Windows は更に遅い）。
+    const r = await run(['--test', '--test-timeout=90000', 'v0/smoke.test.mjs'],
+        { timeout: 600_000 });
     const s = summarizeTests(r.output);
     const ok = r.code === 0;
     steps.push({
@@ -206,6 +212,23 @@ if (!quick && !failed) {
     if (!ok) failed = true;
 } else if (quick) {
     steps.push({ name: 'layout', ok: true, skipped: true });
+}
+
+// 5. クライアント描画の予算（#3）。**実時間で測る**ので layout とは別プロセス。
+//    ⚠️ layout は --virtual-time-budget を使うが、それでは時間を測れない。
+if (!quick && !failed) {
+    const r = await run(['v0/render-check.mjs'], { timeout: 300_000 });
+    const skipped = /skipped/.test(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `render ${(r.ms / 1000).toFixed(1)}s`,
+        ok,
+        skipped,
+        detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),
+    });
+    if (!ok) failed = true;
+} else if (quick) {
+    steps.push({ name: 'render', ok: true, skipped: true });
 }
 
 // ---- 出力: 20行以内 ----

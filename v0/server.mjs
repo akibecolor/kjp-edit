@@ -116,11 +116,58 @@ function parseArgs(argv) {
  * ⚠️ headless Chrome の `--window-size` は Windows では最小幅に丸められ、
  *    390 を指定しても innerWidth が 500 になる（実測）。iframe なら正確に効く。
  */
-function probeHarness(width) {
+/**
+ * 描画の予算を測るハーネス（#3）。
+ *
+ * ⚠️ **同じ経路（`line()` → rAF → flush）を叩く。** 直接 DOM を触ると
+ *    測っている対象が変わる。入口は app.html が `?probe=1` のときだけ出す。
+ * ⚠️ ここは server.mjs のテンプレートリテラルの中。**バックティックを書かない。**
+ */
+function renderHarness(w) {
+    return `<!doctype html><meta charset="utf-8"><title>render probe</title>
+<body style="margin:0">
+<iframe id="f" src="/?probe=1" style="width:${w}px;height:900px;border:0"></iframe>
+<pre id="out"></pre>
+<script type="module">
+const f = document.getElementById('f');
+await new Promise(r => f.addEventListener('load', r, { once: true }));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const win = f.contentWindow;
+for (let i = 0; i < 200 && typeof win.__kjpFeedTerm !== 'function'; i++) await sleep(100);
+const term = f.contentDocument.querySelector('.term');
+let out;
+if (!term || typeof win.__kjpFeedTerm !== 'function') {
+  out = { error: 'measurement entry missing (__kjpFeedTerm / .term)' };
+} else {
+  const LINES = 12000;
+  let maxBlock = 0;
+  const t0 = performance.now();
+  for (let i = 0; i < LINES; i += 200) {
+    const a = performance.now();
+    for (let k = 0; k < 200; k++) win.__kjpFeedTerm('line ' + (i + k) + String.fromCharCode(10));
+    await new Promise(r => win.requestAnimationFrame(r));
+    const b = performance.now();
+    if (b - a > maxBlock) maxBlock = b - a;
+  }
+  out = {
+    lines: LINES,
+    totalMs: Math.round(performance.now() - t0),
+    maxBlockMs: Math.round(maxBlock),
+    spans: term.childNodes.length,
+  };
+}
+document.getElementById('out').textContent = JSON.stringify(out);
+</script>`;
+}
+
+function probeHarness(width, mode) {
     const w = Number.isFinite(width) && width >= 200 && width <= 4000 ? Math.floor(width) : 390;
+    // 🚨 描画の予算を測るモード（#3）。**仮想時間では測れない**ので
+    //    v0/render-check.mjs が実時間で開く（layout-check とは別の検査）。
+    if (mode === 'render') return renderHarness(w);
     return `<!doctype html><meta charset="utf-8"><title>layout probe</title>
 <body style="margin:0">
-<iframe id="f" src="/" style="width:${w}px;height:2000px;border:0"></iframe>
+<iframe id="f" src="/?probe=1" style="width:${w}px;height:2000px;border:0"></iframe>
 <pre id="out"></pre>
 <script type="module">
 const f = document.getElementById('f');
@@ -737,9 +784,22 @@ function cookieSecret() {
         .digest('base64url');
 }
 
-function readCookie(req, name) {
+/**
+ * 🚨 **同名の Cookie を全部返す（最初の一致で打ち切らない）。**
+ *
+ * Cookie はポートで分離されない（RFC 6265）ので、`http://127.0.0.1:3000` など
+ * **任意のローカルページ**が `document.cookie = 'kjp_auth=junk; path=/api/v0'` を焼ける。
+ * RFC 6265 §5.4.2 は **path の長い Cookie を先に並べる**ことを要求するので、
+ * junk は `/api/v0/*` への全要求で決定論的に先頭に来る。最初の一致で返していたため、
+ * サーバが焼き直す `Path=/` では上書きできず、`?token=` を開き直しても復旧せず、
+ * **手で Cookie を消すまで 401 のまま**になっていた（#43。
+ * トンネル越しのスマホからは最も消しにくい相手）。
+ * `--allow-host` のときは同一 tailnet の別ノードが `Domain=<tailnet>.ts.net` で同じことをできる。
+ */
+function readCookies(req, name) {
     const raw = req.headers.cookie;
-    if (typeof raw !== 'string') return null;
+    if (typeof raw !== 'string') return [];
+    const out = [];
     for (const part of raw.split(';')) {
         const i = part.indexOf('=');
         if (i < 0) continue;
@@ -751,9 +811,9 @@ function readCookie(req, name) {
         //    **デーモンが exit 1 で落ちていた**（無認証で撃てる DoS。実測）。
         //    `new URL()` で同じ型を一度直したのに、Cookie で再発させた。
         //    **認可より手前で throw しうる関数は全部囲う。**
-        try { return decodeURIComponent(v); } catch { return v; }
+        try { out.push(decodeURIComponent(v)); } catch { out.push(v); }
     }
-    return null;
+    return out;
 }
 
 /** 長さを漏らさず比較する（比較先を明示できる形） */
@@ -797,7 +857,9 @@ function authed(req, url) {
     // 🚨 Cookie は**読み取り用の別の秘密**とだけ照合する。
     //    ここで実行トークンとも照合してしまうと、Cookie を受け取った
     //    他のローカルサービスがそのまま実行できる状態に戻る。
-    return secretMatches(readCookie(req, AUTH_COOKIE), cookieSecret())
+    // ⚠️ **「どれか1本が合っていれば通す」。** 偽 Cookie を先頭に置くだけで
+    //    締め出せてはいけない（#43）。合っていない本数は通す理由にもならない。
+    return readCookies(req, AUTH_COOKIE).some(v => secretMatches(v, cookieSecret()))
         || tokenMatches(req.headers[TOKEN_HEADER])
         || tokenMatches(url.searchParams.get('token'));
 }
@@ -1027,6 +1089,20 @@ function streamSession(req, res, s, from) {
     };
     req.on('aborted', detach);
     res.on('close', detach);
+    // 🚨 **応答が届く前に切られていたら、その場で detach する。**
+    //    `streamSession` は `create()` → `await listWorktrees()` →
+    //    `await auditExec()` → `spawn` の**後**に呼ばれる。この 150ms 以上の窓で
+    //    クライアントが切ると `res` の 'close' は listener 登録より前に発火済みで、
+    //    **detach が一度も走らない**。すると `subscribers` が 1 のまま残り、
+    //    `lastDetachedAt` が永久に入らないので **#17 の「切断後の猶予」が
+    //    完全に無効化**され、子は絶対上限（既定600秒）まで走る。
+    //    しかも `/api/v0/state` は `subscribers:1 detachedMs:null` を返すので
+    //    **誰も見ていないセッションが「接続中」と表示される**（嘘）。
+    //    UI で「実行→停止」を素早く押すとこの窓に落ちる（レビューで実測）。
+    //    ⚠️ **`req.destroyed` を見てはいけない。** 本文を読み切った正常な要求でも
+    //    真になるので、**毎回 detach してしまい応答が永久に閉じない**（実測でハング）。
+    //    見るのは応答側（切断されたら `res.destroyed` が立つ）。
+    if (res.destroyed) detach();
 }
 
 /** 台帳の判断に従って実際に殺す・消す。1秒ごと。 */
@@ -1176,7 +1252,8 @@ async function handleRequest(req, res) {
         }
         if (opts.layoutProbe && url.pathname === '/__probe') {
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-            res.end(probeHarness(Number(url.searchParams.get('w'))));
+            res.end(probeHarness(Number(url.searchParams.get('w')),
+                url.searchParams.get('mode')));
             return;
         }
         // クライアントが書き込み可否とトークンを知るための経路。
@@ -1242,6 +1319,12 @@ async function handleRequest(req, res) {
                 denyJson(res, 429, `同時実行が上限（${MAX_CONCURRENT_EXEC}）に達しています`);
                 return;
             }
+            // 🚨 **回収機構は「過去に1本成功したか」に依存させない。**
+            //    以前は attachChild 成功後にだけ起動していたので、正常な exec が
+            //    一度も通っていないデーモンでは sweeper が存在せず、枠が返らない
+            //    経路を1つ踏むだけで **429 が恒久化**した（再起動しか回復手段が無い。#35）。
+            startExecSweeper();
+
             // 予約した後の失敗経路は必ず枠を返す（finish が枠を返す）
             const bail = (code, msg) => {
                 execRegistry.finish(session, { note: msg });
@@ -1249,19 +1332,36 @@ async function handleRequest(req, res) {
                 denyJson(res, code, msg);
             };
 
-            const wantPath = toNFC(String(body.worktree ?? ''));
-            const worktrees = await listWorktrees(opts.repo);
-            const wt = worktrees.find(w => samePath(w.path, wantPath));
-            if (!wt) { bail(400, `既知の worktree ではありません: ${wantPath}`); return; }
-            if (wt.bare) { bail(400, 'bare worktree では実行できません'); return; }
-            if (wt.prunable) { bail(409, '作業ツリーが失われています'); return; }
-            session.worktree = wt.path;
+            let wt;
+            try {
+                const wantPath = toNFC(String(body.worktree ?? ''));
+                // 🚨 **ここは throw しうる。** `listWorktrees` は git が非ゼロで終わると
+                //    throw する（リポジトリの移動・削除・破損）。囲っていなかったので
+                //    外側の catch-all に吸われて 500 になるだけで **finish も remove も
+                //    走らず、枠が8本埋まったまま恒久的に 429** になっていた（#35）。
+                const worktrees = await listWorktrees(opts.repo);
+                wt = worktrees.find(w => samePath(w.path, wantPath));
+                if (!wt) { bail(400, `既知の worktree ではありません: ${wantPath}`); return; }
+                if (wt.bare) { bail(400, 'bare worktree では実行できません'); return; }
+                if (wt.prunable) { bail(409, '作業ツリーが失われています'); return; }
+                session.worktree = wt.path;
 
-            await auditExec({
-                event: 'start', session: session.id, worktree: wt.path, argv,
-                keepAlive: session.keepAlive,
-                peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
-            });
+                await auditExec({
+                    event: 'start', session: session.id, worktree: wt.path, argv,
+                    keepAlive: session.keepAlive,
+                    peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
+                });
+            } catch (err) {
+                // ⚠️ **spawn すらしていないことを記録に残す。** sweeper が拾うと
+                //    `signal:"SIGKILL"` / `reason:"timeout"` で終わり、
+                //    「起動していないプロセスを殺した」という嘘になる（#35）。
+                await auditExec({
+                    event: 'bail', reason: 'never-started', session: session.id,
+                    worktree: session.worktree, argv, error: err.message,
+                }).catch(() => { /* 監査に書けなくても枠は返す */ });
+                bail(500, `実行の準備に失敗しました: ${err.message}`);
+                return;
+            }
 
             const { spawn } = await import('node:child_process');
             const { StringDecoder } = await import('node:string_decoder');
@@ -1296,7 +1396,6 @@ async function handleRequest(req, res) {
                 streamSession(req, res, session, 0);
                 return;
             }
-            startExecSweeper();
 
             // 🚨 **stdin の書き込み失敗は非同期の 'error' で来る。**
             //    listener が無いと uncaughtException になり**デーモンが落ちる**
@@ -1694,17 +1793,46 @@ try {
 // ⚠️ リポジトリの中に置かせない（コミットされる）。
 if (opts.tokenFile) {
     const { readFile: rf, writeFile: wf, chmod } = await import('node:fs/promises');
-    const inside = await (async () => {
+    // 🚨 **メイン worktree の top だけでは足りない。**
+    //    このツールが存在理由にしている **linked worktree** が全部素通りしていた。
+    //    N 個のエージェントは常時 `git add -A` するので、置いたトークンはそのまま
+    //    commit に入る（実測で `git show HEAD:token` にトークン本体が出た）。
+    //    さらに bare では `--show-toplevel` が exit 128 で落ち、catch → false で
+    //    **門が丸ごと無効**だった（cc7e9b0 で直したのと同じクラスの再発。#39）。
+    const gate = await (async () => {
+        const roots = [];
         try {
             const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
-            // ⚠️ relative() では駄目。表記が違うと外れて、トークンがコミットされる
-            //    （macOS の /var→/private/var、Windows の RUNNER~1 で実際に外れた）
-            return top !== '' && containsPath(top, opts.tokenFile);
-        } catch { return false; }
+            if (top) roots.push(top);
+        } catch { /* bare。失敗を「外」と読まない */ }
+        // .git 本体（bare のリポジトリ自身もここに入る）
+        try {
+            const common = (await commonDir(opts.repo)).trim();
+            if (common) roots.push(common);
+        } catch { /* noop */ }
+        // 全 worktree の作業ツリー
+        try {
+            for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);
+        } catch { /* noop */ }
+        // ⚠️ 何も分からなかったときに「外」と断定しない（分からないと言う）
+        if (!roots.length) return { unknown: true };
+        // ⚠️ relative() では駄目。表記が違うと外れて、トークンがコミットされる
+        //    （macOS の /var→/private/var、Windows の RUNNER~1 で実際に外れた）
+        return { inside: roots.some(r => containsPath(r, opts.tokenFile)) };
     })();
-    if (inside) {
-        console.error(`\n✖ --token-file をリポジトリの中に置かないでください（コミットされます）: ${opts.tokenFile}\n`);
+    if (gate.inside) {
+        // ⚠️ 理由を場所ごとに正しく言う。`.git` の中は `git add -A` では追跡されないので、
+        //    「コミットされます」だけを理由にすると嘘になる（それでも置き場所としては誤り）。
+        console.error(`\n✖ --token-file をリポジトリの中に置かないでください: ${opts.tokenFile}\n`);
+        console.error('  worktree の中に置くと、エージェントの `git add -A` でコミットされます。');
+        console.error('  .git の中はコミットはされませんが、リポジトリを消すと一緒に消えます。');
+        console.error('  ホームディレクトリの下など、リポジトリの外を指定してください\n');
         process.exit(1);
+    }
+    if (gate.unknown) {
+        console.error('⚠ --token-file がリポジトリの中かどうか判定できませんでした'
+            + `（worktree 一覧が取れません）: ${opts.tokenFile}`);
+        console.error('  コミットされていないか自分で確認してください。');
     }
     try {
         opts.token = (await rf(opts.tokenFile, 'utf8')).trim();
@@ -1763,10 +1891,18 @@ server.listen(opts.port, '127.0.0.1', () => {
     if (opts.allowHosts.size) {
         console.log(`許可した Host: ${[...opts.allowHosts].join(', ')}`);
     }
-    if (opts.requireAuth) {
+    // 🚨 **トークンが必要になる条件は「認証」だけではない。**
+    //    書き込み・実行も `X-Kjp-Token` を要求する。ブラウザは
+    //    `?token=` 付き URL から sessionStorage に入れる経路しか持たないので、
+    //    **URL を出さないと UI から checkout も実行も絶対にできない**
+    //    （それでも「⚠️ 書き込み有効」と表示するので、有効に見えて必ず 403 になる）。
+    //    前のコミットで `/api/v0/session` の払い出しを締めたときに、
+    //    受け渡し経路を requireAuth の中だけに残してしまった回帰（レビューで実測）。
+    if (opts.requireAuth || opts.allowWrite || opts.allowExec) {
         console.log('');
-        console.log('🔒 読み取りにもトークンが必要です (--require-auth)。');
-        console.log('   **この URL を1回開いてください**（Cookie を焼いたら URL から落ちます）:');
+        if (opts.requireAuth) console.log('🔒 読み取りにもトークンが必要です (--require-auth)。');
+        else console.log('🔑 書き込み・実行にはトークンが必要です。');
+        console.log('   **この URL を1回開いてください**（ブラウザがトークンを保持します）:');
         console.log(`     http://127.0.0.1:${port}/?token=${opts.token}`);
         for (const h of opts.allowHosts) {
             console.log(`     https://${h}/?token=${opts.token}`);

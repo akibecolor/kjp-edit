@@ -193,6 +193,29 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // 5回目のレビューの BLOCKING 2件（どちらも直前の修正による回帰）
+    {
+        name: 'token-url-for-write-exec',
+        why: '書き込み・実行を有効にしてもトークン付き URL を表示しない'
+            + '（ブラウザが入手する経路が無いので UI から必ず 403。有効に見えて動かない）',
+        file: 'v0/server.mjs',
+        from: '    if (opts.requireAuth || opts.allowWrite || opts.allowExec) {',
+        to: '    if (opts.requireAuth) {',
+        gone: 'opts.requireAuth || opts.allowWrite || opts.allowExec',
+        pattern: 'ブラウザがトークンを入手できる経路がある',
+    },
+    {
+        name: 'stream-detach-if-gone',
+        why: '応答が届く前に切られた場合を検知しない'
+            + '（購読者が永久に残り、切断後の猶予が完全に無効化される）',
+        file: 'v0/server.mjs',
+        // ⚠️ `req.destroyed` を混ぜた版で書いていたので SKIP になっていた（守りが
+        //    未検証のまま静かに残る）。**SKIP を緑と読まない**（CLAUDE.md）
+        from: '    if (res.destroyed) detach();',
+        to: '    /* 変異: 既に切られている場合を見ない */',
+        gone: 'if (res.destroyed) detach()',
+        pattern: '応答が届く前に切っても切断として扱い',
+    },
     // L3 #2: 判定できないものを「衝突する」と言わない
     {
         name: 'submodule-undecidable',
@@ -466,6 +489,70 @@ const MUTANTS = [
         pattern: 'Cookie の値は実行トークンと別で',
     },
     {
+        name: 'exec-bail-on-prepare-error',
+        why: '準備（worktree 一覧）の失敗を bail に通さない'
+            + '（枠が返らず 8 回で恒久的に 429。再起動しか回復手段が無い #35）',
+        file: 'v0/server.mjs',
+        from: '                bail(500, `実行の準備に失敗しました: ${err.message}`);',
+        to: '                throw err;   /* 変異: 枠を返さず外の catch-all に投げる */',
+        gone: 'bail(500, `実行の準備に失敗しました',
+        pattern: '準備に失敗しても枠を返す',
+    },
+    {
+        name: 'exec-sweeper-early',
+        why: '回収機構の起動を「過去に1本成功したか」に依存させる（#35）',
+        // ⚠️ bail を直した今、**枠の回収は sweeper に依存していない**（finish が返す）。
+        //    残る差は「終了済みセッションの台帳からの追い出し」で、
+        //    `retainMs = 10分` 経ってからしか観測できないので安く測れない。
+        //    それでも前に出しておく: 回収の有無が過去の成功に依存する形は、
+        //    別の失敗経路を足した瞬間に**恒久 429** に戻る（実際にそうなっていた）。
+        defensive: '枠は finish が返すので現状は保険。'
+            + '追い出しの差は retainMs=10分 後にしか出ず安く測れない。'
+            + '失敗経路を足したときに恒久 429 へ戻らないための前出し',
+        file: 'v0/server.mjs',
+        from: '            startExecSweeper();\n\n            // 予約した後の失敗経路は必ず枠を返す',
+        to: '            // 予約した後の失敗経路は必ず枠を返す',
+        gone: '            startExecSweeper();\n\n',
+        pattern: '準備に失敗しても枠を返す',
+    },
+    {
+        name: 'token-file-worktrees',
+        why: '全 worktree を見ずにメインの top だけで判定する'
+            + '（linked worktree に置かせて、エージェントの git add -A でコミットされる #39）',
+        file: 'v0/server.mjs',
+        from: '            for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);',
+        to: '            /* 変異: worktree を見ない */',
+        gone: 'if (w.path) roots.push(w.path)',
+        pattern: 'linked worktree と bare の中も拒否する',
+    },
+    {
+        name: 'token-file-common-dir',
+        why: '.git 本体（bare のリポジトリ自身を含む）を見ない',
+        // ⚠️ 現在の実装では冗長。`listWorktrees()` は bare の worktree レコードも
+        //    返し、`.git` はメイン worktree の中にあるので、どちらも worktree 一覧で
+        //    捕まる（実測: この行を外しても bare / .git の拒否は落ちない）。
+        //    それでも残す理由: **`worktree list` が失敗したときの唯一の根**になる。
+        //    無いと roots が空になり `unknown`（判定できない）に落ちて素通りする。
+        defensive: 'listWorktrees() が bare も .git の親も返すので現状は二重。'
+            + 'worktree list が失敗したときに roots を空にしない（unknown に落とさない）ための根として残す',
+        file: 'v0/server.mjs',
+        from: `            const common = (await commonDir(opts.repo)).trim();
+            if (common) roots.push(common);`,
+        to: '            /* 変異: .git を見ない */',
+        gone: 'if (common) roots.push(common)',
+        pattern: 'linked worktree と bare の中も拒否する',
+    },
+    {
+        name: 'auth-cookie-first-only',
+        why: '同名 Cookie の先頭1本しか見ない（他ポートのページが `path=/api/v0` に junk を焼くと'
+            + '**手で消すまで 401**。焼き直しは Path=/ なので上書きできない）',
+        file: 'v0/server.mjs',
+        from: '    return readCookies(req, AUTH_COOKIE).some(v => secretMatches(v, cookieSecret()))',
+        to: '    return secretMatches(readCookies(req, AUTH_COOKIE)[0], cookieSecret())',
+        gone: '.some(v => secretMatches(v, cookieSecret()))',
+        pattern: '他ポートが焼いた同名 Cookie を先頭に置かれても締め出されない',
+    },
+    {
         name: 'auth-cookie-samesite',
         why: 'Cookie の SameSite / HttpOnly を外す（CSRF と JS からの読み取りに開く）',
         file: 'v0/server.mjs',
@@ -495,6 +582,175 @@ const MUTANTS = [
         to: '    /* 変異: トークンを保持しない */',
         gone: 'sessionStorage.setItem(TOKEN_KEY, t)',
         pattern: '読み取り用の Cookie を焼き、ページ本体を返す',
+    },
+    // ---- 運用スクリプトの門（#45。ここには変異が1件も無かった）----
+    // 🚨 これらの守りは落ちても**手元では気付けない**形で壊れる:
+    //    `--allow-host` を落とすと**再起動後だけ 403**、観測フラグを落とすと
+    //    **ログオン後だけパネルが消える**。だから変異で固定する。
+    {
+        name: 'serve-unknown-flag',
+        why: '知らないオプションを黙って捨てる（--allow-write を渡した人に「読み取り専用」と表示していた #30）',
+        file: 'scripts/serveargs.mjs',
+        from: "        if (!a.startsWith('-') || known.has(a)) continue;",
+        to: '        continue;',
+        gone: 'known.has(a)',
+        pattern: '知らないオプションは黙って捨てずに止める',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-value-skip',
+        why: '値をフラグとして検査する（--port -1 を「知らないオプション」と誤報して原因から目を逸らす）',
+        file: 'scripts/serveargs.mjs',
+        from: '        if (VALUE_FLAGS.has(a)) { i++; continue; }',
+        to: '        /* 変異: 値を飛ばさない */',
+        gone: 'VALUE_FLAGS.has(a)',
+        pattern: '知っているオプションと値は未知として報告しない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-port-range',
+        why: '--port の範囲検証を外す（0 や 65536 で起動して失敗の理由が分からなくなる）',
+        file: 'scripts/serveargs.mjs',
+        from: '    if (!Number.isFinite(n) || n < 1 || n > 65535) return { error: String(raw) };',
+        to: '    /* 変異: 範囲を見ない */',
+        gone: 'n > 65535',
+        pattern: '--port は範囲外と非数値を拒否する',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-host-validate',
+        why: 'ホスト名の形の検証を外す（Run キーの1つの文字列の中で別の引数に化ける #29）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (!h || !/^[A-Za-z0-9._-]+$/.test(h)) return { error: h ?? null };",
+        to: '    if (!h) return { error: h ?? null };',
+        gone: 'A-Za-z0-9._-',
+        pattern: '--allow-host はホスト名の形だけ通す',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-host-forward',
+        why: '--allow-host をサーバに引き継がない（**再起動後だけ 403**。手元では気付けない）',
+        file: 'scripts/serveargs.mjs',
+        from: "    for (const h of hosts) args.push('--allow-host', h);",
+        to: '    /* 変異: 引き継がない */',
+        gone: "for (const h of hosts) args.push",
+        pattern: '--allow-host は値ごとサーバに引き継ぐ',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-watch-forward',
+        why: '観測フラグをサーバに引き継がない（**ログオン後だけパネルが消える**）',
+        file: 'scripts/serveargs.mjs',
+        from: `    if (has('--agents-text')) args.push('--watch-agents', '--allow-transcript-text');
+    else if (has('--watch')) args.push('--watch-agents');`,
+        to: '    /* 変異: 観測フラグを引き継がない */',
+        gone: "args.push('--watch-agents', '--allow-transcript-text')",
+        pattern: '観測フラグを引き継ぐ',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-exec-implies-write',
+        why: '--exec が --write を含まなくなる（実行はできるのに checkout が 403 になる）',
+        file: 'scripts/serveargs.mjs',
+        from: "    const wantWrite = wantExec || has('--write');",
+        to: "    const wantWrite = has('--write');",
+        gone: "wantExec || has('--write')",
+        pattern: '--exec は --write を含むが',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-audit-log',
+        why: '実行を許すのに監査ログを付けない（何が走ったか後から分からない）',
+        file: 'scripts/serveargs.mjs',
+        from: "        if (auditLog) args.push('--audit-log', auditLog);",
+        to: '        /* 変異: 監査ログを付けない */',
+        gone: "args.push('--audit-log', auditLog)",
+        pattern: '--exec は --write を含むが',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-token-persist',
+        why: 'トークンを永続化しない（遠隔から使えず「楽な場所に置く」方向へ流れる）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if ((hosts.length > 0 || wantExec) && tokenFile) args.push('--token-file', tokenFile);",
+        to: '    /* 変異: 永続化しない */',
+        gone: "args.push('--token-file', tokenFile)",
+        pattern: '実行とトンネルはトークンを永続化する',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 純関数を全部テストしても「呼んでいない」は検出できないので、配線も外す
+        name: 'serve-calls-gate',
+        why: 'serve.mjs が未知フラグの門を呼ばない（純関数は緑のままだが打ったフラグが効かない）',
+        file: 'scripts/serve.mjs',
+        from: "    const bad = unknownFlag(argv, SERVE_FLAGS, 'この起動口');",
+        to: '    const bad = null;',
+        gone: 'unknownFlag(argv, SERVE_FLAGS',
+        pattern: 'serve.mjs は知らないオプションで起動せずに止まる',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'autostart-calls-gate',
+        why: 'autostart.mjs が未知フラグの門を呼ばない（壊れた登録がそのまま Run キーに入る）',
+        file: 'scripts/autostart.mjs',
+        from: "    const bad = unknownFlag(argv, AUTOSTART_FLAGS, 'このスクリプト');",
+        to: '    const bad = null;',
+        gone: 'unknownFlag(argv, AUTOSTART_FLAGS',
+        pattern: 'autostart.mjs は知らないオプションで登録せずに止まる',
+        testFile: 'scripts/serveargs.test.mjs',
+        platforms: ['win32'],
+    },
+    {
+        name: 'autostart-forward',
+        why: '自動起動の登録が --allow-host と観測フラグを引き継がない（c0948ea の回帰）',
+        file: 'scripts/serveargs.mjs',
+        from: `    for (const h of hosts.hosts) args.push('--allow-host', h);
+    if (has('--agents-text')) args.push('--agents-text');
+    else if (has('--watch')) args.push('--watch');`,
+        to: '    /* 変異: 登録に引き継がない */',
+        gone: "args.push('--agents-text')",
+        pattern: '自動起動は capability と引き継ぎを',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // #3 の予算。**`node --test` ではなく実ブラウザの検査に掛ける**
+        name: 'render-raf-batch',
+        why: 'rAF でまとめるのをやめる（1件ごとに scrollHeight を読んで総文字数に対して二次。'
+            + '実測 12,000行で 53.8秒、その間 停止ボタンも自動更新も効かない）',
+        file: 'v0/app.html',
+        from: '    if (!flushing) { flushing = true; requestAnimationFrame(flush); }',
+        to: '    flush();',
+        gone: 'requestAnimationFrame(flush)',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'render-term-trim',
+        why: '表示上限で古い要素を捨てるのをやめる（DOM が無限に伸びて固まる）',
+        file: 'v0/app.html',
+        from: '    if (termEl.childNodes.length > TERM_MAX_SPANS) {',
+        to: '    if (false) {',
+        gone: 'termEl.childNodes.length > TERM_MAX_SPANS',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'render-trim-notice',
+        why: '捨てたことの告知を出さない（「全部見えている」と誤認させる）',
+        file: 'v0/app.html',
+        from: `        notice = el('span', 'w', \`⚠ 出力が多いので古い行を捨てています（直近 \${TERM_MAX_SPANS} 要素）
+\`);
+        termEl.prepend(notice);`,
+        to: "        notice = el('span', 'w', '');\n        termEl.prepend(notice);",
+        gone: '古い行を捨てています',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'render-trim-keeps-notice',
+        why: '告知の次からではなく先頭から捨てる（次のトリムで告知自身が消える）',
+        file: 'v0/app.html',
+        from: '      for (let i = 0; i < drop; i++) notice.nextSibling?.remove();',
+        to: '      for (let i = 0; i < drop; i++) termEl.firstChild?.remove();',
+        gone: 'notice.nextSibling?.remove()',
+        script: 'v0/render-check.mjs',
     },
     {
         name: 'transcript-type-allowlist',
@@ -751,10 +1007,15 @@ if (!targets.length) {
 
 function runTest(m) {
     return new Promise(resolve => {
-        const p = spawn(process.execPath, [
-            '--test', `--test-name-pattern=${m.pattern}`,
-            m.testFile ?? 'v0/smoke.test.mjs',
-        ], { cwd: ROOT, shell: false, windowsHide: true, env: { ...process.env, NO_COLOR: '1' } });
+        // `script` を持つ変異は `node --test` ではなく検査スクリプトを直接走らせる。
+        // ⚠️ **layout / render の検査もここに掛けられるようにするため。**
+        //    これが無いと「実ブラウザで測る検査」だけが変異テストの外に残り、
+        //    予算を守っているコードを外しても誰も気付かない状態になる。
+        const argv = m.script
+            ? [m.script]
+            : ['--test', `--test-name-pattern=${m.pattern}`, m.testFile ?? 'v0/smoke.test.mjs'];
+        const p = spawn(process.execPath, argv,
+            { cwd: ROOT, shell: false, windowsHide: true, env: { ...process.env, NO_COLOR: '1' } });
         let out = '';
         p.stdout.on('data', d => { out += d; });
         p.stderr.on('data', d => { out += d; });
@@ -879,6 +1140,30 @@ for (const m of targets) {
             continue;
         }
         const r = await runTest(m);
+        if (m.script) {
+            // 検査スクリプトは「ブラウザが無ければスキップ」を自分で出す。
+            // 🚨 **それを緑と読まない。** 測れていないことを SKIP として出す。
+            if (/skipped/.test(r.out)) {
+                results.push({ m, status: 'SKIP', note: `${m.script} が測れなかった（ブラウザ無し）` });
+                continue;
+            }
+            if (r.timedOut) {
+                results.push({
+                    m, status: 'HUNG',
+                    note: `${m.script} が上限まで返らなかった。`
+                        + '守りを外すと止まらなくなる = 落ちる形になっていない',
+                });
+                continue;
+            }
+            const killed = r.code !== 0;
+            results.push({
+                m,
+                status: killed ? 'KILLED' : (m.defensive ? 'DEFENSIVE' : 'SURVIVED'),
+                note: killed ? ''
+                    : (m.defensive ?? `${m.script} が落ちなかった = この守りは検証されていない`),
+            });
+            continue;
+        }
         // ⚠️ `ℹ tests N` で判定してはいけない。`--test-name-pattern` に外れたテストも
         //    N に数えられて `skipped` になるだけなので、**1件も走っていないのに
         //    「落ちなかった → SURVIVED」と誤報する**（pattern をテスト名ではなく

@@ -29,6 +29,9 @@ import { createConnection } from 'node:net';
 // 🚨 Windows のコマンドラインを作る／読む規則は共有モジュールに集約している
 //    （純粋な関数なのでユニットテストで固定できる。scripts/winargs.test.mjs）
 import { repoOf, samePathish } from './winargs.mjs';
+// 🚨 argv の組み立てと門は純関数に切り出してテストで固定している
+//    （scripts/serveargs.test.mjs。#45 まではここに検査が1件も無かった）
+import { SERVE_FLAGS, unknownFlag, checkPort, collectHosts, serverArgs } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVER = join(ROOT, 'v0', 'server.mjs');
@@ -86,21 +89,14 @@ function inUse(port) {
  * 設計（意識的な操作にする）の根拠そのものを壊す（#30）。
  * サーバ側の名前で打たれることが多いので、正しい名前を示して止める。
  */
-const KNOWN_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text', '--status', '--stop', '--help', '-h']);
-const FLAG_ALIAS = {
-    '--allow-write': '--write',
-    '--allow-exec': '--exec',
-    '--watch-agents': '--watch',
-    '--allow-transcript-text': '--agents-text',
-};
-for (const a of argv) {
-    if (!a.startsWith('-') || KNOWN_FLAGS.has(a)) continue;
-    const hint = FLAG_ALIAS[a] ? `（この起動口では ${FLAG_ALIAS[a]} です）` : '';
-    console.error(`\n✖ 知らないオプションです: ${a}${hint}`);
-    console.error(`  使えるもの: ${[...KNOWN_FLAGS].join(' ')}`);
-    console.error('  サーバに直接渡したいなら node v0/server.mjs を使ってください\n');
-    process.exit(1);
+{
+    const bad = unknownFlag(argv, SERVE_FLAGS, 'この起動口');
+    if (bad) {
+        console.error(`\n✖ 知らないオプションです: ${bad.flag}${bad.hint}`);
+        console.error(`  使えるもの: ${bad.known.join(' ')}`);
+        console.error('  サーバに直接渡したいなら node v0/server.mjs を使ってください\n');
+        process.exit(1);
+    }
 }
 
 /** 動いている kjp-edit を探す（Windows 以外では PowerShell が無いので空を返す） */
@@ -168,11 +164,12 @@ if (already) {
 }
 
 // ---- ポートを決める（黙って変えない） ----
-let port = Number(val('--port', DEFAULT_PORT));
-if (!Number.isFinite(port) || port < 1 || port > 65535) {
-    console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${val('--port', '')}）\n`);
+const portCheck = checkPort(val('--port', undefined), DEFAULT_PORT);
+if (portCheck.error !== undefined) {
+    console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
     process.exit(1);
 }
+let port = portCheck.port;
 if (await inUse(port)) {
     let found = null;
     for (let p = port + 1; p <= port + 20; p++) {
@@ -201,31 +198,22 @@ if (await inUse(port)) {
 
 // ---- capability とトークン ----
 await mkdir(STATE_DIR, { recursive: true });
-const args = [SERVER, '--repo', repo, '--port', String(port)];
+// 🔒 ホスト名は**自動起動と同じ検証**を通す。片方だけ無検証という非対称が #29 の形。
+const hostCheck = collectHosts(argv);
+if (hostCheck.error !== undefined) {
+    console.error('\n✖ --allow-host にはホスト名を指定してください'
+        + `（受け取った値: ${hostCheck.error ?? '(無し)'}）\n`);
+    process.exit(1);
+}
+// 🔒 capability の分界（--exec ⊃ --write、観測は独立）と、トークンの永続化、
+//    引き継ぎは serveargs.mjs の純関数に集約している（テストで固定）。
+const args = serverArgs({
+    argv, server: SERVER, repo, port,
+    tokenFile: join(STATE_DIR, 'token'),
+    auditLog: join(STATE_DIR, 'exec-audit.jsonl'),
+});
 const wantExec = has('--exec');
 const wantWrite = wantExec || has('--write');
-if (wantWrite) args.push('--allow-write');
-// 🔒 --allow-host を付けると読み取りにも認証が必要になる。
-//    トークンが起動ごとに変わると開き直すたびに URL を探すことになるので、
-//    トンネルを使うなら必ず永続化する。
-const wantHost = argv.includes('--allow-host');
-if (wantHost && !wantExec) {
-    args.push('--token-file', join(STATE_DIR, 'token'));
-}
-if (wantExec) {
-    args.push('--allow-exec');
-    // ⚠️ 実行を有効にするときはトークンを永続化する。
-    //    起動ごとにランダムだと遠隔から使えず「楽な場所に置く」方向へ流れる。
-    args.push('--token-file', join(STATE_DIR, 'token'));
-    args.push('--audit-log', join(STATE_DIR, 'exec-audit.jsonl'));
-}
-for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--allow-host') args.push('--allow-host', argv[i + 1] ?? '');
-}
-// 🔒 活動観測は読み取りの範囲を広げる（リポジトリ外を読む）ので、
-//    書き込み・実行とは別に明示させる。既定では付けない。
-if (has('--agents-text')) args.push('--allow-transcript-text');
-else if (has('--watch')) args.push('--watch-agents');
 
 // ---- 起動 ----
 const child = spawn(process.execPath, args, {

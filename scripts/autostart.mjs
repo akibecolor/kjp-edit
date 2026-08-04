@@ -27,6 +27,9 @@ import { fileURLToPath } from 'node:url';
 // 🚨 Run キーの値は CreateProcess の lpCommandLine としてそのまま CRT に解釈される。
 //    素朴な "..." 囲みでは末尾がバックスラッシュの値で引用が閉じない（#29）。
 import { winQuote, trimTrailingSep } from './winargs.mjs';
+// 🚨 引き継ぎ（--allow-host / 観測フラグ）は落ちても**手元では気付けない**
+//    （再起動後だけ 403 / ログオン後だけパネルが消える）。純関数にして固定した（#45）
+import { AUTOSTART_FLAGS, unknownFlag, checkPort, autostartServeArgs } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVE = join(ROOT, 'scripts', 'serve.mjs');
@@ -112,6 +115,18 @@ if (cmd !== 'install') {
 }
 
 // ---- install ----
+// 🚨 **知らないフラグを黙って捨てない。** 捨てると「打ったのに効かない」が
+//    起動するまで分からない（#30）。**他の検証より先に置く**（後ろに置くと、
+//    この門を外したときに壊れた登録が先に出来上がる余地が残る）。
+{
+    const bad = unknownFlag(argv, AUTOSTART_FLAGS, 'このスクリプト');
+    if (bad) {
+        console.error(`\n✖ 知らないオプションです: ${bad.flag}${bad.hint}`);
+        console.error(`  使えるもの: ${bad.known.join(' ')}\n`);
+        process.exit(1);
+    }
+}
+
 // ⚠️ 末尾のセパレータを落とす。残すと CRT の引用規則を踏みやすく、
 //    どのツールでも意味は変わらないので落として良い（**既定値 ROOT がこの形**）。
 const repo = trimTrailingSep(val('--repo', ROOT));
@@ -121,51 +136,22 @@ if (!repo || /["\r\n\0]/.test(repo)) {
     console.error(`\n✖ --repo に使えない文字が入っています（" や改行）: ${JSON.stringify(repo)}\n`);
     process.exit(1);
 }
-const port = val('--port', '7749');
-if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-    console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${port}）\n`);
+const portCheck = checkPort(val('--port', undefined), '7749');
+if (portCheck.error !== undefined) {
+    console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
     process.exit(1);
 }
-const serveArgs = ['--repo', repo, '--port', port];
-if (has('--exec')) serveArgs.push('--exec');
-else if (has('--write')) serveArgs.push('--write');
-// ⚠️ トンネル用のホスト名も引き継ぐ。これが無いと**再起動後だけ 403 になる**
-//    （手元では気付かず、スマホから見たときに初めて分かる形の壊れ方をする）。
-//    許可は明示的なオプトインのままにする（既定はループバックのみ）。
-for (let i = 0; i < argv.length; i++) {
-    if (argv[i] !== '--allow-host') continue;
-    const h = argv[i + 1];
-    // ホスト名として妥当なものだけ。Run キーの値は1つの文字列なので、
-    // 空白や引用符を混ぜられると別の引数に化ける
-    if (!h || !/^[A-Za-z0-9._-]+$/.test(h)) {
-        console.error(`\n✖ --allow-host にはホスト名を指定してください（受け取った値: ${h ?? '(無し)'}）\n`);
-        process.exit(1);
-    }
-    serveArgs.push('--allow-host', h);
-}
-// ⚠️ 観測フラグも引き継ぐ。`--allow-host` を落としていたのと**同型の再発**で、
-//    付けたつもりが読み取り専用で登録され、**ログオン後だけパネルが消える**。
-if (has('--agents-text')) serveArgs.push('--agents-text');
-else if (has('--watch')) serveArgs.push('--watch');
+const port = String(portCheck.port);
 
-// 🚨 **知らないフラグを黙って捨てない。** 捨てると「打ったのに効かない」が
-//    起動するまで分からない（#30）。serve.mjs 側の名前で打たれることが多いので、
-//    正しい名前を示して止める。
-const KNOWN = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text']);
-const ALIAS = {
-    '--allow-write': '--write',
-    '--allow-exec': '--exec',
-    '--watch-agents': '--watch',
-    '--allow-transcript-text': '--agents-text',
-};
-for (const a of argv) {
-    if (!a.startsWith('--') || KNOWN.has(a)) continue;
-    const hint = ALIAS[a] ? `（このスクリプトでは ${ALIAS[a]} です）` : '';
-    console.error(`\n✖ 知らないオプションです: ${a}${hint}`);
-    console.error(`  使えるもの: ${[...KNOWN].join(' ')}\n`);
+// ⚠️ `--allow-host` と観測フラグの引き継ぎは serveargs.mjs でテストに固定してある。
+//    落ちると**再起動後だけ 403 / ログオン後だけパネルが消える**形で壊れる。
+const built = autostartServeArgs({ argv, repo, port });
+if (built.error !== undefined) {
+    console.error('\n✖ --allow-host にはホスト名を指定してください'
+        + `（受け取った値: ${built.error ?? '(無し)'}）\n`);
     process.exit(1);
 }
+const serveArgs = built.args;
 
 // Run キーの値は1つの文字列。**CRT の規則に合わせて引用する**（scripts/winargs.mjs）。
 const value = [process.execPath, SERVE, ...serveArgs].map(winQuote).join(' ');
