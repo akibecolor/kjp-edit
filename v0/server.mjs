@@ -710,7 +710,14 @@ function readCookie(req, name) {
         const i = part.indexOf('=');
         if (i < 0) continue;
         if (part.slice(0, i).trim() !== name) continue;
-        return decodeURIComponent(part.slice(i + 1).trim());
+        const v = part.slice(i + 1).trim();
+        // 🚨 **`decodeURIComponent` は不正なパーセント encoding で throw する。**
+        //    `Cookie: kjp_auth=%` の1本で URIError が投げられ、
+        //    認可の手前の同期例外が async ハンドラの unhandled rejection になって
+        //    **デーモンが exit 1 で落ちていた**（無認証で撃てる DoS。実測）。
+        //    `new URL()` で同じ型を一度直したのに、Cookie で再発させた。
+        //    **認可より手前で throw しうる関数は全部囲う。**
+        try { return decodeURIComponent(v); } catch { return v; }
     }
     return null;
 }
@@ -922,7 +929,31 @@ function streamSession(req, res, s, from) {
     // 無音のコマンドでも「受理された」がすぐ分かるようにする
     res.flushHeaders?.();
 
-    const send = obj => { if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`); };
+    /**
+     * 🚨 **読まない購読者に無制限に溜めない。**
+     *
+     * `res.write()` は相手が読まなくてもメモリに積む。ブラウザのタブが停止した
+     * まま出力の多いコマンドを走らせると、**RSS が 72MB → 433MB まで伸びた**
+     * （レビューで実測）。溜まりが上限を超えたら**その購読者を切る**。
+     * データはリングバッファに残っているので、再接続すれば `from` で追いつける。
+     */
+    const MAX_PENDING_BYTES = 4 * 1024 * 1024;
+    let dropped = false;
+    const send = obj => {
+        if (dropped || res.writableEnded) return;
+        res.write(`${JSON.stringify(obj)}\n`);
+        if (res.writableLength > MAX_PENDING_BYTES) {
+            dropped = true;
+            // ⚠️ 告知しようとしても、詰まっているので届かない。ログと監査に残す。
+            console.error(`⚠ 追いつけていない購読者を切りました（session ${s.id}、`
+                + `${Math.round(res.writableLength / 1024)}KB 未送信）`);
+            auditExec({
+                event: 'drop-subscriber', session: s.id,
+                pendingBytes: res.writableLength,
+            }).catch(() => {});
+            try { res.destroy(); } catch { /* 既に閉じている */ }
+        }
+    };
 
     const { replay, unsubscribe } = execRegistry.subscribe(s, from, rec => {
         send(rec);
@@ -1023,7 +1054,30 @@ function readJson(req, maxBytes = 64 * 1024) {
     });
 }
 
-const server = createServer(async (req, res) => {
+/**
+ * 🚨 **1つの要求でデーモンを落とさないための最後の砦。**
+ *
+ * ハンドラは async なので、**認可より手前の同期例外は unhandled rejection になり
+ * プロセスが exit 1 で落ちる**。`new URL()` でこの型を一度直したのに、
+ * `decodeURIComponent`（Cookie）で再発させた（`Cookie: kjp_auth=%` の1本で落ちた。
+ * レビューで実測）。個別に囲うだけでは次も忘れるので、**外側でも受ける。**
+ *
+ * ⚠️ ここは「気付かなくする」ための蓋ではない。落ちないようにしつつ
+ *    **必ず stderr に出す**（黙って 500 を返すだけにしない）。
+ */
+const server = createServer((req, res) => {
+    handleRequest(req, res).catch(err => {
+        console.error('⚠ 要求の処理で例外（デーモンは継続します）:', err);
+        try {
+            if (!res.headersSent) {
+                res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+            }
+            if (!res.writableEnded) res.end(JSON.stringify({ error: 'internal error' }));
+        } catch { /* 応答も書けない状態。接続は落とす */ res.destroy?.(); }
+    });
+});
+
+async function handleRequest(req, res) {
     // 🚨 new URL() は必ず try で囲む。**認可の手前にある同期例外はプロセスを殺す。**
     //    `GET //[ HTTP/1.1` のような request-target は ERR_INVALID_URL を投げ、
     //    async ハンドラの unhandled rejection でデーモンが exit 1 で落ちる。
@@ -1200,7 +1254,14 @@ const server = createServer(async (req, res) => {
                 streamSession(req, res, session, 0);
                 return;
             }
-            execRegistry.attachChild(session, child);
+            // 🚨 create() から spawn() までに await が入るので、その隙に
+            //    セッションが殺されている（猶予切れ / kill）ことがある。
+            //    そのまま走らせると「停止した」と告げた後に動き続ける。
+            if (!execRegistry.attachChild(session, child)) {
+                await killTree(child);
+                streamSession(req, res, session, 0);
+                return;
+            }
             startExecSweeper();
 
             // 🚨 **stdin の書き込み失敗は非同期の 'error' で来る。**
@@ -1492,7 +1553,7 @@ const server = createServer(async (req, res) => {
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: String(err && err.message || err) }));
     }
-});
+}
 
 // 起動時エラーは生のスタックトレースではなく、次の一手が分かる形で出す
 server.on('error', err => {
@@ -1592,7 +1653,7 @@ if (opts.tokenFile) {
  *   - --allow-host を付けた時点で「サーバに届く相手」が広がる。そこからは
  *     「届く」と「操作してよい」を分ける必要がある（docs/auth-ordering.md）
  * ========================================================================= */
-if (opts.requireAuth === null) opts.requireAuth = opts.allowHosts.size > 0;
+if (opts.requireAuth === null) opts.requireAuth = false;
 if (opts.requireAuth === false && opts.allowHosts.size > 0) {
     // ⚠️ 黙って無認証のままトンネルに出す状態を作らない。起動を止める。
     console.error('\n✖ --no-auth と --allow-host は併用できません。');

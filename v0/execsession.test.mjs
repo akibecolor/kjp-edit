@@ -247,13 +247,52 @@ test('終了したセッションは保持期間のあいだ残り、過ぎた�
     assert.equal(r.get(s.id), null);
 });
 
-test('終了しても購読者がいる間は消さない（読んでいる途中で消えない）', () => {
+// 🚨 以前は「購読者がいる間は消さない」にしていたが、**切断を検知できない
+//    購読者（詰まったソケット等）が1つ残るだけで永久に消えなくなった**
+//    （レビューで実測: RSS が伸び続ける）。終了済みなら新しい出力は来ないので、
+//    保持期間を過ぎたら購読者がいても消す。
+test('🚨 終了後は保持期間を過ぎたら購読者がいても消す（詰まった購読者で永久に残さない）', () => {
     const r = reg({ retainMs: 1 * MIN });
     const s = mk(r);
     r.finish(s, { code: 0 });
-    r.subscribe(s, 0, () => {});
-    r.advance(5 * MIN);
-    assert.deepEqual(r.sweep().evict, [], '読んでいる途中で消している');
+    r.subscribe(s, 0, () => {});   // 切断を検知できない購読者に相当
+
+    r.advance(30 * 1000);
+    assert.deepEqual(r.sweep().evict, [], '保持期間の中で消している（読みに戻れない）');
+
+    r.advance(1 * MIN);
+    const { evict } = r.sweep();
+    assert.equal(evict.length, 1, '購読者がいると永久に残る（メモリが溜まり続ける）');
+    r.remove(evict[0]);
+    assert.equal(r.get(s.id), null);
+    assert.equal(s.subscribers.size, 0, '購読者の参照が残っている（応答が回収されない）');
+});
+
+// 🚨 create() から spawn() までに await が入るので、その隙に sweep や /kill で
+//    終わっていることがある。無条件に running へ戻すと「停止した」と告げた後に
+//    走り続け、あとで exit したときに枠が二重に返る。
+test('🚨 attachChild は終わったセッションを running に戻さない', () => {
+    const r = reg();
+    const s = mk(r);
+    // 起動を待っている間に停止された
+    assert.equal(r.finish(s, { code: null, signal: 'SIGKILL', note: '停止' }), true);
+    assert.equal(r.reserved, 0, '枠が返っていない');
+
+    assert.equal(r.attachChild(s, { pid: 1 }), false, '終わったセッションに子を付けた');
+    assert.equal(s.state, 'done', 'running に戻っている（停止したのに動く）');
+    assert.equal(s.child, null, '子が結び付けられている');
+
+    // 二重に枠を返さない
+    assert.equal(r.finish(s, { code: 0 }), false);
+    assert.equal(r.reserved, 0, '枠が二重に返った（上限が緩む）');
+});
+
+test('attachChild は走っているセッションには付く（正常系を壊していない）', () => {
+    const r = reg();
+    const s = mk(r);
+    assert.equal(r.attachChild(s, { pid: 42 }), true);
+    assert.equal(s.state, 'running');
+    assert.equal(s.child.pid, 42);
 });
 
 // ---------------------------------------------------------------------------

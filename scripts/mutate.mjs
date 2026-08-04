@@ -190,6 +190,54 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // 4回目のレビューの SERIOUS 3件（issue #23-#25）
+    {
+        name: 'cookie-decode-crash',
+        why: '壊れた Cookie（`kjp_auth=%`）1本で認可の手前に URIError が飛び、'
+            + 'デーモンが exit 1 で落ちる（無認証で撃てる DoS）',
+        file: 'v0/server.mjs',
+        from: '        try { return decodeURIComponent(v); } catch { return v; }',
+        to: '        return decodeURIComponent(v);',
+        gone: 'try { return decodeURIComponent(v); }',
+        // ⚠️ 外側の catch-all も守っているので、単独では落ちない可能性がある。
+        //    両方外して守り全体を測る。
+        also: [{
+            from: `    handleRequest(req, res).catch(err => {`,
+            to: `    Promise.resolve().then(() => handleRequest(req, res)).catch(err => { throw err; }).catch(err => {`,
+        }],
+        pattern: '壊れた Cookie / ヘッダでデーモンが落ちない',
+    },
+    {
+        name: 'exec-subscriber-backpressure',
+        why: '読まない購読者に無制限に溜める（RSS 72MB→433MB を実測）',
+        file: 'v0/server.mjs',
+        from: '        if (res.writableLength > MAX_PENDING_BYTES) {',
+        to: '        if (false) {',
+        gone: 'res.writableLength > MAX_PENDING_BYTES',
+        pattern: '読まない購読者は切られ',
+    },
+    {
+        name: 'exec-evict-with-subscribers',
+        why: '購読者が残っていると終了済みセッションを永久に消さない'
+            + '（詰まったソケット1つでメモリが溜まり続ける）',
+        file: 'v0/execsession.mjs',
+        from: '            if (now - doneAt >= this.limits.retainMs) evict.push(s);',
+        to: '            if (now - doneAt >= this.limits.retainMs && !s.subscribers.size) evict.push(s);',
+        gone: 'this.limits.retainMs) evict.push(s);',
+        pattern: '保持期間を過ぎたら購読者がいても消す',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'exec-attach-after-finish',
+        why: '終わったセッションを running に戻す'
+            + '（「停止した」後に走り続け、枠が二重に返る）',
+        file: 'v0/execsession.mjs',
+        from: '        if (!s.running) return false;\n        s.child = child;',
+        to: '        s.child = child;',
+        gone: 'if (!s.running) return false;\n        s.child',
+        pattern: 'attachChild は終わったセッションを running に戻さない',
+        testFile: 'v0/execsession.test.mjs',
+    },
     // 4回目のレビュー（並列・独立）で見つかった BLOCKING 4件。
     // docs/review-4-parallel.md / issue #19-#22
     {

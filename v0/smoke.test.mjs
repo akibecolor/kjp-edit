@@ -1536,6 +1536,49 @@ test('🚨 exec: 相手が終わった直後に標準入力へ送ってもデー
     } finally { child.kill(); }
 });
 
+// 🚨 `res.write()` は相手が読まなくてもメモリに積む。ブラウザのタブが停止した
+//    まま出力の多いコマンドを走らせると RSS が 72MB → 433MB まで伸びた（レビューで実測）。
+//    上限を超えたら**その購読者を切る**（データはリングバッファに残るので再接続で追いつける）。
+test('🚨 exec: 読まない購読者は切られ、応答が無制限に溜まらない', async () => {
+    const { child, url } = await startExec();
+    try {
+        // 大量に出力し続けるコマンド。購読側は**1バイトも読まない**
+        const res = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: [process.execPath, '-e',
+                    'const s="x".repeat(64*1024);let i=0;'
+                    + 'const t=setInterval(()=>{i++;process.stdout.write(s);'
+                    + 'if(i>400)clearInterval(t)},1)'],
+            }),
+        });
+        assert.equal(res.status, 200);
+        // ⚠️ **1回だけ読んで、以後まったく読まない。**
+        //    ループで読んでしまうと溜まらないので検査にならない（一度そう書いた）。
+        //    読まないと undici がソケットから引き取らなくなり、
+        //    サーバ側の res に溜まる = タブが停止した状態と同じ。
+        const reader = res.body.getReader();
+        await reader.read();
+
+        // 監査に「切った」記録が出るまで待つ（固定時間で待たない）
+        const { readFile: rf } = await import('node:fs/promises');
+        const auditPath = join(repo, '.git', 'kjp-exec-audit.jsonl');
+        let sawDrop = false;
+        for (let i = 0; i < 120 && !sawDrop; i++) {
+            await new Promise(r => setTimeout(r, 250));
+            try { sawDrop = /drop-subscriber/.test(await rf(auditPath, 'utf8')); } catch { /* まだ無い */ }
+        }
+        assert.ok(sawDrop,
+            '読まない購読者が切られない（応答が無制限に溜まる）。監査にも残っていない');
+
+        // サーバは生きている（切ったのは購読者だけ）
+        const st = JSON.parse(await (await fetch(`${url}/api/v0/state?fresh=1`)).text());
+        assert.ok(Array.isArray(st.execSessions), 'サーバが応答しない');
+    } finally { child.kill(); }
+});
+
 test('🔒 exec: 不正なセッション id と知らない id を弾く', async () => {
     const { child, url } = await startExec();
     try {
@@ -1923,6 +1966,30 @@ test('🔒 --allow-host を付けると認証が既定で必須になる', async
         assert.match(s.banner(), /require-auth/);
         assert.match(s.banner(), /box\.example\.test\/\?token=/,
             'トンネル用の URL が案内に出ていない');
+    } finally { s.child.kill(); }
+});
+
+// 🚨 認可より手前の同期例外は async ハンドラの unhandled rejection になり
+//    **デーモンを exit 1 で落とす**。`new URL()` で一度直した型を
+//    `decodeURIComponent`（Cookie）で再発させた。無認証で撃てる DoS。
+test('🚨 壊れた Cookie / ヘッダでデーモンが落ちない（無認証で撃てる DoS）', async () => {
+    const s = await startAuthServer(['--require-auth']);
+    let died = null;
+    s.child.on('exit', c => { died = c; });
+    try {
+        // 不正なパーセント encoding。decodeURIComponent が URIError を投げる
+        for (const bad of ['kjp_auth=%', 'kjp_auth=%zz', 'kjp_auth=%E0%A4', 'kjp_auth=a%',
+            'other=%; kjp_auth=%', 'kjp_auth']) {
+            const r = await authGet(s.port, '/api/v0/state', { cookie: bad });
+            assert.ok([401, 200, 400].includes(r.code),
+                `想定外の応答（接続が切れた可能性）: ${bad} → ${r.code} ${r.body}`);
+        }
+        await new Promise(r => setTimeout(r, 400));
+        assert.equal(died, null, `デーモンが落ちた（exit=${died}）`);
+
+        // 落ちていないなら、正常な要求は引き続き通る
+        const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
+        assert.equal((await authGet(s.port, '/api/v0/state', { 'x-kjp-token': token })).code, 200);
     } finally { s.child.kill(); }
 });
 

@@ -182,10 +182,25 @@ export class ExecRegistry {
         return isSessionId(id) ? (this.sessions.get(id) ?? null) : null;
     }
 
-    /** 子プロセスが起動できた */
+    /**
+     * 子プロセスが起動できた。
+     *
+     * 🚨 **既に終わっているセッションを running に戻してはいけない。**
+     *    `create()` から `spawn()` までの間に `await`（worktree の列挙）が入るので、
+     *    その隙に sweep が猶予切れで殺したり、`/kill` が来たりする。
+     *    無条件に `state='running'` にしていたので:
+     *      - 「停止した」と告げた後にプロセスが走り続ける（嘘）
+     *      - あとで exit したときに finish がもう一度通り、**枠が二重に返る**
+     *        （上限8のはずが増える）
+     *    （レビューで実測）
+     *
+     * @returns {boolean} 付けられたか。false なら呼び出し側が子を殺す
+     */
     attachChild(s, child) {
+        if (!s.running) return false;
         s.child = child;
         s.state = 'running';
+        return true;
     }
 
     /**
@@ -258,14 +273,22 @@ export class ExecRegistry {
                 }
                 continue;
             }
-            // 3. 終了後の保持。出力を読みに戻れるように少し残してから消す
+            // 3. 終了後の保持。出力を読みに戻れるように少し残してから消す。
+            // 🚨 **購読者が残っていても、保持期間を過ぎたら消す。**
+            //    以前は `!s.subscribers.size` を条件にしていたので、
+            //    切断を検知できない購読者（詰まったソケット等）が1つ残るだけで
+            //    **セッションが永久に台帳に残りメモリが溜まり続けた**（レビューで実測）。
+            //    終了済みなので、これ以上待っても新しい出力は無い。
             const doneAt = s.exit ? Date.parse(s.exit.at) : s.createdAt;
-            if (now - doneAt >= this.limits.retainMs && !s.subscribers.size) evict.push(s);
+            if (now - doneAt >= this.limits.retainMs) evict.push(s);
         }
         return { kill, evict };
     }
 
     remove(s) {
+        // ⚠️ 購読者の参照も切る。残すと購読側のクロージャ（応答オブジェクト）が
+        //    台帳から消えた後も生き続ける
+        s.subscribers.clear();
         this.sessions.delete(s.id);
     }
 
