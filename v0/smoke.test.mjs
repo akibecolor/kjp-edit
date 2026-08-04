@@ -618,10 +618,12 @@ test('衝突予測: 実際に衝突するペアを検出する', async () => {
     assert.ok(pair, `agent-a × agent-b のペアが無い: ${JSON.stringify(s.conflicts)}`);
     // 両方が shared.txt を別内容で追加しているので add/add で衝突する
     assert.equal(pair.clean, false, 'きれいにマージできると判定されている');
-    assert.ok(pair.files.includes('shared.txt'),
+    // ⚠️ `files` は `{path, synthetic, ...}` の配列（#1 で合成パスに印を付けた）
+    const paths = pair.files.map(f => (typeof f === 'string' ? f : f.path));
+    assert.ok(paths.includes('shared.txt'),
         `衝突ファイルに shared.txt が無い: ${JSON.stringify(pair.files)}`);
     // 日本語＋空白のパスがクォートされずに返る（別名なので衝突しない）
-    for (const f of pair.files) {
+    for (const f of paths) {
         assert.ok(!f.includes('\\3'), `8進エスケープが残っている: ${f}`);
         assert.ok(!f.startsWith('"'), `クォートが残っている: ${f}`);
     }
@@ -1901,6 +1903,59 @@ test('🔒 --exec-timeout に数値でない値を渡したら起動を拒否す
     }
 });
 
+// 🚨 #1: `merge-tree --name-only` は**実在しないパス**を返す（実測: `thing~B`。
+//    file と directory の衝突で git が退避先として作る名前）。それを普通の
+//    ファイル名として出すと、押しても `/api/v0/diff` にも `blob` にも無いので
+//    **開けない行き止まり**になっていた。判別して理由を添える。
+test('🚨 衝突予測: 合成パスを印付けて「開けない理由」を出す', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const wtA = join(repo, '..', `${stem}-synth-a`);
+    const wtB = join(repo, '..', `${stem}-synth-b`);
+    try {
+        // 枝A: thing をディレクトリに / 枝B: thing をファイルに（file/directory 衝突）
+        await g(['worktree', 'add', '-b', 'synth-a', wtA, 'main'], repo);
+        await mkdir(join(wtA, 'thing'), { recursive: true });
+        await writeFile(join(wtA, 'thing', 'inner.txt'), 'from A\n', 'utf8');
+        // ⚠️ 候補ペアは「同じパスを触っている」ことで作るので、`thing` だけでは
+        //    候補にならない（A は `thing/inner.txt`、B は `thing` で別のパス）。
+        //    共通のファイルも衝突させて候補に入れる（候補生成の既知の限界）
+        await writeFile(join(wtA, 'shared.txt'), 'A side\n', 'utf8');
+        await g(['add', '-A'], wtA);
+        await g(['commit', '-q', '-m', 'A: thing はディレクトリ'], wtA);
+
+        await g(['worktree', 'add', '-b', 'synth-b', wtB, 'main'], repo);
+        await writeFile(join(wtB, 'thing'), 'from B\n', 'utf8');
+        await writeFile(join(wtB, 'shared.txt'), 'B side\n', 'utf8');
+        await g(['add', '-A'], wtB);
+        await g(['commit', '-q', '-m', 'B: thing はファイル'], wtB);
+
+        const s = JSON.parse(await (await fetch(`${baseUrl}/api/v0/state?fresh=1`)).text());
+        const pair = (s.conflicts ?? []).find(c => c.clean === false
+            && (c.files ?? []).some(f => /~/.test(typeof f === 'string' ? f : f.path)));
+        assert.ok(pair, '合成パスを含む衝突が出ていない'
+            + `（conflicts: ${JSON.stringify((s.conflicts ?? []).map(c => [c.a, c.b, c.clean]))}）`);
+
+        const synth = pair.files.find(f => typeof f === 'object' && f.synthetic);
+        assert.ok(synth, `合成パスに印が付いていない: ${JSON.stringify(pair.files)}`);
+        assert.match(synth.path, /~/);
+        assert.equal(synth.of, 'thing', `実体のパスが分からない: ${JSON.stringify(synth)}`);
+        assert.match(synth.why, /実在しません/);
+
+        // 普通のファイルは印が付かない（過剰に印を付けていない）
+        for (const f of pair.files) {
+            if (typeof f !== 'object') continue;
+            if (!/~/.test(f.path)) assert.equal(f.synthetic, false, `過剰に印を付けている: ${f.path}`);
+        }
+    } finally {
+        await g(['worktree', 'remove', '--force', wtA], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wtB], repo).catch(() => {});
+        await g(['branch', '-D', 'synth-a'], repo).catch(() => {});
+        await g(['branch', '-D', 'synth-b'], repo).catch(() => {});
+        await rm(wtA, { recursive: true, force: true }).catch(() => {});
+        await rm(wtB, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
 // ---------------------------------------------------------------------------
 // 🔒 読み取り経路の認証（#6 の 1・2）
 //
@@ -2361,7 +2416,8 @@ test('--repo にサブディレクトリを渡すとリポジトリのルート�
         // ⚠️ ルートに正規化しないと merge-tree が cwd 相対で `../shared.txt` を返し、
         //    isSafeRepoPath が弾いて UI から開けなくなる（レビュー指摘）
         for (const c of s.conflicts ?? []) {
-            for (const f of c.files) {
+            for (const f0 of c.files) {
+                const f = typeof f0 === 'string' ? f0 : f0.path;
                 assert.ok(!f.startsWith('..'), `衝突パスが cwd 相対になっている: ${f}`);
             }
         }

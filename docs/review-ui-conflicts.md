@@ -142,10 +142,8 @@ BLOCKING 3 と合わせて「固まって止められない → タブを閉じ�
 
 | | issue |
 |---|---|
-| `--name-only` の衝突パスに合成パスが混ざる（`link~fileB`, `thing~dirA`）。`/api/v0/diff` にも `blob` にも存在しないので UI から開けない | [#1](https://github.com/akibecolor/kjp-edit/issues/1) |
 | **submodule は false positive**（merge-tree はチェックアウトしていない submodule を判断できず衝突扱いにする）。stderr の hint を捨てているので「分からない」が「衝突する」として出る | [#2](https://github.com/akibecolor/kjp-edit/issues/2) |
 | **`docs/performance.md` はサーバ側の収集しか測っていない。** クライアント描画の線が無い（BLOCKING 4 はどのテストにも掛からなかった） | [#3](https://github.com/akibecolor/kjp-edit/issues/3) |
-| ファイラのラベルが実体と合っていない（並べているのは `base...HEAD` の**コミット済み**差分だが、カードの「変更 N・未追跡 N」は未コミット） | [#4](https://github.com/akibecolor/kjp-edit/issues/4) |
 
 ### 仕様として許容（直さない）
 
@@ -154,6 +152,16 @@ BLOCKING 3 と合わせて「固まって止められない → タブを閉じ�
   最適性を論じる意味は薄い
 
 ### 解決済み
+
+- ~~`--name-only` の衝突パスに合成パスが混ざる~~ → **#1 で解決。**
+  git の情報メッセージ（`moving it to X instead`）から退避名を取り、
+  `{path, synthetic, of, why}` として印を付けて「開けない理由」を出す。
+  ⚠️ 接尾辞から推測してはいけない（実測は `thing~refs_heads_synth-b` で、
+  label でもハッシュでもなかった）
+- ~~ファイラのラベルが実体と合っていない~~ → **#4 で解決。**
+  見出しを `ファイラ（<base>...HEAD の差分）` にし、
+  「コミット済みの差分なし / 未コミット N 件」と**両方の数字を出して**
+  食い違いを説明する
 
 - ~~`--repo` にサブディレクトリを渡すと `conflicts[].files` が cwd 相対（`../shared.txt`）になり、
   `overlaps[].path`（リポジトリルート相対）と基準が違う~~

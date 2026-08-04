@@ -697,16 +697,37 @@ export async function mergePreview(cwd, refA, refB, driverNames = []) {
             r.stderr || 'マージできません（tree が出力されていない）');
     }
     const conflicts = [];
-    for (const p of parts) {
-        if (p === '') break;             // 空トークンでセクション終わり
-        conflicts.push(toNFC(p));
+    let i = 0;
+    for (; i < parts.length; i++) {
+        if (parts[i] === '') break;      // 空トークンでセクション終わり
+        conflicts.push(toNFC(parts[i]));
     }
     // 衝突と言うなら必ず1件以上あるはず。0件なら判定できていない
     if (conflicts.length === 0) {
         throw new GitError(['merge-tree', refA, refB], r.code,
             r.stderr || '衝突と報告されたが衝突ファイルが0件');
     }
-    return { clean: false, conflicts };
+
+    // 🚨 **情報メッセージから「実在しない退避名」を取り出す。**
+    //    `--name-only` の衝突パスには git が作る退避名が混ざる（実測:
+    //    `thing~refs_heads_synth-b`）。それを普通のファイル名として出すと
+    //    UI で押しても開けない行き止まりになる（#1）。
+    //    接尾辞から推測すると外れる（label でもハッシュでもなく `refs_heads_...`
+    //    だった）ので、**git が言っている通りに取る**:
+    //      `CONFLICT (file/directory): directory in the way of thing from B;
+    //       moving it to thing~B instead.`
+    //    ⚠️ メッセージは英語に固定されている（BASE_ARGS で LANGUAGE=en / LC_ALL）。
+    const info = parts.slice(i + 1).join('\n');
+    const synthetic = new Map();   // 退避名 → 実体のパス
+    for (const m of info.matchAll(/in the way of (.+?) from [^;]+; moving it to (.+?) instead/g)) {
+        synthetic.set(toNFC(m[2].trim()), toNFC(m[1].trim()));
+    }
+    // symlink 絡みなど別の文面もあるので、退避名だけでも拾う
+    for (const m of info.matchAll(/moving it to (.+?) instead/g)) {
+        const name = toNFC(m[1].trim());
+        if (!synthetic.has(name)) synthetic.set(name, null);
+    }
+    return { clean: false, conflicts, synthetic, info: info.trim() || null };
 }
 
 /** ref から到達できるコミットの集合（グラフの幹を決めるのに使う）。 */

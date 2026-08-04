@@ -1123,7 +1123,20 @@ function render(s) {
     else if (c.clean === null) {
       d.append(document.createTextNode(
         c.truncated ? ' — 差分が大きすぎて判定できませんでした' : ' — 判定できませんでした'));
-    } else for (const f of c.files) d.append(el('div', 'ab', `  ${f}`));
+    } else for (const f of c.files ?? []) {
+      // ⚠️ サーバは `{path, synthetic, of, why}` を返す（古い形の文字列にも耐える）
+      const path = typeof f === 'string' ? f : f.path;
+      const row = el('div', 'ab');
+      row.append(document.createTextNode(`  ${path}`));
+      // 🚨 **開けないものを普通のファイル名として出さない。** `merge-tree` は
+      //    実在しない退避名（`thing~B`）を返すので、押しても開けない
+      //    行き止まりになっていた（#1）。理由を添える。
+      if (typeof f === 'object' && f.synthetic) {
+        row.append(el('span', 'note',
+          ` ← 開けません: ${f.why}${f.of ? `。実体は ${f.of}` : ''}`));
+      }
+      d.append(row);
+    }
     cBox.append(d);
   }
   // 取り込み順序の提案（純ロジック。追加の git 呼び出しは0）
@@ -1170,11 +1183,29 @@ function render(s) {
 
   renderAgents(s);
 
-  const filer = ensurePane($('#left'), 'filer', 'ファイラ（変更ファイル）', []);
+  // 🚨 **何の差分かを見出しに書く。** ここが並べているのは `base...HEAD` の
+  //    **コミット済み**差分で、worktree カードの「変更 N・未追跡 N」は
+  //    **未コミット**の数。別のものを同じ見た目で並べていたので、
+  //    「変更 10」と出ているのにファイラが「(差分なし)」になり、
+  //    **どちらの数字も信じられなくなっていた**（#4）。
+  const filer = ensurePane($('#left'), 'filer',
+    `ファイラ（${s.base ?? 'base'}...HEAD の差分）`, []);
   const tree = el('div', 'tree');
+  // ⚠️ ここは textContent なので Markdown 記法は書かない（そのまま文字として出る）
+  tree.append(el('div', 'note',
+    `コミット済みの差分です（${s.base ?? 'base'} と各 worktree の HEAD を比べたもの）。`
+    + ' カードの「変更 N・未追跡 N」は未コミットの数なので、一致しません。'));
   for (const wt of s.worktrees) {
+    const st = wt.status ?? {};
+    const uncommitted = (st.changed ?? 0) + (st.untracked ?? 0);
     tree.append(el('div', 'd', `▾ ${wt.name}`));
-    if (!wt.files?.length) tree.append(el('div', 'f', '   (差分なし)'));
+    if (!wt.files?.length) {
+      // ⚠️ 「差分なし」だけでは、未コミットの変更があるのに何も無いように見える。
+      //    どちらの数字も出して食い違いを説明する
+      tree.append(el('div', 'f', uncommitted
+        ? `   (コミット済みの差分なし / 未コミット ${uncommitted} 件)`
+        : '   (差分なし)'));
+    }
     for (const f of (wt.files ?? []).slice(0, 12)) {
       const d = el('div', 'f');
       d.append(el('span', 'st', f.status), document.createTextNode(f.path.split('/').pop()));

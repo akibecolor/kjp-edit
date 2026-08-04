@@ -193,6 +193,17 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // L3 #1 / #4: 「開けないものを普通に出す」「別のものを同じ見た目で並べる」
+    {
+        name: 'conflict-synthetic-path',
+        why: 'merge-tree の退避名（実在しないパス）を普通のファイル名として出す'
+            + '（押しても開けない行き止まりになる）',
+        file: 'v0/git.mjs',
+        from: "        synthetic.set(toNFC(m[2].trim()), toNFC(m[1].trim()));",
+        to: '        /* 変異: 退避名を拾わない */',
+        gone: 'synthetic.set(toNFC(m[2].trim())',
+        pattern: '合成パスを印付けて',
+    },
     // #33: bare / prunable の門。以前は**本物の bare を作っていなかった**ので
     //      4つとも外しても全テストが緑だった（過去2件と同じクラスの偽陽性）。
     {

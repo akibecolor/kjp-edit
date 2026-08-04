@@ -456,9 +456,24 @@ async function collectFresh() {
         if (!refA || !refB || pa === pb) return null;
         try {
             const r = await mergePreview(cwd, refA, refB, drivers);
-            // clean が null（読み切れなかった）は「分からない」として扱う
+            // 🚨 **合成パスを印付ける。** `merge-tree --name-only` は
+            //    実在しないパスを返すことがある（実測: `thing~B`。file/directory の
+            //    衝突で git が退避先として作る名前。symlink 対 file も同様）。
+            //    それを普通のファイル名として出すと、UI で押しても
+            //    `/api/v0/diff` にも `blob` にも無いので**開けない行き止まり**になる（#1）。
+            //    ここで判別して「開けない理由」を添える。
+            //    判別は**推測ではなく git の情報メッセージ**から取る
+            //    （接尾辞は label でもハッシュでもなく `refs_heads_...` だった）。
+            const synth = r.synthetic ?? new Map();
+            const files = (r.conflicts ?? []).map(f => (synth.has(f)
+                ? {
+                    path: f, synthetic: true, of: synth.get(f),
+                    why: 'git が退避先として作る名前で、実在しません'
+                        + '（file と directory / symlink の衝突）',
+                }
+                : { path: f, synthetic: false }));
             return { a: wa.label, b: wb.label, aPath: pa, bPath: pb,
-                clean: r.clean, files: r.conflicts, truncated: !!r.truncated };
+                clean: r.clean, files, truncated: !!r.truncated };
         } catch (e) {
             errors.push({ scope: `${wa?.label} × ${wb?.label}`, message: `衝突予測に失敗: ${e.message}` });
             return null;
