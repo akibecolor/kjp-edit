@@ -179,6 +179,14 @@
     font-size: 11px; line-height: 1.45; }
   .term .p { color: var(--ok); } .term .w { color: var(--warn); }
   .term .e { color: var(--danger); } .term .d { color: var(--dim); }
+  /* 自分が送った行。出力と混ざると「誰が言ったか」が読めなくなる */
+  .term .i { color: var(--accent); }
+
+  /* 🚨 `hidden` 属性を作者スタイルで上書きしないための保険。
+     `.cmdbar { display: flex }` のような規則は UA の `[hidden]{display:none}` に
+     **勝つ**ので、`el.hidden = true` にしても消えない。
+     実際に「送れないのに入力欄が出ている（押しても無反応）」状態を作った。 */
+  [hidden] { display: none !important; }
 
   /* グラフ */
   .grow { display: grid; grid-template-columns: auto auto auto 1fr;
@@ -430,6 +438,68 @@ const PRESETS = [
   'claude -p "この worktree の変更を要約して"',
 ];
 
+/**
+ * 会話モードの argv。
+ *
+ * ⚠️ **PTY は要らない。** `--input-format stream-json` で素のパイプ越しに
+ *    多ターンの会話が成立する（実測で確認: 同一プロセス・同一セッションで
+ *    2ターン目が1ターン目を覚えている）。出力も JSON 行なので
+ *    既にある ndjson の配管に乗る。
+ * ⚠️ 権限は `plan` にしておく。会話しながら勝手に書き換えられると、
+ *    観測しているつもりが変更になる。書かせたいなら明示的に argv を編集する。
+ */
+const CHAT_ARGV = [
+  'claude', '-p',
+  '--input-format', 'stream-json',
+  '--output-format', 'stream-json',
+  '--verbose',
+  '--replay-user-messages',
+  '--permission-mode', 'plan',
+];
+
+/** 会話モードの1ターンを stream-json の1行にする（サーバは解釈しない） */
+function chatLine(text) {
+  return `${JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  })}\n`;
+}
+
+/**
+ * 会話モードの出力（stream-json）を読める形にする。
+ *
+ * ⚠️ **`out` は行の途中で切れて届く。** 行単位に組み直してから JSON にする
+ *    （chunk 境界の扱いは v0/ndjson.mjs と同じ問題）。
+ * ⚠️ 解釈できない行は**捨てずにそのまま出す。** 形式は Claude Code の
+ *    内部形式なので変わる。黙って消すと「応答が来ていない」ように見える。
+ */
+function makeChatFilter(line) {
+  let buf = '';
+  return raw => {
+    buf += raw;
+    const parts = buf.split('\n');
+    buf = parts.pop();
+    for (const l of parts) {
+      if (!l.trim()) continue;
+      let r;
+      try { r = JSON.parse(l); } catch { line('', `${l}\n`); continue; }
+      if (r.type === 'assistant') {
+        const t = (r.message?.content ?? [])
+          .filter(b => b.type === 'text').map(b => b.text).join('');
+        if (t.trim()) line('', `${t.trim()}\n`);
+        for (const b of r.message?.content ?? []) {
+          if (b.type === 'tool_use') line('d', `  · ${b.name}\n`);
+        }
+      } else if (r.type === 'result') {
+        line(r.is_error ? 'e' : 'p', `── ${r.is_error ? '✖ エラー' : '✔ 応答おわり'} ──\n`);
+      } else if (r.type === 'system' && r.subtype === 'init') {
+        line('d', `（セッション ${String(r.session_id ?? '').slice(0, 8)} で開始）\n`);
+      }
+      // それ以外（rate_limit_event / user の replay など）は出さない
+    }
+  };
+}
+
 /** 端末の上限。超えたら先頭を捨てる（捨てたことは画面に出す）。 */
 const TERM_MAX_SPANS = 4000;
 
@@ -437,7 +507,8 @@ const TERM_MAX_SPANS = 4000;
  * 実行セッションを購読する。**新規実行と再購読の両方**を担う。
  * @param {?{id: string, from: number}} attach 再購読するセッション（新規なら null）
  */
-async function runExec(termEl, scrollEl, wt, argv, onState, { attach = null, keepAlive = false } = {}) {
+async function runExec(termEl, scrollEl, wt, argv, onState,
+  { attach = null, keepAlive = false, chat = false } = {}) {
   // ⚠️ 出力1件ごとに DOM に append して scrollHeight を読むと、
   //    **強制同期レイアウトが総文字数に比例**して全体が二次になる。
   //    レビューの実測で 12,000 行 = 54 秒、うち 28.9 秒が単一ブロック
@@ -489,8 +560,32 @@ async function runExec(termEl, scrollEl, wt, argv, onState, { attach = null, kee
       });
     } catch { /* 既に終わっている */ }
   };
+  // 会話モードでは stream-json を読める形に直す
+  const chatFilter = chat ? makeChatFilter(line) : null;
+  /** 走っているセッションの標準入力に書く */
+  const write = async (data, eof = false) => {
+    if (!sessionId) return { ok: false, error: 'セッションがまだありません' };
+    try {
+      const r = await fetch(`/api/v0/exec/${sessionId}/input`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
+        body: JSON.stringify(eof ? { eof: true } : { data }),
+      });
+      if (!r.ok) {
+        let msg = `HTTP ${r.status}`;
+        try { msg = (await r.json()).error ?? msg; } catch { /* JSON でない */ }
+        line('e', `✖ ${msg}\n`);
+        return { ok: false, error: msg };
+      }
+      return { ok: true };
+    } catch (e) {
+      line('e', `✖ ${e.message}\n`);
+      return { ok: false, error: e.message };
+    }
+  };
   const publish = () => onState({
-    running: true, abort: () => ac.abort(), kill, sessionId, seq: () => lastSeq,
+    running: true, abort: () => ac.abort(), kill, sessionId, chat, write,
+    seq: () => lastSeq,
   });
   publish();
   line('d', attach ? `↻ セッション ${attach.id} に再接続\n` : `$ ${argv.join(' ')}\n`);
@@ -522,7 +617,9 @@ async function runExec(termEl, scrollEl, wt, argv, onState, { attach = null, kee
         }
         continue;
       }
-      if (ev.t === 'out') line('', ev.d);
+      if (ev.t === 'in') line('i', `▸ ${ev.d}`);
+      else if (ev.t === 'note') line('d', `${ev.d}\n`);
+      else if (ev.t === 'out') { if (chatFilter) chatFilter(ev.d); else line('', ev.d); }
       else if (ev.t === 'err') line('w', ev.d);
       else if (ev.t === 'exit') {
         const ok = ev.code === 0;
@@ -569,9 +666,11 @@ function consoleBody(wt, paneObj) {
   input.value = PRESETS[0];
   input.spellcheck = false;
   const run = el('button', null, '実行');
+  const chatBtn = el('button', null, '会話');
+  chatBtn.title = 'claude と多ターンで会話する（PTY は使いません）';
   const stop = el('button', null, '停止');
   stop.disabled = true;
-  bar.append(sel, input, run, stop);
+  bar.append(sel, input, run, chatBtn, stop);
 
   const peek = el('div', 'argvpeek');
   const scroll = el('div');
@@ -600,6 +699,19 @@ function consoleBody(wt, paneObj) {
   const resume = el('div', 'note');
   resume.hidden = true;
 
+  // 標準入力の欄（#18）。走っているセッションにだけ出す。
+  // ⚠️ **自動更新で作り直さない。** 入力途中の文字が消える
+  //    （書き込み操作の入力を作り直さない規則と同じ理由）。
+  const inbar = el('div', 'cmdbar');
+  inbar.hidden = true;
+  const inField = el('input');
+  inField.placeholder = '送信する行（Enter）';
+  inField.spellcheck = false;
+  const sendBtn = el('button', null, '送信');
+  const eofBtn = el('button', null, 'EOF');
+  eofBtn.title = '標準入力を閉じる（入力待ちのプログラムを終わらせる）';
+  inbar.append(inField, sendBtn, eofBtn);
+
   let cur = null;
   const onState = st => {
     box.dataset.running = st.running ? '1' : '';
@@ -612,11 +724,34 @@ function consoleBody(wt, paneObj) {
     paneObj.abort = st.running ? st.abort : null;
     paneObj.sessionId = st.running ? st.sessionId : null;
     if (st.running) resume.hidden = true;
+    // 標準入力の欄は走っている間だけ出す
+    inbar.hidden = !st.running;
+    inField.placeholder = st.chat
+      ? 'claude に送るメッセージ（Enter）'
+      : '送信する行（Enter）';
+    chatBtn.disabled = st.running || !session.allowExec;
   };
   const start = (opts) => {
     if (parsed.warning || !parsed.argv.length) return;
     runExec(term, scroll, wt, parsed.argv, onState, opts);
   };
+
+  const send = async () => {
+    const text = inField.value;
+    if (!text || !cur?.write) return;
+    inField.value = '';
+    // 会話モードなら stream-json の1行にする。素のモードは行をそのまま送る
+    const r = await cur.write(cur.chat ? chatLine(text) : `${text}\n`);
+    // 送れなかったら入力を戻す（打ち直させない）
+    if (!r?.ok) inField.value = text;
+  };
+  sendBtn.addEventListener('click', send);
+  inField.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+  eofBtn.addEventListener('click', () => cur?.write?.('', true));
+  chatBtn.addEventListener('click', () => {
+    // 会話は専用の argv で始める（入力欄の内容は使わない）
+    runExec(term, scroll, wt, CHAT_ARGV, onState, { chat: true, keepAlive: true });
+  });
 
   /**
    * この worktree で走っているセッションを出す。
@@ -666,7 +801,7 @@ function consoleBody(wt, paneObj) {
     cur?.abort?.();
   });
 
-  box.append(bar, peek, resume, scroll);
+  box.append(bar, peek, resume, scroll, inbar);
   return box;
 }
 

@@ -1249,6 +1249,198 @@ test('🚨 exec: サーバを SIGTERM で止めたら孫プロセスも残さな
     }
 });
 
+// ---------------------------------------------------------------------------
+// #18 標準入力（会話コンソールの土台）
+//
+// ⚠️ サーバは中身を解釈しない。`claude` の stream-json の1行を組み立てるのは
+//    クライアントの仕事。ここでは「汎用の stdin 書き込み」として検証する。
+// ---------------------------------------------------------------------------
+
+/** 行ごとに `echo:<行>` を返し、EOF で `eof` を出す子プロセス */
+const ECHO_SCRIPT = 'process.stdin.setEncoding("utf8");let b="";'
+    + 'process.stdin.on("data",d=>{b+=d;let i;'
+    + 'while((i=b.indexOf("\\n"))>=0){const l=b.slice(0,i);b=b.slice(i+1);'
+    + 'process.stdout.write("echo:"+l+"\\n")}});'
+    + 'process.stdin.on("end",()=>{process.stdout.write("eof\\n")});';
+
+/** セッションを1つ作り、id と「行を読む」関数を返す */
+async function startSession(url, argv, extra = {}) {
+    const ac = new AbortController();
+    const res = await fetch(`${url}/api/v0/exec`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        body: JSON.stringify({ worktree: repo, argv, ...extra }),
+        signal: ac.signal,
+    });
+    assert.equal(res.status, 200, `セッションを作れない: ${res.status}`);
+    const rd = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    const seen = [];
+    /** 条件を満たすレコードが来るまで読む */
+    const until = async (pred, limitMs = 15000) => {
+        const t0 = Date.now();
+        while (!seen.some(pred)) {
+            if (Date.now() - t0 > limitMs) {
+                throw new Error(`条件を満たすレコードが来ない。見えたもの: ${JSON.stringify(seen)}`);
+            }
+            const { value, done } = await rd.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const parts = buf.split('\n');
+            buf = parts.pop();
+            for (const l of parts) if (l.trim()) seen.push(JSON.parse(l));
+        }
+        return seen;
+    };
+    await until(r => r.t === 'session');
+    const id = seen.find(r => r.t === 'session').id;
+    return { id, seen, until, abort: () => ac.abort(), cancel: () => rd.cancel().catch(() => {}) };
+}
+
+const sendInput = (url, id, body) => fetch(`${url}/api/v0/exec/${id}/input`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+    body: JSON.stringify(body),
+});
+
+test('🚨 exec: 標準入力に書けて、往復し、EOF で閉じられる', async () => {
+    const { child, url } = await startExec();
+    try {
+        const s = await startSession(url, [process.execPath, '-e', ECHO_SCRIPT]);
+        // 1ターン目
+        const r1 = await sendInput(url, s.id, { data: 'hello\n' });
+        assert.equal(r1.status, 200);
+        assert.equal((await r1.json()).bytes, 6);
+        await s.until(r => r.t === 'out' && r.d.includes('echo:hello'));
+
+        // 2ターン目（同じプロセスに続けて送れる = 会話が成立する形）
+        await sendInput(url, s.id, { data: 'second\n' });
+        await s.until(r => r.t === 'out' && r.d.includes('echo:second'));
+
+        // 入力も記録に残り、購読者に流れる（別端末から見ても何を送ったか分かる）
+        const ins = s.seen.filter(r => r.t === 'in');
+        assert.deepEqual(ins.map(r => r.d), ['hello\n', 'second\n']);
+
+        // EOF で閉じる
+        await sendInput(url, s.id, { eof: true });
+        await s.until(r => r.t === 'out' && r.d.includes('eof'));
+        await s.until(r => r.t === 'exit');
+
+        // 閉じた後の書き込みは 409（黙って捨てない）
+        const after = await sendInput(url, s.id, { data: 'late\n' });
+        assert.equal(after.status, 409);
+        s.abort();
+    } finally { child.kill(); }
+});
+
+test('exec: 入力は再接続でも再生される（自分の発言が消えない）', async () => {
+    const { child, url } = await startExec();
+    try {
+        const s = await startSession(url, [process.execPath, '-e', ECHO_SCRIPT]);
+        await sendInput(url, s.id, { data: 'remembered\n' });
+        await s.until(r => r.t === 'out' && r.d.includes('echo:remembered'));
+        s.abort();
+
+        const re = await fetch(`${url}/api/v0/exec/${s.id}/stream`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({ from: 0 }),
+        });
+        const rd = re.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        const got = [];
+        while (!got.some(r => r.t === 'out' && r.d.includes('echo:remembered'))) {
+            const { value, done } = await rd.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const parts = buf.split('\n');
+            buf = parts.pop();
+            for (const l of parts) if (l.trim()) got.push(JSON.parse(l));
+        }
+        assert.ok(got.some(r => r.t === 'in' && r.d === 'remembered\n'),
+            `再接続で入力が再生されない: ${JSON.stringify(got.filter(r => r.t === 'in'))}`);
+        await rd.cancel().catch(() => {});
+    } finally { child.kill(); }
+});
+
+// 🚨 入力は自由文で、秘密が入りうる（パスワードやトークンを打つ場面がある）。
+//    T5 と同じ理屈で**本文は監査に残さない**。残すのはバイト数だけ。
+test('🚨 exec: 監査ログに入力の本文を残さない（バイト数だけ）', async () => {
+    const { child, url } = await startExec();
+    const SECRET = 'INPUT-SECRET-31337';
+    try {
+        const s = await startSession(url, [process.execPath, '-e', ECHO_SCRIPT]);
+        await sendInput(url, s.id, { data: `${SECRET}\n` });
+        await s.until(r => r.t === 'out' && r.d.includes(SECRET));
+
+        const { readFile: rf } = await import('node:fs/promises');
+        const raw = await rf(join(repo, '.git', 'kjp-exec-audit.jsonl'), 'utf8');
+        assert.ok(!raw.includes(SECRET), '監査ログに入力の本文が残っている');
+        const ev = raw.trim().split('\n').map(l => JSON.parse(l))
+            .filter(e => e.session === s.id && e.event === 'input');
+        assert.equal(ev.length, 1, `input が記録されていない: ${ev.length}`);
+        assert.equal(ev[0].bytes, Buffer.byteLength(`${SECRET}\n`, 'utf8'),
+            'バイト数が記録されていない（何も分からなくなる）');
+        s.abort();
+    } finally { child.kill(); }
+});
+
+test('🔒 exec: input も関門を通る（トークン無し / 終了後 / 不正な本文）', async () => {
+    const { child, url } = await startExec();
+    try {
+        const s = await startSession(url, [process.execPath, '-e', ECHO_SCRIPT]);
+        // トークン無し
+        const noTok = await fetch(`${url}/api/v0/exec/${s.id}/input`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ data: 'x\n' }),
+        });
+        assert.equal(noTok.status, 403, 'トークン無しで標準入力に書けてしまった');
+        // GET では書けない（副作用を GET で起こさない）
+        const viaGet = await fetch(`${url}/api/v0/exec/${s.id}/input`, {
+            headers: { 'x-kjp-token': EXEC_TOKEN },
+        });
+        assert.notEqual(viaGet.status, 200, 'GET で標準入力に書けてしまった');
+        // data も eof も無い
+        const empty = await sendInput(url, s.id, { nothing: true });
+        assert.equal(empty.status, 400);
+
+        // 終了したセッションには書けない
+        await sendInput(url, s.id, { eof: true });
+        await s.until(r => r.t === 'exit');
+        const done = await sendInput(url, s.id, { data: 'x\n' });
+        assert.equal(done.status, 409);
+        s.abort();
+    } finally { child.kill(); }
+});
+
+test('exec: 大きすぎる入力は拒否する', async () => {
+    const { child, url } = await startExec();
+    try {
+        const s = await startSession(url, [process.execPath, '-e', ECHO_SCRIPT]);
+        const big = await sendInput(url, s.id, { data: `${'x'.repeat(80 * 1024)}\n` });
+        // ⚠️ 413 で返ること自体が検査対象。以前は req.destroy() していたので
+        //    クライアントには『fetch failed』しか見えず、原因が分からなかった
+        assert.equal(big.status, 413, '64KB を超える入力が通った（または応答が届いていない）');
+        assert.match((await big.json()).error, /大きすぎます/);
+        s.abort();
+    } finally { child.kill(); }
+});
+
+test('🔒 exec: 標準入力の経路も --allow-exec なしでは存在しない', async () => {
+    const s = await startAuthServer([]);
+    try {
+        const r = await fetch(`http://127.0.0.1:${s.port}/api/v0/exec/0123456789abcdef/input`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ data: 'x\n' }),
+        });
+        assert.equal(r.status, 403);
+    } finally { s.child.kill(); }
+});
+
 test('🔒 exec: 不正なセッション id と知らない id を弾く', async () => {
     const { child, url } = await startExec();
     try {

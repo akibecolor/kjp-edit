@@ -148,6 +148,13 @@ const over = [...doc.querySelectorAll('*')].filter(e => rect(e).right > vw + 1)
 //    getComputedStyle(e).display だけで判定すると、意図的に隠した .refcell の
 //    中のバッジを「幅0に潰れている」と誤検出する（実際に踏んだ）。
 const drawn = e => e.getClientRects().length > 0;
+// 🚨 hidden 属性を付けたのに描かれているものを探す。
+//    ⚠️ ここは server.mjs のテンプレートリテラルの中なので**バックティックを書かない**。
+//    .cmdbar の display:flex のような作者スタイルは UA の
+//    [hidden]{display:none} に**勝つ**ので、el.hidden = true が効かない。
+//    「送れないのに入力欄が出ている（押しても無反応）」を実際に作った。
+const hiddenButDrawn = [...doc.querySelectorAll('[hidden]')].filter(drawn)
+  .map(e => e.tagName + (e.className ? '.' + String(e.className).trim().split(/\\s+/).join('.') : ''));
 const badges = [...doc.querySelectorAll('.ref')].filter(drawn);
 // 描かれているのに幅が無い = overflow:hidden や循環参照で情報が消えている
 const squashed = badges.filter(e => rect(e).width < 24)
@@ -158,6 +165,8 @@ document.getElementById('out').textContent = JSON.stringify({
   bodyClientWidth: doc.body.clientWidth,
   overflowing: over.slice(0, 12),
   overflowingCount: over.length,
+  hiddenButDrawn: hiddenButDrawn.slice(0, 12),
+  hiddenButDrawnCount: hiddenButDrawn.length,
   squashedBadges: squashed.slice(0, 12),
   squashedCount: squashed.length,
   visibleBadges: badges.length,
@@ -936,9 +945,23 @@ function readJson(req, maxBytes = 64 * 1024) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         let size = 0;
+        let over = false;
         req.on('data', c => {
+            // ⚠️ **`req.destroy()` しない。** ソケットを切ると応答が届かず、
+            //    クライアントには「fetch failed」しか見えない。
+            //    「大きすぎる」と「サーバが落ちた」を区別できないのは、
+            //    このツールが避けるべき種類の壊れ方（実際にテストで踏んだ）。
+            //    読み捨てて（chunks に積まない）応答は 413 で返す。
+            if (over) return;
             size += c.length;
-            if (size > maxBytes) { reject(new Error('ボディが大きすぎます')); req.destroy(); return; }
+            if (size > maxBytes) {
+                over = true;
+                chunks.length = 0;
+                const e = new Error(`ボディが大きすぎます（上限 ${maxBytes} バイト）`);
+                e.tooLarge = true;
+                reject(e);
+                return;
+            }
             chunks.push(c);
         });
         req.on('end', () => {
@@ -1051,7 +1074,7 @@ const server = createServer(async (req, res) => {
         if (url.pathname === '/api/v0/exec') {
             if (!requireExec(req, res)) return;
             let body;
-            try { body = await readJson(req); } catch (err) { denyJson(res, 400, err.message); return; }
+            try { body = await readJson(req); } catch (err) { denyJson(res, err.tooLarge ? 413 : 400, err.message); return; }
 
             // ⚠️ argv 配列で受ける。shell は使わない（引用の崩れと二重解釈を避ける）
             const argv = Array.isArray(body.argv) ? body.argv.map(String) : null;
@@ -1149,7 +1172,7 @@ const server = createServer(async (req, res) => {
         // 実行セッションの再購読。**切断しても走り続けている**ので、
         // 最後に見た通番の続きから貰えるようにする（#17）。
         {
-            const m = /^\/api\/v0\/exec\/([^/]+)\/(stream|kill)$/.exec(url.pathname);
+            const m = /^\/api\/v0\/exec\/([^/]+)\/(stream|kill|input)$/.exec(url.pathname);
             if (m) {
                 // 🔒 実行と同じ関門を通す（GET にしない。POST + トークン + 同一オリジン）
                 if (!requireExec(req, res)) return;
@@ -1172,6 +1195,50 @@ const server = createServer(async (req, res) => {
                     res.end(JSON.stringify({ ok: true, alreadyDone: !was }));
                     return;
                 }
+                if (m[2] === 'input') {
+                    // 走っているセッションの標準入力に書く（#18）。
+                    //
+                    // ⚠️ **サーバは中身を解釈しない。** `claude` の
+                    //    `--input-format stream-json` 用の1行を組み立てるのは
+                    //    クライアントの仕事。ここを賢くすると、対応する
+                    //    プログラムごとに分岐が増えて汎用性を失う。
+                    // 🔒 監査には**バイト数だけ**書く。入力は自由文で、
+                    //    秘密が入りうる（T5 と同じ理屈で本文は残さない）。
+                    let inBody;
+                    try { inBody = await readJson(req); } catch (err) { denyJson(res, err.tooLarge ? 413 : 400, err.message); return; }
+                    if (!s.running) { denyJson(res, 409, 'そのセッションは終了しています'); return; }
+                    const eof = inBody.eof === true;
+                    const data = typeof inBody.data === 'string' ? inBody.data : null;
+                    if (!eof && data === null) { denyJson(res, 400, 'data（文字列）か eof が必要です'); return; }
+                    if (!s.child?.stdin || s.child.stdin.destroyed || !s.child.stdin.writable) {
+                        denyJson(res, 409, '標準入力は既に閉じています');
+                        return;
+                    }
+                    const bytes = data === null ? 0 : Buffer.byteLength(data, 'utf8');
+                    try {
+                        if (data !== null) s.child.stdin.write(data);
+                        if (eof) s.child.stdin.end();
+                    } catch (err) {
+                        // 子が既に死んでいると EPIPE。落とさずに理由を返す
+                        denyJson(res, 409, `標準入力に書けません: ${err.message}`);
+                        return;
+                    }
+                    // 入力も**記録に残して購読者全員に流す**。
+                    // そうしないと別の端末から見ている側に「何を送ったか」が見えず、
+                    // 再接続したときにも自分の入力が消える。
+                    if (data !== null) execRegistry.emit(s, 'in', data);
+                    if (eof) execRegistry.emit(s, 'note', '（標準入力を閉じました）');
+                    await auditExec({
+                        event: 'input', session: s.id, bytes, eof,
+                        peer: req.socket.remoteAddress ?? null,
+                    });
+                    res.writeHead(200, {
+                        'content-type': 'application/json; charset=utf-8',
+                        'cache-control': 'no-store',
+                    });
+                    res.end(JSON.stringify({ ok: true, bytes, seq: s.log.seq }));
+                    return;
+                }
                 let body = {};
                 try { body = await readJson(req); } catch { /* from 無しでも良い */ }
                 const from = Number(body.from);
@@ -1191,7 +1258,7 @@ const server = createServer(async (req, res) => {
             try {
                 body = await readJson(req);
             } catch (err) {
-                denyJson(res, 400, err.message);
+                denyJson(res, err.tooLarge ? 413 : 400, err.message);
                 return;
             }
             const ref = String(body.ref ?? '');

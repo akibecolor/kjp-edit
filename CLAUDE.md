@@ -164,6 +164,17 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
   `requestAnimationFrame` でまとめ、追従判定は `scroll` イベントで真偽値として持つ
 - **DOM を後から `querySelector` で探して掴まない。** 作った要素はオブジェクトに持つ。
   構造が変わると静かに別の要素を掴む（`div > div:last-child` が親自身を掴んでいた）
+- 🚨 **`hidden` 属性は作者スタイルに負ける。** `.cmdbar { display: flex }` のような
+  規則は UA の `[hidden] { display: none }` に**勝つ**ので、`el.hidden = true` が効かない。
+  「送れないのに入力欄が出ている（押しても無反応）」を実際に作った。
+  `[hidden] { display: none !important }` を置き、**layout-check が
+  「hidden なのに描かれている要素」を落とす**ようにしてある
+- ⚠️ **`--layout-probe` のハーネスは `v0/server.mjs` のテンプレートリテラルの中。
+  バックティックを書くと構文エラーになる**（コメントでも）
+- **capability を切ると描かれない UI は、検査でも描かれない。**
+  `layout-check` は `--allow-exec` 付きで起動する。無しだとコンソールは
+  「実行は無効です」の一文になり、**コマンドバーが測られない**
+  （ボタンを1つ足して 390px で溢れても気付けなかった）
 - **表示上限で省略したら必ず告知する。** カードはあるのにコンソールが無い、
   という状態を無言で作らない
 - **書き込み操作の入力（`<select>` 等）は自動更新で作り直さない。**

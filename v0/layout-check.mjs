@@ -52,8 +52,12 @@ if (!browser) {
 
 // サーバを起動して URL を得る
 const server = spawn(process.execPath,
-    // 活動観測のペインも狭い画面の検査対象に含める（記録が無くても行は出る）
-    [SERVER, '--repo', repo, '--port', '0', '--layout-probe', '--watch-agents'],
+    // ⚠️ 活動観測と**実行**も有効にする。--allow-exec が無いと
+    //    コンソールは「実行は無効です」の一文になり、**コマンドバー
+    //    （select + 入力 + ボタン3つ）が描かれないので測れない**。
+    //    ボタンを1つ足したときに 390px で溢れても気付けなかった。
+    [SERVER, '--repo', repo, '--port', '0', '--layout-probe', '--watch-agents',
+        '--allow-exec', '--token', 'layout-check-token-0123456789'],
     { shell: false, windowsHide: true });
 server.stdout.setEncoding('utf8');
 server.stderr.setEncoding('utf8');
@@ -121,6 +125,11 @@ try {
         if (overflows) {
             problems.push(`幅 ${width}: body が横に溢れている `
                 + `(${r.bodyScrollWidth} > ${r.bodyClientWidth}) — ${r.overflowing.join(', ')}`);
+        }
+        // 🚨 hidden なのに描かれている = 押しても無反応の操作が出ている
+        if (r.hiddenButDrawnCount > 0) {
+            problems.push(`幅 ${width}: hidden なのに描かれている要素がある `
+                + `(${r.hiddenButDrawn.join(', ')})`);
         }
         if (r.squashedCount > 0) {
             problems.push(`幅 ${width}: バッジが幅24px未満に潰れている `
