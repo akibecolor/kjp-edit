@@ -133,6 +133,22 @@ node scripts/serve.mjs --allow-host fractal2.tail73c198.ts.net
 | 🔒 許可 Host に前置き（`evil-fractal2.…`） | **403** |
 | 実トンネル越し `https://fractal2.tail73c198.ts.net` | 200 |
 
+### 認証（2026-08-04 から）
+
+`--allow-host` を付けると**読み取りにもトークンが必要**になる。
+`scripts/serve.mjs` が `~/.kjp-edit/token` に永続化するので、
+**スマホでは最初の1回だけ `?token=...` 付きの URL を開く**（Cookie が焼かれる）。
+起動時にその URL が表示される。
+
+実トンネル越しに確認済み:
+
+| | |
+|---|---|
+| 無認証 | **401** |
+| `?token=` で開く | 302 → `/`（URL からトークンが落ちる） |
+| Cookie 付き | 200 |
+| 誤った Cookie | **401** |
+
 ### なぜ `--allow-host` が必要か
 
 **トンネル経由の Host はループバックではなくなる。** 既定ではループバック以外の

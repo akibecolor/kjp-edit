@@ -506,20 +506,35 @@ test('--allow-host で指定したホスト名だけは通る（トンネル用�
     );
     child.stdout.setEncoding('utf8');
     try {
+        // トークンの案内も同じ塊で出るので banner ごと受け取る
+        let banner = '';
         const url = await new Promise((resolve, reject) => {
             const t = setTimeout(() => reject(new Error('起動しなかった')), 15000);
-            let buf = '';
             child.stdout.on('data', d => {
-                buf += d;
-                const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
-                if (m) { clearTimeout(t); resolve(m[0]); }
+                banner += d;
+                const m = banner.match(/http:\/\/127\.0\.0\.1:\d+/);
+                if (m) { clearTimeout(t); setTimeout(() => resolve(m[0]), 400); }
             });
             child.on('error', reject);
         });
-        const ok = await rawGet(`${url}/api/v0/state`, { host: 'box.tail-scale.ts.net' });
-        assert.equal(ok.status, 200, '許可したホスト名が通らない');
-        const no = await rawGet(`${url}/api/v0/state`, { host: 'evil.example' });
-        assert.equal(no.status, 403, '許可していないホスト名が通ってしまった');
+        // ⚠️ --allow-host を付けると**認証が既定で必須になる**ので、
+        //    許可したホスト名でもトークンが無ければ 401。
+        //    「Host が通る」と「操作してよい」は別の判定であることを固定する。
+        const noTok = await rawGet(`${url}/api/v0/state`, { host: 'box.tail-scale.ts.net' });
+        assert.equal(noTok.status, 401, 'トンネル用のホスト名が無認証で通ってしまった');
+
+        const token = /\?token=([A-Za-z0-9_-]+)/.exec(banner)?.[1];
+        assert.ok(token, `トークンが案内に出ていない: ${banner}`);
+        const ok = await rawGet(`${url}/api/v0/state`,
+            { host: 'box.tail-scale.ts.net', 'x-kjp-token': token });
+        assert.equal(ok.status, 200, '許可したホスト名 + トークンが通らない');
+
+        // 🔒 Host の判定は認証より手前。**正しいトークンでも Host が違えば 403。**
+        //    順序が逆だと、トークンを持つ相手が任意の Host で入れてしまう
+        //    （rebinding 対策が認証の後ろに回ると意味が薄れる）
+        const no = await rawGet(`${url}/api/v0/state`,
+            { host: 'evil.example', 'x-kjp-token': token });
+        assert.equal(no.status, 403, '許可していないホスト名がトークン付きで通ってしまった');
     } finally {
         child.kill();
     }
@@ -1156,6 +1171,145 @@ test('🔒 --exec-timeout に数値でない値を渡したら起動を拒否す
         assert.equal(code, 1, `不正な値で起動してしまった: ${bad}`);
         assert.match(err, /--exec-timeout/);
     }
+});
+
+// ---------------------------------------------------------------------------
+// 🔒 読み取り経路の認証（#6 の 1・2）
+//
+// これが無い間、読み取りを守っていたのは Host 許可 + Sec-Fetch-Site だけで、
+// **トンネルに届く相手（tailnet の全端末）は誰でも差分を読めた。**
+// 標準入力の経路（#18）を開ける前提なので、ここを固定する。
+//
+// ⚠️ Host を検証する種類のテストは fetch で書かない。undici は Host を
+//    上書きできず黙って既定値を送るので、「防がれた」ではなく
+//    「攻撃を送れていない」を見てしまう（実際に偽陽性を出した）。
+//    ここは node:http の request() を使う。
+// ---------------------------------------------------------------------------
+
+/** 独立したサーバを起動して port と banner を返す */
+async function startAuthServer(extra) {
+    const child = spawn(process.execPath, [SERVER, '--repo', repo, '--port', '0', ...extra],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    let banner = '';
+    const port = await Promise.race([
+        new Promise((res, rej) => {
+            child.stdout.on('data', d => {
+                banner += d;
+                const m = banner.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+                // トークンの案内も同じ塊で出るので、少し待って banner を確定させる
+                if (m) setTimeout(() => res(Number(m[1])), 400);
+            });
+            child.on('error', rej);
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(`起動しなかった:\n${banner}`)), 20000)),
+    ]);
+    return { child, port, banner: () => banner };
+}
+
+function authGet(port, path, headers = {}) {
+    return new Promise(res => {
+        const r = httpRequest({ host: '127.0.0.1', port, path, method: 'GET', headers }, x => {
+            let b = '';
+            x.on('data', d => { b += d; });
+            x.on('end', () => res({
+                code: x.statusCode, body: b,
+                setCookie: (x.headers['set-cookie'] ?? []).join(' '),
+                location: x.headers.location ?? null,
+            }));
+        });
+        r.on('error', e => res({ code: 0, body: e.message, setCookie: '', location: null }));
+        r.end();
+    });
+}
+
+test('既定（ループバックのみ）では読み取りに認証を要求しない', async () => {
+    const s = await startAuthServer([]);
+    try {
+        assert.equal((await authGet(s.port, '/api/v0/state')).code, 200);
+        const sess = JSON.parse((await authGet(s.port, '/api/v0/session')).body);
+        assert.equal(sess.requireAuth, false, '既定で認証が要求されている（摩擦を増やしている）');
+        assert.ok(!/require-auth/.test(s.banner()), '既定なのに認証の案内が出ている');
+    } finally { s.child.kill(); }
+});
+
+test('🔒 --require-auth: トークンが無い / 違うと 401、Cookie とヘッダで通る', async () => {
+    const s = await startAuthServer(['--require-auth']);
+    try {
+        const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
+        assert.ok(token && token.length >= 24, `起動時にトークン付き URL が出ていない: ${s.banner()}`);
+
+        assert.equal((await authGet(s.port, '/api/v0/state')).code, 401, 'トークン無しが通った');
+        assert.equal((await authGet(s.port, '/api/v0/state',
+            { 'x-kjp-token': 'wrong-value-0123456789abc' })).code, 401, '誤ったトークンが通った');
+        assert.equal((await authGet(s.port, '/api/v0/state', { 'x-kjp-token': token })).code, 200);
+        assert.equal((await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${token}` })).code, 200);
+
+        // 401 の本文でトークンの手掛かりを与えない
+        const deny = await authGet(s.port, '/api/v0/state');
+        assert.ok(!deny.body.includes(token), '401 の本文にトークンが混ざっている');
+    } finally { s.child.kill(); }
+});
+
+test('🔒 ?token= は Cookie を焼いて URL からトークンを落とす', async () => {
+    const s = await startAuthServer(['--require-auth']);
+    try {
+        const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
+        const boot = await authGet(s.port, `/?token=${token}`);
+        assert.equal(boot.code, 302, 'ブートストラップがリダイレクトしていない');
+        assert.match(boot.setCookie, /HttpOnly/, 'Cookie が HttpOnly でない');
+        assert.match(boot.setCookie, /SameSite=Strict/, 'Cookie が SameSite=Strict でない');
+        // ⚠️ Secure を付けると http のループバックで保存されず、ローカルで動かなくなる
+        assert.ok(!/Secure/.test(boot.setCookie), 'Secure が付いている');
+        // 履歴・Referer にトークンを残さない
+        assert.ok(!(boot.location ?? '').includes('token'),
+            `リダイレクト先に token が残っている: ${boot.location}`);
+    } finally { s.child.kill(); }
+});
+
+test('🚨 --require-auth では /api/v0/session が無認証でトークンを払い出さない', async () => {
+    const s = await startAuthServer(['--require-auth', '--allow-write']);
+    try {
+        const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
+        // ここが無認証で通ると、読み取りにトークンを要求しても意味が無い
+        // （届く相手が誰でも取れるので、トークンは CSRF 対策でしかなくなる）
+        const anon = await authGet(s.port, '/api/v0/session');
+        assert.equal(anon.code, 401, '無認証でトークンを払い出している');
+        assert.ok(!anon.body.includes(token), '401 の本文にトークンが入っている');
+
+        const ok = await authGet(s.port, '/api/v0/session', { 'x-kjp-token': token });
+        assert.equal(ok.code, 200);
+        assert.equal(JSON.parse(ok.body).token, token, '認証済みにトークンを返していない');
+    } finally { s.child.kill(); }
+});
+
+test('🔒 --allow-host を付けると認証が既定で必須になる', async () => {
+    const s = await startAuthServer(['--allow-host', 'box.example.test']);
+    try {
+        assert.equal((await authGet(s.port, '/api/v0/state')).code, 401,
+            'トンネルを開けたのに無認証で読める');
+        assert.match(s.banner(), /require-auth/);
+        assert.match(s.banner(), /box\.example\.test\/\?token=/,
+            'トンネル用の URL が案内に出ていない');
+    } finally { s.child.kill(); }
+});
+
+test('🔒 --no-auth と --allow-host の併用は起動を拒否する', async () => {
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-host', 'x.test', '--no-auth'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stderr.setEncoding('utf8');
+    let err = '';
+    child.stderr.on('data', d => { err += d; });
+    // ⚠️ 拒否されなかったときにサーバは動き続けるので、素の await にしない
+    const code = await Promise.race([
+        new Promise(r => child.on('close', r)),
+        new Promise(r => setTimeout(() => r('timeout'), 15000)),
+    ]);
+    try {
+        assert.equal(code, 1, `無認証でトンネルに出せてしまった（${code}）`);
+        assert.match(err, /併用できません/);
+    } finally { child.kill(); }
 });
 
 // ---------------------------------------------------------------------------

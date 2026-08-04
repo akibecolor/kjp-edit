@@ -42,6 +42,10 @@ function parseArgs(argv) {
         //    理由: --watch-agents だけなら「payload に自由文が1文字も無い」を
         //    テストで固定できる。その不変条件が守りの背骨になる（docs/agent-observation.md）。
         watchAgents: false, allowTranscriptText: false,
+        // 🔒 読み取り経路にもトークンを要求するか。
+        //    null = 未指定。**--allow-host を付けた瞬間に必須にする**（下で決める）。
+        //    ループバック限定の従来の使い方は摩擦ゼロのまま保つ。
+        requireAuth: null,
     };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
@@ -68,6 +72,10 @@ function parseArgs(argv) {
         else if (a === '--token') opts.token = argv[++i];
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
         else if (a === '--token-file') opts.tokenFile = resolve(argv[++i]);
+        else if (a === '--require-auth') opts.requireAuth = true;
+        // ⚠️ 明示的に切る道を残す。ただし --allow-host と併用したら起動を止める
+        //    （黙って無認証でトンネルに出す状態を作らない）。
+        else if (a === '--no-auth') opts.requireAuth = false;
         else if (a === '--watch-agents') opts.watchAgents = true;
         // ⚠️ text は watch を含意させる（片方だけ指定して静かに無効、を作らない）
         else if (a === '--allow-transcript-text') { opts.allowTranscriptText = true; opts.watchAgents = true; }
@@ -80,6 +88,8 @@ function parseArgs(argv) {
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
+            console.log('       --require-auth       読み取りにもトークンを要求する（--allow-host のとき既定オン）');
+            console.log('       --no-auth            上を明示的に切る（--allow-host との併用は拒否）');
             console.log('       --watch-agents       エージェントの活動を観測する（既定オフ。リポジトリ外を読む）');
             console.log('       --allow-transcript-text  発話とコマンド行も出す（既定オフ。--watch-agents を含む）');
             console.log('       --layout-probe       レイアウト検査用の /__probe を有効にする');
@@ -623,6 +633,41 @@ function denyJson(res, code, message) {
     res.end(JSON.stringify({ error: message }));
 }
 
+const AUTH_COOKIE = 'kjp_auth';
+
+/**
+ * 🔒 読み取り経路の認証。
+ *
+ * これが無い間、読み取りを守っていたのは **Host 許可 + Sec-Fetch-Site だけ**で、
+ * アプリ側の認証はゼロだった。つまりトンネルに届く相手（tailnet に居る全端末）は
+ * 誰でも差分を読めた。`--allow-exec` や標準入力の経路を開けるなら、
+ * 「サーバに届く」と「操作してよい」を分ける必要がある（docs/auth-ordering.md）。
+ *
+ * 受け取り方は3つ。**どれもトークン本体の比較は timingSafeEqual を通す。**
+ *   1. Cookie（ブラウザの通常経路。初回だけ URL で渡して以後は Cookie）
+ *   2. `?token=` （初回のブートストラップ。Cookie を焼いて即リダイレクトする）
+ *   3. `X-Kjp-Token` ヘッダ（テストと非ブラウザのクライアント）
+ *
+ * ⚠️ Cookie を使う以上 CSRF を自前で防ぐ必要があるが、**入口で
+ *    `Sec-Fetch-Site` を検証しているので別サイト起点の要求は既に 403**。
+ *    加えて副作用のある経路はカスタムヘッダを要求する（preflight が必須になる）。
+ *    Cookie は `HttpOnly` / `SameSite=Strict` で出す。
+ * ⚠️ `Secure` は付けない。ループバックは http なので付けると Cookie が
+ *    保存されず**ローカルで一切動かなくなる**。トンネル側（tailscale serve）が
+ *    https を終端する構成なので、経路の暗号化はそちらの責任。
+ */
+function readCookie(req, name) {
+    const raw = req.headers.cookie;
+    if (typeof raw !== 'string') return null;
+    for (const part of raw.split(';')) {
+        const i = part.indexOf('=');
+        if (i < 0) continue;
+        if (part.slice(0, i).trim() !== name) continue;
+        return decodeURIComponent(part.slice(i + 1).trim());
+    }
+    return null;
+}
+
 /** 長さを漏らさずトークンを比較する */
 function tokenMatches(given) {
     if (typeof given !== 'string' || !opts.token) return false;
@@ -632,6 +677,17 @@ function tokenMatches(given) {
     const a = createHash('sha256').update(given, 'utf8').digest();
     const b = createHash('sha256').update(opts.token, 'utf8').digest();
     return timingSafeEqual(a, b);
+}
+
+/**
+ * その要求が認証済みか。`--require-auth` が無いときは常に true
+ * （ループバック限定の従来の使い方を壊さないため）。
+ */
+function authed(req, url) {
+    if (!opts.requireAuth) return true;
+    return tokenMatches(readCookie(req, AUTH_COOKIE))
+        || tokenMatches(req.headers[TOKEN_HEADER])
+        || tokenMatches(url.searchParams.get('token'));
 }
 
 /**
@@ -810,6 +866,35 @@ const server = createServer(async (req, res) => {
         res.end('forbidden: ループバック以外の Host / 別サイトからの参照は拒否します\n');
         return;
     }
+    // 🔒 読み取りの認証も**入口で**判定する。個別のハンドラに任せない。
+    //    ここを通らない経路を作らないことが、後から穴を1つ忘れないための唯一の方法。
+    if (!authed(req, url)) {
+        // ⚠️ 「トークンが違う」と「トークンが無い」を区別して返さない
+        //    （総当たりに手掛かりを与えない）。
+        res.writeHead(401, {
+            'content-type': 'text/plain; charset=utf-8',
+            'cache-control': 'no-store',
+        });
+        res.end('unauthorized: トークンが必要です。'
+            + '起動時に表示された ?token=... 付きの URL を開いてください\n');
+        return;
+    }
+    // ?token=... で来たら Cookie を焼いて、**URL からトークンを落として**やり直させる。
+    //    履歴・Referer・共有リンクにトークンを残さないため。
+    if (opts.requireAuth && url.searchParams.get('token')) {
+        const clean = new URL(url.href);
+        clean.searchParams.delete('token');
+        res.writeHead(302, {
+            location: `${clean.pathname}${clean.search}` || '/',
+            // ⚠️ Secure は付けない（ループバックは http なので保存されなくなる）。
+            //    経路の暗号化はトンネル側（tailscale serve）の責任。
+            'set-cookie': `${AUTH_COOKIE}=${encodeURIComponent(opts.token)}`
+                + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000',
+            'cache-control': 'no-store',
+        });
+        res.end();
+        return;
+    }
     try {
         if (url.pathname === '/api/v0/state') {
             // ?fresh=1 で TTL キャッシュを無視する（手動リロード用）
@@ -830,6 +915,11 @@ const server = createServer(async (req, res) => {
         // クライアントが書き込み可否とトークンを知るための経路。
         // 🔒 Host 検証と Sec-Fetch-Site を通った同一オリジンにだけ返る。
         //    cross-origin では CORS が無いので応答が読めない。
+        // 🚨 **`--require-auth` のときは「既に認証されている要求」にしか
+        //    トークンを返さない。** ここが無認証で払い出している限り、
+        //    読み取り経路にトークンを要求しても意味が無い
+        //    （届く相手が誰でも取れるので、トークンは CSRF 対策でしかない）。
+        //    入口の authed() を通っているので、ここに来た要求は認証済み。
         if (url.pathname === '/api/v0/session') {
             const site = req.headers['sec-fetch-site'];
             const sameOrigin = !site || site === 'same-origin' || site === 'none';
@@ -842,6 +932,7 @@ const server = createServer(async (req, res) => {
                 allowExec: opts.allowExec,
                 watchAgents: opts.watchAgents,
                 allowTranscriptText: opts.allowTranscriptText,
+                requireAuth: opts.requireAuth,
                 tokenHeader: TOKEN_HEADER,
                 token: opts.allowWrite && sameOrigin ? opts.token : null,
             }));
@@ -1202,6 +1293,28 @@ if (opts.tokenFile) {
     }
 }
 
+/* =========================================================================
+ * 🔒 読み取り経路の認証を要求するかを決める。
+ *
+ * 判断: **トンネルを開けた瞬間から必須。** ループバックだけなら不要。
+ *   - ループバックには別サイトから届かない（入口の Sec-Fetch-Site 検証）ので、
+ *     摩擦を足す意味が薄い
+ *   - --allow-host を付けた時点で「サーバに届く相手」が広がる。そこからは
+ *     「届く」と「操作してよい」を分ける必要がある（docs/auth-ordering.md）
+ * ========================================================================= */
+if (opts.requireAuth === null) opts.requireAuth = opts.allowHosts.size > 0;
+if (opts.requireAuth === false && opts.allowHosts.size > 0) {
+    // ⚠️ 黙って無認証のままトンネルに出す状態を作らない。起動を止める。
+    console.error('\n✖ --no-auth と --allow-host は併用できません。');
+    console.error('  トンネルに届く相手が全員、無認証で差分を読める状態になります。');
+    console.error('  ループバックだけで使うなら --allow-host を外してください。\n');
+    process.exit(1);
+}
+// 認証するならトークンが要る（書き込み・実行を使わない場合も）
+if (opts.requireAuth && !opts.token) {
+    opts.token = randomBytes(32).toString('base64url');
+}
+
 if (opts.allowExec) {
     if (!opts.token || opts.token.length < 24) {
         console.error('\n✖ --allow-exec には 24 文字以上の --token が必要です。');
@@ -1225,6 +1338,17 @@ server.listen(opts.port, '127.0.0.1', () => {
     console.log(`repo: ${opts.repo}`);
     if (opts.allowHosts.size) {
         console.log(`許可した Host: ${[...opts.allowHosts].join(', ')}`);
+    }
+    if (opts.requireAuth) {
+        console.log('');
+        console.log('🔒 読み取りにもトークンが必要です (--require-auth)。');
+        console.log('   **この URL を1回開いてください**（Cookie を焼いたら URL から落ちます）:');
+        console.log(`     http://127.0.0.1:${port}/?token=${opts.token}`);
+        for (const h of opts.allowHosts) {
+            console.log(`     https://${h}/?token=${opts.token}`);
+        }
+        if (opts.tokenFile) console.log(`   トークンの置き場所: ${opts.tokenFile}`);
+        else console.log('   ⚠️ 再起動すると変わります（--token-file で固定できます）');
     }
     if (opts.allowExec) {
         console.log('');

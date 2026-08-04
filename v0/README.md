@@ -4,6 +4,7 @@
 依存パッケージゼロ（Node 標準ライブラリのみ）。
 **既定は読み取り専用**で、checkout（`--allow-write`）と
 任意コマンドの実行（`--allow-exec`）はそれぞれ明示的に有効化します。
+**トンネルに出す（`--allow-host`）と読み取りにも認証が必須になります。**
 
 ```bash
 node scripts/serve.mjs                # ← 普段はこれ（手順は docs/daily-use.md）
@@ -94,8 +95,9 @@ UI は縦に積む折り畳みパネルで、各セクションは畳んだま�
 
 ### 🔒 トンネルの注意
 
-このサーバは**認証を持ちません。**外から届かせる場合、
-**トンネルをループバックで終端させ、トンネル側で認証してください。**
+外から届かせる場合、**トンネルをループバックで終端させてください。**
+`--allow-host` を付けた時点で**読み取りにもトークンが必須**になります
+（下の「読み取りの認証」）。トンネル側でも認証できるならそれも重ねてください。
 
 ```bash
 tailscale serve --bg 7749
@@ -104,7 +106,7 @@ node scripts/serve.mjs --allow-host box.your-tailnet.ts.net
 ```
 
 手順とスマホ側の確認項目は [../docs/daily-use.md](../docs/daily-use.md) にあります
-（**実機での確認はまだしていません**）。
+（**Android 実機で確認済み**）。
 
 **`--allow-host` を指定しない限り、ループバック以外の Host は 403 です。**
 これは DNS rebinding を防ぐためで、`127.0.0.1` バインドと CORS では防げません
@@ -120,8 +122,9 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 
 ## 設計上の約束
 
-- 🔒 **`127.0.0.1` のみにバインド。認証は持たない。**
+- 🔒 **`127.0.0.1` のみにバインド。**
   外から届かせるならトンネル（`tailscale serve` 等）をループバックで終端させる。
+  **トンネルに出すなら読み取りにも認証が必須**（`--allow-host` で自動的にオン）。
   **`0.0.0.0` にバインドしないこと**（[../docs/architecture.md](../docs/architecture.md) D1）
 - **既定は読み取り専用。** ただし衝突予測の `git merge-tree --write-tree` は
   **オブジェクトDB に loose object を書く**（ref / index / 作業ツリーには触らない。gc で回収される）。
@@ -157,7 +160,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `/api/v0/state` | 全状態。`?fresh=1` で TTL キャッシュを無視。`stats.gitSpawns` に git の起動回数（定数5 + worktree 1本あたり3） |
 | `/api/v0/diff?base=&ref=&path=` | 1ファイルの unified diff |
 | `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`、NUL 混入は `binary` |
-| `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す） |
+| `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す。**`--require-auth` では認証済みにしか返さない**） |
 | `POST /api/v0/checkout` | ブランチ切り替え。**`--allow-write` が必要** |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
 | `/layout` | `/` の別名（互換のため） |
@@ -196,10 +199,45 @@ node v0/server.mjs --allow-exec --token "$TOKEN"
 そして **Claude Code は `claude -p "..."` で非対話実行できる**ので、
 エージェントを遠隔から動かすのに PTY は不要です。
 
+さらに `--input-format stream-json` なら**パイプ越しに多ターンの会話が成立します**
+（実測で確認。同一プロセス・同一セッションで2ターン目が1ターン目を覚えている）。
+コンソールから入力できるようにする作業は
+[#18](https://github.com/akibecolor/kjp-edit/issues/18)、
+切断で殺さないセッションは [#17](https://github.com/akibecolor/kjp-edit/issues/17)。
+
 | | |
 |---|---|
 | `--allow-exec` | 既定オフ。**24文字以上の `--token` か `--token-file` が無いと起動しません**（有効化を必ず意識的な操作にするため） |
 | `--token-file` | 無ければ 0600 で生成し、あれば読む（再起動でトークンが変わらない）。**リポジトリの中を指すと起動を拒否します**（コミットされるため）。`scripts/serve.mjs --exec` は `~/.kjp-edit/token` を自動で渡します |
+
+### 🔒 読み取りの認証（トンネルを開けた瞬間から必須）
+
+```bash
+node v0/server.mjs                                  # ループバックのみ → 認証なし
+node v0/server.mjs --allow-host box.example.ts.net  # → **認証が自動で必須になる**
+node v0/server.mjs --require-auth                   # ループバックでも要求する
+```
+
+**判断: トンネルを開けた瞬間から必須。** ループバックには別サイトから届かない
+（入口の `Sec-Fetch-Site` 検証）ので摩擦を足す意味が薄い。
+`--allow-host` を付けた時点で「サーバに届く相手」が広がるので、
+そこからは**「届く」と「操作してよい」を分ける**（`docs/auth-ordering.md`）。
+
+起動時に表示される `?token=...` 付きの URL を**1回開く**と Cookie が焼かれ、
+以後は普通に開けます。Cookie は `HttpOnly` / `SameSite=Strict`、
+リダイレクトで**URL からトークンを落とす**（履歴と Referer に残さない）。
+
+| | |
+|---|---|
+| 受け取り方 | Cookie / `X-Kjp-Token` ヘッダ / 初回の `?token=` |
+| 比較 | SHA-256 に固定長化してから `timingSafeEqual`（長さも漏らさない） |
+| 判定の順序 | **Host → Sec-Fetch-Site → 認証。** 正しいトークンでも Host が違えば 403 |
+| `Secure` | **付けない。** ループバックは http なので付けると Cookie が保存されずローカルで動かなくなる。経路の暗号化はトンネル側の責任 |
+| `--no-auth` | 明示的に切れるが、**`--allow-host` との併用は起動を拒否**（黙って無認証でトンネルに出す状態を作らない） |
+
+🚨 **`--require-auth` のときは `/api/v0/session` が無認証でトークンを返しません。**
+ここが払い出している限り読み取りにトークンを要求しても意味がなく
+（届く相手が誰でも取れる）、トークンは CSRF 対策にしかなりません。
 
 ### エージェントの活動観測（既定オフ、書き込み・実行とも別の capability）
 

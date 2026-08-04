@@ -165,6 +165,13 @@ const args = [SERVER, '--repo', repo, '--port', String(port)];
 const wantExec = has('--exec');
 const wantWrite = wantExec || has('--write');
 if (wantWrite) args.push('--allow-write');
+// 🔒 --allow-host を付けると読み取りにも認証が必要になる。
+//    トークンが起動ごとに変わると開き直すたびに URL を探すことになるので、
+//    トンネルを使うなら必ず永続化する。
+const wantHost = argv.includes('--allow-host');
+if (wantHost && !wantExec) {
+    args.push('--token-file', join(STATE_DIR, 'token'));
+}
 if (wantExec) {
     args.push('--allow-exec');
     // ⚠️ 実行を有効にするときはトークンを永続化する。
