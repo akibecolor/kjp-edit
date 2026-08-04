@@ -110,7 +110,10 @@ const MUTANTS = [
         name: 'exec-retain-evict',
         why: '終了したセッションを台帳から消さない（メモリに溜まり続ける）',
         file: 'v0/execsession.mjs',
-        from: '            if (now - doneAt >= this.limits.retainMs && !s.subscribers.size) evict.push(s);',
+        // ⚠️ #24 の修正で条件から `&& !s.subscribers.size` を外したので追随させた。
+        //    「消すかどうか」を測るのがこちら、「購読者がいても消すか」は
+        //    `exec-evict-with-subscribers` が測る（別の守り）
+        from: '            if (now - doneAt >= this.limits.retainMs) evict.push(s);',
         to: '            /* 変異: 終了後の掃除をやめる */',
         gone: 'evict.push(s)',
         pattern: '保持期間のあいだ残り、過ぎたら台帳から消える',

@@ -506,16 +506,24 @@ test('--allow-host で指定したホスト名だけは通る（トンネル用�
     );
     child.stdout.setEncoding('utf8');
     try {
-        // トークンの案内も同じ塊で出るので banner ごと受け取る
+        // トークンの案内も同じ塊で出るので banner ごと受け取る。
+        // ⚠️ **stderr を捨てない。** 捨てると CI で「起動しなかった」だけが残り
+        //    原因が消える（実際に1往復無駄にした）。
         let banner = '';
+        let errOut = '';
+        child.stderr.setEncoding('utf8');
+        child.stderr.on('data', d => { errOut += d; });
         const url = await new Promise((resolve, reject) => {
-            const t = setTimeout(() => reject(new Error('起動しなかった')), 15000);
+            const fail = () => reject(new Error(`起動しなかった\n  stdout: ${banner.trim() || '(空)'}`
+                + `\n  stderr: ${errOut.trim() || '(空)'}`));
+            const t = setTimeout(fail, 30000);
             child.stdout.on('data', d => {
                 banner += d;
                 const m = banner.match(/http:\/\/127\.0\.0\.1:\d+/);
                 if (m) { clearTimeout(t); setTimeout(() => resolve(m[0]), 400); }
             });
-            child.on('error', reject);
+            child.on('error', e => { clearTimeout(t); reject(e); });
+            child.on('exit', () => setTimeout(() => { clearTimeout(t); fail(); }, 50));
         });
         // ⚠️ --allow-host を付けると**認証が既定で必須になる**ので、
         //    許可したホスト名でもトークンが無ければ 401。
@@ -1769,7 +1777,17 @@ async function startAuthServer(extra) {
     const child = spawn(process.execPath, [SERVER, '--repo', repo, '--port', '0', ...extra],
         { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
     child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     let banner = '';
+    // 🚨 **stderr を捨てない。** 起動に失敗した理由は stderr に出るので、
+    //    捨てると CI で「起動しなかった:」だけが残り**原因が完全に消える**
+    //    （実際にそうなって1往復無駄にした）。終了コードも添える。
+    let errOut = '';
+    let exited = null;
+    child.stderr.on('data', d => { errOut += d; });
+    child.on('exit', (code, signal) => { exited = `exit=${code} signal=${signal}`; });
+    const why = () => `起動しなかった\n  stdout: ${banner.trim() || '(空)'}`
+        + `\n  stderr: ${errOut.trim() || '(空)'}\n  ${exited ?? '(まだ生きている)'}`;
     const port = await Promise.race([
         new Promise((res, rej) => {
             child.stdout.on('data', d => {
@@ -1778,11 +1796,13 @@ async function startAuthServer(extra) {
                 // トークンの案内も同じ塊で出るので、少し待って banner を確定させる
                 if (m) setTimeout(() => res(Number(m[1])), 400);
             });
-            child.on('error', rej);
+            child.on('error', e => rej(new Error(`${why()}\n  spawn: ${e.message}`)));
+            // 起動前に落ちたら待たずに失敗させる（20秒待つ意味がない）
+            child.on('exit', () => setTimeout(() => rej(new Error(why())), 50));
         }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error(`起動しなかった:\n${banner}`)), 20000)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(why())), 20000)),
     ]);
-    return { child, port, banner: () => banner };
+    return { child, port, banner: () => banner, stderr: () => errOut };
 }
 
 function authGet(port, path, headers = {}) {

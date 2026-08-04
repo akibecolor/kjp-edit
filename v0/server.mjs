@@ -1653,7 +1653,7 @@ if (opts.tokenFile) {
  *   - --allow-host を付けた時点で「サーバに届く相手」が広がる。そこからは
  *     「届く」と「操作してよい」を分ける必要がある（docs/auth-ordering.md）
  * ========================================================================= */
-if (opts.requireAuth === null) opts.requireAuth = false;
+if (opts.requireAuth === null) opts.requireAuth = opts.allowHosts.size > 0;
 if (opts.requireAuth === false && opts.allowHosts.size > 0) {
     // ⚠️ 黙って無認証のままトンネルに出す状態を作らない。起動を止める。
     console.error('\n✖ --no-auth と --allow-host は併用できません。');
