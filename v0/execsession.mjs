@@ -32,6 +32,13 @@ export const DEFAULTS = {
     bufferRecords: 4000,       // 件数の上限（極端に小さい行が大量に来る場合）
     detachedGraceMs: 5 * 60 * 1000,
     retainMs: 10 * 60 * 1000,  // 終了後、台帳に残す時間
+    // 🚨 標準入力の**総量**の上限（#26）。1回 64KB を縛っても、相手が読まなければ
+    //    書いた分は親のメモリに無限に溜まる。「守りを緩めた代わりの制約」の表に
+    //    **入力の総量だけが無かった**。しかも溜まっている間も ok:true を返すので
+    //    画面から滞留が見えない。
+    inputTotalBytes: 4 * 1024 * 1024,
+    // 相手が読まずに溜まっている量の上限（backpressure を見る）
+    inputPendingBytes: 1 * 1024 * 1024,
 };
 
 /** セッション id の形。HTTP から来た値はこれで検証してから使う。 */
@@ -114,6 +121,7 @@ class Session {
         this.subscribers = new Set(); // (rec) => void
         this.lastDetachedAt = null;   // 購読者ゼロになった時刻
         this.killRequested = null;    // 理由（監査用）
+        this.inputBytes = 0;          // 標準入力に書いた総量（#26）
     }
 
     get running() {
@@ -135,6 +143,9 @@ class Session {
             detachedMs: this.lastDetachedAt === null ? null : Math.max(0, now - this.lastDetachedAt),
             seq: this.log.seq,
             dropped: this.log.dropped,
+            inputBytes: this.inputBytes,
+            // 相手が読まずに溜まっている量。ok:true だけ返して滞留を隠さない
+            inputPending: this.child?.stdin?.writableLength ?? 0,
             exit: this.exit,
         };
     }

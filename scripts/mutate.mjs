@@ -193,6 +193,54 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // 4回目のレビューの SERIOUS 4件（issue #26-#28, #32）
+    {
+        name: 'input-total-limit',
+        why: '標準入力の総量を縛らない（相手が読まないと親のメモリに無限に溜まる）',
+        file: 'v0/server.mjs',
+        from: '                    if (s.inputBytes + bytes > limits.inputTotalBytes) {',
+        to: '                    if (false) {',
+        gone: 's.inputBytes + bytes > limits.inputTotalBytes',
+        // 滞留の上限（1MB）が先に効くので、単独では落ちない可能性がある。
+        // 両方外して「上限が全く無い」状態を測る
+        also: [{
+            from: '                    if (pending > limits.inputPendingBytes) {',
+            to: '                    if (false) {',
+        }],
+        pattern: '標準入力の総量と滞留に上限がある',
+    },
+    {
+        name: 'transcript-adaptive-tail',
+        why: '巨大な1レコードで完全な行が0本になったとき読み直さない'
+            + '（稼働中のエージェントに「記録がありません」と表示する嘘）',
+        file: 'v0/transcript.mjs',
+        from: '            needMore: complete === 0 && len < size,',
+        to: '            needMore: false,',
+        gone: 'complete === 0 && len < size',
+        pattern: '巨大な1レコードでも読み直して',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-too-big-honest',
+        why: '上限まで読んでも取れなかったことを伝えない（黙って「記録なし」になる）',
+        file: 'v0/transcript.mjs',
+        from: '        s.tooBigToRead = tail.tooBigToRead === true;',
+        to: '        s.tooBigToRead = false;',
+        gone: 'tail.tooBigToRead === true',
+        pattern: '読めなかった」と伝える',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-subagents',
+        why: 'サブエージェントの活動を数えない'
+            + '（親の追記が止まるので、稼働中を「待機」と表示する嘘）',
+        file: 'v0/transcript.mjs',
+        from: '        const sub = await subagentActivity(newest.path, {',
+        to: '        const sub = null && await subagentActivity(newest.path, {',
+        gone: '        const sub = await subagentActivity',
+        pattern: 'サブエージェントの活動を数え',
+        testFile: 'v0/transcript.test.mjs',
+    },
     // 4回目のレビューの SERIOUS 3件（issue #23-#25）
     {
         name: 'cookie-decode-crash',
@@ -630,7 +678,8 @@ function runTest(m) {
         let out = '';
         p.stdout.on('data', d => { out += d; });
         p.stderr.on('data', d => { out += d; });
-        const t = setTimeout(() => p.kill('SIGKILL'), 300_000);
+        let timedOut = false;
+        const t = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, 300_000);
         // 🚨 **'error' を必ず拾う。** ChildProcess の 'error' に listener が無いと
         //    Node は uncaught exception として**プロセスを即死させる**。
         //    そうなると下の finally が走らず、**書き換えたソースが復元されないまま
@@ -639,9 +688,9 @@ function runTest(m) {
         //    一時的な spawn 失敗が引き金）。
         p.on('error', err => {
             clearTimeout(t);
-            resolve({ code: -1, out: `${out}\n[spawn 失敗] ${err.message}` });
+            resolve({ code: -1, out: `${out}\n[spawn 失敗] ${err.message}`, timedOut });
         });
-        p.on('close', code => { clearTimeout(t); resolve({ code, out }); });
+        p.on('close', code => { clearTimeout(t); resolve({ code, out, timedOut }); });
     });
 }
 
@@ -757,6 +806,23 @@ for (const m of targets) {
         //    実際に走った本数は pass + fail で数える。
         const n = k => Number(new RegExp(`^ℹ ${k} (\\d+)`, 'm').exec(r.out)?.[1] ?? 0);
         if (n('pass') + n('fail') === 0) {
+            // 🚨 **「走らなかった」には2つの原因があり、意味が正反対。**
+            //    (a) pattern がテスト名に一致していない → 検査の設定ミス（SKIP）
+            //    (b) **テストがハングして SIGKILL された** → 守りを外したら
+            //        止まらなくなった = **変異は効いている**。これを SKIP にすると
+            //        ツール自身が「SKIP を緑と読まない」という規則を破り、
+            //        しかも「テスト名を直せ」という**無関係な修正へ誘導する**（#32）。
+            //    要約が出ていない（= 途中で殺された）なら (b) として扱う。
+            const summarized = /^ℹ tests \d+/m.test(r.out);
+            if (!summarized || r.timedOut) {
+                results.push({
+                    m, status: 'HUNG',
+                    note: 'テストがハングした（要約が出ていない）。'
+                        + '守りを外すと止まらなくなる = 変異は効いているが、'
+                        + '**落ちる形になっていない**。上限を付けて失敗として観測できるようにすること',
+                });
+                continue;
+            }
             results.push({
                 m, status: 'SKIP',
                 note: `pattern に一致するテストが無い（テスト名に含まれる文字列を書く）: ${m.pattern}`,
@@ -779,17 +845,22 @@ for (const m of targets) {
 console.log('');
 let bad = 0;
 for (const r of results) {
-    const mark = { KILLED: '✔', SURVIVED: '✖', DEFENSIVE: '◦', SKIP: '–' }[r.status];
-    // 冗長な防御とプラットフォーム外は失敗にしない（記録として残す）
-    if (r.status === 'SURVIVED') bad++;
+    const mark = { KILLED: '✔', SURVIVED: '✖', HUNG: '✖', DEFENSIVE: '◦', SKIP: '–' }[r.status];
+    // 冗長な防御とプラットフォーム外は失敗にしない（記録として残す）。
+    // 🚨 **HUNG も失敗**。ハングは「落ちない検査」なので緑にしてはいけない（#32）
+    if (r.status === 'SURVIVED' || r.status === 'HUNG') bad++;
     console.log(`${mark} ${r.m.name.padEnd(28)} ${r.status.padEnd(9)} ${r.note || r.m.why}`);
 }
 console.log('');
 const k = results.filter(r => r.status === 'KILLED').length;
 const d = results.filter(r => r.status === 'DEFENSIVE').length;
 const sk = results.filter(r => r.status === 'SKIP').length;
-console.log(`${k} 件が期待通り落ちた / ${d} 件は冗長な防御（想定内）/ ${sk} 件はスキップ`);
+const hung = results.filter(r => r.status === 'HUNG').length;
+console.log(`${k} 件が期待通り落ちた / ${d} 件は冗長な防御（想定内）`
+    + ` / ${sk} 件はスキップ${hung ? ` / ${hung} 件はハング` : ''}`);
 if (bad) console.log('✖ = テストがその守りを検証できていない。テストを直すこと');
+// ⚠️ SKIP も無害ではない。**検証されていない守り**なので数を必ず出す
+if (sk) console.log(`– = ${sk} 件は検証されていない（プラットフォーム外か設定ミス）`);
 // 🚨 終了時に残骸が無いことを確かめる。ここが残ると次回以降が汚染される。
 {
     const left = [...new Set(MUTANTS.map(m => `${m.file}.mutate-bak`))].filter(existsSync);

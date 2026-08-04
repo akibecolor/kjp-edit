@@ -239,7 +239,7 @@ claude -p --input-format stream-json --output-format stream-json
 |---|---|
 | 動くもの | `claude` の会話 / `git commit -F -` / `patch` / 行単位の REPL / y-N を stdin で読む CLI |
 | **動かないもの** | 全画面 TUI（`vim` / `lazygit`）と端末デバイスを直接開くもの（`git` の認証プロンプト、`sudo`）。そこが要るなら [#14](https://github.com/akibecolor/kjp-edit/issues/14) |
-| 上限 | 1回 64KB（超えたら **413**。以前は接続を切っていて「fetch failed」しか見えなかった） |
+| 上限 | 1回 64KB / **1セッションの総量 4MB** / **相手が読まずに溜まった分 1MB**（超えたら 413 か 429）。1回だけ縛っても相手が読まなければ親のメモリに溜まり続けるため（#26）。応答に `totalBytes` と `pending` を返すので滞留が見える |
 | 入力の記録 | `{t:"in"}` として記録に残り、**購読者全員に流れ、再接続でも再生される**（別端末から見ても何を送ったか分かる） |
 | 🔒 監査 | **バイト数だけ**。入力は自由文で秘密が入りうるので本文は残しません（T5 と同じ理屈） |
 

@@ -30,9 +30,13 @@ import { containsPath, relativeInside, isSafeRepoPath } from './git.mjs';
 
 export const LIMITS = {
     tailBytes: 256 * 1024,   // 末尾だけ読む（実測で 24MB の記録があった）
+    // ⚠️ 1レコードが 1.25MB という実データがある。完全な行が取れないときだけ
+    //    ここまで広げて読み直す（#27）。無制限には広げない
+    tailMaxBytes: 4 * 1024 * 1024,
     headBytes: 16 * 1024,    // cwd を知るために先頭だけ読む
     maxLines: 600,           // 走査する行数の上限
     maxDirs: 60,             // projects 配下を見る上限
+    maxSubagentFiles: 300,   // サブエージェントの記録を数える上限（#28）
     maxRecent: 12,           // 出す活動の件数
     maxText: 8,              // 出す発話の件数
     textChars: 400,          // 1件あたりの文字数
@@ -244,10 +248,100 @@ export async function readTail(file, maxBytes = LIMITS.tailBytes) {
         const lines = buf.toString('utf8').split('\n');
         // 末尾から読んだので、ファイル全体を読んでいない限り1行目は途中
         if (len < size) lines.shift();
-        return { lines, bytes: len, truncated: len < size };
+
+        // 🚨 **完全な行が0本になる場合がある。** 実データには 1.25MB / 776KB の
+        //    1レコードが実在する（大きい tool_result / file-history）。それが
+        //    末尾付近にあると 256KB では1行も完成せず、summarize は
+        //    lastActivityAt=null を返し、UI は稼働中のエージェントに対して
+        //    **「エージェントを走らせた記録がありません」と表示する**（嘘）。
+        //    そこで「読む量が足りなかった」ことを呼び出し側に伝えて、
+        //    より広く読み直せるようにする（#27）。
+        const complete = lines.filter(l => l.trim()).length;
+        return {
+            lines, bytes: len, truncated: len < size,
+            // 読める行が無く、まだ読んでいない部分がある = 1レコードが大きすぎる
+            needMore: complete === 0 && len < size,
+        };
     } finally {
         await fh.close();
     }
+}
+
+/**
+ * 完全な行が取れるまで読む量を増やして読む。
+ *
+ * ⚠️ **無制限には広げない。** 上限（既定 4MB）まで倍々にして、それでも
+ *    取れなければ「大きすぎて読めなかった」ことを伝える。
+ *    黙って「記録なし」にするのが #27 の欠陥だったので、
+ *    **どちらの場合も理由が残る形**にする。
+ */
+export async function readTailAdaptive(file, {
+    start = LIMITS.tailBytes, max = LIMITS.tailMaxBytes,
+} = {}) {
+    let want = start;
+    let last = await readTail(file, want);
+    let grew = 0;
+    while (last.needMore && want < max) {
+        want = Math.min(want * 4, max);
+        last = await readTail(file, want);
+        grew++;
+    }
+    return { ...last, bytesWanted: want, grew, tooBigToRead: last.needMore };
+}
+
+/**
+ * サブエージェントの活動を数える（#28）。
+ *
+ * 🚨 **`isSidechain` では数えられない。** 実データの4本すべてで 0 件だった
+ *    （サブエージェントを使っていても 0）。サブエージェントの記録は
+ *    **親と別のファイル**にあるので、親のファイルを読んでも何も出ない:
+ *
+ *      <slug>/<sessionId>.jsonl                        ← 親
+ *      <slug>/<sessionId>/subagents/agent-*.jsonl      ← サブエージェント
+ *      <slug>/<sessionId>/subagents/workflows/<run>/agent-*.jsonl
+ *
+ *    その結果、親がサブエージェントを走らせている間は親ファイルへの追記が
+ *    止まり、UI は稼働中のエージェントを**「待機 N分」と表示していた**（嘘）。
+ *
+ * ⚠️ **中身は読まない。** 数と mtime だけで足りるし、読めば T5 の入口を
+ *    増やすことになる（サブエージェントの記録にもツールの結果が入る）。
+ * ⚠️ 件数の上限を置き、超えたら告知する。
+ */
+async function subagentActivity(sessionFile, { now, activeMs, maxFiles }) {
+    const dir = join(sessionFile.replace(/\.jsonl$/i, ''), 'subagents');
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return null; }
+
+    const files = [];
+    let truncated = false;
+    /** 1階層だけ潜る（workflows/<runId>/agent-*.jsonl まで） */
+    const collect = async (d, ents, depth) => {
+        for (const e of ents) {
+            if (files.length >= maxFiles) { truncated = true; return; }
+            const p = join(d, e.name);
+            if (e.isDirectory()) {
+                if (depth >= 2) continue;
+                try { await collect(p, await readdir(p, { withFileTypes: true }), depth + 1); }
+                catch { /* 読めないディレクトリは飛ばす */ }
+                continue;
+            }
+            if (!e.name.endsWith('.jsonl')) continue;   // ⚠️ それ以外は触らない
+            files.push(p);
+        }
+    };
+    await collect(dir, entries, 0);
+
+    let active = 0;
+    let newestMs = 0;
+    for (const f of files) {
+        try {
+            const st = await stat(f);
+            if (!st.isFile()) continue;
+            if (st.mtimeMs > newestMs) newestMs = st.mtimeMs;
+            if (now - st.mtimeMs <= activeMs) active++;
+        } catch { /* 消えた */ }
+    }
+    return { total: files.length, active, newestMs, truncated };
 }
 
 /** 先頭 n バイトから cwd を拾う（どの worktree の記録かを知るためだけ） */
@@ -335,10 +429,53 @@ export async function collectAgents(worktrees, {
         if (!owner) continue;   // 他プロジェクトの記録。無視する（エラーではない）
 
         let tail;
-        try { tail = await readTail(newest.path, limits.tailBytes); } catch { continue; }
+        try {
+            tail = await readTailAdaptive(newest.path,
+                { start: limits.tailBytes, max: limits.tailMaxBytes });
+        } catch { continue; }
         const s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits });
         s.bytesRead = tail.bytes;
         s.tailOnly = tail.truncated;
+        // 🚨 読めなかったことを**必ず伝える**。黙って「記録なし」にしない（#27）
+        s.tooBigToRead = tail.tooBigToRead === true;
+        if (tail.grew > 0) s.grewReads = tail.grew;
+
+        // 🚨 サブエージェントの活動。**親のファイルには出ない**ので別に見る（#28）。
+        //    親が待っている間にサブが動いていると、これが無いと『待機』と嘘をつく。
+        const sub = await subagentActivity(newest.path, {
+            now, activeMs: limits.activeMs, maxFiles: limits.maxSubagentFiles,
+        });
+        if (sub) {
+            s.subagents = { total: sub.total, active: sub.active };
+            // isSidechain では数えられないので、ファイル数で置き換える
+            s.sidechains = sub.active;
+            // サブが動いていれば、その時刻を『最後の活動』として採る
+            if (sub.newestMs > 0) {
+                const parentMs = s.lastActivityAt ? Date.parse(s.lastActivityAt) : 0;
+                if (sub.newestMs > parentMs) {
+                    s.lastActivityAt = new Date(sub.newestMs).toISOString();
+                    s.activityFrom = 'subagent';
+                }
+                s.ageMs = Math.max(0, now - Date.parse(s.lastActivityAt));
+                s.state = s.ageMs <= limits.activeMs ? 'active'
+                    : s.ageMs <= limits.idleMs ? 'idle' : 'stale';
+            }
+            if (sub.truncated) {
+                errors.push({
+                    scope: 'agents',
+                    message: `${owner.label} のサブエージェントは`
+                        + `${limits.maxSubagentFiles} 件で打ち切りました（実際はもっとあります）。`,
+                });
+            }
+        }
+        if (s.tooBigToRead) {
+            errors.push({
+                scope: 'agents',
+                message: `${owner.label} の記録は1レコードが大きすぎて読めませんでした`
+                    + `（末尾 ${Math.round(tail.bytesWanted / 1024)}KB を読んでも完全な行がありません）。`
+                    + ' 「記録なし」ではなく「読めなかった」です。',
+            });
+        }
         const prev = byPath.get(owner.path);
         // 同じ worktree に複数の記録が対応することがある（slug の大文字小文字違い）。
         // 新しい方を採る

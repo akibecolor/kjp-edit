@@ -980,10 +980,26 @@ function renderAgents(s) {
     const meta = [
       a.lastActivityAt ? when(a.lastActivityAt) : null,
       a.permissionMode ? `権限 ${a.permissionMode}` : null,
-      a.sidechains ? `サブ ${a.sidechains}` : null,
+      // 🚨 サブエージェントは**親の記録には出ない**ので別に数えている（#28）。
+      //    親が待っている間にサブが動いていると、これが無いと「待機」と嘘になる
+      a.subagents?.total
+        ? `サブ ${a.subagents.active}/${a.subagents.total} 稼働`
+        : (a.sidechains ? `サブ ${a.sidechains}` : null),
+      a.activityFrom === 'subagent' ? '（最後の活動はサブ）' : null,
     ].filter(Boolean);
     if (meta.length) head.append(el('span', 'note', ` ${meta.join(' / ')}`));
     d.append(head);
+    // 🚨 **「記録なし」と「読めなかった」を分ける。** 以前は1レコードが
+    //    大きすぎて（実データに 1.25MB がある）完全な行が取れないと
+    //    state='none' になり、**稼働中のエージェントに「記録がありません」と
+    //    表示**していた（#27）。
+    if (a.tooBigToRead) {
+      d.append(el('div', 'note warn',
+        '⚠ 記録の1レコードが大きすぎて読めませんでした（記録が無いのではありません）。'
+        + ` 末尾 ${Math.round((a.bytesRead ?? 0) / 1024)}KB を読んでも完全な行がありません。`));
+      box.append(d);
+      continue;
+    }
     if (a.state === 'none') {
       d.append(el('div', 'note', 'この worktree でエージェントを走らせた記録がありません。'));
       box.append(d);

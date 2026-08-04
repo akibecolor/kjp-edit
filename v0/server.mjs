@@ -1379,8 +1379,31 @@ async function handleRequest(req, res) {
                         return;
                     }
                     const bytes = data === null ? 0 : Buffer.byteLength(data, 'utf8');
+                    // 🚨 **総量と滞留を縛る（#26）。** 1回 64KB を縛っても、相手が
+                    //    読まなければ書いた分は親のメモリに無限に溜まる。
+                    //    「守りを緩めた代わりの制約」の表に入力の総量だけが無かった。
+                    const limits = execRegistry.limits;
+                    if (s.inputBytes + bytes > limits.inputTotalBytes) {
+                        denyJson(res, 413,
+                            `このセッションに送れる総量の上限（${Math.round(limits.inputTotalBytes / 1024)}KB）`
+                            + `を超えます（これまで ${Math.round(s.inputBytes / 1024)}KB）。`
+                            + ' 相手が読んでいないか、送りすぎです');
+                        return;
+                    }
+                    // ⚠️ 相手が読まずに溜まっている分も見る。**ok:true だけ返して
+                    //    滞留を隠さない**（画面から見えないと気付けない）
+                    const pending = s.child.stdin.writableLength ?? 0;
+                    if (pending > limits.inputPendingBytes) {
+                        denyJson(res, 429,
+                            `相手が読んでいません（未読 ${Math.round(pending / 1024)}KB）。`
+                            + ' 読まれるまで送れません');
+                        return;
+                    }
                     try {
-                        if (data !== null) s.child.stdin.write(data);
+                        if (data !== null) {
+                            s.child.stdin.write(data);
+                            s.inputBytes += bytes;
+                        }
                         if (eof) s.child.stdin.end();
                     } catch (err) {
                         // 子が既に死んでいると EPIPE。落とさずに理由を返す
@@ -1400,7 +1423,12 @@ async function handleRequest(req, res) {
                         'content-type': 'application/json; charset=utf-8',
                         'cache-control': 'no-store',
                     });
-                    res.end(JSON.stringify({ ok: true, bytes, seq: s.log.seq }));
+                    res.end(JSON.stringify({
+                        ok: true, bytes, seq: s.log.seq,
+                        // 送った側が滞留に気付けるようにする（#26）
+                        totalBytes: s.inputBytes,
+                        pending: s.child?.stdin?.writableLength ?? 0,
+                    }));
                     return;
                 }
                 let body = {};

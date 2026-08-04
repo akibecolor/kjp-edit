@@ -1450,6 +1450,48 @@ test('🔒 exec: input も関門を通る（トークン無し / 終了後 / 不
     } finally { child.kill(); }
 });
 
+// 🚨 #26: 1回 64KB を縛っても、相手が読まなければ書いた分は親のメモリに
+//    無限に溜まる。README の「上限 1回 64KB」は総量を縛っていないのに
+//    縛られているように読めた。しかも溜まっている間も ok:true を返すので
+//    画面から滞留が見えなかった。
+test('🚨 exec: 標準入力の総量と滞留に上限がある（ok:true で隠さない）', async () => {
+    const { child, url } = await startExec();
+    try {
+        // stdin を**読まない**プロセス
+        const s = await startSession(url, [process.execPath, '-e', 'setInterval(()=>{},1000)']);
+        let total = 0;
+        let stopped = null;
+        // 64KB を積み続ける。総量 4MB / 滞留 1MB のどちらかで止まるはず
+        for (let i = 0; i < 200; i++) {
+            const r = await sendInput(url, s.id, { data: `${'z'.repeat(60 * 1024)}\n` });
+            if (r.status === 200) {
+                const j = await r.json();
+                total = j.totalBytes;
+                // 応答が滞留を見せていること（隠さない）
+                assert.equal(typeof j.pending, 'number', '滞留が応答に出ていない');
+                continue;
+            }
+            stopped = { status: r.status, error: (await r.json()).error };
+            break;
+        }
+        assert.ok(stopped, `無制限に受け付けている（総量 ${Math.round(total / 1024)}KB）`);
+        assert.ok([413, 429].includes(stopped.status),
+            `想定外の拒否コード: ${JSON.stringify(stopped)}`);
+        assert.match(stopped.error, /上限|読んでいません/);
+
+        // 一覧にも総量と滞留が出る（画面から見える）
+        const st = JSON.parse(await (await fetch(`${url}/api/v0/state?fresh=1`)).text());
+        const one = st.execSessions.find(x => x.id === s.id);
+        assert.ok(one.inputBytes > 0, '総量が一覧に出ていない');
+        assert.equal(typeof one.inputPending, 'number', '滞留が一覧に出ていない');
+        s.abort();
+        await fetch(`${url}/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        }).catch(() => {});
+    } finally { child.kill(); }
+});
+
 test('exec: 大きすぎる入力は拒否する', async () => {
     const { child, url } = await startExec();
     try {

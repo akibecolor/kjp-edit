@@ -359,6 +359,122 @@ test('collectAgents: cwd で worktree に対応付け、無関係な記録は無
     }
 });
 
+// 🚨 #27: 実データには 1.25MB / 776KB の**1レコード**が実在する
+//    （大きい tool_result / file-history）。256KB では完全な行が0本になり、
+//    以前は state='none' → 稼働中のエージェントに「記録がありません」と表示していた。
+test('🚨 巨大な1レコードでも読み直して、記録なしと嘘をつかない', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-big-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-bigwt-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const dir = join(root, 'proj'); await mkdir(dir);
+        // 700KB の tool_result を持つレコード（256KB では1行も完成しない）
+        const huge = JSON.stringify({
+            type: 'user', timestamp: ago(5000), cwd: wt, sessionId: 'sx',
+            toolUseResult: { stdout: 'x'.repeat(700 * 1024), stderr: '' },
+            message: { content: [{ type: 'tool_result', content: 'ok' }] },
+        });
+        const act = JSON.stringify({
+            type: 'assistant', timestamp: ago(1000), cwd: wt, sessionId: 'sx',
+            message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        });
+        // 末尾が「巨大レコード → 小さい活動」の順。256KB だと巨大レコードの
+        // 途中から始まるので、先頭の不完全行を捨てた結果 act だけ残る…はずが
+        // 巨大レコードが末尾に近いと1行も残らない形を作る
+        await writeFile(join(dir, 'sx.jsonl'), `${act}\n${huge}\n`, 'utf8');
+
+        const worktrees = [{ path: wt, label: 'agent-a' }];
+        const { agents, errors } = await collectAgents(worktrees, { root, now: NOW });
+        const a = agents[0];
+        // 読み直して活動が見えるか、少なくとも「読めなかった」と分かること。
+        // **黙って none にするのは駄目**
+        const honest = a.state !== 'none' || a.tooBigToRead === true
+            || errors.some(e => /読めません/.test(e.message));
+        assert.ok(honest,
+            `巨大レコードで黙って「記録なし」になっている: ${JSON.stringify(a)}`);
+        // 読み直したなら活動が見える
+        if (!a.tooBigToRead) {
+            assert.equal(a.state, 'active', '読み直しても活動が見えない');
+            assert.equal(a.toolCounts.Edit, 1);
+        }
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
+test('🚨 上限まで読んでも1行も取れなければ「読めなかった」と伝える（記録なしにしない）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-big2-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-bigwt2-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const dir = join(root, 'proj'); await mkdir(dir);
+        // 先頭に cwd を持つ小さい行、そのあと**改行の無い**巨大な塊
+        const head = JSON.stringify({ type: 'assistant', timestamp: ago(1000), cwd: wt, sessionId: 's' });
+        await writeFile(join(dir, 's.jsonl'), `${head}\n${'y'.repeat(200 * 1024)}`, 'utf8');
+        const { agents, errors } = await collectAgents([{ path: wt, label: 'agent-a' }], {
+            root, now: NOW,
+            limits: { ...LIMITS, tailBytes: 4096, tailMaxBytes: 16 * 1024 },
+        });
+        const a = agents[0];
+        assert.ok(a.tooBigToRead === true || a.state !== 'none',
+            `黙って「記録なし」になっている: ${JSON.stringify(a)}`);
+        if (a.tooBigToRead) {
+            assert.ok(errors.some(e => /読めません/.test(e.message)),
+                '理由が errors に出ていない');
+        }
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
+// 🚨 #28: サブエージェントの記録は `<sessionId>/subagents/agent-*.jsonl` にあり、
+//    親のファイルには出ない。`isSidechain` は実データ4本すべてで0件だった。
+//    その結果、親がサブを走らせている間は「待機 N分」と表示されていた（嘘）。
+test('🚨 サブエージェントの活動を数え、親を「待機」と嘘表示しない', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-sub-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-subwt-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const dir = join(root, 'proj'); await mkdir(dir);
+        // 親の最後の活動は 30 分前（このままなら idle = 「待機」）
+        const old = new Date(NOW - 30 * 60 * 1000).toISOString();
+        await writeFile(join(dir, 'sx.jsonl'), `${JSON.stringify({
+            type: 'assistant', timestamp: old, cwd: wt, sessionId: 'sx',
+            message: { content: [{ type: 'tool_use', name: 'Task', input: {} }] },
+        })}\n`, 'utf8');
+        // サブエージェントの記録（中身は読まれないので空でよい）。**今書いた**
+        const subDir = join(dir, 'sx', 'subagents');
+        await mkdir(subDir, { recursive: true });
+        await writeFile(join(subDir, 'agent-a1.jsonl'), '{}\n', 'utf8');
+        await writeFile(join(subDir, 'agent-a2.jsonl'), '{}\n', 'utf8');
+        // workflows の下も1階層見る
+        const wfDir = join(subDir, 'workflows', 'wf_1');
+        await mkdir(wfDir, { recursive: true });
+        await writeFile(join(wfDir, 'agent-b1.jsonl'), '{}\n', 'utf8');
+
+        const { agents } = await collectAgents([{ path: wt, label: 'agent-a' }], {
+            root, now: Date.now(),   // mtime は実時刻なので now も実時刻で見る
+        });
+        const a = agents[0];
+        assert.ok(a.subagents, 'サブエージェントを数えていない');
+        assert.equal(a.subagents.total, 3, `件数が合わない: ${JSON.stringify(a.subagents)}`);
+        assert.equal(a.subagents.active, 3, '直近に書かれたサブを稼働と見ていない');
+        assert.equal(a.sidechains, 3, 'sidechains が常に 0 のまま');
+        // 🚨 ここが本体: 親が30分前でも、サブが動いていれば稼働中
+        assert.equal(a.state, 'active',
+            `サブが動いているのに「${a.state}」と表示している（親の追記が止まるだけ）`);
+        assert.equal(a.activityFrom, 'subagent', '最後の活動の出所が分からない');
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
 test('collectAgents: 記録の場所が無ければ理由を errors に出す（黙って消えない）', async () => {
     const { agents, errors } = await collectAgents([{ path: WT, label: 'a' }], {
         root: join(tmpdir(), 'kjp-does-not-exist-9c1f'), now: NOW,
