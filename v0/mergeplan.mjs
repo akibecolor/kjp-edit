@@ -38,15 +38,21 @@ export function planMerge(candidates, conflicts) {
     for (const c of conflicts ?? []) {
         if (!known.has(c.a) || !known.has(c.b)) continue;
         if (c.a === c.b) continue;                 // 自己ペアは無意味
-        tested++;
-        // clean が true 以外（false / null=不明）は「安全ではない」側に置く
+        // 🚨 **`clean === null`（不明）を衝突として扱わない。**
+        //    以前は「true 以外は安全でない側」に置いていたので、submodule のように
+        //    git が判定できないペアが**「衝突する」として提示**されていた（#2）。
+        //    不明は「検査していない」と同じ扱いにする = ③ 不明に落ちる。
+        //    こうすると `testedPairs` も正直な数になる。
         if (c.clean === true) {
+            tested++;
             cleanAdj.get(c.a).add(c.b);
             cleanAdj.get(c.b).add(c.a);
-        } else {
+        } else if (c.clean === false) {
+            tested++;
             conflictAdj.get(c.a).add(c.b);
             conflictAdj.get(c.b).add(c.a);
         }
+        // null は辺を張らない（検査済みにも数えない）
     }
 
     const totalPairs = labels.length * (labels.length - 1) / 2;

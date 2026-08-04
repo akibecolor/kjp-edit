@@ -193,6 +193,27 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // L3 #2: 判定できないものを「衝突する」と言わない
+    {
+        name: 'submodule-undecidable',
+        why: 'submodule の衝突を「判定できない」ではなく「衝突する」として出す'
+            + '（git 自身が trivial なケースしか対応しないと言っている）',
+        file: 'v0/git.mjs',
+        from: '        if (/submodule/i.test(kind)) {',
+        to: '        if (false) {',
+        gone: 'if (/submodule/i.test(kind)) {',
+        pattern: 'submodule は「衝突する」ではなく',
+    },
+    {
+        name: 'mergeplan-unknown-not-conflict',
+        why: 'clean=null（不明）を衝突として扱う（判定できないペアを「衝突する」と提示する嘘）',
+        file: 'v0/mergeplan.mjs',
+        from: '        } else if (c.clean === false) {\n            tested++;',
+        to: '        } else {\n            tested++;',
+        gone: '} else if (c.clean === false) {',
+        pattern: '「衝突する」と提示しない',
+        testFile: 'v0/mergeplan.test.mjs',
+    },
     // L3 #1 / #4: 「開けないものを普通に出す」「別のものを同じ見た目で並べる」
     {
         name: 'conflict-synthetic-path',

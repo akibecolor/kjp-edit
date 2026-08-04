@@ -142,7 +142,6 @@ BLOCKING 3 と合わせて「固まって止められない → タブを閉じ�
 
 | | issue |
 |---|---|
-| **submodule は false positive**（merge-tree はチェックアウトしていない submodule を判断できず衝突扱いにする）。stderr の hint を捨てているので「分からない」が「衝突する」として出る | [#2](https://github.com/akibecolor/kjp-edit/issues/2) |
 | **`docs/performance.md` はサーバ側の収集しか測っていない。** クライアント描画の線が無い（BLOCKING 4 はどのテストにも掛からなかった） | [#3](https://github.com/akibecolor/kjp-edit/issues/3) |
 
 ### 仕様として許容（直さない）
@@ -152,6 +151,16 @@ BLOCKING 3 と合わせて「固まって止められない → タブを閉じ�
   最適性を論じる意味は薄い
 
 ### 解決済み
+
+- ~~submodule は false positive~~ → **#2 で解決。**
+  git 自身が hint で「trivial なケースしか対応しない」と言っているので、
+  **「衝突する」ではなく「判定できない」**に倒す。情報セクションを
+  `<パス数> NUL <path>... NUL <種類> NUL <メッセージ>` の**構造として読み**、
+  種類が submodule のパスに理由を付ける（メッセージ本文に頼ると、親の作業ツリーに
+  submodule が展開されていない構成で取りこぼす。実測）。
+  `mergeplan` 側でも `clean=null` を衝突ではなく**未検査**として扱うようにした
+  （以前は「true 以外は安全でない側」だったので、判定できないペアが
+  「衝突する」として提示されていた。**古いテストがその嘘を固定していた**）
 
 - ~~`--name-only` の衝突パスに合成パスが混ざる~~ → **#1 で解決。**
   git の情報メッセージ（`moving it to X instead`）から退避名を取り、

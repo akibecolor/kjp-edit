@@ -727,7 +727,46 @@ export async function mergePreview(cwd, refA, refB, driverNames = []) {
         const name = toNFC(m[1].trim());
         if (!synthetic.has(name)) synthetic.set(name, null);
     }
-    return { clean: false, conflicts, synthetic, info: info.trim() || null };
+    // 🚨 **submodule は「衝突する」ではなく「判定できない」。**
+    //    git 自身が hint でそう言っている（実測）:
+    //      `hint: Recursive merging with submodules currently only supports
+    //       trivial cases.` / `CONFLICT (submodule)` / `Failed to merge submodule mod`
+    //    これを普通の衝突として出すのは、`{clean:false, conflicts:[]}` を返していた
+    //    過去の不具合と同じ「嘘」の型（#2）。3値（clean / conflict / 不明）の
+    //    「不明」に寄せる。
+    const undecidable = new Map();   // path → 理由
+    // 情報セクションは `<パス数> NUL <path>... NUL <衝突の種類> NUL <メッセージ>` の並び。
+    // ⚠️ メッセージ本文（`Failed to merge submodule mod`）に頼ると取りこぼす。
+    //    親の作業ツリーに submodule が展開されていない構成では
+    //    そのメッセージが出ず、種類だけが `CONFLICT (submodule)` になる（実測）。
+    //    **構造として読んで種類で判定する。**
+    const rec = parts.slice(i + 1);
+    for (let k = 0; k < rec.length;) {
+        const count = Number(rec[k]);
+        if (!Number.isInteger(count) || count < 1 || count > 64) { k++; continue; }
+        const paths = rec.slice(k + 1, k + 1 + count).map(toNFC);
+        const kind = rec[k + 1 + count] ?? '';
+        if (/submodule/i.test(kind)) {
+            for (const p of paths) {
+                undecidable.set(p,
+                    'submodule はマージを試せません（git が trivial なケースだけ対応）');
+            }
+        }
+        k += count + 3;   // 件数 + パス群 + 種類 + メッセージ
+    }
+    // メッセージ本文からも拾う（構造が変わったときの保険）
+    for (const m of info.matchAll(/Failed to merge submodule (.+?)(?:\n|$)/g)) {
+        const p = toNFC(m[1].trim());
+        if (!undecidable.has(p)) {
+            undecidable.set(p, 'submodule はマージを試せません（git が trivial なケースだけ対応）');
+        }
+    }
+    // 実体を取れなかったが hint はある場合も「不明」に倒す
+    const trivialOnly = /only supports trivial cases/i.test(r.stderr ?? '');
+    return {
+        clean: false, conflicts, synthetic, undecidable, trivialOnly,
+        info: info.trim() || null,
+    };
 }
 
 /** ref から到達できるコミットの集合（グラフの幹を決めるのに使う）。 */

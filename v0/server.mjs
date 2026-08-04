@@ -465,15 +465,34 @@ async function collectFresh() {
             //    判別は**推測ではなく git の情報メッセージ**から取る
             //    （接尾辞は label でもハッシュでもなく `refs_heads_...` だった）。
             const synth = r.synthetic ?? new Map();
-            const files = (r.conflicts ?? []).map(f => (synth.has(f)
-                ? {
-                    path: f, synthetic: true, of: synth.get(f),
-                    why: 'git が退避先として作る名前で、実在しません'
-                        + '（file と directory / symlink の衝突）',
+            const undec = r.undecidable ?? new Map();
+            const files = (r.conflicts ?? []).map(f => {
+                if (synth.has(f)) {
+                    return {
+                        path: f, synthetic: true, of: synth.get(f),
+                        why: 'git が退避先として作る名前で、実在しません'
+                            + '（file と directory / symlink の衝突）',
+                    };
                 }
-                : { path: f, synthetic: false }));
-            return { a: wa.label, b: wb.label, aPath: pa, bPath: pb,
-                clean: r.clean, files, truncated: !!r.truncated };
+                if (undec.has(f)) {
+                    return { path: f, synthetic: false, undecidable: true, why: undec.get(f) };
+                }
+                return { path: f, synthetic: false };
+            });
+            // 🚨 **判定できないものだけなら「衝突する」と言わない。**
+            //    submodule は git が trivial なケースしか扱えないので、
+            //    衝突扱いにするのは嘘（#2）。3値の「不明」に倒す。
+            const decidable = files.filter(f => !f.undecidable);
+            const clean = (r.clean === false && decidable.length === 0) ? null : r.clean;
+            return {
+                a: wa.label, b: wb.label, aPath: pa, bPath: pb,
+                clean, files, truncated: !!r.truncated,
+                undecidableOnly: clean === null && r.clean === false,
+                reason: clean === null && r.clean === false
+                    ? 'submodule があるため判定できません'
+                        + '（git は trivial なケースだけ対応。「衝突する」ではありません）'
+                    : null,
+            };
         } catch (e) {
             errors.push({ scope: `${wa?.label} × ${wb?.label}`, message: `衝突予測に失敗: ${e.message}` });
             return null;

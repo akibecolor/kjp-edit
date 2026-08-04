@@ -83,6 +83,22 @@ test('検査していないペアの数を返す', () => {
     assert.equal(r.untestedPairs, 2);
 });
 
+// 🚨 #2: submodule は git が「trivial なケースしか対応しない」と言うので
+//    `clean: null`（不明）になる。以前は「true 以外は安全でない側」に置いていたので、
+//    **判定できないペアが「衝突する」として提示**されていた（嘘）。
+test('🚨 clean=null（不明）は衝突ではなく「未検査」として扱う', () => {
+    const r = planMerge([c('a'), c('b')], [{ a: 'a', b: 'b', clean: null }]);
+    // 衝突として提示してはいけない
+    assert.deepEqual(r.deferred, [], '不明を「衝突する」として出している');
+    // どちらか一方は塊に入るが、相手は「不明」に落ちる
+    assert.equal(r.batch.length, 1, `塊の中身: ${JSON.stringify(r.batch)}`);
+    assert.equal(r.unknown.length, 1, `不明: ${JSON.stringify(r.unknown)}`);
+    assert.deepEqual(r.unknown[0].untestedWith, r.batch);
+    // 検査済みに数えない（数えると「検査したのに分からない」が見えなくなる）
+    assert.equal(r.testedPairs, 0, '不明を検査済みに数えている');
+    assert.equal(r.untestedPairs, 1);
+});
+
 test('候補に無いラベルのペアは無視する', () => {
     const r = planMerge([c('a'), c('b')], [pair('a', 'zzz', false), pair('a', 'b', true)]);
     assert.deepEqual(r.batch.sort(), ['a', 'b']);
@@ -158,8 +174,13 @@ test('自己ペア（a × a）は無視する', () => {
 });
 
 // 不明（clean === null。読み切れなかった等）は「安全」側に置かない
-test('clean が null のペアは衝突側として扱う', () => {
+// ⚠️ このテストは以前「clean が null のペアは**衝突側**として扱う」だった。
+//    それは**嘘を固定していた**（#2）。判定できないものを「衝突する」と
+//    提示するのは、`{clean:false, conflicts:[]}` を返していた過去の不具合と同型。
+//    今は「未検査」= ③ 不明に落ちる（上のテストが新しい契約を固定している）。
+test('clean が null のペアを「衝突する」と提示しない（安全側だが嘘は言わない）', () => {
     const r = planMerge([c('a'), c('b')], [{ a: 'a', b: 'b', clean: null }]);
-    assert.equal(r.batch.length, 1);
-    assert.equal(r.deferred.length, 1);
+    assert.equal(r.batch.length, 1, '両方を塊に入れてはいけない（未検査なので）');
+    assert.deepEqual(r.deferred, [], '不明を衝突として提示している');
+    assert.equal(r.unknown.length, 1, '不明として提示していない');
 });

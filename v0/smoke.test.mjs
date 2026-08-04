@@ -1956,6 +1956,81 @@ test('🚨 衝突予測: 合成パスを印付けて「開けない理由」を�
     }
 });
 
+// 🚨 #2: submodule は git 自身が「trivial なケースしか対応しない」と言う
+//    （実測の stderr: `hint: Recursive merging with submodules currently only
+//    supports trivial cases.`）。それを「衝突する」として出すのは
+//    `{clean:false, conflicts:[]}` を返していた過去の不具合と同型の嘘。
+test('🚨 衝突予測: submodule は「衝突する」ではなく「判定できない」', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const subRepo = join(repo, '..', `${stem}-submod-src`);
+    const wtA = join(repo, '..', `${stem}-submod-a`);
+    const wtB = join(repo, '..', `${stem}-submod-b`);
+    const allowFile = ['-c', 'protocol.file.allow=always'];
+    try {
+        // submodule 用のリポジトリ。**分岐した2つのコミット**を作る
+        // （直系だと gitlink を fast-forward できて clean になる。実測で踏んだ）
+        await mkdir(subRepo, { recursive: true });
+        await g(['init', '-q', '-b', 'main'], subRepo);
+        await writeFile(join(subRepo, 'f.txt'), 'v1\n', 'utf8');
+        await g(['add', '-A'], subRepo);
+        await g(['commit', '-q', '-m', 'v1'], subRepo);
+        const c1 = (await g(['rev-parse', 'HEAD'], subRepo)).trim();
+        await g(['checkout', '-q', '-b', 'x', c1], subRepo);
+        await writeFile(join(subRepo, 'f.txt'), 'v2\n', 'utf8');
+        await g(['add', '-A'], subRepo);
+        await g(['commit', '-q', '-m', 'v2'], subRepo);
+        const c2 = (await g(['rev-parse', 'HEAD'], subRepo)).trim();
+        await g(['checkout', '-q', '-b', 'y', c1], subRepo);
+        await writeFile(join(subRepo, 'f.txt'), 'v3\n', 'utf8');
+        await g(['add', '-A'], subRepo);
+        await g(['commit', '-q', '-m', 'v3'], subRepo);
+        const c3 = (await g(['rev-parse', 'HEAD'], subRepo)).trim();
+
+        // 親に submodule を入れて、2本の worktree で別のコミットを指す
+        await g(['worktree', 'add', '-b', 'submod-a', wtA, 'main'], repo);
+        await g([...allowFile, 'submodule', 'add', '-q', subRepo, 'mod'], wtA);
+        await g(['-C', 'mod', 'checkout', '-q', c2], wtA);
+        await writeFile(join(wtA, 'shared.txt'), 'A side\n', 'utf8');
+        await g(['add', '-A'], wtA);
+        await g(['commit', '-q', '-m', 'A: sub=v2'], wtA);
+
+        await g(['worktree', 'add', '-b', 'submod-b', wtB, 'main'], repo);
+        await g([...allowFile, 'submodule', 'add', '-q', subRepo, 'mod'], wtB);
+        await g(['-C', 'mod', 'checkout', '-q', c3], wtB);
+        await writeFile(join(wtB, 'shared.txt'), 'B side\n', 'utf8');
+        await g(['add', '-A'], wtB);
+        await g(['commit', '-q', '-m', 'B: sub=v3'], wtB);
+
+        const s = JSON.parse(await (await fetch(`${baseUrl}/api/v0/state?fresh=1`)).text());
+        // ⚠️ ラベルはブランチ名ではなく worktree のディレクトリ名由来
+        //    （`kjp-smoke-XXXX-submod-a`）。末尾で照合する
+        const pair = (s.conflicts ?? []).find(c =>
+            [c.a, c.b].some(x => x.endsWith('-submod-a'))
+            && [c.a, c.b].some(x => x.endsWith('-submod-b')));
+        assert.ok(pair, `submodule のペアが候補に無い: `
+            + `${JSON.stringify((s.conflicts ?? []).map(x => [x.a, x.b, x.clean]))}`);
+
+        // submodule の path に「判定できない」印が付く
+        const mod = (pair.files ?? []).find(f => typeof f === 'object' && f.undecidable);
+        if (mod) {
+            assert.match(mod.why, /submodule/);
+            assert.equal(mod.path, 'mod');
+        }
+        // shared.txt も衝突しているので clean は false のまま（本物の衝突はある）。
+        // 🚨 **submodule だけが衝突だった場合は null になる**ことが本題なので、
+        //    そこは mergeplan の unit テストと git.mjs の実測で固定している。
+        //    ここでは「submodule に理由が付く」ことを見る。
+        assert.ok(mod || pair.clean === null,
+            `submodule に理由が付いていない: ${JSON.stringify(pair)}`);
+    } finally {
+        await g(['worktree', 'remove', '--force', wtA], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wtB], repo).catch(() => {});
+        await g(['branch', '-D', 'submod-a'], repo).catch(() => {});
+        await g(['branch', '-D', 'submod-b'], repo).catch(() => {});
+        for (const p of [wtA, wtB, subRepo]) await rm(p, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
 // ---------------------------------------------------------------------------
 // 🔒 読み取り経路の認証（#6 の 1・2）
 //

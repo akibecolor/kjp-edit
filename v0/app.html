@@ -1121,8 +1121,17 @@ function render(s) {
     d.append(el('b', null, `${mark} ${c.a} × ${c.b}`));
     if (c.clean === true) d.append(document.createTextNode(' — きれいにマージできます'));
     else if (c.clean === null) {
+      // 🚨 「判定できない」の**理由**を出す。理由が無いと利用者は
+      //    「衝突する」と読んでしまう（submodule はまさにそれだった。#2）
       d.append(document.createTextNode(
-        c.truncated ? ' — 差分が大きすぎて判定できませんでした' : ' — 判定できませんでした'));
+        c.reason ? ` — ${c.reason}`
+          : c.truncated ? ' — 差分が大きすぎて判定できませんでした' : ' — 判定できませんでした'));
+      for (const f of c.files ?? []) {
+        const path = typeof f === 'string' ? f : f.path;
+        if (typeof f === 'object' && f.undecidable) {
+          d.append(el('div', 'ab', `  ${path} ← ${f.why}`));
+        }
+      }
     } else for (const f of c.files ?? []) {
       // ⚠️ サーバは `{path, synthetic, of, why}` を返す（古い形の文字列にも耐える）
       const path = typeof f === 'string' ? f : f.path;
