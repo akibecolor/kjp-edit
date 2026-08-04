@@ -1136,11 +1136,45 @@ if (args.includes('--list')) {
     for (const m of MUTANTS) console.log(`${m.name.padEnd(28)} ${m.why}`);
     process.exit(0);
 }
-const want = args.filter(a => !a.startsWith('--'));
-const targets = want.length ? MUTANTS.filter(m => want.includes(m.name)) : MUTANTS;
+// ⚠️ `--shard 2/4` の値は名前の指定ではない。除かないと
+//    「一致する変異がありません: 2/4」になる（実際に踏んだ）
+const shardValueIdx = args.indexOf('--shard') + 1;
+const want = args.filter((a, i) => !a.startsWith('--') && i !== shardValueIdx);
+let targets = want.length ? MUTANTS.filter(m => want.includes(m.name)) : MUTANTS;
+
+/**
+ * `--shard i/n` で分割する。CI を並列に回すため。
+ *
+ * 🚨 **時間が伸びると CI で打ち切られ、結果が「不明」になる。**
+ *    変異が 62 → 96 件に増えたら Linux の job（上限15分）が cancelled になり、
+ *    **突然変異の結果が出ないまま**「他は success」の表示になった。
+ *    打ち切られたものを緑と読まないために、分割して各シャードを短く保つ。
+ * ⚠️ **分割したことを必ず出す。** 出さないと部分実行を全体と読み違える。
+ */
+let shard = null;
+{
+    const i = args.findIndex(a => a === '--shard');
+    const raw = i !== -1 ? args[i + 1] : args.find(a => a.startsWith('--shard='))?.split('=')[1];
+    if (raw !== undefined) {
+        const m = /^(\d+)\/(\d+)$/.exec(String(raw));
+        if (!m || Number(m[1]) < 1 || Number(m[1]) > Number(m[2])) {
+            console.error(`--shard は i/n の形で指定してください（受け取った値: ${raw}）`);
+            process.exit(1);
+        }
+        shard = { index: Number(m[1]), total: Number(m[2]) };
+        // 費用が偏らないよう round-robin で配る（render 系は1件60秒、unit 系は2秒）
+        targets = targets.filter((_, k) => k % shard.total === shard.index - 1);
+    }
+}
 if (!targets.length) {
-    console.error(`一致する変異がありません: ${want.join(', ')}`);
+    console.error(want.length
+        ? `一致する変異がありません: ${want.join(', ')}`
+        : `シャード ${shard?.index}/${shard?.total} に割り当てられた変異がありません`);
     process.exit(1);
+}
+if (shard) {
+    console.log(`シャード ${shard.index}/${shard.total}: `
+        + `${targets.length} 件（全 ${MUTANTS.length} 件のうち）を走らせます`);
 }
 
 function runTest(m) {
@@ -1231,13 +1265,30 @@ process.on('unhandledRejection', e => {
 
 // 🚨 前回の実行が残した書き換えを引きずらない。
 //    残骸がある状態で走らせると、変異の上に変異を重ねることになる。
+//
+// ⚠️ **SIGKILL では `finally` もシグナルハンドラも走らない。** 実際に踏んだ:
+//    シェルの上限（2分）で SIGKILL され、`v0/app.html` が変異したまま残った。
+//    しかも `*.mutate-bak` は `.gitignore` にあるので `git status` には出ない
+//    （変異したソース自体は出るので、**`git add -A` の前に読む**のが最後の砦）。
+//    復元を手順ではなく**仕組み**にする: `--restore` で bak から戻す。
 {
     const stale = [...new Set(MUTANTS.map(m => `${m.file}.mutate-bak`))].filter(existsSync);
+    if (args.includes('--restore')) {
+        if (!stale.length) { console.log('復元するものはありません'); process.exit(0); }
+        let ok = true;
+        for (const b of stale) {
+            const file = b.replace(/\.mutate-bak$/, '');
+            if (restoreFile(file, b)) console.log(`✔ 復元しました: ${file}`);
+            else ok = false;
+        }
+        process.exit(ok ? 0 : 1);
+    }
     if (stale.length) {
         console.error('\n✖ 前回の実行が残した書き換えがあります:');
         for (const b of stale) console.error(`    ${b} → ${b.replace(/\.mutate-bak$/, '')}`);
-        console.error('\n  ソースが変異したままの可能性があります。復元してから走らせてください:');
-        console.error('    git status / git diff で確認し、必要なら bak から戻す\n');
+        console.error('\n  ソースが変異したままです（SIGKILL されると finally が走りません）。');
+        console.error('  bak から戻す:');
+        console.error('      node scripts/mutate.mjs --restore\n');
         process.exit(1);
     }
 }
@@ -1366,7 +1417,9 @@ const hung = results.filter(r => r.status === 'HUNG').length;
 const stale = results.filter(r => r.status === 'STALE').length;
 console.log(`${k} 件が期待通り落ちた / ${d} 件は冗長な防御（想定内）`
     + ` / ${sk} 件はスキップ${hung ? ` / ${hung} 件はハング` : ''}`
-    + `${stale ? ` / ${stale} 件は字面がずれている` : ''}`);
+    + `${stale ? ` / ${stale} 件は字面がずれている` : ''}`
+    // 🚨 部分実行を全体と読み違えないよう、必ず添える
+    + (shard ? `（シャード ${shard.index}/${shard.total}。全 ${MUTANTS.length} 件の一部）` : ''));
 if (bad) console.log('✖ = テストがその守りを検証できていない。テストを直すこと');
 // 🚨 **字面がずれた変異は失敗。** 「守りを外せていない」だけなので、
 //    守りが検証されない状態が静かに続く（CI で SKIP のまま残っていた）。

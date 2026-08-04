@@ -85,6 +85,16 @@ node v0/layout-check.mjs         # 実ブラウザでレイアウトを測る（
   変異が KILLED でも測っているのは「行が消えたこと」だけで、
   `core.fsmonitor` / `pathspec magic` と同じ型の偽陽性（`docs/review-5-parallel.md`）。
   **「行を消さずに到達不能にする」変異を1件必ず置く**（`auth-token-bootstrap-unreachable`）
+- 🚨 **検査が長くなったら分割する。打ち切られた結果を緑と読まない。**
+  変異が 62 → 96 件に増えたら CI の job（上限15分）が **cancelled** になり、
+  **突然変異の結果が出ないまま**「他は success」の表示になった。
+  `--shard i/n` で分けて別 job にした。**部分実行は必ずそう告知する**
+- 🚨 **`finally` もシグナルハンドラも SIGKILL では走らない。**
+  シェルの上限（2分）で殺されて `v0/app.html` が変異したまま残った。
+  `*.mutate-bak` は `.gitignore` にあるので `git status` に出ない（変異したソース自体は
+  出るので **`git add -A` の前に読む**のが最後の砦）。復元は手順ではなく仕組みにする:
+  **`node scripts/mutate.mjs --restore`**。
+  そして**全件の変異テストを前景のシェルで走らせない**（バックグラウンドにする）
 - 🚨 **`gone` がソースとずれた変異は SKIP ではなく失敗（STALE）として扱う。**
   「守りを外せていない」だけなので、守りが未検証のまま静かに続く。
   `worktree-allowlist` は CI で SKIP のまま残り、`cookie-decode-crash` も

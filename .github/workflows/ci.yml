@@ -28,21 +28,6 @@ jobs:
           node-version: '24'
       # 依存パッケージゼロなので install ステップは無い
       - run: node scripts/verify.mjs
-      # 突然変異テスト。「守っている」と主張するコードを外して、
-      # 対応するテストが実際に落ちるかを確かめる。
-      # ⚠️ ソースを書き換えて復元するので verify の後に置く。
-      #    Linux でだけ走らせる（3プラットフォームで回すと時間が3倍になり、
-      #    大半の変異はプラットフォーム非依存。POSIX 専用の変異はここで検証される）。
-      - name: mutation tests
-        if: matrix.os == 'ubuntu-24.04'
-        run: node scripts/mutate.mjs
-      # 変異が復元されていること（ソースが汚れたまま終わっていない）
-      - name: working tree is clean after mutation
-        if: matrix.os == 'ubuntu-24.04'
-        shell: bash
-        run: |
-          dirty=$(git status --porcelain)
-          if [ -n "$dirty" ]; then echo "$dirty"; exit 1; fi
       # 改行が正規化されていること (.gitattributes)
       - name: line endings are LF in the index
         shell: bash
@@ -55,3 +40,36 @@ jobs:
         run: |
           dup=$(git ls-files | tr 'A-Z' 'a-z' | sort | uniq -d || true)
           if [ -n "$dup" ]; then echo "$dup"; exit 1; fi
+
+  # 突然変異テスト。「守っている」と主張するコードを外して、
+  # 対応するテストが実際に落ちるかを確かめる。
+  #
+  # 🚨 **verify とは別の job にして分割する。** 同じ job に入れていたら、
+  #    変異が 62 → 96 件に増えたところで上限（15分）に当たって
+  #    **cancelled になり、突然変異の結果が出ないまま**
+  #    「他は success」の表示になった（結果が「不明」なのを緑と読める形）。
+  #    分割すれば1シャードは短いままで、増えても timeout に当たらない。
+  # ⚠️ Linux でだけ走らせる（大半の変異はプラットフォーム非依存。
+  #    win32 専用の変異はここでは SKIP として出る）。
+  mutation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+      - name: mutation tests (shard ${{ matrix.shard }}/4)
+        run: node scripts/mutate.mjs --shard ${{ matrix.shard }}/4
+      # 変異が復元されていること（ソースが汚れたまま終わっていない）
+      # ⚠️ `if: always()` にする。変異が失敗したときこそ復元を確かめたい
+      - name: working tree is clean after mutation
+        if: always()
+        shell: bash
+        run: |
+          dirty=$(git status --porcelain)
+          if [ -n "$dirty" ]; then echo "$dirty"; exit 1; fi
