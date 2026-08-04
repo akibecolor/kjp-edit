@@ -1785,15 +1785,104 @@ test('🚨 exec: 同時実行の上限が実際に効く', async () => {
     }
 });
 
-test('🔒 exec: bare worktree では実行しない', async () => {
-    const { child, url } = await startExec();
+// 🚨 このテストは以前「bare worktree は smoke のフィクスチャに無いので、
+//    無効な worktree で経路が閉じていることだけ確認する（bare の網羅は
+//    unit 側の責務）」と書いていたが、**unit 側に bare のテストは無かった**。
+//    つまり `wt.bare` / `wt.prunable` の門は exec も checkout も
+//    **外しても全テストが緑**だった（過去2件と同じクラスの偽陽性。#33）。
+//    ここで**本物の bare / prunable を作って**4つの門すべてを測る。
+test('🚨 exec / checkout: bare と prunable の門が実際に効く', async () => {
+    // 実体のある bare worktree と、実体を消した prunable worktree を用意する
+    const stem = repo.split(/[\\/]/).pop();
+    const bareWt = join(repo, '..', `${stem}-bare-real`);
+    const goneWt = join(repo, '..', `${stem}-gone-real`);
+    await g(['worktree', 'add', '--detach', goneWt, 'HEAD'], repo);
+    // bare worktree は `worktree add` では作れないので、bare clone を追加する
+    await g(['clone', '--bare', '--quiet', repo, bareWt], repo);
+
+    const { child, url } = await startExec(['--allow-write']);
     try {
-        // bare worktree は smoke のフィクスチャに無いので、無効な worktree で
-        // 経路が閉じていることだけ確認する（bare の網羅は unit 側の責務）
-        const r = await readExec(url, { worktree: `${repo}-bare-nope`, argv: ['git', '--version'] });
-        assert.equal(r.status, 400);
+        // prunable にする（実体を消す。git はまだ台帳に持っている）
+        await rm(goneWt, { recursive: true, force: true });
+        const st = JSON.parse(await (await fetch(`${url}/api/v0/state?fresh=1`)).text());
+        const prunable = st.worktrees.find(w => w.prunable);
+        assert.ok(prunable, `prunable な worktree が payload に出ていない: `
+            + `${JSON.stringify(st.worktrees.map(w => [w.name, w.prunable]))}`);
+
+        // 1. exec は prunable を拒否する（cwd にすると ENOENT で経路が壊れる）
+        const e1 = await readExec(url, { worktree: prunable.path, argv: ['git', '--version'] });
+        assert.equal(e1.status, 409, 'exec が prunable を通した');
+
+        // 2. checkout も prunable を拒否する
+        const c1 = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({ worktree: prunable.path, ref: 'main' }),
+        });
+        assert.equal(c1.status, 409, `checkout が prunable を通した: ${c1.status}`);
+        // ⚠️ **理由まで見る。** 門を外しても git 自身が失敗して 409 を返すので、
+        //    status だけでは「門が効いた」と「git が拒否した」を区別できない
+        //    （最初そう書いて変異が生き残った）
+        assert.match((await c1.json()).error, /作業ツリーが失われています/,
+            '門ではなく git の失敗で 409 になっている（門を外しても緑になる）');
+
+        // 3・4. bare は「既知の worktree」として出ないので、
+        //       bare を cwd にしようとしても allowlist で止まる。
+        //       ただし **bare が worktree 一覧に現れる構成**（bare リポジトリを
+        //       --repo に渡した場合）では bare の門が唯一の守りになる。
+        const bareSrv = spawn(process.execPath,
+            [SERVER, '--repo', bareWt, '--port', '0', '--allow-exec',
+                '--token', EXEC_TOKEN, '--allow-write'],
+            { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+        bareSrv.stdout.setEncoding('utf8');
+        bareSrv.stderr.setEncoding('utf8');
+        let bnr = '';
+        let berr = '';
+        bareSrv.stderr.on('data', d => { berr += d; });
+        try {
+            const bUrl = await Promise.race([
+                new Promise((res, rej) => {
+                    bareSrv.stdout.on('data', d => {
+                        bnr += d;
+                        const m = bnr.match(/http:\/\/127\.0\.0\.1:\d+/);
+                        if (m) setTimeout(() => res(m[0]), 400);
+                    });
+                    bareSrv.on('error', rej);
+                    bareSrv.on('exit', () => setTimeout(() => rej(new Error(
+                        `bare で起動しなかった\n  stdout: ${bnr}\n  stderr: ${berr}`)), 50));
+                }),
+                new Promise((_, rej) => setTimeout(() => rej(new Error(
+                    `bare で起動しなかった\n  stdout: ${bnr}\n  stderr: ${berr}`)), 20000)),
+            ]);
+            const bst = JSON.parse(await (await fetch(`${bUrl}/api/v0/state?fresh=1`)).text());
+            const bare = bst.worktrees.find(w => w.bare);
+            assert.ok(bare, `bare な worktree が payload に出ていない: `
+                + `${JSON.stringify(bst.worktrees.map(w => [w.name, w.bare]))}`);
+
+            // 3. exec は bare を拒否する（作業ツリーが無い場所で任意コマンドが走る）
+            const e2 = await fetch(`${bUrl}/api/v0/exec`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+                body: JSON.stringify({ worktree: bare.path, argv: ['git', '--version'] }),
+            });
+            assert.equal(e2.status, 400, 'exec が bare を通した（作業ツリーが無い場所で実行）');
+            assert.match((await e2.json()).error, /bare/);
+
+            // 4. checkout も bare を拒否する
+            const c2 = await fetch(`${bUrl}/api/v0/checkout`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+                body: JSON.stringify({ worktree: bare.path, ref: 'main' }),
+            });
+            assert.equal(c2.status, 400, 'checkout が bare を通した');
+        } finally {
+            bareSrv.kill();
+        }
     } finally {
         child.kill();
+        await g(['worktree', 'prune'], repo).catch(() => {});
+        await rm(bareWt, { recursive: true, force: true }).catch(() => {});
+        await rm(goneWt, { recursive: true, force: true }).catch(() => {});
     }
 });
 

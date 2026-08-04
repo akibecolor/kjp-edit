@@ -1614,15 +1614,26 @@ server.on('error', err => {
 //    `overlaps[].path`（ルート相対）と基準が食い違う。さらに
 //    `isSafeRepoPath` が `..` を弾くので UI から開けなくなる（レビュー指摘）。
 try {
-    const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
+    // 🚨 **bare では `--show-toplevel` が exit 128 で落ちる**
+    //    （`fatal: this operation must be run in a work tree`）。空文字を返すのではない。
+    //    そのため以前は bare リポジトリを「git リポジトリとして開けません」と
+    //    誤って拒否していた。**bare を親にして linked worktree を並べる構成**は
+    //    エージェントを並列に走らせる普通のやり方なので、受け付ける。
+    //    （これが `wt.bare` の門が到達不能だった原因でもある。#33）
+    let top = '';
+    try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim(); }
+    catch { /* bare。下で判定する */ }
     if (top) {
         if (!samePath(top, opts.repo)) {
             console.log(`repo をリポジトリのルートに解決しました: ${opts.repo} → ${top}`);
         }
         opts.repo = top;
     } else {
-        // bare リポジトリには toplevel が無い。開けることだけ確認する
-        await git(['rev-parse', '--git-dir'], { cwd: opts.repo });
+        const bare = (await git(['rev-parse', '--is-bare-repository'], { cwd: opts.repo })).trim();
+        if (bare !== 'true') {
+            throw new Error('作業ツリーが無く、bare でもありません（.git の中を指していませんか）');
+        }
+        console.log('bare リポジトリを見ています（作業ツリーは linked worktree 側にあります）');
     }
 } catch (err) {
     console.error(`\n✖ git リポジトリとして開けません: ${opts.repo}`);

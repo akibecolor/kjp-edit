@@ -24,6 +24,7 @@ node scripts/autostart.mjs install    # ログオン時に自動起動（既定�
 ```bash
 node v0/server.mjs                    # カレントのリポジトリを見る
 node v0/server.mjs --repo /path/to/r  # 別のリポジトリ（サブディレクトリでもルートに正規化される）
+node v0/server.mjs --repo /path/to/bare.git  # **bare も渡せる**（作業ツリーは linked worktree 側）
 node v0/server.mjs --port 7749 --limit 300 --base main
 ```
 

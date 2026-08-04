@@ -193,6 +193,54 @@ const MUTANTS = [
         gone: 'opts.requireAuth === false && opts.allowHosts.size > 0',
         pattern: '併用は起動を拒否する',
     },
+    // #33: bare / prunable の門。以前は**本物の bare を作っていなかった**ので
+    //      4つとも外しても全テストが緑だった（過去2件と同じクラスの偽陽性）。
+    {
+        name: 'exec-bare-gate',
+        why: 'bare worktree を cwd にできる（作業ツリーの無い場所で任意コマンドが走る）',
+        file: 'v0/server.mjs',
+        from: "            if (wt.bare) { bail(400, 'bare worktree では実行できません'); return; }",
+        to: '            /* 変異: bare の門を外す */',
+        gone: "bail(400, 'bare worktree では実行できません')",
+        pattern: 'bare と prunable の門が実際に効く',
+    },
+    {
+        name: 'exec-prunable-gate',
+        why: '実体の消えた worktree を cwd にできる（ENOENT で経路が壊れる）',
+        file: 'v0/server.mjs',
+        from: "            if (wt.prunable) { bail(409, '作業ツリーが失われています'); return; }",
+        to: '            /* 変異: prunable の門を外す */',
+        gone: "bail(409, '作業ツリーが失われています')",
+        pattern: 'bare と prunable の門が実際に効く',
+    },
+    {
+        name: 'checkout-bare-gate',
+        why: 'bare worktree で checkout を通す（作業ツリーが無いので必ず壊れる）',
+        file: 'v0/server.mjs',
+        from: "            if (wt.bare) { denyJson(res, 400, 'bare worktree では checkout できません'); return; }",
+        to: '            /* 変異: bare の門を外す */',
+        gone: "'bare worktree では checkout できません'",
+        pattern: 'bare と prunable の門が実際に効く',
+    },
+    {
+        name: 'checkout-prunable-gate',
+        why: '実体の消えた worktree で checkout を通す',
+        file: 'v0/server.mjs',
+        from: "            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }",
+        to: '            /* 変異: prunable の門を外す */',
+        gone: "denyJson(res, 409, '作業ツリーが失われています')",
+        pattern: 'bare と prunable の門が実際に効く',
+    },
+    {
+        name: 'repo-accepts-bare',
+        why: 'bare リポジトリを開けなくする（bare を親に worktree を並べる構成が使えない。'
+            + 'かつ bare の門が到達不能になって検証できなくなる）',
+        file: 'v0/server.mjs',
+        from: "    try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim(); }\n    catch { /* bare。下で判定する */ }",
+        to: "    top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();",
+        gone: 'catch { /* bare。下で判定する */ }',
+        pattern: 'bare と prunable の門が実際に効く',
+    },
     // 4回目のレビューの SERIOUS 4件（issue #26-#28, #32）
     {
         name: 'input-total-limit',
