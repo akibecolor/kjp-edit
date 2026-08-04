@@ -1584,6 +1584,17 @@ test('🚨 exec: 読まない購読者は切られ、応答が無制限に溜ま
         // サーバは生きている（切ったのは購読者だけ）
         const st = JSON.parse(await (await fetch(`${url}/api/v0/state?fresh=1`)).text());
         assert.ok(Array.isArray(st.execSessions), 'サーバが応答しない');
+
+        // ⚠️ **重いテストは自分の後始末をする。** 25MB を吐く子を残すと
+        //    後続のテストが CPU / IO を奪われ、**別のテストが「起動しなかった」で
+        //    落ちる**（CI で実際に2件落ちた。原因の心当たりはこれ）。
+        //    サーバを kill するだけでは、Windows では SIGTERM ハンドラが走らず孫が残る。
+        for (const s of st.execSessions.filter(x => x.state === 'running')) {
+            await fetch(`${url}/api/v0/exec/${s.id}/kill`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            }).catch(() => {});
+        }
     } finally { child.kill(); }
 });
 
