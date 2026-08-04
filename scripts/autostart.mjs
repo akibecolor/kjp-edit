@@ -24,6 +24,9 @@
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// 🚨 Run キーの値は CreateProcess の lpCommandLine としてそのまま CRT に解釈される。
+//    素朴な "..." 囲みでは末尾がバックスラッシュの値で引用が閉じない（#29）。
+import { winQuote, trimTrailingSep } from './winargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVE = join(ROOT, 'scripts', 'serve.mjs');
@@ -74,9 +77,23 @@ if (cmd === 'status') {
     const caps = [/--exec/.test(v) && '実行', /--write/.test(v) && '書き込み']
         .filter(Boolean).join('+') || '読み取り専用';
     const host = /--allow-host\s+(\S+)/.exec(v)?.[1];
+    const watch = /--agents-text/.test(v) ? '活動観測+発話'
+        : /--watch\b/.test(v) ? '活動観測' : null;
     console.log(`登録されています（ログオン時 / ${caps}`
+        + `${watch ? ` / ${watch}` : ''}`
         + `${host ? ` / Host 許可: ${host}` : ''}）`);
     console.log(`  中身: ${v}`);
+    // 🚨 **登録した文字列が壊れていないかを status で言う。** 以前は引用が
+    //    閉じていない値でも「登録されています」と出し続けたので、
+    //    再起動するまで壊れていることに気付けなかった（#29）。
+    const quotes = (v.match(/(?<!\\)"/g) ?? []).length;
+    if (quotes % 2 !== 0) {
+        console.log('');
+        console.log('🚨 登録されている文字列の引用が閉じていません。');
+        console.log('   このままではログオン時に起動に失敗します（--port や --allow-host が');
+        console.log('   repo 引数に飲まれます）。登録し直してください:');
+        console.log('     node scripts/autostart.mjs install');
+    }
     console.log('  解除するには: node scripts/autostart.mjs uninstall');
     process.exit(0);
 }
@@ -95,7 +112,15 @@ if (cmd !== 'install') {
 }
 
 // ---- install ----
-const repo = val('--repo', ROOT);
+// ⚠️ 末尾のセパレータを落とす。残すと CRT の引用規則を踏みやすく、
+//    どのツールでも意味は変わらないので落として良い（**既定値 ROOT がこの形**）。
+const repo = trimTrailingSep(val('--repo', ROOT));
+if (!repo || /["\r\n\0]/.test(repo)) {
+    // `--allow-host` は検証しているのに `--repo` が無検証、という非対称が
+    // #29 の原因だった。引用を壊す文字は最初から弾く。
+    console.error(`\n✖ --repo に使えない文字が入っています（" や改行）: ${JSON.stringify(repo)}\n`);
+    process.exit(1);
+}
 const port = val('--port', '7749');
 if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
     console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${port}）\n`);
@@ -118,10 +143,32 @@ for (let i = 0; i < argv.length; i++) {
     }
     serveArgs.push('--allow-host', h);
 }
+// ⚠️ 観測フラグも引き継ぐ。`--allow-host` を落としていたのと**同型の再発**で、
+//    付けたつもりが読み取り専用で登録され、**ログオン後だけパネルが消える**。
+if (has('--agents-text')) serveArgs.push('--agents-text');
+else if (has('--watch')) serveArgs.push('--watch');
 
-// Run キーの値は1つの文字列。空白を含むパスをクォートする。
-const value = [process.execPath, SERVE, ...serveArgs]
-    .map(a => (/\s/.test(a) ? `"${a}"` : a)).join(' ');
+// 🚨 **知らないフラグを黙って捨てない。** 捨てると「打ったのに効かない」が
+//    起動するまで分からない（#30）。serve.mjs 側の名前で打たれることが多いので、
+//    正しい名前を示して止める。
+const KNOWN = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
+    '--watch', '--agents-text']);
+const ALIAS = {
+    '--allow-write': '--write',
+    '--allow-exec': '--exec',
+    '--watch-agents': '--watch',
+    '--allow-transcript-text': '--agents-text',
+};
+for (const a of argv) {
+    if (!a.startsWith('--') || KNOWN.has(a)) continue;
+    const hint = ALIAS[a] ? `（このスクリプトでは ${ALIAS[a]} です）` : '';
+    console.error(`\n✖ 知らないオプションです: ${a}${hint}`);
+    console.error(`  使えるもの: ${[...KNOWN].join(' ')}\n`);
+    process.exit(1);
+}
+
+// Run キーの値は1つの文字列。**CRT の規則に合わせて引用する**（scripts/winargs.mjs）。
+const value = [process.execPath, SERVE, ...serveArgs].map(winQuote).join(' ');
 
 const r = await run('reg', ['add', RUN_KEY, '/v', NAME, '/t', 'REG_SZ', '/d', value, '/f']);
 if (r.code !== 0) {
@@ -129,7 +176,11 @@ if (r.code !== 0) {
     process.exit(1);
 }
 const caps = has('--exec') ? '実行+書き込み' : has('--write') ? '書き込み' : '読み取り専用';
-console.log(`自動起動を登録しました（ログオン時 / ${caps}）`);
+// ⚠️ **登録時と status で同じものを出す。** 片方だけに出すと
+//    「登録できたのか」を確認する手段がずれる（#30 の指摘と同じ形）
+const watchLabel = has('--agents-text') ? ' / 活動観測+発話'
+    : has('--watch') ? ' / 活動観測' : '';
+console.log(`自動起動を登録しました（ログオン時 / ${caps}${watchLabel}）`);
 console.log(`  repo: ${repo}`);
 console.log(`  URL : http://127.0.0.1:${port}`);
 console.log(`  中身: ${value}`);

@@ -26,6 +26,9 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
+// 🚨 Windows のコマンドラインを作る／読む規則は共有モジュールに集約している
+//    （純粋な関数なのでユニットテストで固定できる。scripts/winargs.test.mjs）
+import { repoOf, samePathish } from './winargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVER = join(ROOT, 'v0', 'server.mjs');
@@ -74,6 +77,32 @@ function inUse(port) {
     });
 }
 
+/**
+ * 🚨 **知らないフラグを黙って捨てない。**
+ *
+ * 以前は未知のオプションを無視していたので、`--allow-write` を渡した人に
+ * **「読み取り専用（書き込みは --allow-write で有効化）」と表示**していた。
+ * 打ったフラグが効いていないことが分からないのは、capability を明示させる
+ * 設計（意識的な操作にする）の根拠そのものを壊す（#30）。
+ * サーバ側の名前で打たれることが多いので、正しい名前を示して止める。
+ */
+const KNOWN_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
+    '--watch', '--agents-text', '--status', '--stop', '--help', '-h']);
+const FLAG_ALIAS = {
+    '--allow-write': '--write',
+    '--allow-exec': '--exec',
+    '--watch-agents': '--watch',
+    '--allow-transcript-text': '--agents-text',
+};
+for (const a of argv) {
+    if (!a.startsWith('-') || KNOWN_FLAGS.has(a)) continue;
+    const hint = FLAG_ALIAS[a] ? `（この起動口では ${FLAG_ALIAS[a]} です）` : '';
+    console.error(`\n✖ 知らないオプションです: ${a}${hint}`);
+    console.error(`  使えるもの: ${[...KNOWN_FLAGS].join(' ')}`);
+    console.error('  サーバに直接渡したいなら node v0/server.mjs を使ってください\n');
+    process.exit(1);
+}
+
 /** 動いている kjp-edit を探す（Windows 以外では PowerShell が無いので空を返す） */
 async function running() {
     if (process.platform !== 'win32') return [];
@@ -98,10 +127,13 @@ if (has('--status')) {
     const list = await running();
     if (!list.length) { console.log('動いている kjp-edit はありません'); process.exit(0); }
     for (const r of list) {
-        const repo = /--repo\s+(\S+)/.exec(r.cmd)?.[1] ?? '(cwd)';
+        const repo = repoOf(r.cmd) ?? '(cwd)';
         const caps = [r.cmd.includes('--allow-exec') && '実行', r.cmd.includes('--allow-write') && '書き込み']
             .filter(Boolean).join('+') || '読み取り専用';
-        console.log(`PID ${r.pid}  port ${r.port ?? '?'}  ${caps}  ${repo}`);
+        // 何が有効かを全部出す（観測フラグを落としていたのが #30）
+        const watch = r.cmd.includes('--allow-transcript-text') ? ' 活動観測+発話'
+            : r.cmd.includes('--watch-agents') ? ' 活動観測' : '';
+        console.log(`PID ${r.pid}  port ${r.port ?? '?'}  ${caps}${watch}  ${repo}`);
     }
     process.exit(0);
 }
@@ -127,12 +159,7 @@ try {
 }
 
 // ---- 既に動いていないか ----
-const already = (await running()).find(r => {
-    const m = /--repo\s+(\S+)/.exec(r.cmd);
-    if (!m) return false;
-    const a = m[1].replace(/\\/g, '/').toLowerCase();
-    return a === repo.replace(/\\/g, '/').toLowerCase();
-});
+const already = (await running()).find(r => samePathish(repoOf(r.cmd), repo));
 if (already) {
     console.log(`既に動いています → http://127.0.0.1:${already.port ?? '?'}`);
     console.log(`  PID ${already.pid}  repo ${repo}`);
@@ -155,7 +182,20 @@ if (await inUse(port)) {
         console.error(`\n✖ ${port} から 20 個先まで空きがありません\n`);
         process.exit(1);
     }
-    console.log(`⚠ ポート ${port} は使用中です（別のプロセス）。${found} を使います。`);
+    // ⚠️ **「別のプロセス」と断定しない。** 掴んでいるのが同じリポジトリを見る
+    //    自分自身のこともある（二重起動の判定が外れていた頃はまさにそれで、
+    //    「別のプロセス」という説明が事実と違っていた。#31）。
+    //    分かる範囲で正体を出し、分からないなら分からないと言う。
+    const holder = (await running()).find(r => r.port === port);
+    const who = holder
+        ? `PID ${holder.pid} の kjp-edit（repo ${repoOf(holder.cmd) ?? '不明'}）`
+        : '別のプロセス（正体は分かりません）';
+    console.log(`⚠ ポート ${port} は使用中です — ${who}。${found} を使います。`);
+    if (holder) {
+        console.log('  同じリポジトリを見ているなら2本目は不要です'
+            + '（watcher・キャッシュ・実行枠が二重になります）。');
+        console.log('  止めるには: node scripts/serve.mjs --stop');
+    }
     port = found;
 }
 
