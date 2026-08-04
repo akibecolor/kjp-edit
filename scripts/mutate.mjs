@@ -482,8 +482,64 @@ function runTest(m) {
         p.stdout.on('data', d => { out += d; });
         p.stderr.on('data', d => { out += d; });
         const t = setTimeout(() => p.kill('SIGKILL'), 300_000);
+        // 🚨 **'error' を必ず拾う。** ChildProcess の 'error' に listener が無いと
+        //    Node は uncaught exception として**プロセスを即死させる**。
+        //    そうなると下の finally が走らず、**書き換えたソースが復元されないまま
+        //    `*.mutate-bak` が残る**。実際に起き、その bak が `git add -A` で
+        //    コミットに混入した（Windows で多数プロセスを起動している最中の
+        //    一時的な spawn 失敗が引き金）。
+        p.on('error', err => {
+            clearTimeout(t);
+            resolve({ code: -1, out: `${out}\n[spawn 失敗] ${err.message}` });
+        });
         p.on('close', code => { clearTimeout(t); resolve({ code, out }); });
     });
+}
+
+/**
+ * 書き換えたソースを必ず戻すための最後の砦。
+ *
+ * ⚠️ `finally` は**throw には効くがプロセスの即死には効かない**。
+ *    シグナルと uncaught をここで拾って復元する。
+ */
+const pending = new Map();   // file -> bak
+function restoreAll(why) {
+    for (const [file, bak] of pending) {
+        try {
+            if (existsSync(bak)) { copyFileSync(bak, file); unlinkSync(bak); }
+            console.error(`⚠ ${why}: ${file} を復元しました`);
+        } catch (e) {
+            console.error(`✖ ${why}: ${file} を復元できません: ${e.message}`);
+            console.error(`   手で戻してください: copy ${bak} ${file}`);
+        }
+    }
+    pending.clear();
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => { restoreAll(`シグナル ${sig}`); process.exit(130); });
+}
+process.on('uncaughtException', e => {
+    restoreAll('uncaught');
+    console.error(e);
+    process.exit(1);
+});
+process.on('unhandledRejection', e => {
+    restoreAll('unhandledRejection');
+    console.error(e);
+    process.exit(1);
+});
+
+// 🚨 前回の実行が残した書き換えを引きずらない。
+//    残骸がある状態で走らせると、変異の上に変異を重ねることになる。
+{
+    const stale = [...new Set(MUTANTS.map(m => `${m.file}.mutate-bak`))].filter(existsSync);
+    if (stale.length) {
+        console.error('\n✖ 前回の実行が残した書き換えがあります:');
+        for (const b of stale) console.error(`    ${b} → ${b.replace(/\.mutate-bak$/, '')}`);
+        console.error('\n  ソースが変異したままの可能性があります。復元してから走らせてください:');
+        console.error('    git status / git diff で確認し、必要なら bak から戻す\n');
+        process.exit(1);
+    }
 }
 
 const results = [];
@@ -502,6 +558,7 @@ for (const m of targets) {
         }
         copyFileSync(m.file, bak);
         applied = true;
+        pending.set(m.file, bak);
         writeFileSync(m.file, src.replace(m.from, m.to), 'utf8');
         if (readFileSync(m.file, 'utf8').includes(m.gone)) {
             results.push({ m, status: 'SKIP', note: '書き換えが効いていない（gone の判定が甘い）' });
@@ -530,6 +587,7 @@ for (const m of targets) {
         });
     } finally {
         if (applied && existsSync(bak)) { copyFileSync(bak, m.file); unlinkSync(bak); }
+        pending.delete(m.file);
     }
 }
 
@@ -547,4 +605,14 @@ const d = results.filter(r => r.status === 'DEFENSIVE').length;
 const sk = results.filter(r => r.status === 'SKIP').length;
 console.log(`${k} 件が期待通り落ちた / ${d} 件は冗長な防御（想定内）/ ${sk} 件はスキップ`);
 if (bad) console.log('✖ = テストがその守りを検証できていない。テストを直すこと');
+// 🚨 終了時に残骸が無いことを確かめる。ここが残ると次回以降が汚染される。
+{
+    const left = [...new Set(MUTANTS.map(m => `${m.file}.mutate-bak`))].filter(existsSync);
+    if (left.length) {
+        console.error(`
+✖ 書き換えの控えが残っています: ${left.join(', ')}`);
+        console.error('  ソースが復元されていない可能性があります。git diff で確認してください。');
+        bad++;
+    }
+}
 process.exit(bad ? 1 : 0);

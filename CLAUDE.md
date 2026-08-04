@@ -42,6 +42,17 @@ node v0/layout-check.mjs         # 実ブラウザでレイアウトを測る（
   （どちらも `docs/review-write-exec.md`）。**落ちない検査は無意味**
 - **突然変異テスト用のスクリプトで `process.exit()` を `try` 内に書かない。**
   `finally` を飛ばして書き換えたソースが復元されず、修正を1行失った。`throw` にする
+- 🚨 **`finally` は throw には効くが、プロセスの即死には効かない。**
+  `spawn()` した子の `'error'` に listener を付けていなかったので、
+  一時的な spawn 失敗が **uncaught exception になってプロセスが即死**し、
+  書き換えたソースの控え（`*.mutate-bak`）が残った。しかもそれが
+  **`git add -A` でコミットに混入した**。守りは3段にする:
+  1. `child.on('error')` を必ず付ける（`close` だけでは足りない）
+  2. シグナルと `uncaughtException` / `unhandledRejection` で復元する
+  3. `*.mutate-bak` を `.gitignore` に入れ、**開始前に残骸があれば起動を拒否**し、
+     **終了時に残骸が無いことを確かめる**
+- 🚨 **`git add -A` の前に `git status` を読む。** 生成物や控えが混入する。
+  混入を防ぐのは `.gitignore`（意志ではなく仕組みで防ぐ）
 - 🚨 **変異の `pattern` は「テスト名」に含まれる文字列にする。**
   `--test-name-pattern` に外れたテストも `ℹ tests` には数えられて `skipped` になるので、
   **1件も走っていないのに「落ちなかった → SURVIVED」と誤報する。**

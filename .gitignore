@@ -31,3 +31,9 @@ yarn-error.log*
 # Local env
 .env
 .env.local
+
+# 🚨 突然変異テストがソースを書き換える前に取る控え。
+#    scripts/mutate.mjs が spawn の 'error' を拾っていなかった時期に
+#    プロセスが即死して finally が走らず、これが残ったまま
+#    `git add -A` でコミットに混入した。二度と入らないようにする。
+*.mutate-bak
