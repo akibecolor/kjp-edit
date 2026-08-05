@@ -203,9 +203,14 @@ git はこれを exit 0 で通しますが、続きの `rebase --continue` は
 ### 実行（既定オフ、書き込みとは別の capability）
 
 ```bash
-TOKEN=$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")
-node v0/server.mjs --allow-exec --token "$TOKEN"
+# 🚨 **--token-file を使うこと**（値をコマンド行に書かない）
+node v0/server.mjs --allow-exec --token-file ~/.kjp-edit/token-exec
 ```
+
+⚠️ **`--token <値>` でリテラルを打たないこと。** そのコマンド行は Claude Code の
+セッション記録に残り、`--allow-transcript-text` を付けると **read 権限で読める**
+（7回目のレビュー。`maskSecrets` で落とすようにしたが、完全な防御ではない）。
+`--token-file` なら値がコマンド行に出ない。
 
 `POST /api/v0/exec` に `{worktree, argv}` を送ると、出力が行区切り JSON で流れます
 （`{"t":"out"|"err","d":"..."}` … `{"t":"exit","code":0}`）。

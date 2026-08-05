@@ -1064,6 +1064,67 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/chatfilter.test.mjs',
     },
     {
+        // 🚨 7回目のレビュー: 下限が exec だけだったので `--token abc` が通った
+        name: 'token-min-length',
+        why: '読み取り/書き込みトークンに長さの下限を掛けない'
+            + '（--allow-host で唯一の壁になるのに、3文字なら総当たりで29回目に通った）',
+        file: 'v0/server.mjs',
+        from: 'if (opts.token !== null && opts.token.length < 24) {',
+        to: 'if (false) {',
+        gone: 'opts.token !== null && opts.token.length < 24',
+        pattern: '短いトークンでは起動しない',
+    },
+    {
+        name: 'auth-fail-audit',
+        why: '認証失敗を記録しない（当て放題かつ痕跡ゼロで総当たりできる）',
+        file: 'v0/server.mjs',
+        from: '        await noteAuthFail(req, url);',
+        to: '        /* 変異: 失敗を記録も遅延もしない */',
+        gone: 'await noteAuthFail(req, url)',
+        pattern: '認証失敗は記録され',
+    },
+    {
+        name: 'auth-fail-delay',
+        why: '連続失敗に遅延を掛けない（総当たりが 1500 req/s で通る。実測）',
+        file: 'v0/server.mjs',
+        from: "    if (!Number.isFinite(count) || count <= 3) return 0;\n"
+            + '    return Math.min(AUTH_FAIL_MAX_DELAY_MS, 2 ** (count - 3) * 50);',
+        to: '    return 0;   /* 変異: 遅延を掛けない */',
+        gone: '2 ** (count - 3) * 50',
+        pattern: '認証失敗は記録され',
+    },
+    {
+        // 🚨 7回目のレビュー: read 権限のコマンド行に実行トークンが載っていた
+        name: 'transcript-mask-secrets',
+        why: 'コマンド行の秘密をマスクしない（read 権限で実行トークンが読めて '
+            + 'read → RCE に昇格する。README が案内していた起動手順がまさにその形）',
+        file: 'v0/transcript.mjs',
+        from: '                    const masked = maskSecrets(input.command, secrets);',
+        to: '                    const masked = { text: input.command, masked: false };',
+        gone: 'maskSecrets(input.command, secrets)',
+        pattern: 'コマンド行から自分の資格情報を落とし',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-mask-announce',
+        why: 'マスクしたことを告知しない（黙って消すと「そう打っていない」と誤読される）',
+        file: 'v0/transcript.mjs',
+        from: '                    if (masked.masked) entry.commandMasked = true;',
+        to: '                    /* 変異: 落としたことを言わない */',
+        gone: 'entry.commandMasked = true',
+        pattern: 'コマンド行から自分の資格情報を落とし',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'server-passes-secrets',
+        why: 'サーバが自分の資格情報を渡さない（マスクの仕組みがあっても効かない）',
+        file: 'v0/server.mjs',
+        from: '                secrets: [opts.token, cookieSecret()].filter(Boolean),',
+        to: '                secrets: [],   /* 変異: 自分の秘密を渡さない */',
+        gone: 'secrets: [opts.token, cookieSecret()]',
+        pattern: 'コマンド行に載った実行トークンを read 権限で配らない',
+    },
+    {
         // 🚨 7回目のレビュー: 相対パスをデーモンの cwd で解決していた
         name: 'transcript-relative-cwd',
         why: '相対パスをデーモンの cwd で解決する'

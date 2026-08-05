@@ -570,7 +570,16 @@ async function collectFresh() {
     if (opts.watchAgents) {
         const r = await collectAgents(
             worktrees.filter(w => !w.bare && !w.prunable).map(w => ({ path: w.path, label: w.label })),
-            { allowText: opts.allowTranscriptText },
+            {
+                allowText: opts.allowTranscriptText,
+                // 🚨 **自分の資格情報をコマンド行から落とす。** `--allow-transcript-text` は
+                //    記録の `Bash` / `PowerShell` のコマンド行を **read 権限で**出す。
+                //    README が案内していた起動手順は `--allow-exec --token "$TOKEN"` で、
+                //    値をリテラルで打った回は記録に残る（実データで 42 件）。
+                //    そのままだと Cookie しか持たない読み取り専用の相手が実行トークンを
+                //    回収でき、**read が RCE に昇格する**（7回目のレビュー）。
+                secrets: [opts.token, cookieSecret()].filter(Boolean),
+            },
         );
         agents = r.agents;
         errors.push(...r.errors);
@@ -846,6 +855,53 @@ function tokenMatches(given) {
     return timingSafeEqual(a, b);
 }
 
+/**
+ * 🚨 **認証失敗を記録し、連続失敗に遅延を掛ける（7回目のレビュー）。**
+ *
+ * `--allow-host` を付けた瞬間、トンネルに届く相手に対する**唯一の壁がトークン**
+ * になる。にもかかわらず 401 はどこにも記録されず（監査は exec の start/exit だけ）、
+ * 遅延も回数制限も無かったので、**当て放題かつ痕跡ゼロで総当たり**できた
+ * （実測: 3文字のトークンなら29回目に 200。17,576 回外しても一切絞られない）。
+ * 当たれば読み取り全部と `POST /api/v0/checkout` が通る。
+ *
+ * ⚠️ **本文は残さない**（トークンの候補を記録に書かない）。残すのは
+ *    peer / host / path と連続失敗の回数だけ。
+ * ⚠️ 遅延は**指数**にするが上限を付ける（無限に伸ばすとイベントループに
+ *    タイマーが溜まり、正規の利用者も締め出す）。
+ */
+const authFails = new Map();   // peer -> { count, firstAt }
+const AUTH_FAIL_WINDOW_MS = 5 * 60 * 1000;
+const AUTH_FAIL_MAX_DELAY_MS = 2000;
+
+/** 連続失敗から遅延（ms）を決める。純関数なのでテストで固定できる */
+export function authFailDelay(count) {
+    if (!Number.isFinite(count) || count <= 3) return 0;
+    return Math.min(AUTH_FAIL_MAX_DELAY_MS, 2 ** (count - 3) * 50);
+}
+
+async function noteAuthFail(req, url) {
+    const peer = req.socket.remoteAddress ?? '(不明)';
+    const now = Date.now();
+    const cur = authFails.get(peer);
+    const rec = (cur && now - cur.firstAt < AUTH_FAIL_WINDOW_MS)
+        ? { count: cur.count + 1, firstAt: cur.firstAt }
+        : { count: 1, firstAt: now };
+    authFails.set(peer, rec);
+    // 台帳が無限に増えないよう古いものを落とす
+    if (authFails.size > 256) {
+        for (const [k, v] of authFails) {
+            if (now - v.firstAt >= AUTH_FAIL_WINDOW_MS) authFails.delete(k);
+        }
+    }
+    // 🔒 **本文は残さない。** 誰が何回外したかだけ
+    await auditExec({
+        event: 'auth-failed', peer, host: req.headers.host ?? null,
+        path: url.pathname, count: rec.count,
+    }).catch(() => { /* 監査に書けなくても応答は返す */ });
+    const delay = authFailDelay(rec.count);
+    if (delay > 0) await new Promise(r => setTimeout(r, delay));
+    return rec.count;
+}
 /**
  * その要求が認証済みか。`--require-auth` が無いときは常に true
  * （ループバック限定の従来の使い方を壊さないため）。
@@ -1277,6 +1333,9 @@ async function handleRequest(req, res) {
     // 🔒 読み取りの認証も**入口で**判定する。個別のハンドラに任せない。
     //    ここを通らない経路を作らないことが、後から穴を1つ忘れないための唯一の方法。
     if (!authed(req, url)) {
+        // 🚨 **失敗を記録して、連続失敗には遅延を掛ける。** ここが無いと
+        //    痕跡ゼロで総当たりできる（実測で29回目に通った）。
+        await noteAuthFail(req, url);
         // ⚠️ 「トークンが違う」と「トークンが無い」を区別して返さない
         //    （総当たりに手掛かりを与えない）。
         res.writeHead(401, {
@@ -1982,6 +2041,24 @@ if (opts.requireAuth === false && opts.allowHosts.size > 0) {
 //    明示的に決めたか**（それが「有効化を必ず意識的な操作にする」という趣旨）。
 //    ⚠️ **明示だけでは足りない。長さの下限も残す**（`--token short` を通してしまった）。
 //       「明示的に決めたこと」と「推測されない長さ」は別の要求。
+// 🚨 **長さの下限は capability を問わず掛ける（7回目のレビュー）。**
+//    以前は下限が `--allow-exec` のときだけだったので、`--token abc` がそのまま通った。
+//    `--allow-host` を付けた瞬間、トンネルに届く相手に対する**唯一の壁がこのトークン**
+//    なのに、`aaa,aab,…` の総当たりで**29回目に 200** が返った（実測）。
+//    当たれば読み取り全部と `POST /api/v0/checkout` が通る
+//    （post-checkout フックがあるリポジトリでは実質コード実行）。
+//    ⚠️ 正規の経路（`scripts/serve.mjs`）は必ず `--token-file` を渡すので
+//    短いトークンは作れないが、手打ちの `node v0/server.mjs --token <短い>` で露出する。
+//    **意志ではなく仕組みで防ぐ。**
+if (opts.token !== null && opts.token.length < 24) {
+    console.error(`\n✖ --token は 24 文字以上にしてください（受け取った長さ: ${opts.token.length}）。`);
+    console.error('  トンネルに出すとこのトークンが唯一の壁になります');
+    console.error('  （実測: 3文字なら総当たりで29回目に通った）。\n');
+    console.error('  生成例:');
+    console.error('      node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"\n');
+    process.exit(1);
+}
+
 if (opts.allowExec && (!opts.tokenExplicit || !opts.token || opts.token.length < 24)) {
     console.error('\n✖ --allow-exec には --token（24 文字以上）か --token-file が必要です。');
     console.error('  実行を遠隔から引けるようにするので、トークンは明示的に決めてください');

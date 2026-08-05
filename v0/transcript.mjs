@@ -170,6 +170,51 @@ function isAbsolutePath(p) {
     return /^[A-Za-z]:[\\\\/]/.test(p);
 }
 
+/**
+ * 🚨 **コマンド行に載った秘密をマスクする（7回目のレビュー）。**
+ *
+ * 読み取りと実行を分けた根拠は「Cookie は他のローカルポートに漏れるが、
+ * 漏れても読み取りまで」だった。ところが `--allow-transcript-text` を付けると、
+ * 記録された `Bash` / `PowerShell` のコマンド行が `/api/v0/state` に丸ごと出る。
+ * README が案内していた起動手順は `--allow-exec --token "$TOKEN"` で、
+ * **値をリテラルで打った回は記録に残る**（実データで `--token` リテラル 42 件を確認）。
+ * つまり Cookie しか持たない読み取り専用の相手（他ポートのページ / トンネルの
+ * 閲覧者）が実行トークンを回収でき、**read が RCE に昇格する**。
+ *
+ * ⚠️ **完全な防御ではない**（秘密の形は無限にある）。ここで落とすのは
+ *    (a) **このデーモン自身の資格情報**（値が分かっているので確実に落とせる）と
+ *    (b) `--token` / `--password` 等の**直後の語**。
+ *    **落としたことは必ず告知する**（黙って消すと「そう打っていない」と誤読される）。
+ * @param {string} text コマンド行
+ * @param {string[]} secrets 値が分かっている秘密（token / cookie の導出値）
+ * @returns {{text: string, masked: boolean}}
+ */
+const SECRET_KEYS = "token|password|passwd|secret|api[-_]?key|authorization|bearer";
+export function maskSecrets(text, secrets = []) {
+    if (typeof text !== "string" || !text) return { text, masked: false };
+    let out = text;
+    let masked = false;
+    // (a) 値が分かっているものは確実に落とす（短すぎる値は誤爆するので見ない）
+    for (const v of secrets) {
+        if (typeof v !== "string" || v.length < 8) continue;
+        while (out.includes(v)) {
+            out = out.replace(v, "(マスクしました)");
+            masked = true;
+        }
+    }
+    // (b) 秘密を渡す形の**直後の語**を落とす（`--token=X` と `--token X` の両方、
+    //     `x-kjp-token: X` のようなヘッダ形も）
+    const forms = [
+        new RegExp("(--?(?:" + SECRET_KEYS + ")=)([^ ]+)", "gi"),
+        new RegExp("(--?(?:" + SECRET_KEYS + ")[ ]+)([^ ]+)", "gi"),
+        new RegExp("((?:" + SECRET_KEYS + ")['\"]?[:=][ ]*)([^ '\"]+)", "gi"),
+    ];
+    for (const re of forms) {
+        out = out.replace(re, (m, head) => { masked = true; return head + "(マスクしました)"; });
+    }
+    return { text: out, masked };
+}
+
 // ---------------------------------------------------------------------------
 // 要約（純関数。fs を触らないので単体でテストできる）
 // ---------------------------------------------------------------------------
@@ -183,7 +228,12 @@ function isAbsolutePath(p) {
  * @param {boolean} [o.allowText] 自由文（発話・コマンド行）を出すか
  * @param {number} [o.now] 現在時刻（ms）。テストで固定するために注入できる
  */
-export function summarize(lines, { worktreePath, allowText = false, now = Date.now(), limits = LIMITS } = {}) {
+export function summarize(lines, {
+    worktreePath, allowText = false, now = Date.now(), limits = LIMITS,
+    // 🔒 値が分かっている秘密（このデーモンの token / cookie の導出値）。
+    //    コマンド行に載っていたら落とす（read が RCE に昇格する経路を塞ぐ）
+    secrets = [],
+} = {}) {
     const out = {
         session: null,
         lastActivityAt: null,
@@ -274,7 +324,12 @@ export function summarize(lines, { worktreePath, allowText = false, now = Date.n
                 };
                 // T2: コマンド行は自由文。既定では出さない
                 if (allowText && COMMAND_TOOLS.has(name)) {
-                    entry.command = clip(input.command, limits.commandChars);
+                    // 🚨 **秘密を落としてから切り詰める。** コマンド行は read 権限で
+                    //    出るので、実行トークンが載っていると read → RCE に昇格する
+                    const masked = maskSecrets(input.command, secrets);
+                    entry.command = clip(masked.text, limits.commandChars);
+                    // 落としたことは必ず告知する（黙って消すと「そう打っていない」と読める）
+                    if (masked.masked) entry.commandMasked = true;
                 }
                 out.recent.push(entry);
                 continue;
@@ -473,6 +528,8 @@ export function transcriptRoot() {
  */
 export async function collectAgents(worktrees, {
     root = transcriptRoot(), allowText = false, now = Date.now(), limits = LIMITS,
+    // 🔒 コマンド行から落とす秘密（サーバが自分の token / cookie 導出値を渡す）
+    secrets = [],
     // ⚠️ **検査専用の継ぎ目**（既定は素の stat）。1ファイルの stat 失敗で
     //    プロジェクト丸ごとを捨てていた形を測るために要る。移植可能に
     //    「stat が投げるファイル」を作る手段が無い（symlink は Windows で EPERM、
@@ -574,7 +631,7 @@ export async function collectAgents(worktrees, {
         try {
             tail = await readTailAdaptive(newest.path,
                 { start: limits.tailBytes, max: limits.tailMaxBytes });
-            s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits });
+            s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits, secrets });
             // 🚨 **窓が全部「知らない種別」でも「記録なし」と言わない。**
             //    実データには許可リスト外の type が 304KB 連続する箇所があり、
             //    既定の窓（256KB）を超える。完全な行は取れているので #27 の救済に
@@ -590,7 +647,7 @@ export async function collectAgents(worktrees, {
                 wider.bytesWanted = tail.bytesWanted;
                 wider.grew = tail.grew;
                 tail = wider;
-                s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits });
+                s = summarize(tail.lines, { worktreePath: owner.path, allowText, now, limits, secrets });
             }
         } catch { continue; }
         s.bytesRead = tail.bytes;

@@ -705,6 +705,187 @@ test('衝突予測: 実際に衝突するペアを検出する', async () => {
  * CLAUDE.md が「`-z` の多トークン」を再発トップの罠として挙げている当のコードで、
  * **`git mv` がテストに1回も出てこなかった**（7回目のレビュー。grep で0件）。
  */
+/**
+ * 🚨 **read 権限のコマンド行から実行トークンを回収できないこと（7回目のレビュー）。**
+ *
+ * 読み取りと実行を分けた根拠は「Cookie は他ポートに漏れるが、漏れても読み取りまで」。
+ * ところが `--allow-transcript-text` は記録の `Bash` のコマンド行を丸ごと出す。
+ * README が案内していた起動手順は `--allow-exec --token "$TOKEN"` なので、
+ * **値をリテラルで打った回は記録に残る**（実データで 42 件）。
+ * つまり Cookie しか持たない相手が実行トークンを回収でき、read が RCE に昇格する。
+ */
+/**
+ * 🚨 **認証失敗を記録し、連続失敗には遅延を掛ける（7回目のレビュー）。**
+ *
+ * `--allow-host` を付けた瞬間、トンネルに届く相手に対する**唯一の壁がトークン**
+ * になる。にもかかわらず 401 はどこにも記録されず、遅延も回数制限も無かったので
+ * **当て放題かつ痕跡ゼロで総当たり**できた（実測: 3文字なら29回目に 200、
+ * 17,576 回外しても絞られない）。当たれば読み取り全部と checkout が通る。
+ *
+ * ⚠️ 試された値そのものは記録しない（トークンの候補を記録に書かない）。
+ */
+/**
+ * 🚨 **トークンの長さの下限は capability を問わず掛ける（7回目のレビュー）。**
+ *
+ * 以前は下限が `--allow-exec` のときだけだったので `--token abc` が通った。
+ * `--allow-host` を付けるとトンネルに届く相手に対する**唯一の壁**がこれになる
+ * （実測: 3文字なら総当たりで29回目に 200 が返った）。
+ */
+test('🔒 短いトークンでは起動しない（capability を問わず）', async () => {
+    const cases = [
+        [['--token', 'abc'], '読み取りだけ'],
+        [['--token', 'abc', '--allow-host', 'x.example'], 'トンネル'],
+        [['--token', 'abc', '--allow-write'], '書き込み'],
+        [['--token', 'a'.repeat(23)], '23 文字（境界の1つ手前）'],
+    ];
+    for (const [extra, label] of cases) {
+        const child = spawn(process.execPath,
+            [SERVER, '--repo', repo, '--port', '0', ...extra],
+            { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+        child.stderr.setEncoding('utf8');
+        let err = '';
+        child.stderr.on('data', d => { err += d; });
+        // ⚠️ 拒否されないとサーバは listen し続けるので素の await にしない
+        const code = await Promise.race([
+            new Promise(r => child.on('close', r)),
+            new Promise(r => setTimeout(() => r('running'), 15000)),
+        ]);
+        child.kill();
+        assert.equal(code, 1, `起動してしまった（${label}）`);
+        assert.match(err, /24 文字以上/, label);
+    }
+    // 24 文字なら通る（門が全部を拒否していないこと）
+    const okChild = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--token', 'a'.repeat(24)],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    okChild.stdout.setEncoding('utf8');
+    try {
+        const started = await Promise.race([
+            new Promise(r => {
+                let buf = '';
+                okChild.stdout.on('data', d => {
+                    buf += d;
+                    if (/http:[/][/]127[.]0[.]0[.]1:[0-9]+/.test(buf)) r(true);
+                });
+            }),
+            new Promise(r => setTimeout(() => r(false), 15000)),
+        ]);
+        assert.ok(started, '24 文字のトークンで起動しない');
+    } finally { okChild.kill(); }
+});
+test('🔒 認証失敗は記録され、連続失敗は遅くなる（本文は残さない）', async () => {
+    const audit = join(repo, '..', `auth-audit-${Date.now()}.jsonl`);
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--require-auth',
+            '--token', EXEC_TOKEN, '--audit-log', audit],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    try {
+        const url = await new Promise((res, rej) => {
+            const t2 = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:[/][/]127[.]0[.]0[.]1:\d+/);
+                if (m) { clearTimeout(t2); res(m[0]); }
+            });
+            child.on('error', rej);
+        });
+
+        // 8回外す。遅延は 4 回目から伸びる（0,0,0,50,100,200,400,800 = 1550ms）
+        const t0 = Date.now();
+        for (let i = 0; i < 8; i++) {
+            const r = await fetch(`${url}/api/v0/state`,
+                { headers: { 'x-kjp-token': `wrong-value-${i}` } });
+            assert.equal(r.status, 401, `${i} 回目が 401 でない`);
+            await r.text();
+        }
+        const ms = Date.now() - t0;
+        assert.ok(ms > 300,
+            `連続失敗が遅くなっていない（${ms}ms）。痕跡ゼロで総当たりできる`);
+
+        // 正規のトークンは通る（遅延で締め出していない）
+        const ok = await fetch(`${url}/api/v0/state`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } });
+        assert.equal(ok.status, 200, '正しいトークンが通らない');
+        await ok.text();
+
+        // 監査に残っていること（誰が何回外したか）
+        await new Promise(r => setTimeout(r, 300));
+        const { readFile: rf } = await import('node:fs/promises');
+        const lines = (await rf(audit, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const fails = lines.filter(e => e.event === 'auth-failed');
+        assert.ok(fails.length >= 8, `失敗が記録されていない: ${fails.length} 件`);
+        assert.equal(typeof fails[0].peer, 'string');
+        assert.equal(fails[0].path, '/api/v0/state');
+        // 🔒 **試された値は記録しない**（トークンの候補を記録に書かない）
+        assert.ok(!JSON.stringify(lines).includes('wrong-value-'),
+            '試されたトークンの値が監査に入っている');
+    } finally {
+        child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+test('🔒 コマンド行に載った実行トークンを read 権限で配らない', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'kjp-mask-home-'));
+    // 記録を仕込む（サーバは ~/.claude/projects を読むので HOME を差し替える）
+    const projDir = join(home, '.claude', 'projects', 'proj');
+    await mkdir(projDir, { recursive: true });
+    const rec = JSON.stringify({
+        type: 'assistant', timestamp: new Date().toISOString(), cwd: repo, sessionId: 'sx',
+        message: { content: [{ type: 'tool_use', name: 'Bash',
+            input: { command: `node v0/server.mjs --allow-exec --token ${EXEC_TOKEN}` } }] },
+    });
+    // 🚨 **値でしか落とせない形も入れる。** 形（--token X）だけを見ていると、
+    //    トークンが裸で出る行（echo / パイプ / 変数展開の跡）が素通りする。
+    //    ここが「サーバが自分の資格情報を渡す」ことの唯一の検査になる。
+    const bare = JSON.stringify({
+        type: 'assistant', timestamp: new Date().toISOString(), cwd: repo, sessionId: 'sx',
+        message: { content: [{ type: 'tool_use', name: 'Bash',
+            input: { command: `echo ${EXEC_TOKEN} | tee /dev/null` } }] },
+    });
+    await writeFile(join(projDir, 'sx.jsonl'), rec + '\n' + bare + '\n', 'utf8');
+
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec', '--token', EXEC_TOKEN,
+            '--watch-agents', '--allow-transcript-text'],
+        { shell: false, windowsHide: true,
+            env: { ...process.env, ...isolatedConfig(), USERPROFILE: home, HOME: home } });
+    child.stdout.setEncoding('utf8');
+    try {
+        const url = await new Promise((res, rej) => {
+            const t2 = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:[/][/]127[.]0[.]0[.]1:\d+/);
+                if (m) { clearTimeout(t2); res(m[0]); }
+            });
+            child.on('error', rej);
+        });
+
+        const r = await fetch(`${url}/api/v0/state?fresh=1`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } });
+        assert.equal(r.status, 200);
+        const body = await r.text();
+        // 🚨 本題: 実行トークンが payload に出ていないこと
+        assert.ok(!body.includes(EXEC_TOKEN),
+            'コマンド行から実行トークンが読める（read が RCE に昇格する）');
+        // ただし観測はできている（記録を読んでいることの確認。読めていないと検査にならない）
+        const st = JSON.parse(body);
+        const withCmd = (st.agents ?? []).flatMap(a => a.recent ?? [])
+            .filter(x => typeof x.command === 'string');
+        assert.ok(withCmd.length >= 1,
+            `コマンド行が1件も読めていない（検査になっていない）: ${JSON.stringify(st.agents)}`);
+        assert.ok(withCmd.some(x => /マスクしました/.test(x.command)),
+            `マスクの痕跡が無い: ${JSON.stringify(withCmd)}`);
+        assert.ok(withCmd.some(x => x.commandMasked === true),
+            '落としたことを payload で伝えていない');
+    } finally {
+        child.kill();
+        await rm(home, { recursive: true, force: true }).catch(() => {});
+    }
+});
 test('🚨 rename（R の3トークン）で後続のファイルがずれない', async () => {
     const stem = repo.split(/[\\/]/).pop();
     const wt = join(repo, '..', `${stem}-ren`);

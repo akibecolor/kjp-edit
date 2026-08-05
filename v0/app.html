@@ -1107,7 +1107,11 @@ function renderAgents(s) {
       //    （デーモンの cwd で解決すると別のファイルの名前を出す）
       if (r.pathUnresolved) line.append(el('span', 'note', ' (相対パスの基準が不明)'));
       if (r.sidechain) line.append(el('span', 'note', ' (サブ)'));
-      if (r.command) line.append(el('div', 'note', `$ ${r.command}`));
+      // 🚨 マスクしたことを言う（黙って消すと「そう打っていない」と誤読される）
+      if (r.command) {
+        line.append(el('div', 'note',
+          `$ ${r.command}${r.commandMasked ? '   ← 秘密を落としました' : ''}`));
+      }
       d.append(line);
     }
     for (const t of a.text ?? []) {

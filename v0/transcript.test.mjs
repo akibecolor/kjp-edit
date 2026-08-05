@@ -11,7 +11,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { summarize, repoRelative, readTail, collectAgents, LIMITS } from './transcript.mjs';
+import {
+    summarize, repoRelative, readTail, collectAgents, LIMITS, maskSecrets,
+} from './transcript.mjs';
 import { relativeInside } from './git.mjs';
 
 const SECRET = 'INJECT-SECRET-12345';
@@ -757,5 +759,53 @@ test('🚨 1ファイルが読めなくてもプロジェクトを捨てない�
     } finally {
         await rm(root, { recursive: true, force: true });
         await rm(wtRoot, { recursive: true, force: true });
+    }
+});
+
+/**
+ * 🚨 **コマンド行に載った実行トークンを read 権限で配らない（7回目のレビュー）。**
+ *
+ * 読み取りと実行を分けた根拠は「Cookie は他ポートに漏れるが、漏れても読み取りまで」。
+ * ところが `--allow-transcript-text` は記録の `Bash` のコマンド行を丸ごと出す。
+ * README が案内していた起動手順は `--allow-exec --token "$TOKEN"` で、
+ * **値をリテラルで打った回は記録に残る**（実データで 42 件）。
+ * つまり Cookie しか持たない相手が実行トークンを回収でき、**read が RCE に昇格する**。
+ */
+test('🔒 コマンド行から自分の資格情報を落とし、落としたことを言う', () => {
+    const TOK = 'S3CR3T-exec-token-abcdefghijklmnop';
+    const lines = [JSON.stringify({
+        type: 'assistant', timestamp: ago(500), cwd: WT, sessionId: 's',
+        message: { content: [{ type: 'tool_use', name: 'Bash',
+            input: { command: `node v0/server.mjs --allow-exec --token ${TOK}` } }] },
+    })];
+    const s = summarize(lines, {
+        worktreePath: WT, now: NOW, allowText: true, secrets: [TOK],
+    });
+    const json = JSON.stringify(s);
+    assert.ok(!json.includes(TOK), `実行トークンがコマンド行から漏れている:\n${json}`);
+    assert.match(s.recent[0].command, /マスクしました/, 'マスクの痕跡が無い');
+    assert.equal(s.recent[0].commandMasked, true, '落としたことを伝えていない');
+    // コマンド行そのものは残る（観測の役には立つ）
+    assert.match(s.recent[0].command, /--allow-exec/);
+});
+
+test('🔒 秘密を渡す形は値が分からなくても落とす（--token / ヘッダ / 環境変数）', () => {
+    const forms = [
+        'node v0/server.mjs --token abcdefghijklmnop',
+        'node v0/server.mjs --token=abcdefghijklmnop',
+        'curl -H "x-kjp-token: abcdefghijklmnop" http://127.0.0.1:7749/',
+        'API_KEY=abcdefghijklmnop npm run deploy',
+        'psql --password abcdefghijklmnop',
+    ];
+    for (const command of forms) {
+        const r = maskSecrets(command, []);   // 値は渡さない
+        assert.equal(r.masked, true, `落としていない: ${command}`);
+        assert.ok(!r.text.includes('abcdefghijklmnop'), `値が残っている: ${r.text}`);
+    }
+    // 普通のコマンドは素通し（過剰にマスクしない）
+    for (const command of ['npm test', 'git status --short', 'node --version']) {
+        const r = maskSecrets(command, []);
+        assert.equal(r.masked, false, `過剰にマスクしている: ${command} → ${r.text}`);
+        assert.equal(r.text, command);
     }
 });
