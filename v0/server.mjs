@@ -1740,6 +1740,166 @@ async function handleRequest(req, res) {
 
         // 🔒 checkout。**このツールの主張そのもの**なので、git が exit 0 で通してしまう
         //    危険な checkout を明示的に拒否する。
+        /**
+         * 🔒 **取り込み（merge）。`--allow-write` が必要。**
+         *
+         * なぜ足したか: このツールが唯一持っている「衝突予測」と「取り込み順序の提案」が
+         * **提案だけで実行できなかった**。実行するには `--allow-exec`（任意コマンド =
+         * 遠隔コード実行）を開けるか、端末に戻るしかなかった。
+         *
+         * 🚨 **任意コード実行を増やさないための設計:**
+         *   1. **衝突すると予測されたものは実行しない。** `merge-tree` で先に試して
+         *      clean でなければ拒否する（作業ツリーを衝突状態にしない）。
+         *      「判定できない」（submodule / 大きすぎる差分）も拒否する
+         *   2. **カスタム merge driver があるリポジトリでは実行しない。**
+         *      driver は `.gitattributes` + config で任意コマンドを起動する
+         *      （衝突予測では `merge.<name>.driver=false` で潰しているが、
+         *       本番の merge では潰すと結果が変わるので、実行そのものを断る）
+         *   3. **hooks を通さない**（`core.hooksPath` を空のディレクトリに向ける）。
+         *      `post-merge` / `prepare-commit-msg` / `commit-msg` はリポジトリ設定の
+         *      コードなので、HTTP から起動できる状態にしない
+         *   4. 作業ツリーが dirty なら拒否（未コミットの変更を巻き込まない）
+         *   5. シーケンサ停止中は拒否（checkout と同じ理由）
+         *
+         * ⚠️ つまり**画面からできるのは「安全と分かっている取り込み」だけ**。
+         *    それ以外は端末でやる、という線を引いている。
+         */
+        if (url.pathname === '/api/v0/merge') {
+            if (!requireMutation(req, res)) return;
+            let body;
+            try {
+                body = await readJson(req);
+            } catch (err) {
+                denyJson(res, err.tooLarge ? 413 : 400, err.message);
+                return;
+            }
+            const branch = String(body.branch ?? '');
+            // 🚨 checkout と同じ理由で isSafeRef を通す（オプション注入 / reflog）
+            if (!isSafeRef(branch)) { denyJson(res, 400, `ref が不正です: ${branch}`); return; }
+            const wantPath = toNFC(String(body.worktree ?? ''));
+
+            const worktrees = await listWorktrees(opts.repo);
+            const wt = worktrees.find(w => samePath(w.path, wantPath));
+            if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
+            if (wt.bare) { denyJson(res, 400, 'bare worktree では取り込めません'); return; }
+            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
+
+            const refs = await refMap(opts.repo);
+            if (!resolveRef(refs, branch)) {
+                denyJson(res, 400, `解決できない ref です: ${branch}`);
+                return;
+            }
+            // 自分自身を取り込もうとしたら止める（git は「既に最新」だが意図が壊れている）
+            if (wt.shortBranch && wt.shortBranch === branch) {
+                denyJson(res, 400, `${branch} は今この worktree が居るブランチです`);
+                return;
+            }
+
+            // 5. シーケンサ停止中は拒否（checkout と同じ）
+            const seq = await sequencerState(wt.path).catch(() => ({}));
+            const blockers = [
+                [seq.rebasing, 'rebase 進行中'],
+                [seq.merging, 'マージ未コミット（MERGE_HEAD あり）'],
+                [seq.cherryPicking, 'cherry-pick 進行中'],
+                [seq.reverting, 'revert 進行中'],
+                [seq.bisecting, 'bisect 進行中'],
+                [seq.sequencing, 'sequencer に未処理の操作が残っている'],
+            ].filter(([f]) => f).map(([, label]) => label);
+            if (blockers.length) {
+                denyJson(res, 409,
+                    `${blockers.join(' / ')} のため取り込みを拒否しました。`
+                    + ' 先に --continue / --abort で決着させてください');
+                return;
+            }
+
+            // 4. dirty なら拒否（未コミットの変更を巻き込まない）
+            const st = await worktreeStatus(wt.path).catch(() => null);
+            if (st === null) {
+                denyJson(res, 409, '作業ツリーの状態を確認できませんでした（取り込みません）');
+                return;
+            }
+            if (st.changed > 0 || st.unmerged > 0) {
+                denyJson(res, 409,
+                    `未コミットの変更が ${st.changed} 件あります（未マージ ${st.unmerged} 件）。`
+                    + ' 巻き込まないよう取り込みを拒否しました。先にコミットか stash してください');
+                return;
+            }
+
+            // 2. カスタム merge driver があるなら実行しない（任意コマンドが走る）
+            const drivers = await mergeDriverNames(wt.path);
+            if (drivers.length) {
+                denyJson(res, 409,
+                    `カスタム merge driver が設定されています（${drivers.join(', ')}）。`
+                    + ' driver はリポジトリ設定の任意コマンドを起動するので、'
+                    + '画面からの取り込みは行いません。端末で実行してください');
+                return;
+            }
+
+            // 1. 衝突すると予測されたら実行しない（作業ツリーを衝突状態にしない）
+            const from = wt.shortBranch ?? wt.head ?? 'HEAD';
+            let pre;
+            try {
+                pre = await mergePreview(wt.path, from, branch, drivers);
+            } catch (err) {
+                denyJson(res, 409, `衝突の予測に失敗したので取り込みません: ${err.message}`);
+                return;
+            }
+            if (pre.clean !== true) {
+                const why = pre.clean === null
+                    ? (pre.reason ?? '判定できませんでした（submodule か、差分が大きすぎます）')
+                    : `衝突します: ${(pre.conflicts ?? []).slice(0, 5).join(', ')}`;
+                denyJson(res, 409,
+                    `${why}。画面からは「衝突しないと分かっている取り込み」だけ行います。`
+                    + ' 端末で git merge して解決してください');
+                return;
+            }
+
+            // 3. hooks を通さない（リポジトリ設定のコードを HTTP から起動させない）
+            const { mkdtemp } = await import('node:fs/promises');
+            const { tmpdir } = await import('node:os');
+            const emptyHooks = await mkdtemp(join(tmpdir(), 'kjp-nohooks-'));
+            await auditExec({
+                event: 'merge', worktree: wt.path, from, branch,
+                peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
+            });
+            try {
+                await git([
+                    '-c', `core.hooksPath=${emptyHooks}`,
+                    'merge', '--no-edit', '--end-of-options', branch,
+                ], { cwd: wt.path, optionalLocks: true });
+            } catch (err) {
+                await auditExec({
+                    event: 'merge-failed', worktree: wt.path, from, branch, error: err.message,
+                });
+                denyJson(res, 409, `git が取り込みを拒否しました: ${err.message}`);
+                return;
+            } finally {
+                const { rm } = await import('node:fs/promises');
+                await rm(emptyHooks, { recursive: true, force: true }).catch(() => {});
+            }
+            cached = null;   // 状態が変わったのでキャッシュを捨てる
+            // 🚨 **取り込んだ後の状態を数え直してから返す**（「取り込みました」を
+            //    確かめずに言わない）。衝突状態になっていないことも見る
+            const seqAfter = await sequencerState(wt.path).catch(() => ({}));
+            const after = (await listWorktrees(opts.repo)).find(w => samePath(w.path, wantPath));
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                ok: true,
+                worktree: wt.path,
+                branch,
+                head: after?.head ?? null,
+                shortBranch: after?.shortBranch ?? null,
+                // 予測が clean だったのに衝突状態になったら、それは**予測が外れた**という事実
+                conflicted: seqAfter.merging === true,
+                warning: seqAfter.merging === true
+                    ? '⚠ 衝突しないと予測したのに衝突状態になりました。端末で確認してください'
+                    : null,
+            }));
+            return;
+        }
         if (url.pathname === '/api/v0/checkout') {
             if (!requireMutation(req, res)) return;
             let body;

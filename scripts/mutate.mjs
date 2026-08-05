@@ -1325,6 +1325,58 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/paths.test.mjs',
     },
     {
+        // 🚨 取り込み（merge）は「衝突しないと分かっているもの」だけ実行する
+        name: 'merge-predicted-clean',
+        why: '衝突すると予測されたものも取り込む'
+            + '（作業ツリーが衝突状態になり、UI が「取り込みました」と言う）',
+        file: 'v0/server.mjs',
+        from: '            if (pre.clean !== true) {',
+        to: '            if (false) {',
+        gone: 'if (pre.clean !== true)',
+        pattern: '衝突しないものは取り込め、衝突するものは拒否する',
+    },
+    {
+        name: 'merge-driver-refused',
+        why: 'カスタム merge driver があるリポジトリでも取り込む'
+            + '（driver はリポジトリ設定の任意コマンドを起動する = 読み書きの capability で RCE）',
+        file: 'v0/server.mjs',
+        // ⚠️ `if (drivers.length) {` は衝突予測側にもある（499行）。**一意にする**
+        from: '            const drivers = await mergeDriverNames(wt.path);\n'
+            + '            if (drivers.length) {',
+        to: '            const drivers = await mergeDriverNames(wt.path);\n'
+            + '            if (false) {',
+        gone: 'await mergeDriverNames(wt.path);\n            if (drivers.length)',
+        pattern: 'カスタム merge driver があるリポジトリでは実行しない',
+    },
+    {
+        name: 'merge-dirty-refused',
+        why: 'dirty な作業ツリーでも取り込む（未コミットの変更を巻き込む）',
+        file: 'v0/server.mjs',
+        from: '            if (st.changed > 0 || st.unmerged > 0) {',
+        to: '            if (false) {',
+        gone: 'st.changed > 0 || st.unmerged > 0',
+        pattern: '衝突しないものは取り込め、衝突するものは拒否する',
+    },
+    {
+        name: 'merge-no-hooks',
+        why: 'merge で hooks を通す（post-merge / commit-msg はリポジトリ設定のコードなので、'
+            + 'HTTP から任意コード実行になる）',
+        file: 'v0/server.mjs',
+        from: "                    '-c', `core.hooksPath=${emptyHooks}`,",
+        to: '                    /* 変異: hooks を通す */',
+        gone: 'core.hooksPath=${emptyHooks}',
+        pattern: 'merge が hooks を実行しない',
+    },
+    {
+        name: 'merge-ref-validation',
+        why: 'merge の ref を検証しない（`--force` 等のオプション注入と reflog 経由）',
+        file: 'v0/server.mjs',
+        from: '            if (!isSafeRef(branch)) { denyJson(res, 400, `ref が不正です: ${branch}`); return; }',
+        to: '            /* 変異: ref を検証しない */',
+        gone: 'if (!isSafeRef(branch))',
+        pattern: '衝突しないものは取り込め、衝突するものは拒否する',
+    },
+    {
         name: 'checkout-ref-validation',
         why: 'オプション名のブランチで未コミットの変更が破棄される',
         file: 'v0/server.mjs',

@@ -1263,6 +1263,64 @@ function render(s) {
       d.append(el('b', null, '① まとめて取り込める: '),
         document.createTextNode(plan.batch.join(' → ')));
       d.append(el('div', 'note', '（この塊は全ペアを検査済みで、どれも衝突しません）'));
+      // 🚨 **提案だけで終わらせない。** ここが「見えるがやれることが少ない」の中心だった。
+      //    押せるのは `--allow-write` があるときだけ。サーバ側は
+      //    「衝突しないと予測できたもの」しか実行しない（それ以外は 409 で理由を返す）。
+      if (session.allowWrite && session.token) {
+        const target = (state?.worktrees ?? []).find(w => w.shortBranch === state?.base)
+          ?? (state?.worktrees ?? [])[0];
+        if (target) {
+          const row = el('div', 'ab');
+          row.append(el('span', 'note', `${target.name} (${target.shortBranch ?? 'detached'}) に取り込む: `));
+          for (const br of plan.batch) {
+            // 取り込み先自身は押せない（サーバも 400 で断る）
+            if (br === target.shortBranch) continue;
+            const b = el('button', null, br);
+            b.title = `${br} を ${target.name} に取り込む（衝突しないと予測できた場合だけ実行されます）`;
+            b.addEventListener('click', async () => {
+              b.disabled = true;
+              const note = el('div', 'note');
+              row.append(note);
+              note.textContent = `${br} を取り込んでいます…`;
+              try {
+                const r = await fetch('/api/v0/merge', {
+                  method: 'POST',
+                  headers: {
+                    'content-type': 'application/json',
+                    [session.tokenHeader]: session.token,
+                  },
+                  body: JSON.stringify({ worktree: target.path, branch: br }),
+                });
+                const body = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                  // 🚨 **断られた理由をそのまま出す。** 「できません」だけだと
+                  //    何を直せばよいか分からない（衝突 / dirty / driver / 進行中）
+                  note.className = 'note warn';
+                  note.textContent = `✖ ${br}: ${body.error ?? `HTTP ${r.status}`}`;
+                  b.disabled = false;
+                  return;
+                }
+                note.textContent = `✔ ${br} を取り込みました`
+                  + (body.warning ? `  ${body.warning}` : '');
+                await load(true);
+              } catch (e) {
+                note.className = 'note warn';
+                note.textContent = `✖ ${br}: ${e.message}`;
+                b.disabled = false;
+              }
+            });
+            row.append(b);
+          }
+          if (row.querySelector('button')) d.append(row);
+        }
+      } else if (session.allowWrite && !session.token) {
+        d.append(el('div', 'note warn',
+          '⚠ 取り込みはトークンが無いので使えません。'
+          + ' 起動時に表示された ?token=… 付きの URL を開き直してください'));
+      } else {
+        d.append(el('div', 'note',
+          '（画面から取り込むには --write が必要です。今は読み取り専用です）'));
+      }
       cBox.append(d);
     }
     for (const df of plan.deferred) {

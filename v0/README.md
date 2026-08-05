@@ -177,6 +177,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`、NUL 混入は `binary` |
 | `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す。**`--require-auth` では認証済みにしか返さない**） |
 | `POST /api/v0/checkout` | ブランチ切り替え。**`--allow-write` が必要** |
+| `POST /api/v0/merge` | 取り込み（merge）。**`--allow-write` が必要**。**衝突しないと予測できたものだけ**実行する |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
 | `/layout` | `/` の別名（互換のため） |
 
@@ -199,6 +200,28 @@ git はこれを exit 0 で通しますが、続きの `rebase --continue` は
 副作用のある操作は `requireMutation()` を必ず通ります
 （`--allow-write` / POST / `Sec-Fetch-Site: same-origin` / `X-Kjp-Token`）。
 順序と理由は [../docs/auth-ordering.md](../docs/auth-ordering.md)。
+
+### 取り込み（merge。`--allow-write` の枠内）
+
+**衝突予測と取り込み順序の提案が、提案だけで実行できなかった**ので足しました。
+画面の「① まとめて取り込める」に取り込みボタンが出ます。
+
+🚨 **任意コード実行を増やさないための線引き:**
+
+| 断る条件 | なぜ |
+|---|---|
+| 衝突すると**予測された** | 作業ツリーを衝突状態にしない（`merge-tree` で先に試す） |
+| 「判定できない」（submodule / 差分が大きすぎる） | 分からないものを実行しない |
+| **カスタム merge driver がある** | driver はリポジトリ設定の任意コマンドを起動する |
+| 作業ツリーが dirty | 未コミットの変更を巻き込まない |
+| シーケンサ停止中 | checkout と同じ理由（rebase が別ブランチにリプレイされる） |
+
+さらに **hooks を通しません**（`core.hooksPath` を空のディレクトリに向ける）。
+`post-merge` / `commit-msg` はリポジトリ設定のコードなので、
+書き込みの capability で任意コード実行にならないようにしています。
+
+⚠️ つまり**画面からできるのは「安全と分かっている取り込み」だけ**です。
+それ以外は理由を出して断るので、端末で `git merge` してください。
 
 ### 実行（既定オフ、書き込みとは別の capability）
 

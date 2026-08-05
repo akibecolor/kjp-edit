@@ -1188,6 +1188,200 @@ test('checkout が実際にブランチを切り替える', async () => {
     }
 });
 
+/**
+ * 🔒 **取り込み（merge）は「衝突しないと分かっているもの」だけ実行する。**
+ *
+ * このツールが唯一持っている衝突予測と順序提案が**提案だけで実行できなかった**
+ * ので足した経路。任意コード実行を増やさないために、
+ * 衝突予測が clean でないもの・カスタム merge driver があるリポジトリ・
+ * dirty な作業ツリー・シーケンサ停止中は**すべて拒否**する。
+ */
+test('🔒 merge: --allow-write なしでは経路が存在しない', async () => {
+    const r = await fetch(`${baseUrl}/api/v0/merge`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ worktree: repo, branch: 'agent-a' }),
+    });
+    assert.equal(r.status, 403, '--allow-write なしで取り込めてしまう');
+});
+
+test('🔒 merge: 衝突しないものは取り込め、衝突するものは拒否する', async () => {
+    const { child, url } = await startWritable();
+    const token = WRITE_TOKEN;
+    const stem = repo.split(/[\\/]/).pop();
+    const base = join(repo, '..', `${stem}-mg-base`);
+    const ok = join(repo, '..', `${stem}-mg-ok`);
+    const bad = join(repo, '..', `${stem}-mg-bad`);
+    const post = (worktree, branch) => fetch(`${url}/api/v0/merge`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-kjp-token': token,
+            'sec-fetch-site': 'same-origin',
+        },
+        body: JSON.stringify({ worktree, branch }),
+    });
+    try {
+        // 取り込み先（base）と、衝突しない枝（ok）と、衝突する枝（bad）を作る
+        await g(['worktree', 'add', '-q', '-b', 'mg-base', base, 'main'], repo);
+        await g(['worktree', 'add', '-q', '-b', 'mg-ok', ok, 'main'], repo);
+        await writeFile(join(ok, 'only-in-ok.txt'), 'ok side\n', 'utf8');
+        await g(['add', '-A'], ok);
+        await g(['commit', '-q', '-m', '衝突しない追加'], ok);
+
+        await g(['worktree', 'add', '-q', '-b', 'mg-bad', bad, 'main'], repo);
+        await writeFile(join(bad, 'clash.txt'), 'from bad\n', 'utf8');
+        await g(['add', '-A'], bad);
+        await g(['commit', '-q', '-m', 'bad 側の clash'], bad);
+        // base 側にも同じパスを別内容で入れる（= 衝突する）
+        await writeFile(join(base, 'clash.txt'), 'from base\n', 'utf8');
+        await g(['add', '-A'], base);
+        await g(['commit', '-q', '-m', 'base 側の clash'], base);
+
+        // (1) 衝突しないものは取り込める
+        const r1 = await post(base, 'mg-ok');
+        const b1 = await r1.json();
+        assert.equal(r1.status, 200, `衝突しない取り込みが失敗した: ${JSON.stringify(b1)}`);
+        assert.equal(b1.conflicted, false, '衝突状態になっている');
+        // 実際に入っていること（数え直す）
+        const files = await g(['ls-tree', '--name-only', 'HEAD'], base);
+        assert.match(files, /only-in-ok\.txt/, '取り込んだと言ったのに入っていない');
+
+        // (2) 衝突するものは拒否し、**作業ツリーを衝突状態にしない**
+        const r2 = await post(base, 'mg-bad');
+        const b2 = await r2.json();
+        assert.equal(r2.status, 409, `衝突する取り込みが通ってしまった: ${JSON.stringify(b2)}`);
+        assert.match(b2.error, /衝突/);
+        // MERGE_HEAD が残っていないこと（拒否したのに半端な状態にしていない）
+        const st = await g(['status', '--porcelain=v2', '--branch'], base);
+        assert.ok(!st.includes('U '), `未マージのエントリが残っている: ${st}`);
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(join(base, '.git')), true);
+
+        // (3) 自分自身は拒否
+        const r3 = await post(base, 'mg-base');
+        assert.equal(r3.status, 400, '自分自身を取り込めてしまう');
+
+        // (4) 知らない ref は拒否
+        assert.equal((await post(base, 'no-such-branch')).status, 400);
+        // 🚨 **実際に危険な ref を作って測る。** `git update-ref refs/heads/--force` は
+        //    作れてしまい、refMap に載るので `resolveRef` は通す。
+        //    `isSafeRef` が無いと argv でオプションとして解釈されうる。
+        //    ⚠️ 素の `--force` を投げるだけでは `resolveRef` でも 400 になるので、
+        //    **検査が isSafeRef を測れていなかった**（変異が SURVIVED した）。
+        //    **理由まで見る**ことで区別する。
+        await g(['update-ref', 'refs/heads/--force', 'HEAD'], repo);
+        const rBad = await post(base, '--force');
+        assert.equal(rBad.status, 400, '不正な ref が通った');
+        assert.match((await rBad.json()).error, /ref が不正です/,
+            'isSafeRef ではなく別の理由で断っている（守りを測れていない）');
+
+        // (5) dirty な作業ツリーは拒否（未コミットの変更を巻き込まない）
+        await writeFile(join(base, 'dirty.txt'), 'x\n', 'utf8');
+        await g(['add', '-A'], base);
+        const r5 = await post(base, 'mg-ok');
+        assert.equal(r5.status, 409, 'dirty なのに取り込んだ');
+        assert.match((await r5.json()).error, /未コミット/);
+    } finally {
+        child.kill();
+        await g(['update-ref', '-d', 'refs/heads/--force'], repo).catch(() => {});
+        for (const [wt, br] of [[base, 'mg-base'], [ok, 'mg-ok'], [bad, 'mg-bad']]) {
+            await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+            await g(['branch', '-D', br], repo).catch(() => {});
+            await rm(wt, { recursive: true, force: true }).catch(() => {});
+        }
+    }
+});
+
+/**
+ * 🚨 **merge が hooks を実行しないこと。**
+ *
+ * `git merge` は `post-merge` / `prepare-commit-msg` / `commit-msg` を走らせる。
+ * これらは**リポジトリ設定のコード**なので、HTTP から起動できる状態にすると
+ * 「書き込みの capability」で任意コード実行になる（merge driver と同じクラス）。
+ * `core.hooksPath` を空のディレクトリに向けて通さない。
+ */
+test('🚨 merge が hooks を実行しない（リポジトリ設定のコードを走らせない）', async () => {
+    const { child, url } = await startWritable();
+    const token = WRITE_TOKEN;
+    const stem = repo.split(/[\\/]/).pop();
+    const base = join(repo, '..', `${stem}-hk-base`);
+    const src = join(repo, '..', `${stem}-hk-src`);
+    const marker = join(repo, '..', `hook-ran-${Date.now()}.txt`).replace(/[\\]/g, '/');
+    const { existsSync } = await import('node:fs');
+    const { chmod } = await import('node:fs/promises');
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'hk-base', base, 'main'], repo);
+        await g(['worktree', 'add', '-q', '-b', 'hk-src', src, 'main'], repo);
+        await writeFile(join(src, 'hk.txt'), 'src\n', 'utf8');
+        await g(['add', '-A'], src);
+        await g(['commit', '-q', '-m', 'hooks の検査用'], src);
+
+        // post-merge フックを仕込む（sh + 実行ビット。Linux では exec ビットが要る）
+        // ⚠️ `--git-path` は**絶対パスを返すことがある**（linked worktree では
+        //    共通の .git/hooks を指す）。join すると二重になる（実際に踏んだ）
+        const hooksDir = (await g(['rev-parse', '--git-path', 'hooks'], base)).trim();
+        // ⚠️ 正規表現にスラッシュを持ち込まない（規則8）。文字で判定する
+        const isAbs = hooksDir.startsWith('/') || /^[A-Za-z]:/.test(hooksDir);
+        const hookPath = isAbs ? hooksDir : join(base, hooksDir);
+        const { mkdir } = await import('node:fs/promises');
+        await mkdir(hookPath, { recursive: true }).catch(() => {});
+        const hook = join(hookPath, 'post-merge');
+        await writeFile(hook, '#!/bin/sh\nprintf ran >> "' + marker + '"\n', 'utf8');
+        await chmod(hook, 0o755);
+
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': token,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: base, branch: 'hk-src' }),
+        });
+        assert.equal(r.status, 200, `取り込めない: ${JSON.stringify(await r.json())}`);
+        await new Promise(x => setTimeout(x, 400));
+        assert.equal(existsSync(marker), false,
+            'post-merge フックが実行された（書き込みの capability で任意コード実行）');
+    } finally {
+        child.kill();
+        for (const [wt, br] of [[base, 'hk-base'], [src, 'hk-src']]) {
+            await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+            await g(['branch', '-D', br], repo).catch(() => {});
+            await rm(wt, { recursive: true, force: true }).catch(() => {});
+        }
+        await rm(marker, { force: true }).catch(() => {});
+    }
+});
+test('🔒 merge: カスタム merge driver があるリポジトリでは実行しない', async () => {
+    const { child, url } = await startWritable();
+    const token = WRITE_TOKEN;
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-mgd`);
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'mgd', wt, 'main'], repo);
+        await g(['config', 'merge.evil.name', 'demo'], repo);
+        await g(['config', 'merge.evil.driver', 'false %A %O %B'], repo);
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': token,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: wt, branch: 'agent-a' }),
+        });
+        assert.equal(r.status, 409, 'driver があるのに取り込んだ（任意コマンドが走る）');
+        assert.match((await r.json()).error, /merge driver/);
+    } finally {
+        child.kill();
+        await g(['config', '--unset', 'merge.evil.driver'], repo).catch(() => {});
+        await g(['config', '--unset', 'merge.evil.name'], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'mgd'], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+    }
+});
 test('🚨 checkout はシーケンサ停止中を拒否する（git は通してしまう操作）', async () => {
     const { child, url, session } = await startWritable();
     const stem = repo.split(/[\\/]/).pop();
