@@ -828,6 +828,31 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         script: 'v0/render-check.mjs',
     },
     {
+        // #4: ファイラの数字が信じられる形になっていること
+        name: 'filer-what-diff',
+        why: 'ファイラが「何の差分か」を言わない（`base...HEAD` のコミット済み差分と'
+            + 'カードの「変更 N・未追跡 N」= 未コミットの数を、同じ見た目で並べる）',
+        file: 'v0/app.html',
+        from: `  tree.append(el('div', 'note',
+    \`コミット済みの差分です（\${s.base ?? 'base'} と各 worktree の HEAD を比べたもの）。\`
+    + ' カードの「変更 N・未追跡 N」は未コミットの数なので、一致しません。'));`,
+        to: '  /* 変異: 何の差分かを言わない */',
+        gone: '未コミットの数なので、一致しません',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'filer-uncommitted-count',
+        why: 'コミット済み差分ゼロのときに未コミットの数を出さない'
+            + '（「変更 1」なのに「(差分なし)」になり、どちらの数字も信じられなくなる #4）',
+        file: 'v0/app.html',
+        from: `      tree.append(el('div', 'f', uncommitted
+        ? \`   (コミット済みの差分なし / 未コミット \${uncommitted} 件)\`
+        : '   (差分なし)'));`,
+        to: "      tree.append(el('div', 'f', '   (差分なし)'));",
+        gone: 'コミット済みの差分なし / 未コミット',
+        script: 'v0/render-check.mjs',
+    },
+    {
         name: 'render-term-trim',
         why: '表示上限で古い要素を捨てるのをやめる（DOM が無限に伸びて固まる）',
         file: 'v0/app.html',

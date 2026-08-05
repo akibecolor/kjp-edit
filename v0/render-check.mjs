@@ -92,6 +92,11 @@ const MEASURE = `(async () => {
     // ⚠️ dataset のフラグではなく**実際に見える文字**を返す。
     //    フラグだけ見ると、告知の要素を作らなくても検査が通ってしまう。
     firstText: (term.firstChild?.textContent ?? '').slice(0, 80),
+    // 🚨 #4: ファイラが「何の差分か」を言っているか、**実際に見える文字**で確かめる。
+    //    「変更 1」なのに「(差分なし)」という食い違いを説明できていること。
+    filerText: (document.querySelector('.tree')?.textContent ?? '').slice(0, 1200),
+    filerTitle: [...document.querySelectorAll('h2, .ph, .title, header')]
+      .map(e => e.textContent ?? '').find(t => t.includes('ファイラ')) ?? '',
   };
 })()`;
 
@@ -107,6 +112,16 @@ try {
     await writeFile(join(repo, 'f.txt'), 'x\n', 'utf8');
     await g(['add', '-A'], repo);
     await g(['commit', '-q', '-m', 'seed'], repo);
+
+    // 🚨 #4 の検査用: **コミット済み差分ゼロ + 未コミット変更あり**の worktree を作る。
+    //    ファイラが並べるのは `base...HEAD` の**コミット済み**差分なのに、
+    //    カードの「変更 N・未追跡 N」は**未コミット**の数。別のものを同じ見た目で
+    //    並べていたので「変更 1」なのにファイラが「(差分なし)」になり、
+    //    **どちらの数字も信じられなくなっていた**。両方出して食い違いを説明する。
+    await g(['worktree', 'add', '-q', '-b', 'uncommitted-only',
+        join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`)], repo);
+    await writeFile(join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`, 'f.txt'),
+        'changed but not committed\n', 'utf8');
 
     // 実行を有効にしないとコンソールペインが描かれない = 計測対象が出ない
     server = spawn(process.execPath,
@@ -245,6 +260,18 @@ try {
     if (!/probe=1/.test(probe.search)) {
         problems.push(`token 以外のクエリまで消している: ${probe.search}`);
     }
+    // 🚨 #4: ファイラの数字が信じられる形になっていること（実際に見える文字で確かめる）
+    // ⚠️ 「コミット済み」だけを見ると、下の「コミット済みの差分なし」にも一致してしまう。
+    //    **告知の文そのもの**を見る（照合が甘いと告知を消しても緑になる）
+    if (!/一致しません/.test(probe.filerText)) {
+        problems.push('ファイラが「何の差分か」を言っていない'
+            + `（base...HEAD のコミット済み差分と、未コミットの数は別物）: ${probe.filerText.slice(0, 120)}`);
+    }
+    if (!/コミット済みの差分なし \/ 未コミット \d+ 件/.test(probe.filerText)) {
+        problems.push('コミット済み差分ゼロ + 未コミット変更あり の worktree で'
+            + '「変更 N」と「(差分なし)」の食い違いを説明していない'
+            + `: ${probe.filerText.slice(0, 300)}`);
+    }
     if (!/捨てて/.test(probe.firstText)) {
         problems.push('古い行を捨てたのに告知が見えない（「全部見えている」と誤認させる）'
             + `: 先頭は ${JSON.stringify(probe.firstText)}`);
@@ -263,6 +290,20 @@ try {
     try { chrome?.kill('SIGKILL'); } catch { /* noop */ }
     try { server?.kill(); } catch { /* noop */ }
     await sleep(400);
-    await rm(profile, { recursive: true, force: true }).catch(() => {});
-    await rm(repo, { recursive: true, force: true }).catch(() => {});
+    // 🚨 **後始末は retry する。** kill の直後は Chrome とサーバがまだファイルを
+    //    掴んでいて Windows では `rm` が共有違反で落ちる。`.catch(() => {})` で
+    //    飲んでいたので、**temp にディレクトリが残っていた**（実測で3個）。
+    //    取り残しは意志ではなく仕組みで防ぐ。
+    const rmRetry = async p => {
+        for (let i = 0; i < 20; i++) {
+            try { await rm(p, { recursive: true, force: true }); return true; } catch { /* 掴まれている */ }
+            await sleep(200);
+        }
+        console.log(`   ⚠ 消せませんでした（手で消してください）: ${p}`);
+        return false;
+    };
+    // ⚠️ worktree は repo の**外**（兄弟）に作ったので個別に消す
+    await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`));
+    await rmRetry(repo);
+    await rmRetry(profile);
 }
