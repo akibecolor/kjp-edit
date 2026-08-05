@@ -204,11 +204,28 @@ v0/server.mjs の parseArgs() と起動時の警告・拒否。
     },
 ];
 
+// 🚨 **観点を絞れるようにする（`args.only`）。** 前回はエージェントがセッション上限で
+//    失敗し、6観点のうち 2 観点（exec-session / tests）が**1件も走らなかった**。
+//    全部やり直すと費用が4倍になるので、抜けた観点だけ走らせ直せる形にする。
+//    ⚠️ **絞ったことは必ず告知する**（黙って部分実行すると「全部見た」と読める）。
+const only = Array.isArray(args?.only) ? args.only
+    : (typeof args?.only === 'string' ? args.only.split(',').map(s => s.trim()) : null);
+const targetDims = only ? DIMENSIONS.filter(d => only.includes(d.key)) : DIMENSIONS;
+if (only) {
+    const unknown = only.filter(k => !DIMENSIONS.some(d => d.key === k));
+    if (unknown.length) throw new Error(`そんな観点はありません: ${unknown.join(', ')}`);
+}
+
 phase('Review');
-log(`範囲 ${range} を ${DIMENSIONS.length} 観点で並列にレビューします`);
+if (only) {
+    log(`⚠ 部分レビュー: ${targetDims.length}/${DIMENSIONS.length} 観点だけ走らせます`
+        + `（${targetDims.map(d => d.key).join(', ')}）。他の観点は見ていません`);
+} else {
+    log(`範囲 ${range} を ${DIMENSIONS.length} 観点で並列にレビューします`);
+}
 
 const perDimension = await pipeline(
-    DIMENSIONS,
+    targetDims,
     d => agent(`${CONTEXT}\n\n${d.prompt}${extraFocus}\n\n`
         + '重大度の基準: BLOCKING = 秘密の漏洩 / 任意コード実行 / データ破壊 / '
         + '嘘の表示。SERIOUS = 資源の取り残し・誤検出・守りの抜け。MINOR = その他。\n'
@@ -259,6 +276,9 @@ survived.sort((a, b) => rank[a.severity] - rank[b.severity]);
 
 return {
     range,
+    // 🚨 どの観点を見たかを結果に入れる（部分実行を全体と読み違えないため）
+    dimensions: targetDims.map(d => d.key),
+    partial: only ? { seen: targetDims.map(d => d.key), total: DIMENSIONS.length } : null,
     confirmed: survived,
     refuted: refuted.map(x => ({
         dimension: x.dimension, title: x.finding.title, reason: x.verdict.reason,

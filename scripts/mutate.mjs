@@ -274,7 +274,33 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         from: "        synthetic.set(toNFC(m[2].trim()), toNFC(m[1].trim()));",
         to: '        /* 変異: 退避名を拾わない */',
         gone: 'synthetic.set(toNFC(m[2].trim())',
+        // ⚠️ 構造からも取るようになったので、メッセージ側だけ外しても
+        //    file/directory は検出できる。**両方外して守り全体を測る。**
+        also: [{
+            from: `        if (count === 2) {
+            const [p, q] = paths;
+            if (p.startsWith(\`\${q}~\`)) synthetic.set(p, q);
+            else if (q.startsWith(\`\${p}~\`)) synthetic.set(q, p);
+        }`,
+            to: '        /* 変異: 構造からも拾わない */',
+        }],
         pattern: '合成パスを印付けて',
+    },
+    {
+        // 🚨 symlink 対 file は**メッセージに退避名が出ない**ので、構造からしか取れない
+        name: 'conflict-synthetic-structural',
+        why: '情報レコードの構造から退避名を取らない'
+            + '（symlink 対 file = CONFLICT (distinct types) は '
+            + '`moving it to X instead` と言わないので、合成パスが印無しで出る）',
+        file: 'v0/git.mjs',
+        from: `        if (count === 2) {
+            const [p, q] = paths;
+            if (p.startsWith(\`\${q}~\`)) synthetic.set(p, q);
+            else if (q.startsWith(\`\${p}~\`)) synthetic.set(q, p);
+        }`,
+        to: '        /* 変異: 構造から拾わない */',
+        gone: 'if (p.startsWith(`${q}~`))',
+        pattern: 'symlink 対 file の合成パスにも印が付く',
     },
     // #33: bare / prunable の門。以前は**本物の bare を作っていなかった**ので
     //      4つとも外しても全テストが緑だった（過去2件と同じクラスの偽陽性）。

@@ -27,6 +27,18 @@ let baseUrl;
 let emptyConfig;   // 空の gitconfig
 
 /**
+ * 🚨 **桁違いに遅い起動を、緑のうちに記録する（#34）。**
+ *
+ * `--allow-host` のテストが CI で「起動しなかった」で落ちる flaky があり、
+ * **落ちてから調べても再現しない**（3プラットフォーム同時に落ちて、
+ * 次の push では同じコードで緑になった）。
+ * 起動は実測で**中央 107ms**（worktree 4本、`--allow-host` / `--watch-agents` 込み。
+ * 疑われていた `git rev-parse` の正規化は原因ではなかった）。
+ * なので 3 秒を超えたら異常。**緑でも数字を残して、次に落ちる前に気付ける形にする。**
+ */
+const slowStarts = [];
+
+/**
  * 開発者の ~/.gitconfig と system gitconfig を無効化する env。
  *
  * ⚠️ os.devNull は使えない。Windows では '\\\\.\\nul' になり git が
@@ -143,6 +155,15 @@ after(async () => {
         await rm(join(repo, '..', `${stem}-${n}`), { recursive: true, force: true });
     }
     await rm(repo, { recursive: true, force: true });
+
+    // 🚨 遅い起動があったら**緑でも出す**（#34。落ちてから調べても再現しない）
+    if (slowStarts.length) {
+        console.error(`\n⚠ 起動が異常に遅い実行が ${slowStarts.length} 件ありました`
+            + '（基準 107ms）。CI で「起動しなかった」で落ちる前兆です:');
+        for (const s of slowStarts.slice(0, 8)) {
+            console.error(`    ${s.ms}ms  argv: ${s.argv}`);
+        }
+    }
 });
 
 // ⚠️ 必ず fresh=1 で叩く。サーバは短い TTL キャッシュを持つので、
@@ -2204,6 +2225,63 @@ test('🚨 衝突予測: 合成パスを印付けて「開けない理由」を�
     }
 });
 
+/**
+ * 🚨 **symlink 対 file の衝突でも合成パスに印が付くこと（#1）。**
+ *
+ * file/directory だけを検査していたので、もう一方の形（symlink 対 file）は
+ * 未検証だった。⚠️ **Windows では symlink をファイルとして作れない**（EPERM。実測）。
+ * そこで **git の index に mode 120000 で直接入れる**（`update-index --cacheinfo`）。
+ * これならどのプラットフォームでも symlink のツリーを作れる。
+ */
+test('🚨 衝突予測: symlink 対 file の合成パスにも印が付く', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const wtA = join(repo, '..', `${stem}-sym-a`);
+    const wtB = join(repo, '..', `${stem}-sym-b`);
+    try {
+        // 枝A: link を **symlink** にする（index に mode 120000 で入れる）
+        await g(['worktree', 'add', '-b', 'sym-a', wtA, 'main'], repo);
+        // ⚠️ `hash-object --stdin` は入力を待って**ハングする**（stdin を渡していない）。
+        //    ファイル経由にする。内容 = リンク先のパス（symlink の blob はそれ）
+        await writeFile(join(wtA, '.link-target'), 'target.txt', 'utf8');
+        const oid = (await g(['hash-object', '-w', join(wtA, '.link-target')], wtA)).trim();
+        await g(['update-index', '--add', '--cacheinfo', `120000,${oid},link`], wtA);
+        // 候補ペアにするため共通のファイルも衝突させる（候補生成の既知の限界）
+        await writeFile(join(wtA, 'shared2.txt'), 'A side\n', 'utf8');
+        await g(['add', 'shared2.txt'], wtA);
+        await g(['commit', '-q', '-m', 'A: link は symlink'], wtA);
+        const modeA = (await g(['ls-tree', 'sym-a', 'link'], wtA)).trim();
+        assert.match(modeA, /^120000/, `symlink として入っていない: ${modeA}`);
+
+        // 枝B: link を **通常ファイル**にする
+        await g(['worktree', 'add', '-b', 'sym-b', wtB, 'main'], repo);
+        await writeFile(join(wtB, 'link'), 'from B\n', 'utf8');
+        await writeFile(join(wtB, 'shared2.txt'), 'B side\n', 'utf8');
+        await g(['add', '-A'], wtB);
+        await g(['commit', '-q', '-m', 'B: link は通常ファイル'], wtB);
+
+        const st = JSON.parse(await (await fetch(`${baseUrl}/api/v0/state?fresh=1`)).text());
+        // ⚠️ label は**ブランチ名ではなく worktree のディレクトリ名**（実測で気付いた）
+        const isSym = v => /-sym-[ab]$/.test(String(v));
+        const pair = (st.conflicts ?? []).find(c => isSym(c.a) && isSym(c.b));
+        assert.ok(pair, `sym-a × sym-b の衝突が出ていない: ${JSON.stringify((st.conflicts ?? []).map(c => [c.a, c.b, c.clean]))}`);
+        assert.equal(pair.clean, false, `衝突として出ていない: ${JSON.stringify(pair)}`);
+
+        // 合成パス（`link~refs_heads_...`）に印と理由が付いていること
+        const synth = (pair.files ?? []).find(f => typeof f === 'object' && f.synthetic);
+        assert.ok(synth, `symlink 対 file で合成パスに印が付いていない: ${JSON.stringify(pair.files)}`);
+        assert.match(synth.path, /~/);
+        assert.equal(synth.of, 'link', `実体のパスが分からない: ${JSON.stringify(synth)}`);
+        assert.match(synth.why, /実在しません/);
+    } finally {
+        await g(['worktree', 'remove', '--force', wtA], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wtB], repo).catch(() => {});
+        await g(['branch', '-D', 'sym-a'], repo).catch(() => {});
+        await g(['branch', '-D', 'sym-b'], repo).catch(() => {});
+        await rm(wtA, { recursive: true, force: true }).catch(() => {});
+        await rm(wtB, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
 // 🚨 #2: submodule は git 自身が「trivial なケースしか対応しない」と言う
 //    （実測の stderr: `hint: Recursive merging with submodules currently only
 //    supports trivial cases.`）。それを「衝突する」として出すのは
@@ -2308,9 +2386,17 @@ async function startAuthServer(extra) {
     child.on('exit', (code, signal) => { exited = `exit=${code} signal=${signal}`; });
     // ⚠️ 何を待っていたのかも書く。「起動しなかった」だけでは、
     //    プロセスが出てこなかったのかトークンの案内を待っていたのか区別できない
-    const why = () => `起動しなかった（待っていたもの: URL`
+    // 🚨 **経過時間と基準値を添える（#34）。** 起動は実測で**中央 107ms**
+    //    （worktree 4本、`--allow-host` / `--watch-agents` を付けても同じ。
+    //     疑われていた `git rev-parse` の正規化は原因ではなかった）。
+    //    つまり上限に当たったなら「遅い経路」ではなく**200倍以上の飢餓**で、
+    //    上限を上げるのは対策にならない。**数字を残して次回に判断させる。**
+    const startedAt = Date.now();
+    const why = () => `起動しなかった（${Date.now() - startedAt}ms 待った。`
+        + '実測の基準は 107ms なので、これは遅さではなく飢餓か起動失敗）'
+        + '\n  待っていたもの: URL'
         + `${extra.some(a => ['--require-auth', '--allow-host', '--allow-write',
-            '--allow-exec', '--token-file', '--token'].includes(a)) ? ' + ?token=' : ''}）`
+            '--allow-exec', '--token-file', '--token'].includes(a)) ? ' + ?token=' : ''}`
         + `\n  argv: ${extra.join(' ') || '(なし)'}`
         + `\n  stdout: ${banner.trim() || '(空)'}`
         + `\n  stderr: ${errOut.trim() || '(空)'}\n  ${exited ?? '(まだ生きている)'}`;
@@ -2333,7 +2419,18 @@ async function startAuthServer(extra) {
             //    「最後のデータから 300ms 動きが無い」を合図にする（負荷に自動追従する）。
             let idle = null;
             let cap = null;
-            const settle = port => { clearTimeout(idle); clearTimeout(cap); res(port); };
+            const settle = port => {
+                clearTimeout(idle);
+                clearTimeout(cap);
+                // 🚨 **落ちる前に証拠を残す（#34）。** 起動が基準（107ms）から桁違いに
+                //    遅いとき、緑のうちに記録しておかないと「次に落ちたとき」しか気付けない。
+                //    flaky は落ちてから調べても再現しないので、**緑の側で観測する。**
+                const took = Date.now() - startedAt;
+                if (took > 3000) {
+                    slowStarts.push({ argv: extra.join(' ') || '(なし)', ms: took });
+                }
+                res(port);
+            };
             child.stdout.on('data', d => {
                 banner += d;
                 const m = banner.match(/http:\/\/127\.0\.0\.1:(\d+)/);

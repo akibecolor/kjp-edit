@@ -746,6 +746,21 @@ export async function mergePreview(cwd, refA, refB, driverNames = []) {
         if (!Number.isInteger(count) || count < 1 || count > 64) { k++; continue; }
         const paths = rec.slice(k + 1, k + 1 + count).map(toNFC);
         const kind = rec[k + 1 + count] ?? '';
+        // 🚨 **退避名は構造から取る。メッセージ本文に頼ると取りこぼす。**
+        //    `CONFLICT (file/directory)` は `moving it to X instead` と言うが、
+        //    `CONFLICT (distinct types)`（symlink 対 file）は**言わない**:
+        //      `link had different types on each side; renamed one of them
+        //       so each can be recorded somewhere.`
+        //    そのため symlink 対 file の合成パスが印無しで出ていた（#1 の見落とし。
+        //    回帰テストを足して初めて分かった）。
+        //    どちらも**2パスの情報レコード**で、一方が `<実体>~<接尾辞>` の形になる。
+        //    ⚠️ **順序は種類によって逆**（file/directory は 合成→実体、
+        //       distinct types は 実体→合成）。順序に依存せず形で決める。
+        if (count === 2) {
+            const [p, q] = paths;
+            if (p.startsWith(`${q}~`)) synthetic.set(p, q);
+            else if (q.startsWith(`${p}~`)) synthetic.set(q, p);
+        }
         if (/submodule/i.test(kind)) {
             for (const p of paths) {
                 undecidable.set(p,

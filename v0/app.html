@@ -1189,19 +1189,41 @@ function render(s) {
           d.append(el('div', 'ab', `  ${path} ← ${f.why}`));
         }
       }
-    } else for (const f of c.files ?? []) {
-      // ⚠️ サーバは `{path, synthetic, of, why}` を返す（古い形の文字列にも耐える）
-      const path = typeof f === 'string' ? f : f.path;
-      const row = el('div', 'ab');
-      row.append(document.createTextNode(`  ${path}`));
-      // 🚨 **開けないものを普通のファイル名として出さない。** `merge-tree` は
-      //    実在しない退避名（`thing~B`）を返すので、押しても開けない
-      //    行き止まりになっていた（#1）。理由を添える。
-      if (typeof f === 'object' && f.synthetic) {
-        row.append(el('span', 'note',
-          ` ← 開けません: ${f.why}${f.of ? `。実体は ${f.of}` : ''}`));
+    } else {
+      // 衝突したファイルを押したら A 側の差分を開く。押せる相手を先に決めておく
+      const aWt = (state?.worktrees ?? []).find(w => samePathish(w.path, c.aPath));
+      for (const f of c.files ?? []) {
+        // ⚠️ サーバは `{path, synthetic, of, why}` を返す（古い形の文字列にも耐える）
+        const path = typeof f === 'string' ? f : f.path;
+        const row = el('div', 'ab');
+        const synthetic = typeof f === 'object' && f.synthetic;
+        // 🚨 **開けないものを普通のファイル名として出さない。** `merge-tree` は
+        //    実在しない退避名（`thing~B`）を返すので、押しても開けない
+        //    行き止まりになっていた（#1）。理由を添える。
+        if (synthetic) {
+          row.append(document.createTextNode(`  ${path}`));
+          row.append(el('span', 'note',
+            ` ← 開けません: ${f.why}${f.of ? `。実体は ${f.of}` : ''}`));
+        } else if (aWt) {
+          // 🚨 **実在するパスは押せるようにする。** 「表示されているのに開けない」を
+          //    合成パスだけの話にしない（#1 の完了条件は「開ける形か、
+          //    理由つきで開けない形のどちらか」）。開くのは **A 側 × base** の差分で、
+          //    A×B の差分ではないので**そう書く**（何を見ているか誤解させない）。
+          row.append(document.createTextNode('  '));
+          const link = el('span', 'f');
+          link.textContent = path;
+          link.style.display = 'inline';
+          link.title = `${c.a} の差分（base と比べたもの）を開きます`;
+          link.addEventListener('click', () => openDiff(aWt, path));
+          row.append(link);
+          row.append(el('span', 'note', ` ← 押すと ${c.a} 側の差分（base と比較）`));
+        } else {
+          row.append(document.createTextNode(`  ${path}`));
+          row.append(el('span', 'note',
+            ` ← 開けません: ${c.a} の worktree が一覧にありません`));
+        }
+        d.append(row);
       }
-      d.append(row);
     }
     cBox.append(d);
   }
