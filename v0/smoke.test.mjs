@@ -688,6 +688,105 @@ test('衝突予測: 実際に衝突するペアを検出する', async () => {
     }
 });
 
+/**
+ * 🚨 **diff がリポジトリ設定のコマンドを実行しないこと（textconv / ext-diff）。**
+ *
+ * `core.fsmonitor` と**同じレビュー・同じコミット**で入った守りなのに、
+ * fsmonitor だけテストと変異があり、`--no-textconv` / `--no-ext-diff` 側は
+ * **テストも変異も1件も無かった**（7回目のレビュー）。
+ * 1行の書き戻しで、無認証の読み取り経路（`/api/v0/diff`）が RCE に戻る。
+ */
+/**
+ * 🚨 **rename の3トークン（`status` NUL `from` NUL `to`）がずれないこと。**
+ *
+ * ここが1つずれると status とパスの対応が**全部シフト**し、
+ * 別 worktree のファイル名をカードに出す / 「同じファイルを触っている」の
+ * 重複検出が嘘になる / 差分タブが違うファイルを開く。
+ * CLAUDE.md が「`-z` の多トークン」を再発トップの罠として挙げている当のコードで、
+ * **`git mv` がテストに1回も出てこなかった**（7回目のレビュー。grep で0件）。
+ */
+test('🚨 rename（R の3トークン）で後続のファイルがずれない', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-ren`);
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'renamed', wt, 'main'], repo);
+        // rename を1件 + その**後ろ**に普通の変更を2件作る
+        // （ずれると後続の status とパスの対応が壊れる）
+        // ⚠️ main にあるのは README.md だけ（shared.txt は agent 側で作られる）
+        await g(['mv', 'README.md', 'renamed.md'], wt);
+        await writeFile(join(wt, 'zz-added.txt'), 'added\n', 'utf8');
+        await writeFile(join(wt, 'zz-second.txt'), 'second\n', 'utf8');
+        await g(['add', '-A'], wt);
+        await g(['commit', '-q', '-m', 'rename と後続の変更'], wt);
+
+        const s2 = await state();
+        const card = s2.worktrees.find(w => w.branch === 'renamed');
+        assert.ok(card, `renamed の worktree が無い: ${s2.worktrees.map(w => w.branch)}`);
+        const files = card.files ?? [];
+
+        // R が1件だけ出て、新旧のパスが正しく入っていること
+        const ren = files.filter(f => f.status === 'R');
+        assert.equal(ren.length, 1, `rename が1件でない: ${JSON.stringify(files)}`);
+        assert.equal(ren[0].path, 'renamed.md', `新しいパスが違う: ${JSON.stringify(ren[0])}`);
+        assert.equal(ren[0].from, 'README.md', `元のパスが違う: ${JSON.stringify(ren[0])}`);
+
+        // 🚨 **後続がずれていないこと。** ここが本題（3トークンを2つとして読むと
+        //    以降の status とパスの対応が全部1つずれる）
+        const added = files.find(f => f.path === 'zz-added.txt');
+        assert.ok(added, `後続の追加ファイルが無い（ずれている）: ${JSON.stringify(files)}`);
+        assert.equal(added.status, 'A', `追加の status が違う（ずれている）: ${added.status}`);
+        const second = files.find(f => f.path === 'zz-second.txt');
+        assert.ok(second, `後続の2件目が無い（ずれている）: ${JSON.stringify(files)}`);
+        assert.equal(second.status, 'A', `2件目の status が違う（ずれている）: ${second.status}`);
+        // 🚨 **件数も見る。** 3トークンを2つとして読むと、余分なエントリ
+        //    （旧パスが status に化けたもの）が増えるか、対応が1つずれる
+        assert.equal(files.length, 3,
+            `エントリ数が合わない（ずれている）: ${JSON.stringify(files)}`);
+
+        // status が1文字の既知の値だけであること（トークンがパスとして入っていない）
+        for (const f of files) {
+            assert.match(f.status, /^[ACDMRTUX]$/, `status が壊れている: ${JSON.stringify(f)}`);
+            assert.ok(!f.path.includes(String.fromCharCode(0)), 'NUL が残っている');
+        }
+    } finally {
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'renamed'], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+    }
+});
+test('🚨 diff がリポジトリ設定のコマンドを実行しない（textconv / ext-diff）', async () => {
+    const marker = join(repo, 'textconv-ran.txt').replace(/[\\]/g, '/');
+    const hook = join(repo, 'textconv.sh').replace(/[\\]/g, '/');
+    const { existsSync } = await import('node:fs');
+    const { chmod } = await import('node:fs/promises');
+    try {
+        // フックは sh スクリプト + 実行ビット（Linux では exec ビットが無いと起動しない）
+        await writeFile(hook, '#!/bin/sh\nprintf ran >> "' + marker + '"\ncat "$1"\n', 'utf8');
+        await chmod(hook, 0o755);
+        // .gitattributes を **コミットする**（in-tree の属性が読まれる）
+        await writeFile(join(repo, '.gitattributes'), 'shared.txt diff=evil\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: textconv のテスト用'], repo);
+        await g(['config', 'diff.evil.textconv', hook], repo);
+        await g(['config', 'diff.evil.command', hook], repo);
+
+        // 読み取り専用の経路を叩く（--allow-write も --allow-exec も不要）
+        const r = await fetch(`${baseUrl}/api/v0/diff?base=main&ref=agent-a&path=shared.txt`);
+        assert.equal(r.status, 200, `diff が取れない: ${r.status}`);
+        await r.json();
+        await new Promise(x => setTimeout(x, 400));
+        assert.equal(existsSync(marker), false,
+            'textconv / ext-diff が実行された（読み取り経路から任意コード実行）');
+    } finally {
+        await g(['config', '--unset', 'diff.evil.textconv'], repo).catch(() => {});
+        await g(['config', '--unset', 'diff.evil.command'], repo).catch(() => {});
+        await rm(join(repo, '.gitattributes'), { force: true }).catch(() => {});
+        await rm(hook, { force: true }).catch(() => {});
+        await rm(marker, { force: true }).catch(() => {});
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: textconv のテスト後始末'], repo).catch(() => {});
+    }
+});
 // 🚨 core.fsmonitor と同じクラスの穴。コミット済みの .gitattributes と
 //    .git/config の merge driver で、/api/v0/state を1回叩くだけで
 //    任意コマンドが走っていた（--allow-write 不要）。

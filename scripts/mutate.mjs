@@ -1213,6 +1213,45 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/transcript.test.mjs',
     },
     {
+        // 🚨 7回目のレビュー: `-z` の多トークンは再発トップの罠なのに、
+        //    `git mv` がテストに1回も出てこなかった
+        name: 'changed-files-rename',
+        why: 'rename の3トークン（status NUL from NUL to）を2つとして読む'
+            + '（status とパスの対応が全部ずれ、別のファイル名をカードに出す）',
+        file: 'v0/git.mjs',
+        from: `        if (status[0] === 'R' || status[0] === 'C') {
+            const from = parts[i++], to = parts[i++];
+            files.push({ status: status[0], path: toNFC(to ?? ''), from: toNFC(from ?? '') });
+        } else {`,
+        to: `        if (false) {
+        } else {`,
+        gone: "status[0] === 'R' || status[0] === 'C'",
+        pattern: 'rename（R の3トークン）で後続のファイルがずれない',
+    },
+    {
+        // 🚨 7回目のレビュー: fsmonitor と同じコミットで入った守りなのに、
+        //    こちらだけテストも変異も1件も無かった
+        name: 'diff-no-textconv',
+        why: 'diff で --no-textconv を外す（リポジトリ設定 diff.<name>.textconv の'
+            + 'コマンドが無認証の読み取り経路から走る = RCE）',
+        file: 'v0/git.mjs',
+        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',",
+        to: "        'diff', '--no-color', '--no-ext-diff',",
+        gone: "'--no-ext-diff', '--no-textconv'",
+        pattern: 'diff がリポジトリ設定のコマンドを実行しない',
+    },
+    {
+        name: 'diff-no-ext-diff',
+        why: 'diff で --no-ext-diff を外す（diff.<name>.command の外部差分ツールが走る）',
+        file: 'v0/git.mjs',
+        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',",
+        to: "        'diff', '--no-color', '--no-textconv',",
+        gone: "'--no-color', '--no-ext-diff'",
+        // ⚠️ 「`--no-textconv` があるから測れない」と書きかけたが、**実測では落ちる**
+        //    （`diff.evil.command` が起動する）。推測でコメントを書かないこと。
+        pattern: 'diff がリポジトリ設定のコマンドを実行しない',
+    },
+    {
         name: 'literal-pathspecs',
         why: 'pathspec magic で1ファイル指定が全体になる',
         file: 'v0/git.mjs',

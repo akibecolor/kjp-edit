@@ -194,8 +194,12 @@ if (!quick && !failed) {
         detail: ok ? [] : testDetail(r, s),
     });
     if (!ok) failed = true;
-} else if (quick) {
-    steps.push({ name: 'smoke', ok: true, skipped: true });
+} else {
+    // 🚨 **走らなかったことを出す。** 先行ステップが落ちると行そのものが
+    //    消えていたので、「5つのうち3つが走っていない」ことがどこにも書かれず、
+    //    直した後に「smoke も layout も見た」と読める形になっていた
+    //    （mutation の shard が cancelled で「他は success」に見えた事故と同型）。
+    steps.push({ name: 'smoke', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
 // 4. レイアウト検査（ブラウザが有る環境だけ。CI では自動でスキップされる）
@@ -211,8 +215,8 @@ if (!quick && !failed) {
         detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),
     });
     if (!ok) failed = true;
-} else if (quick) {
-    steps.push({ name: 'layout', ok: true, skipped: true });
+} else {
+    steps.push({ name: 'layout', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
 // 5. クライアント描画の予算（#3）。**実時間で測る**ので layout とは別プロセス。
@@ -228,14 +232,15 @@ if (!quick && !failed) {
         detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),
     });
     if (!ok) failed = true;
-} else if (quick) {
-    steps.push({ name: 'render', ok: true, skipped: true });
+} else {
+    steps.push({ name: 'render', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
 // ---- 出力: 20行以内 ----
 for (const s of steps) {
     const mark = s.skipped ? '–' : s.ok ? '✔' : '✖';
-    const why = s.skipped ? (quick ? ' (skipped: --quick)' : ' (skipped: ブラウザ無し)') : '';
+    // ⚠️ 理由を取り違えない。--quick / 先行ステップの失敗 / ブラウザ無し は別物
+    const why = s.skipped ? ` (skipped: ${s.why ?? 'ブラウザ無し'})` : '';
     console.log(`${mark} ${s.name}${why}`);
     for (const d of s.detail ?? []) console.log(`    ${d}`);
 }
