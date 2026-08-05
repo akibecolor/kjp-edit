@@ -143,11 +143,31 @@ export function repoRelative(base, abs) {
  *    代わりに**長さで縛る**。パスは本質的に自由文なので、
  *    「自由文は1文字も通さない」とは言えない（`docs/agent-observation.md` を直した）。
  */
-export function observedPath(base, raw, max) {
-    const rel = repoRelative(base, raw);
+export function observedPath(base, raw, max, recordCwd = null) {
+    // 🚨 **相対パスをデーモンの cwd で解決してはいけない。** 記録側のパスは
+    //    相対のことがある（Grep / Glob の `path` など）。`realpathSync.native()` は
+    //    **サーバプロセスの cwd** を基準に解決するので、
+    //    (a) 触っていないファイルを「触った」と表示し、
+    //    (b) worktree 内のファイルを「(リポジトリ外)」と表示する。
+    //    レコードには `cwd` が入っていて所有者判定に使っているのに、
+    //    パスの解決には使っていなかった（7回目のレビュー）。
+    //    ⚠️ 基準が分からない相対パスは**「外」と断言せず不明にする**。
+    let abs = raw;
+    if (typeof raw === 'string' && raw && !isAbsolutePath(raw)) {
+        if (typeof recordCwd === 'string' && recordCwd) abs = join(recordCwd, raw);
+        else return { path: null, outside: false, clipped: false, unresolved: true };
+    }
+    const rel = repoRelative(base, abs);
     if (rel === null) return { path: null, outside: true, clipped: false };
     if (rel.length <= max) return { path: rel, outside: false, clipped: false };
     return { path: `${rel.slice(0, max)}…`, outside: false, clipped: true };
+}
+
+/** 絶対パスか（Windows のドライブレターと UNC も見る） */
+function isAbsolutePath(p) {
+    // ⚠️ 区切りは \\ と / の両方（UNC の先頭は区切り2つ）
+    if (p.startsWith('/') || p.startsWith('\\')) return true;
+    return /^[A-Za-z]:[\\\\/]/.test(p);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,13 +258,18 @@ export function summarize(lines, { worktreePath, allowText = false, now = Date.n
                 let seen = { path: null, outside: false, clipped: false };
                 for (const k of PATH_KEYS) {
                     if (typeof input[k] !== 'string') continue;
-                    seen = observedPath(worktreePath, input[k], limits.pathChars);
+                    // ⚠️ レコードの cwd を渡す（相対パスの基準。無ければ不明にする）
+                    seen = observedPath(worktreePath, input[k], limits.pathChars,
+                        typeof r.cwd === 'string' ? r.cwd : null);
                     break;
                 }
                 const entry = {
                     at, tool: name, path: seen.path, outside: seen.outside,
                     // 省略したことを payload に残す（黙って切ると「開けるパス」に見える）
                     pathClipped: seen.clipped,
+                    // 🚨 相対パスの基準が分からなかった = 「外」ではなく「不明」。
+                    //    デーモンの cwd で解決すると別のファイルの名前を出す（7回目のレビュー）
+                    pathUnresolved: seen.unresolved === true,
                     sidechain: r.isSidechain === true,
                 };
                 // T2: コマンド行は自由文。既定では出さない
@@ -448,6 +473,12 @@ export function transcriptRoot() {
  */
 export async function collectAgents(worktrees, {
     root = transcriptRoot(), allowText = false, now = Date.now(), limits = LIMITS,
+    // ⚠️ **検査専用の継ぎ目**（既定は素の stat）。1ファイルの stat 失敗で
+    //    プロジェクト丸ごとを捨てていた形を測るために要る。移植可能に
+    //    「stat が投げるファイル」を作る手段が無い（symlink は Windows で EPERM、
+    //    ディレクトリは stat が成功する）ので、注入で作る。
+    //    --layout-probe / --exec-stream-delay と同じ「既定では存在しない経路」。
+    statFn = stat,
 } = {}) {
     const errors = [];
     const byPath = new Map();   // worktree path -> 要約
@@ -468,6 +499,9 @@ export async function collectAgents(worktrees, {
     let scannedDirs = 0;
     let skippedDirs = 0;
     let cwdlessDirs = 0;   // cwd が読めず、どの worktree のものか判定できなかった数
+    // 🚨 読めなかったものは**件数を必ず出す**（黙って「記録なし」にしない）
+    let unreadableDirs = 0;
+    let unreadableFiles = 0;
     for (const d of dirs) {
         if (!d.isDirectory()) continue;
         if (scannedDirs >= limits.maxDirs) { skippedDirs++; continue; }
@@ -475,15 +509,24 @@ export async function collectAgents(worktrees, {
         const dir = join(root, d.name);
         // そのディレクトリの *.jsonl を新しい順に並べる
         const files = [];
-        try {
-            for (const f of await readdir(dir)) {
-                if (!f.endsWith('.jsonl')) continue;   // ⚠️ それ以外は開かない
-                const p = join(dir, f);
-                const s = await stat(p);
+        // 🚨 **1ファイルの失敗でディレクトリ全体を捨てない。** try がループの**外**に
+        //    あったので、`stat()` が1つでも投げると（消えた最中 / 権限 / ロック）
+        //    **プロジェクトディレクトリ丸ごと**を無告知で捨てていた。
+        //    結果、5秒前に Edit を書いたエージェントに「記録がありません」と断言する
+        //    — #27 / #36 / #37 で3回潰した型が、まだここに残っていた（7回目のレビュー）。
+        let entries = null;
+        try { entries = await readdir(dir); } catch { unreadableDirs++; continue; }
+        let skippedFiles = 0;
+        for (const f of entries) {
+            if (!f.endsWith('.jsonl')) continue;   // ⚠️ それ以外は開かない
+            const p = join(dir, f);
+            try {
+                const s = await statFn(p);
                 if (!s.isFile()) continue;
                 files.push({ path: p, mtimeMs: s.mtimeMs });
-            }
-        } catch { continue; }
+            } catch { skippedFiles++; }   // そのファイルだけ飛ばす
+        }
+        if (skippedFiles) unreadableFiles += skippedFiles;
         if (!files.length) continue;
         files.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
@@ -624,6 +667,16 @@ export async function collectAgents(worktrees, {
             scope: 'agents',
             message: `${cwdlessDirs} 個のプロジェクトの記録から cwd が読めませんでした`
                 + '（どの worktree のものか判定できないので観測から漏れています）。',
+        });
+    }
+    // 🚨 **読めなかったことを黙って飲まない。** 1ファイルの失敗で
+    //    プロジェクト全体を捨てていた形（#27 / #36 / #37 と同型）を直した名残として、
+    //    残った失敗は件数で告知する。
+    if (unreadableDirs || unreadableFiles) {
+        errors.push({
+            scope: 'agents',
+            message: `記録を読めなかったものがあります（プロジェクト ${unreadableDirs} 個 / `
+                + `ファイル ${unreadableFiles} 個）。その分は観測から漏れています。`,
         });
     }
 

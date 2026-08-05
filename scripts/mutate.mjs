@@ -1064,6 +1064,47 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/chatfilter.test.mjs',
     },
     {
+        // 🚨 7回目のレビュー: 相対パスをデーモンの cwd で解決していた
+        name: 'transcript-relative-cwd',
+        why: '相対パスをデーモンの cwd で解決する'
+            + '（触っていないファイルを「触った」と表示し、worktree 内を「外」と表示する）',
+        file: 'v0/transcript.mjs',
+        from: `    let abs = raw;
+    if (typeof raw === 'string' && raw && !isAbsolutePath(raw)) {
+        if (typeof recordCwd === 'string' && recordCwd) abs = join(recordCwd, raw);
+        else return { path: null, outside: false, clipped: false, unresolved: true };
+    }`,
+        to: '    const abs = raw;   /* 変異: 相対パスをそのまま渡す */',
+        gone: 'isAbsolutePath(raw)',
+        pattern: '相対パスはレコードの cwd で解決し',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-dir-not-dropped',
+        why: '1ファイルの stat 失敗でプロジェクト丸ごとを捨てる'
+            + '（稼働中でも「記録がありません」と断言する。#27/#36/#37 と同型）',
+        file: 'v0/transcript.mjs',
+        from: '            } catch { skippedFiles++; }   // そのファイルだけ飛ばす',
+        to: '            } catch { break; }   /* 変異: そのディレクトリを丸ごと捨てる */',
+        gone: 'catch { skippedFiles++; }',
+        pattern: '1ファイルが読めなくてもプロジェクトを捨てない',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'relative-inside-depth',
+        why: '元表記の段数が足りないのに相対パスを返す'
+            + '（リポジトリ外の親ディレクトリ名を「リポジトリ相対パス」として出す）',
+        file: 'v0/git.mjs',
+        from: '    if (orig.length < depth) return null;',
+        to: '    /* 変異: 段数の対応を確かめない */',
+        gone: 'if (orig.length < depth) return null',
+        pattern: '元表記の段数が足りなければ',
+        testFile: 'v0/transcript.test.mjs',
+        defensive: '手元では junction が作れず（EPERM）、段数がずれる形を'
+            + '移植可能に作れないので落とせない。不変条件（返る段数 <= 元表記の段数）は'
+            + 'テストで固定してある。測れない理由を明示して残す',
+    },
+    {
         name: 'transcript-cwd-next-candidate',
         why: '最新の1本で cwd が読めないと諦める（cwd を持たない 112B のスタブが最新だと、'
             + '同じ dir の 182MB の実セッションを丸ごと捨てて「記録なし」と嘘をつく #36）',

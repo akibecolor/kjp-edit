@@ -1103,6 +1103,9 @@ function renderAgents(s) {
       //    開けない（`openable` に無いのでリンクにもならない）。黙って出すと
       //    「そのファイルを触った」という誤読になる（#38）
       if (r.pathClipped) line.append(el('span', 'note', ' (パスが長いので省略)'));
+      // 🚨 相対パスの基準が分からなかった場合。**「外」と断言しない**
+      //    （デーモンの cwd で解決すると別のファイルの名前を出す）
+      if (r.pathUnresolved) line.append(el('span', 'note', ' (相対パスの基準が不明)'));
       if (r.sidechain) line.append(el('span', 'note', ' (サブ)'));
       if (r.command) line.append(el('div', 'note', `$ ${r.command}`));
       d.append(line);

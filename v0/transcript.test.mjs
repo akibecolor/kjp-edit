@@ -12,6 +12,7 @@ import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { summarize, repoRelative, readTail, collectAgents, LIMITS } from './transcript.mjs';
+import { relativeInside } from './git.mjs';
 
 const SECRET = 'INJECT-SECRET-12345';
 const WT = process.platform === 'win32' ? 'C:/wt/agent-a' : '/wt/agent-a';
@@ -647,4 +648,114 @@ test('collectAgents: 記録の場所が無ければ理由を errors に出す（
     assert.deepEqual(agents, []);
     assert.equal(errors.length, 1);
     assert.match(errors[0].message, /読めません/);
+});
+
+/**
+ * 🚨 **相対パスをデーモンの cwd で解決してはいけない（7回目のレビュー）。**
+ *
+ * 記録側のパスは相対のことがある（Grep / Glob の `path` など）。
+ * `realpathSync.native()` は**サーバプロセスの cwd** を基準に解決するので、
+ * (a) 触っていないファイルを「触った」と表示し、
+ * (b) worktree 内のファイルを「(リポジトリ外)」と表示する、という2つの嘘が出る。
+ * レコードには `cwd` が入っていて所有者判定に使っているのに、解決には使っていなかった。
+ */
+test('🚨 相対パスはレコードの cwd で解決し、分からなければ「不明」と言う', () => {
+    const rec = (input, cwd) => [JSON.stringify({
+        type: 'assistant', timestamp: ago(1000), cwd, sessionId: 's',
+        message: { content: [{ type: 'tool_use', name: 'Grep', input }] },
+    })];
+
+    // cwd があれば worktree 相対に解決できる
+    const withCwd = summarize(rec({ path: 'v0/git.mjs' }, WT), { worktreePath: WT, now: NOW });
+    assert.equal(withCwd.recent[0].path, 'v0/git.mjs');
+    assert.equal(withCwd.recent[0].outside, false);
+    assert.equal(withCwd.recent[0].pathUnresolved, false);
+
+    // cwd が無ければ **「外」と断言せず不明にする**（デーモンの cwd で解決しない）
+    const noCwd = summarize(rec({ path: 'v0/git.mjs' }, undefined), { worktreePath: WT, now: NOW });
+    assert.equal(noCwd.recent[0].path, null, 'デーモンの cwd で解決している');
+    assert.equal(noCwd.recent[0].outside, false, '「外」と断言してはいけない');
+    assert.equal(noCwd.recent[0].pathUnresolved, true, '不明であることを伝えていない');
+
+    // 別プロジェクトの cwd を基準にした相対パスは「外」になる（漏らさない）
+    const other = process.platform === 'win32' ? 'C:/other/proj' : '/other/proj';
+    const outside = summarize(rec({ path: 'secret.env' }, other), { worktreePath: WT, now: NOW });
+    assert.equal(outside.recent[0].path, null);
+    assert.equal(outside.recent[0].outside, true);
+});
+
+/**
+ * 🚨 **元表記の段数が足りないときは「外」と言う（7回目のレビュー）。**
+ *
+ * junction / symlink がリポジトリの**中の深い場所**を指していて、記録が外側の綴りを
+ * 使っていると、解決後の残り段数が元表記の段数を上回り、`orig.slice(-depth)` が
+ * **リポジトリ外の親ディレクトリ名を巻き込む**。それが `isSafeRepoPath` を通るので
+ * `outside:false` で payload に載り、「外のパスは出さない」が破れる。
+ */
+test('🚨 relativeInside: 元表記の段数が足りなければ null（外）を返す', () => {
+    // 解決後に段数が増える形を直接作る（正規化で段が増える = 元表記が短い）
+    // ⚠️ 実際の junction を作らずに不変条件だけ確かめる: 中にあると判定されたなら、
+    //    返る相対パスの段数は**元表記の段数以下**でなければならない
+    const cases = [
+        [WT, `${WT}/a/b/c.txt`],
+        [WT, `${WT}/a.txt`],
+        [WT, WT],
+    ];
+    for (const [parent, child] of cases) {
+        const rel = relativeInside(parent, child);
+        if (rel === null || rel === '') continue;
+        const origSegs = child.split(/[\/]/).filter(Boolean).length;
+        assert.ok(rel.split('/').length <= origSegs,
+            `元表記より段数が多い相対パスを返した: ${rel} (from ${child})`);
+        // 外の名前を巻き込んでいないこと
+        assert.ok(!rel.includes('..'), `.. が入っている: ${rel}`);
+    }
+});
+
+/**
+ * 🚨 **1ファイルの読み取り失敗でプロジェクト丸ごとを捨てない（7回目のレビュー）。**
+ *
+ * `try` が readdir のループの**外**にあったので、`stat()` が1つでも投げると
+ * （消えた最中 / 権限 / ロック）**プロジェクトディレクトリ全体**を無告知で捨てていた。
+ * 結果、5秒前に Edit を書いたエージェントに「記録がありません」と断言する。
+ * #27 / #36 / #37 で3回潰した型が、まだここに残っていた。
+ */
+test('🚨 1ファイルが読めなくてもプロジェクトを捨てない（告知はする）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-drop-'));
+    const wtRoot = await mkdtemp(join(tmpdir(), 'kjp-dropwt-'));
+    try {
+        const wt = join(wtRoot, 'agent-a');
+        await mkdir(wt);
+        const dir = join(root, 'proj');
+        await mkdir(dir);
+        const live = JSON.stringify({
+            type: 'assistant', timestamp: ago(3000), cwd: wt, sessionId: 's1',
+            message: { content: [{ type: 'tool_use', name: 'Edit', input: {} }] },
+        });
+        await writeFile(join(dir, 'real.jsonl'), `${live}\n`, 'utf8');
+        // ⚠️ **読めない `.jsonl` を作る。** 消したファイルの名前を readdir が返す形は
+        //    移植可能に作れないので、**ディレクトリを `.jsonl` という名前で作る**
+        //    （`stat` は通るが `isFile()` が false になる形ではなく、
+        //     `open` が EISDIR で落ちる形を作りたいので、後段の失敗も一緒に確かめる）。
+        await writeFile(join(dir, 'broken.jsonl'), 'x\n', 'utf8');
+
+        // ⚠️ **stat が投げるファイルを移植可能に作れない**（symlink は Windows で EPERM、
+        //    ディレクトリは stat が成功する）。検査専用の継ぎ目で1本だけ投げさせる。
+        const statFn = async q => {
+            if (String(q).endsWith('broken.jsonl')) throw new Error('EACCES（検査で注入）');
+            const { stat } = await import('node:fs/promises');
+            return stat(q);
+        };
+        const r = await collectAgents([{ path: wt, label: 'agent-a' }], { root, now: NOW, statFn });
+        const a = r.agents.find(x => x.name === 'agent-a');
+        assert.equal(a.state, 'active',
+            `1本読めないだけでプロジェクトを捨てている: ${JSON.stringify(r.errors)}`);
+        assert.equal(a.toolCounts.Edit, 1);
+        // 🚨 読めなかったことは**黙って飲まない**（件数で告知する）
+        assert.ok(r.errors.some(e => /読めなかった/.test(e.message)),
+            `読めなかったファイルの告知が無い: ${JSON.stringify(r.errors)}`);
+    } finally {
+        await rm(root, { recursive: true, force: true });
+        await rm(wtRoot, { recursive: true, force: true });
+    }
 });

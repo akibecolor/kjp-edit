@@ -454,7 +454,16 @@ export function relativeInside(parent, child) {
         .replace(isWin ? /[\\/]+/g : /\/+/g, '/')
         .replace(/\/+$/, '')
         .split('/');
-    return orig.slice(Math.max(0, orig.length - depth)).join('/');
+    // 🚨 **元表記の残り段数が depth より少ないなら諦める（null = 外として扱う）。**
+    //    junction / symlink が**リポジトリの中の深い場所**を指していて、記録が
+    //    その外側の綴りを使っていると、解決後の残り段数が元表記の段数を上回り、
+    //    `orig.slice(-depth)` が**リポジトリ外の親ディレクトリ名を巻き込む**。
+    //    それが `isSafeRepoPath` を通るので `outside:false` で payload に載り、
+    //    「リポジトリ外のパスは出さない」が破れる（外のディレクトリ名が漏れ、
+    //    存在しないパスを「触ったファイル」として表示する嘘にもなる）。
+    //    ⚠️ ここは**推測して埋めない**。対応が取れないなら外と言う（7回目のレビュー）。
+    if (orig.length < depth) return null;
+    return orig.slice(orig.length - depth).join('/');
 }
 
 /**
