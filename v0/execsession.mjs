@@ -272,6 +272,13 @@ export class ExecRegistry {
         const evict = [];
         for (const s of this.sessions.values()) {
             if (s.running) {
+                // 🚨 **既に殺しに行っているものを二度候補にしない。**
+                //    サーバは「殺してから終端する」順序（殺せたかを確かめてから
+                //    `exit` を積む）なので、await の間セッションは running のまま。
+                //    ここで弾かないと 1 秒後の tick が同じものを二重に殺しに行く。
+                //    ⚠️ 殺せなかったときサーバは `killRequested` を null に戻すので、
+                //    そのときは次の tick で**もう一度候補になる**（回復経路を残す）。
+                if (s.killRequested) continue;
                 // 1. 絶対上限。これは緩めない
                 if (now - s.createdAt >= this.execTimeoutMs) {
                     kill.push({ session: s, reason: 'timeout' });

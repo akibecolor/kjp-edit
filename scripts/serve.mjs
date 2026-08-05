@@ -31,7 +31,10 @@ import { createConnection } from 'node:net';
 import { repoOf, samePathish } from './winargs.mjs';
 // 🚨 argv の組み立てと門は純関数に切り出してテストで固定している
 //    （scripts/serveargs.test.mjs。#45 まではここに検査が1件も無かった）
-import { SERVE_FLAGS, unknownFlag, checkPort, collectHosts, serverArgs } from './serveargs.mjs';
+import {
+    SERVE_FLAGS, unknownFlag, checkPort, collectHosts, serverArgs,
+    runningCaps, requestedCaps, describeCaps,
+} from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVER = join(ROOT, 'v0', 'server.mjs');
@@ -158,7 +161,14 @@ if (has('--status')) {
         // 何が有効かを全部出す（観測フラグを落としていたのが #30）
         const watch = r.cmd.includes('--allow-transcript-text') ? ' 活動観測+発話'
             : r.cmd.includes('--watch-agents') ? ' 活動観測' : '';
-        console.log(`PID ${r.pid}  port ${r.port ?? '?'}  ${caps}${watch}  ${repo}`);
+        // 🚨 **`--allow-host` を必ず出す。** ここは「何が有効か」を確認する唯一の手段で、
+        //    Host 許可は**誰が届くか**を決める唯一のフラグ。これが無いと
+        //    tailnet 全体から読めるデーモンとループバック専用が同じ1行に見える。
+        //    `autostart.mjs` の status は出しているので、片方だけ欠けた非対称だった。
+        //    ⚠️ 1件だけ出して省略しない（複数指定できる）。
+        const hosts = [...r.cmd.matchAll(/--allow-host\s+(\S+)/g)].map(m => m[1]);
+        const hostPart = hosts.length ? `  Host許可: ${hosts.join(', ')}` : '  ループバックのみ';
+        console.log(`PID ${r.pid}  port ${r.port ?? '?'}  ${caps}${watch}${hostPart}  ${repo}`);
     }
     process.exit(0);
 }
@@ -227,6 +237,25 @@ const already = probe.list.find(r => samePathish(repoOf(r.cmd), repo));
 if (already) {
     console.log(`既に動いています → http://127.0.0.1:${already.port ?? '?'}`);
     console.log(`  PID ${already.pid}  repo ${repo}`);
+    // 🚨 **動いているものの capability を必ず出す。** 以前は URL だけを出していたので、
+    //    先に `--exec` のデーモンが動いていると、素の `node scripts/serve.mjs`
+    //    （読み取り専用のつもり）が「既に動いています → URL」と出して exit 0 し、
+    //    **案内した先が RCE 可能なデーモンであることを1文字も言わなかった**。
+    console.log(`  動いているもの: ${describeCaps(already.cmd)}`);
+    // 🚨 **打ったフラグを黙って捨てない**（#30 と同じ根拠）。今回要求した capability が
+    //    動いているものに無いなら、exit 0 にせず**差分を並べて**止めて入れ直させる。
+    const missing = requestedCaps(argv).filter(c => !runningCaps(already.cmd).includes(c));
+    if (missing.length) {
+        console.error(`
+✖ 要求した capability が動いているものに含まれていません: ${missing.join(', ')}`);
+        console.error('  黙って無視すると「打ったのに効かない」状態になります。');
+        console.error('  入れ直してください:');
+        console.error('      node scripts/serve.mjs --stop');
+        // ⚠️ 打った引数をそのまま見せる（スクリプトの絶対パスは出さない。読みにくいだけ）
+        const shown = argv.map(a => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ');
+        console.error(`      node scripts/serve.mjs ${shown}\n`);
+        process.exit(1);
+    }
     console.log('  止めるには: node scripts/serve.mjs --stop');
     process.exit(0);
 }
@@ -302,6 +331,8 @@ const args = serverArgs({
     // 🚨 **読み取り用と実行用を同じ値にしない**（6回目のレビュー）。
     //    読み取り用の URL をスマホで開くことが、実行トークンを配ることになっていた。
     tokenFile: join(STATE_DIR, 'token-read'),
+    // 🚨 write も別の値にする（読み取り用として配ったトークンで checkout させない）
+    writeTokenFile: join(STATE_DIR, 'token-write'),
     execTokenFile: join(STATE_DIR, 'token-exec'),
     auditLog: join(STATE_DIR, 'exec-audit.jsonl'),
 });

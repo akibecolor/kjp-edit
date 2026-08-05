@@ -601,9 +601,17 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
       if (ev.t === 'session') {
         sessionId = ev.id;
         publish();
-        if (ev.keepAlive) line('d', '（切断しても最後まで走ります）\n');
+        // 🚨 **「最後まで走ります」は完走の約束になっていて嘘だった。**
+        //    keepAlive でも `--exec-timeout`（既定600秒）で SIGKILL される。
+        //    スマホで会話を始めて席を離れると10分で殺され、claude 側の文脈は
+        //    取り戻せない（`--resume` は配線していない）。**上限を必ず言う。**
+        const limit = typeof ev.timeoutMs === 'number'
+          ? `開始から ${Math.round(ev.timeoutMs / 1000)} 秒で停止します`
+          : '上限は不明です';
+        if (ev.keepAlive) line('d', `（切断しても走り続けます。ただし${limit}）\n`);
         else if (ev.detachedGraceMs) {
-          line('d', `（切断しても ${Math.round(ev.detachedGraceMs / 1000)} 秒は走り続けます）\n`);
+          line('d', `（切断しても ${Math.round(ev.detachedGraceMs / 1000)} 秒は走り続けます。`
+            + `${limit}）\n`);
         }
         continue;
       }
@@ -757,7 +765,16 @@ function consoleBody(wt, paneObj) {
     if (!r?.ok) inField.value = text;
   };
   sendBtn.addEventListener('click', send);
-  inField.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+  // 🚨 **IME の変換確定の Enter で発火させない。** 日本語で打つ前提の UI なのに
+  //    `isComposing` を見ていなかったので、変換候補を確定する Enter が
+  //    送信/実行を撃っていた。標準入力側は**未変換の読み**を stdin に書いて欄を空にし、
+  //    直後の compositionend で変換後の文字列が空欄に戻るので、1つのメッセージが
+  //    「読みだけ送信」+「漢字が欄に残る」に割れる。実行側はさらに悪く、
+  //    半端な文字列を splitArgv して **worktree でそのまま実行**する。
+  //    ⚠️ `keyCode === 229` も見る（古い IME は isComposing を立てずに 229 を送る）。
+  inField.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) send();
+  });
   eofBtn.addEventListener('click', () => cur?.write?.('', true));
   chatBtn.addEventListener('click', () => {
     // 会話は専用の argv で始める（入力欄の内容は使わない）
@@ -811,7 +828,10 @@ function consoleBody(wt, paneObj) {
     }
   };
   run.addEventListener('click', start);
-  input.addEventListener('keydown', e => { if (e.key === 'Enter' && !run.disabled) start(); });
+  // 🚨 実行側も同じ（IME の確定 Enter で半端な argv を実行しない）
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229 && !run.disabled) start();
+  });
   // ⚠️ 「停止」は本当に止める（kill）。abort だけでは切断にすぎず、
   //    サーバ側は猶予のあいだ走り続ける
   stop.addEventListener('click', async () => {

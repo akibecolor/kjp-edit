@@ -969,14 +969,18 @@ const MAX_CONCURRENT_EXEC = 8;
  *      唯一の道が `cmd /c npm test` = まさにこの形。避けられない経路だった）
  */
 async function killTree(child) {
-    if (!child.pid) return;
+    if (!child.pid) return { killed: true, why: null };
+    const pid = child.pid;
+    let taskkillCode = null;
     if (process.platform === 'win32') {
         // Windows: taskkill /T で木ごと
         try {
             const { execFile } = await import('node:child_process');
-            await new Promise(resolve => {
-                execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'],
-                    { windowsHide: true }, () => resolve());
+            // 🚨 **終了コードを捨てない。** アクセス拒否・taskkill 不在・木から外れた孫を
+            //    「成功」と区別できないまま `signal:"SIGKILL"` と記録していた
+            taskkillCode = await new Promise(resolve => {
+                execFile('taskkill', ['/PID', String(pid), '/T', '/F'],
+                    { windowsHide: true }, err => resolve(err ? (err.code ?? 1) : 0));
             });
         } catch { /* taskkill が無い環境では下の kill に任せる */ }
     } else {
@@ -989,6 +993,25 @@ async function killTree(child) {
     try { child.kill('SIGKILL'); } catch { /* 既に死んでいる */ }
     // 孫がパイプを握っていても応答を閉じられるようにする
     try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* noop */ }
+
+    // 🚨 **「停止しました」は数え直してから書く**（CLAUDE.md）。この規則は
+    //    `scripts/serve.mjs` の `running()` にしか適用されておらず、
+    //    ここには数え直しが無かった（「規則を書いた場所から遠いコードには
+    //    適用し忘れる」型）。失敗しても `signal:"SIGKILL"` と記録し、
+    //    `/kill` は `{ok:true}` を返し、以後 sweep は候補にせず、
+    //    **回復経路が1つも無い**状態になっていた。
+    for (let i = 0; i < 20; i++) {
+        if (child.exitCode !== null || child.signalCode !== null) return { killed: true, why: null };
+        let alive = true;
+        try { process.kill(pid, 0); } catch { alive = false; }
+        if (!alive) return { killed: true, why: null };
+        await new Promise(r => setTimeout(r, 100));
+    }
+    return {
+        killed: false,
+        why: `PID ${pid} がまだ生きています`
+            + (taskkillCode !== null ? `（taskkill は exit ${taskkillCode}）` : ''),
+    };
 }
 
 /**
@@ -1074,6 +1097,12 @@ function streamSession(req, res, s, from) {
         worktree: s.worktree,
         seq: replay.seq,
         detachedGraceMs: s.keepAlive ? null : opts.execDetachedGraceMs,
+        // 🚨 **絶対上限を必ず送る。** これが無いと UI は寿命について
+        //    「切断しても最後まで走ります」しか言えず、**完走の約束**になっていた。
+        //    実際は `--exec-timeout`（既定600秒）で SIGKILL される。
+        //    「停止しましたと言って停止していない」の裏返しで、同じ型の食い違い
+        //    （スマホで会話を始めて席を離れると10分で殺され、文脈は取り戻せない）。
+        timeoutMs: opts.execTimeoutMs,
     });
     if (replay.missing > 0) {
         send({ t: 'err', d: `⚠ 出力が上限を超えたので ${replay.missing} 件を省略しました` });
@@ -1124,15 +1153,34 @@ function startExecSweeper() {
             const note = reason === 'timeout'
                 ? `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します`
                 : `⚠ 切断されたまま ${opts.execDetachedGraceMs / 1000}s 経ったので停止します`;
-            // ⚠️ 先に finish しておく。kill を待つ間に sweep がもう一度回って
-            //    二重に殺しに行くのを防ぐ（finish は1回しか効かない）。
+            // ⚠️ 二重に殺しに行くのを防ぐため `killRequested` を先に立てる
+            //    （`sweep()` はこれが立っているセッションを候補にしない）。
+            // 🚨 **殺してから終端する。** finish が先だと、実際に死ぬまでの出力が
+            //    `exit` の後ろに並んで live には届かず、殺せなかった場合も
+            //    「停止しました」と記録してしまう（`/kill` と同じ理由）。
             session.killRequested = reason;
-            execRegistry.finish(session, { code: null, signal: 'SIGKILL', note });
+            // 🚨 **理由は殺す前に流す。** 殺してから終端する順序にしたので、
+            //    子の 'exit' ハンドラが先に終端することがあり（実測: `code:1`）、
+            //    finish に載せた note が**捨てられて停止理由が消えた**
+            //    （「なぜ止まったか」が読めなくなる = 観測ツールとして本末転倒）。
+            //    先に理由を1件流せば、実際の終了コードと両方が残る。
+            execRegistry.emit(session, 'err', `${note}\n`);
             await auditExec({
                 event: 'kill', reason, session: session.id,
                 worktree: session.worktree, argv: session.argv,
             });
-            if (session.child) await killTree(session.child);
+            const r = session.child
+                ? await killTree(session.child) : { killed: true, why: null };
+            if (!r.killed) {
+                session.killRequested = null;   // 次の tick で もう一度試せるように戻す
+                execRegistry.emit(session, 'err', `⚠ 停止できませんでした: ${r.why}\n`);
+                await auditExec({
+                    event: 'kill-failed', reason, session: session.id,
+                    worktree: session.worktree, argv: session.argv, why: r.why,
+                });
+                continue;
+            }
+            execRegistry.finish(session, { code: null, signal: 'SIGKILL', note });
         }
         for (const s of evict) execRegistry.remove(s);
     }, 1000);
@@ -1513,10 +1561,34 @@ async function handleRequest(req, res) {
                         event: 'kill', reason: 'requested', session: s.id,
                         worktree: s.worktree, argv: s.argv,
                     });
+                    // 🚨 **殺してから終端する（順序を逆にした）。** 以前は
+                    //    `finish()` が先だったので、(a) 実際に死ぬまでに出た出力は
+                    //    `exit` の後ろに並び **live には1件も届かず告知も無い**、
+                    //    (b) 出力が多いと `exit` 自身がリングから押し出されて
+                    //    **終端が消える**、(c) 殺せなかったのに「停止しました」と
+                    //    記録する、という3つが同時に起きていた。
+                    //    ⚠️ 二重に殺しに行くのを防ぐため、`killRequested` を先に立てる
+                    //    （`sweep()` はこれが立っているセッションを候補にしない）。
+                    s.killRequested = 'requested';
+                    // 🚨 理由は殺す前に流す（子の 'exit' が先に終端すると
+                    //    finish の note が捨てられ、停止理由が消える。sweeper と同じ理由）
+                    execRegistry.emit(s, 'err', '⚠ 停止を要求されました\n');
+                    const r = s.child ? await killTree(s.child) : { killed: true, why: null };
+                    if (!r.killed) {
+                        // 殺せていないなら終端しない（走っているものを「停止」と言わない）。
+                        // `killRequested` を戻して、上限で sweep がもう一度試せるようにする
+                        s.killRequested = null;
+                        execRegistry.emit(s, 'err', `⚠ 停止できませんでした: ${r.why}\n`);
+                        await auditExec({
+                            event: 'kill-failed', reason: 'requested', session: s.id,
+                            worktree: s.worktree, argv: s.argv, why: r.why,
+                        });
+                        denyJson(res, 500, `停止できませんでした: ${r.why}`);
+                        return;
+                    }
                     const was = execRegistry.finish(s, {
-                        code: null, signal: 'SIGKILL', note: '⚠ 停止を要求されました',
+                        code: null, signal: 'SIGKILL', note: '⚠ 停止しました',
                     });
-                    if (s.child) await killTree(s.child);
                     res.writeHead(200, {
                         'content-type': 'application/json; charset=utf-8',
                         'cache-control': 'no-store',

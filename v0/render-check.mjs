@@ -100,6 +100,46 @@ const MEASURE = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **IME の変換確定の Enter で実行が発火しないこと（実ブラウザで測る）。**
+ *
+ * 日本語で打つ前提の UI なのに `isComposing` を見ていなかったので、
+ * 変換候補を確定する Enter が **半端な argv をそのまま実行**していた。
+ * 字面の検査では意味が無い（条件を消しても行は残る）ので、
+ * **合成イベントを撃って副作用の有無を見る**。
+ */
+const IME_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < 200; i++) {
+    if (document.querySelector(".cmdbar input")) break;
+    await wait(100);
+  }
+  const input = document.querySelector(".cmdbar input");
+  const term = document.querySelector(".term");
+  if (!input || !term) return { error: "コマンドバーが無い（--allow-exec とトークンを確認）" };
+  const fire = composing => {
+    const ev = new KeyboardEvent("keydown", { key: "Enter", bubbles: true });
+    Object.defineProperty(ev, "isComposing", { get: () => composing });
+    input.dispatchEvent(ev);
+  };
+  const textOf = () => term.textContent ?? "";
+  input.value = "git --version";
+  const before = textOf();
+  fire(true);            // 変換中の確定 Enter → 実行してはいけない
+  await wait(1500);
+  const afterComposing = textOf();
+  fire(false);           // 確定後の Enter → 実行してよい
+  let afterReal = afterComposing;
+  for (let i = 0; i < 60; i++) {
+    await wait(100);
+    afterReal = textOf();
+    if (afterReal.length > afterComposing.length) break;
+  }
+  return {
+    firedWhileComposing: afterComposing.length !== before.length,
+    firedAfterComposing: afterReal.length > afterComposing.length,
+  };
+})()`;
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -217,6 +257,11 @@ try {
         timer = setTimeout(() => done(rej)(new Error(`${method} が返らない`)), 240000);
     });
 
+    // 🚨 IME の検査は**描画の計測より前**に走らせる（12,000行流した後だと
+    //    端末の文字量で副作用を判定できない）
+    const ime = (await send(10, 'Runtime.evaluate',
+        { expression: IME_CHECK, awaitPromise: true, returnByValue: true }))?.result?.value;
+
     // ⚠️ ページの再描画と重なると `Execution context was destroyed` になる。
     //    1回だけやり直す（それでも駄目なら失敗として出す）
     let r;
@@ -234,6 +279,17 @@ try {
     if (probe.error) throw new Error(probe.error);
 
     const problems = [];
+    // 🔒 IME: 変換中は発火せず、確定後は発火すること（片側だけの検査にしない）
+    if (!ime || ime.error) {
+        problems.push(`IME の検査ができなかった: ${ime?.error ?? "結果が取れない"}`);
+    } else {
+        if (ime.firedWhileComposing) {
+            problems.push('IME の変換中の Enter で実行が発火した（未確定の argv がそのまま走る）');
+        }
+        if (!ime.firedAfterComposing) {
+            problems.push('確定後の Enter で実行が発火しない（IME の守りが広すぎる）');
+        }
+    }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {
         problems.push(`最長ブロック ${probe.maxBlockMs}ms > 予算 ${BUDGET_MAX_BLOCK_MS}ms`
             + '（UI が固まって停止ボタンも自動更新も効かない）');

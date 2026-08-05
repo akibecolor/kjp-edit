@@ -761,6 +761,32 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'scripts/serveargs.test.mjs',
     },
     {
+        // 🚨 7回目のレビュー: 分けたのは exec だけで、write が read を使い回していた
+        name: 'serve-token-write-separate',
+        why: '--write --allow-host が読み取り用トークンを使い回す'
+            + '（読み取り用として配った値が checkout の資格情報になる）',
+        file: 'scripts/serveargs.mjs',
+        from: '    const file = wantExec ? execTokenFile : (wantWrite ? writeTokenFile : tokenFile);',
+        to: '    const file = wantExec ? execTokenFile : tokenFile;',
+        gone: 'wantWrite ? writeTokenFile : tokenFile',
+        pattern: '読み取り用トンネルと実行でトークンのファイルを分ける',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-running-caps',
+        why: '動いているデーモンの capability を読めなくする'
+            + '（先に --exec のデーモンが動いていると、読み取り専用のつもりの起動が'
+            + 'RCE 可能なデーモンの URL を黙って案内する）',
+        file: 'scripts/serveargs.mjs',
+        from: "    const tokens = new Set(String(cmd ?? '').split(/\\s+/));\n"
+            + "    return ['--allow-exec', '--allow-write', '--watch-agents', '--allow-transcript-text',\n"
+            + "        '--allow-host'].filter(f => tokens.has(f));",
+        to: '    return [];',
+        gone: 'tokens.has(f)',
+        pattern: '動いているデーモンの capability を読める',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
         name: 'serve-token-separate',
         why: '読み取り用トンネルと実行で同じトークンファイルを使う'
             + '（読み取り用の URL をスマホで開くことが実行トークンを配ることになる。6回目のレビュー）',
@@ -825,6 +851,82 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         from: '    if (!flushing) { flushing = true; requestAnimationFrame(flush); }',
         to: '    flush();',
         gone: 'requestAnimationFrame(flush)',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // 🚨 7回目のレビュー: finish が先だと exit の後ろに出力が並び、live には届かない
+        name: 'kill-then-finish-order',
+        why: '殺す前に終端する（実際に死ぬまでの出力が live に届かず告知も無い。'
+            + '出力が多いと exit 自身がリングから押し出されて終端が消える）',
+        file: 'v0/server.mjs',
+        // ⚠️ **finish を消すだけでは元のバグにならない**（子の 'exit' ハンドラが
+        //    後から finish するので、結果は「殺してから終端」= 修正後と同じになる。
+        //    最初これで書いて SURVIVED になった）。**順序を元に戻す**のが正しい変異。
+        from: "                    s.killRequested = 'requested';",
+        to: "                    s.killRequested = 'requested';\n"
+            + "                    execRegistry.finish(s, { code: null, signal: 'SIGKILL',\n"
+            + "                        note: '⚠ 停止を要求されました' });   /* 変異: 殺す前に終端する */",
+        gone: "s.killRequested = 'requested';\n                    const r =",
+        pattern: 'exit の後ろに並ばない',
+    },
+    {
+        name: 'kill-confirm',
+        why: 'killTree の成否を確かめずに「停止しました」と記録する'
+            + '（殺せなくても signal:SIGKILL と書き、以後 sweep も候補にしないので回復経路が無い）',
+        file: 'v0/server.mjs',
+        from: `    for (let i = 0; i < 20; i++) {
+        if (child.exitCode !== null || child.signalCode !== null) return { killed: true, why: null };
+        let alive = true;
+        try { process.kill(pid, 0); } catch { alive = false; }
+        if (!alive) return { killed: true, why: null };
+        await new Promise(r => setTimeout(r, 100));
+    }`,
+        to: '    return { killed: true, why: null };',
+        gone: 'if (!alive) return { killed: true, why: null }',
+        // ⚠️ **これは測れない。** 数え直しが効くのは「kill が失敗したとき」だけで、
+        //    落ちないプロセスを移植可能に作る手段が無い（権限で保護されたプロセスが要る）。
+        //    成功経路の差は「応答が返る時点で子が確実に死んでいる」だけで、
+        //    それを assert すると数ミリ秒の競争になり flaky になる。
+        //    **「未検証」を defensive で誤魔化さない**という規則に従って、
+        //    測れない理由をここに書いて残す。
+        defensive: '数え直しが効くのは kill が失敗したときだけで、'
+            + '落ちないプロセスを移植可能に作れないので測れない。'
+            + '成功経路の差は数ミリ秒の競争で flaky になる。理由を明示して残す',
+        pattern: '中間シェルを挟んだ孫プロセス',
+    },
+    {
+        name: 'sweep-skip-killing',
+        why: '殺しに行っているセッションを sweep がもう一度候補にする（二重に殺しに行く）',
+        file: 'v0/execsession.mjs',
+        from: '                if (s.killRequested) continue;',
+        to: '                /* 変異: 二重の kill を防がない */',
+        gone: 'if (s.killRequested) continue',
+        pattern: '上限時間を超えたら停止する',
+        defensive: '現状は二重に殺しても結果は同じ（killTree は冪等で finish も1回だけ効く）。'
+            + '殺せなかったときに killRequested を戻して再試行させる形の前提なので、前出しで残す',
+    },
+    {
+        name: 'session-absolute-timeout',
+        why: 'session レコードに絶対上限を入れない'
+            + '（UI が「切断しても最後まで走ります」= 完走の約束しか言えなくなる。'
+            + '実際は --exec-timeout で SIGKILL される）',
+        file: 'v0/server.mjs',
+        from: '        timeoutMs: opts.execTimeoutMs,',
+        to: '        /* 変異: 絶対上限を送らない */',
+        gone: 'timeoutMs: opts.execTimeoutMs',
+        // ⚠️ assert を足したのは「明示的な kill」のテストの中（keepAlive の session を
+        //    読んでいる場所）。**pattern は assert がある側のテスト名にする**
+        pattern: '明示的な kill で止まり',
+    },
+    {
+        // 🚨 7回目のレビュー: 日本語入力の確定 Enter で実行が発火していた
+        name: 'ime-composing-exec',
+        why: 'IME の変換確定 Enter で実行が発火する'
+            + '（未確定の argv が splitArgv されて worktree でそのまま走る）',
+        file: 'v0/app.html',
+        from: "    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229 && !run.disabled) start();",
+        to: "    if (e.key === 'Enter' && !run.disabled) start();",
+        gone: "!e.isComposing && e.keyCode !== 229 && !run.disabled",
         script: 'v0/render-check.mjs',
     },
     {
@@ -1130,8 +1232,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         // taskkill は win32 にしか無い。POSIX では通らない経路
         platforms: ['win32'],
         file: 'v0/server.mjs',
-        from: "                execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'],",
-        to: "                execFile('taskkill', ['/PID', String(child.pid), '/F'],",
+        // ⚠️ 終了コードを見るようにしたので字面が変わった（`child.pid` → `pid`）
+        from: "                execFile('taskkill', ['/PID', String(pid), '/T', '/F'],",
+        to: "                execFile('taskkill', ['/PID', String(pid), '/F'],",
         gone: "'/T', '/F'",
         pattern: '中間シェルを挟んだ孫プロセス',
     },

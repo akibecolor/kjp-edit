@@ -1442,6 +1442,12 @@ test('🚨 exec: 明示的な kill で止まり、監査に残る', async () => 
         assert.equal(first.t, 'session');
         assert.equal(first.keepAlive, true, 'keepAlive が反映されていない');
         assert.equal(first.detachedGraceMs, null, 'keepAlive なのに猶予が出ている');
+        // 🚨 **絶対上限を必ず送る。** これが無いと UI は「切断しても最後まで走ります」
+        //    しか言えず、**完走の約束**になる（実際は --exec-timeout で SIGKILL）。
+        //    keepAlive のセッションこそ、いつ殺されるかを言わなければならない
+        assert.equal(typeof first.timeoutMs, 'number',
+            `session レコードに絶対上限が入っていない: ${JSON.stringify(first)}`);
+        assert.ok(first.timeoutMs > 0, `上限が正の数でない: ${first.timeoutMs}`);
 
         while (size() === 0) await new Promise(r => setTimeout(r, 50));
         ac.abort();
@@ -1601,6 +1607,55 @@ const sendInput = (url, id, body) => fetch(`${url}/api/v0/exec/${id}/input`, {
     body: JSON.stringify(body),
 });
 
+/**
+ * 🚨 **停止したら、そこで終端すること（exit の後ろに出力を並べない）。**
+ *
+ * 以前は `/kill` と sweeper がどちらも **finish() を先に、killTree() を後に**
+ * 呼んでいた。`finish()` は `exit` を流して購読側が `res.end()` するので、
+ * (a) 実際に死ぬまでに出た出力は **live に1件も届かず、省略の告知も無い**
+ * (b) 再購読すると `exit` より**後ろに** out が並ぶ（終わったと言った後の出力）
+ * (c) 出力が多いと `exit` 自身がリングから押し出されて**終端が消える**
+ * が同時に起きていた。「省略したのに告知しない」型そのもの。
+ * → **殺してから終端する**順序に変えた。
+ */
+test('🚨 exec: 停止した後の出力が exit の後ろに並ばない', async () => {
+    const { child, url } = await startExec();
+    try {
+        // 出力を出し続けるプロセス（1ms ごとに 2KB）
+        const script = "setInterval(() => process.stdout.write('x'.repeat(2048)), 1)";
+        const s = await startSession(url, [process.execPath, '-e', script]);
+        await s.until(r => r.t === 'out');
+        await new Promise(r => setTimeout(r, 700));
+
+        const kr = await fetch(`${url}/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        assert.equal(kr.status, 200, `停止できない: ${kr.status}`);
+        await s.until(r => r.t === 'exit', 20000);
+
+        // (b) 台帳側（再購読）で exit が最後であること
+        const rep = await fetch(`${url}/api/v0/exec/${s.id}/stream?from=0`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        assert.equal(rep.status, 200);
+        const recs = (await rep.text()).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const exitAt = recs.findIndex(r => r.t === 'exit');
+        assert.notEqual(exitAt, -1, `再購読に exit が無い（終端が消えた）: ${recs.length} 件`);
+        const after = recs.slice(exitAt + 1).filter(r => r.t === 'out' || r.t === 'err');
+        assert.equal(after.length, 0,
+            `exit の後ろに出力が ${after.length} 件並んでいる（終わったと言った後の出力）`);
+
+        // (a) live が受けた最大通番が台帳の最大通番と一致すること（黙って捨てていない）
+        const nums = r => r.filter(x => typeof x.n === 'number').map(x => x.n);
+        const liveMax = Math.max(0, ...nums(s.seen));
+        const ledgerMax = Math.max(0, ...nums(recs));
+        assert.equal(liveMax, ledgerMax,
+            `live が受け取れなかった出力がある（live ${liveMax} / 台帳 ${ledgerMax}）`);
+        s.abort();
+    } finally { child.kill(); }
+});
 test('🚨 exec: 標準入力に書けて、往復し、EOF で閉じられる', async () => {
     const { child, url } = await startExec();
     try {

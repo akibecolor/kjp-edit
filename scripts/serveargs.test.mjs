@@ -15,12 +15,14 @@ import { join } from 'node:path';
 import {
     SERVE_FLAGS, AUTOSTART_FLAGS, unknownFlag, checkPort, checkHost,
     collectHosts, serverArgs, autostartServeArgs,
+    runningCaps, requestedCaps, describeCaps,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
 const base = extra => serverArgs({
     argv: extra, server: SERVER, repo: '/r', port: 7749,
-    tokenFile: '/s/token-read', execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
+    tokenFile: '/s/token-read', writeTokenFile: '/s/token-write',
+    execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
 });
 /** args から --token-file の値を取る。無ければ null
  *  ⚠️ `indexOf` が -1 のときに +1 して 0 にしない（args[0] を値と誤読する） */
@@ -130,7 +132,14 @@ test('🔒 読み取り用トンネルと実行でトークンのファイルを
 
     // 実行 + トンネルなら実行用（強い方）を使う。読み取り用に降格させない
     assert.equal(tokenFileOf(base(['--exec', '--allow-host', 'box.ts.net'])), '/s/token-exec');
-    // --write は checkout だけなので起動ごとのランダムで足りる（鍵を置かない）
+    // 🚨 **--write --allow-host も読み取り用と別の値にする。** 6回目に分けたのは
+    //    exec だけだったので、書き込みデーモンが読み取り専用トンネルと同じ
+    //    token-read を使っていた（読み取り用として配ったトークンが checkout の
+    //    資格情報になる）。**この検査は以前その穴を承認していた**（7回目のレビュー）
+    assert.equal(tokenFileOf(base(['--write', '--allow-host', 'box.ts.net'])), '/s/token-write');
+    assert.notEqual(tokenFileOf(base(['--write', '--allow-host', 'box.ts.net'])),
+        tokenFileOf(base(['--allow-host', 'box.ts.net'])));
+    // ループバックだけなら永続化しない（要らない場所に鍵を置かない）
     assert.equal(tokenFileOf(base(['--write'])), null);
 });
 
@@ -227,4 +236,45 @@ test('autostart.mjs は知らないオプションで登録せずに止まる（
     assert.match(r.out, /知らないオプションです: --watch-agents/,
         '門より先に別の検証で落ちている（門を呼んでいない）');
     assert.match(r.out, /このスクリプトでは --watch です/);
+});
+
+/**
+ * 🚨 **「既に動いています」で URL だけ出してはいけない。**
+ *
+ * 先に `--exec` のデーモンが動いていると、素の `node scripts/serve.mjs`
+ * （読み取り専用のつもり）が「既に動いています → URL」と出して exit 0 し、
+ * **案内した先が RCE 可能なデーモンであることを1文字も言わなかった**（7回目のレビュー）。
+ */
+test('🔒 動いているデーモンの capability を読める（実行を黙って案内しない）', () => {
+    const execCmd = 'node C:/x/v0/server.mjs --repo C:/r --port 7749'
+        + ' --allow-write --allow-exec --watch-agents --allow-host box.ts.net';
+    assert.deepEqual(runningCaps(execCmd).sort(),
+        ['--allow-exec', '--allow-host', '--allow-write', '--watch-agents']);
+    assert.match(describeCaps(execCmd), /実行/, '実行が有効なことを言っていない');
+    assert.match(describeCaps(execCmd), /Host許可: box.ts.net/);
+
+    const roCmd = 'node C:/x/v0/server.mjs --repo C:/r --port 7749';
+    assert.deepEqual(runningCaps(roCmd), []);
+    assert.match(describeCaps(roCmd), /読み取り専用/);
+    assert.match(describeCaps(roCmd), /ループバックのみ/, 'Host 許可の有無を言っていない');
+
+    // ⚠️ 部分一致で誤検出しない（`--allow-hostx` を `--allow-host` と読まない）
+    assert.deepEqual(runningCaps('node v0/server.mjs --allow-hostx y'), []);
+});
+
+test('要求した capability をサーバ側の名前に直せる（差分を出すため）', () => {
+    assert.deepEqual(requestedCaps(['--exec']).sort(), ['--allow-exec', '--allow-write']);
+    assert.deepEqual(requestedCaps(['--write']), ['--allow-write']);
+    assert.deepEqual(requestedCaps(['--agents-text']).sort(),
+        ['--allow-transcript-text', '--watch-agents']);
+    assert.deepEqual(requestedCaps(['--watch']), ['--watch-agents']);
+    assert.deepEqual(requestedCaps(['--allow-host', 'a.ts.net']), ['--allow-host']);
+    assert.deepEqual(requestedCaps([]), []);
+    assert.deepEqual(requestedCaps(null), [], '壊れた入力で投げない');
+
+    // 読み取り専用のデーモンが動いている状態で --exec を要求したら差分が出る
+    const missing = requestedCaps(['--exec'])
+        .filter(c => !runningCaps('node v0/server.mjs --repo C:/r').includes(c));
+    assert.deepEqual(missing.sort(), ['--allow-exec', '--allow-write'],
+        '黙って無視すると「打ったのに効かない」状態になる');
 });

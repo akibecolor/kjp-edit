@@ -92,7 +92,9 @@ export function collectHosts(argv) {
  * 🔒 ここが capability の分界。**`--exec` は `--write` を含むが、逆は含まない。**
  *    観測（`--watch` / `--agents-text`）はどちらとも独立で、既定では付けない。
  */
-export function serverArgs({ argv, server, repo, port, tokenFile, execTokenFile, auditLog }) {
+export function serverArgs({
+    argv, server, repo, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
+}) {
     const has = f => argv.includes(f);
     const args = [server, '--repo', repo, '--port', String(port)];
     const wantExec = has('--exec');
@@ -110,7 +112,14 @@ export function serverArgs({ argv, server, repo, port, tokenFile, execTokenFile,
     //     6回目のレビュー）。**capability ごとに別の資格情報にする。**
     // 🔒 `--allow-host` を付けると読み取りにも認証が要る。トークンが起動ごとに
     //    変わると開き直すたびに URL を探すので、トンネルを使うなら必ず永続化する。
-    const file = wantExec ? execTokenFile : tokenFile;
+    // 🚨 **3段にする（read / write / exec）。** 6回目に分けたのは exec だけだったので、
+    //    `--write --allow-host` のデーモンは読み取り専用トンネルと**同じ token-read** を
+    //    使っていた。読み取り用として配った（スマホの履歴・ブックマーク・トンネルの
+    //    アクセスログに残した）トークンが、書き込みデーモンでは
+    //    `POST /api/v0/checkout` の資格情報になる。**分界は資格情報のレベルでも引く**
+    //    （7回目のレビュー。しかもテストが「--write は起動ごとのランダムで足りる」と
+    //     書いてこの組み合わせを承認していた）。
+    const file = wantExec ? execTokenFile : (wantWrite ? writeTokenFile : tokenFile);
     if ((hosts.length > 0 || wantExec) && file) args.push('--token-file', file);
     if (wantExec) {
         args.push('--allow-exec');
@@ -144,4 +153,49 @@ export function autostartServeArgs({ argv, repo, port }) {
     if (has('--agents-text')) args.push('--agents-text');
     else if (has('--watch')) args.push('--watch');
     return { args };
+}
+
+/**
+ * 動いているデーモンのコマンド行から capability を読む。
+ *
+ * 🚨 **「既に動いています」で URL だけ出してはいけない。** 先に `--exec` の
+ *    デーモンが動いていると、素の `node scripts/serve.mjs`（読み取り専用のつもり）が
+ *    「既に動いています → URL」と出して exit 0 し、**案内した先が RCE 可能な
+ *    デーモンであることを1文字も言わなかった**（7回目のレビュー）。
+ * @param {string} cmd 動いているプロセスのコマンド行
+ * @returns {string[]} サーバ側のフラグ名
+ */
+export function runningCaps(cmd) {
+    // ⚠️ 正規表現でコマンド行を舐めない。`--allow-host` が `--allow-hostx` にも
+    //    当たるし、テンプレートリテラルの中で `\s` が潰れて `s` になる事故もある
+    //    （実際に踏んだ）。**空白で切ってトークンとして比べる。**
+    const tokens = new Set(String(cmd ?? '').split(/\s+/));
+    return ['--allow-exec', '--allow-write', '--watch-agents', '--allow-transcript-text',
+        '--allow-host'].filter(f => tokens.has(f));
+}
+
+/** この起動口の argv が要求している capability（サーバ側のフラグ名に直して返す） */
+export function requestedCaps(argv) {
+    const a = Array.isArray(argv) ? argv : [];
+    const out = [];
+    if (a.includes('--exec')) { out.push('--allow-exec', '--allow-write'); }
+    else if (a.includes('--write')) out.push('--allow-write');
+    if (a.includes('--agents-text')) out.push('--watch-agents', '--allow-transcript-text');
+    else if (a.includes('--watch')) out.push('--watch-agents');
+    if (a.includes('--allow-host')) out.push('--allow-host');
+    return out;
+}
+
+/** 人が読む形にする（`--status` と「既に動いています」で同じ言い方をする） */
+export function describeCaps(cmd) {
+    const caps = runningCaps(cmd);
+    const parts = [];
+    if (caps.includes('--allow-exec')) parts.push('🚨 実行（任意コマンド）');
+    else if (caps.includes('--allow-write')) parts.push('書き込み（checkout）');
+    else parts.push('読み取り専用');
+    if (caps.includes('--allow-transcript-text')) parts.push('活動観測+発話');
+    else if (caps.includes('--watch-agents')) parts.push('活動観測');
+    const hosts = [...String(cmd ?? '').matchAll(/--allow-host\s+(\S+)/g)].map(m => m[1]);
+    parts.push(hosts.length ? `Host許可: ${hosts.join(', ')}` : 'ループバックのみ');
+    return parts.join(' / ');
 }
