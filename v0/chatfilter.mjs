@@ -31,11 +31,33 @@ export function makeChatFilter(line) {
             let r;
             try { r = JSON.parse(l); } catch { line('', `${l}\n`); continue; }
             if (r.type === 'assistant') {
-                const t = (r.message?.content ?? [])
-                    .filter(b => b.type === 'text').map(b => b.text).join('');
-                if (t.trim()) line('', `${t.trim()}\n`);
-                for (const b of r.message?.content ?? []) {
-                    if (b.type === 'tool_use') line('d', `  · ${b.name}\n`);
+                // 🚨 **`content` が配列でない形が来る。** `.filter` が TypeError を投げ、
+                //    それが購読ループを抜けて finally の `onState({running:false})` に落ちる。
+                //    結果、**ペインは「停止」表示なのにセッションは走り続け、
+                //    そのペインからは止められない**（このツールが最も重いとする食い違い）。
+                //    `transcript.mjs` は同じ形を `Array.isArray` で守っている。
+                const blocks = Array.isArray(r.message?.content) ? r.message.content : null;
+                if (blocks === null) {
+                    line('d', '  （assistant の content が配列ではないので表示していません）\n');
+                    continue;
+                }
+                // 🚨 **1行も出さずに終わらせない。** 知らないブロック種別だけの
+                //    assistant レコードを黙って捨てると、宣言（解釈できない行は捨てない）に
+                //    反するうえ「応答が来ていない」ように見える
+                let emitted = false;
+                const t = blocks.filter(b => b?.type === 'text')
+                    .map(b => (typeof b.text === 'string' ? b.text : '')).join('');
+                if (t.trim()) { line('', `${t.trim()}\n`); emitted = true; }
+                for (const b of blocks) {
+                    if (b?.type === 'tool_use') {
+                        line('d', `  · ${typeof b.name === 'string' ? b.name : '(名前なし)'}\n`);
+                        emitted = true;
+                    }
+                }
+                if (!emitted) {
+                    const kinds = blocks.map(b => (typeof b?.type === 'string' ? b.type : '?'))
+                        .join(',').slice(0, 60);
+                    line('d', `  （assistant の中身を解釈できませんでした: ${kinds || '空'}）\n`);
                 }
             } else if (r.type === 'result') {
                 line(r.is_error ? 'e' : 'p', `── ${r.is_error ? '✖ エラー' : '✔ 応答おわり'} ──\n`);

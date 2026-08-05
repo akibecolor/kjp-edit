@@ -255,7 +255,7 @@
 // 行割れ・マルチバイト割れの処理は共有モジュール（unit テストと同じコード）
 import { parseNdjson } from './ndjson.mjs';
 // argv の分割も共有モジュール（app.html の中だとテストできない）
-import { splitArgv } from './argv.mjs';
+import { splitArgv, isChatArgv } from './argv.mjs';
 // 会話モードの出力の解釈も同じ理由で外に出した。
 // **中に書いていたので「捨てない」という約束が破れていたのに気付けなかった**（#44）
 import { makeChatFilter } from './chatfilter.mjs';
@@ -609,7 +609,17 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
       }
       if (ev.t === 'in') line('i', `▸ ${ev.d}`);
       else if (ev.t === 'note') line('d', `${ev.d}\n`);
-      else if (ev.t === 'out') { if (chatFilter) chatFilter.feed(ev.d); else line('', ev.d); }
+      // 🚨 **フィルタの失敗で購読ループを終わらせない。** 例外が抜けると finally の
+      //    `onState({running:false})` が走り、**「停止」表示なのに走り続けている**
+      //    状態になる（しかもそのペインからは止められない）。
+      //    解釈できない行は捨てないという宣言どおり、生のまま出して続ける。
+      else if (ev.t === 'out') {
+        if (!chatFilter) line('', ev.d);
+        else {
+          try { chatFilter.feed(ev.d); }
+          catch (e) { line('w', `⚠ 出力を解釈できませんでした（そのまま出します）: ${e.message}\n`); line('', ev.d); }
+        }
+      }
       else if (ev.t === 'err') line('w', ev.d);
       else if (ev.t === 'exit') {
         const ok = ev.code === 0;
@@ -751,7 +761,8 @@ function consoleBody(wt, paneObj) {
   eofBtn.addEventListener('click', () => cur?.write?.('', true));
   chatBtn.addEventListener('click', () => {
     // 会話は専用の argv で始める（入力欄の内容は使わない）
-    runExec(term, scroll, wt, CHAT_ARGV, onState, { chat: true, keepAlive: true });
+    // ⚠️ `chat` は argv から導く（渡す値と argv がずれない形にする）
+    runExec(term, scroll, wt, CHAT_ARGV, onState, { chat: isChatArgv(CHAT_ARGV), keepAlive: true });
   });
 
   /**
@@ -777,7 +788,13 @@ function consoleBody(wt, paneObj) {
       const re = el('button', null, '再接続');
       re.addEventListener('click', () => {
         // 通番 0 から = 残っている分を全部再生してもらう
-        runExec(term, scroll, wt, s.argv, onState, { attach: { id: s.id, from: 0 } });
+        // 🚨 **会話モードを argv から復元する。** 渡さないと次の送信で生のテキストを
+        //    stdin に書き、claude が exit 1 で死んで会話が丸ごと消える（実測）
+        runExec(term, scroll, wt, s.argv, onState, {
+          attach: { id: s.id, from: 0 },
+          chat: isChatArgv(s.argv),
+          keepAlive: s.keepAlive === true,
+        });
       });
       const kb = el('button', null, '停止');
       kb.addEventListener('click', async () => {

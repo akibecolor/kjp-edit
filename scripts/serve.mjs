@@ -99,9 +99,27 @@ function inUse(port) {
     }
 }
 
-/** 動いている kjp-edit を探す（Windows 以外では PowerShell が無いので空を返す） */
+/**
+ * 動いている kjp-edit を探す。
+ *
+ * 🚨 **「調べられない」を「無い」と言わない。** 以前は Windows 以外で `[]` を返して
+ *    いたので、`--status` は起動中でも「動いている kjp-edit はありません」と**断言**し、
+ *    `--stop` は何も止めずに同じ文言を出して exit 0 していた。
+ *    同じファイルの下で自分が「分からないなら分からないと言う」（#31）と書いている
+ *    その規則を、ここが最も破っていた（6回目のレビュー）。
+ *    さらに二重起動の門（`already`）も常に false になるので、同じリポジトリに
+ *    2本目が黙って立ち上がり、watcher・キャッシュ・実行枠・監査が二重になっていた。
+ * @returns {Promise<{supported: boolean, list: object[], why?: string}>}
+ */
 async function running() {
-    if (process.platform !== 'win32') return [];
+    if (process.platform !== 'win32') {
+        return {
+            supported: false,
+            list: [],
+            why: `${process.platform} では動いているものを調べる実装がありません`
+                + '（今は PowerShell 経由のみ）',
+        };
+    }
     const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" '
         + '| Where-Object { $_.CommandLine -like \'*v0/server.mjs*\' -or $_.CommandLine -like \'*v0\\server.mjs*\' } '
         + '| ForEach-Object { $p=(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue '
@@ -110,17 +128,28 @@ async function running() {
     return new Promise(res => {
         execFile('powershell', ['-NoProfile', '-Command', ps],
             { windowsHide: true, encoding: 'utf8' }, (e, out) => {
-                if (e) { res([]); return; }
-                res(out.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
-                    const [pid, port, ...rest] = l.split('\t');
-                    return { pid: Number(pid), port: Number(port) || null, cmd: rest.join('\t') };
-                }));
+                // ⚠️ PowerShell が失敗したのも「無い」ではない
+                if (e) { res({ supported: false, list: [], why: `PowerShell が失敗: ${e.message}` }); return; }
+                res({
+                    supported: true,
+                    list: out.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+                        const [pid, port, ...rest] = l.split('\t');
+                        return { pid: Number(pid), port: Number(port) || null, cmd: rest.join('\t') };
+                    }),
+                });
             });
     });
 }
 
 if (has('--status')) {
-    const list = await running();
+    const { supported, list, why } = await running();
+    if (!supported) {
+        console.log(`⚠ 調べられませんでした: ${why}`);
+        console.log('  「動いていない」ではなく「分からない」です。手で確認してください:');
+        console.log(`      lsof -nP -iTCP:${DEFAULT_PORT} -sTCP:LISTEN`);
+        console.log('      ps -ef | grep v0/server.mjs');
+        process.exit(1);
+    }
     if (!list.length) { console.log('動いている kjp-edit はありません'); process.exit(0); }
     for (const r of list) {
         const repo = repoOf(r.cmd) ?? '(cwd)';
@@ -135,13 +164,43 @@ if (has('--status')) {
 }
 
 if (has('--stop')) {
-    const list = await running();
-    if (!list.length) { console.log('動いている kjp-edit はありません'); process.exit(0); }
-    for (const r of list) {
-        try { process.kill(r.pid); console.log(`停止: PID ${r.pid} (port ${r.port ?? '?'})`); }
-        catch (e) { console.log(`停止できませんでした: PID ${r.pid} — ${e.message}`); }
+    const { supported, list, why } = await running();
+    if (!supported) {
+        console.log(`⚠ 何を止めればよいか分かりませんでした: ${why}`);
+        console.log('  何も止めていません。手で止めてください:');
+        console.log('      pkill -f v0/server.mjs   # 木ごと止めるなら pkill -f -g <pgid>');
+        process.exit(1);
     }
-    process.exit(0);
+    if (!list.length) { console.log('動いている kjp-edit はありません'); process.exit(0); }
+    // 🚨 **`process.kill(pid)` では孫が残る。** Windows の `process.kill` は
+    //    TerminateProcess 相当なので、対象の `process.on('SIGTERM')` が**走らない**。
+    //    そのハンドラが `killTree()`（`taskkill /T /F`）を呼ぶ唯一の場所なので、
+    //    `--stop` 経路ではプロセス木が一切掃除されず、**exec が立てた孫
+    //    （`cmd /c npm test` の中身、`claude -p` の子）が残る**。
+    //    `server.mjs` に「Windows の child.kill() は TerminateProcess 相当で
+    //    その1プロセスしか殺さない」と自分で書いてあるのに、停止経路がそれを迂回していた。
+    //    「停止しました」と書く前に本当に停止したかを確かめる（6回目のレビュー）。
+    let failed = 0;
+    for (const r of list) {
+        const killed = await new Promise(res => {
+            execFile('taskkill', ['/PID', String(r.pid), '/T', '/F'],
+                { windowsHide: true, encoding: 'utf8' }, e => res(!e));
+        });
+        if (killed) console.log(`停止: PID ${r.pid} (port ${r.port ?? '?'}) — 子プロセスも含めて`);
+        else {
+            failed++;
+            console.log(`⚠ 停止できませんでした: PID ${r.pid}`
+                + '（まだ走っている可能性があります。taskkill /PID <pid> /T /F を手で試してください）');
+        }
+    }
+    // 本当に消えたかを確かめてから終わる（「止めたつもり」を作らない）
+    const after = await running();
+    const left = after.supported ? after.list.filter(r => list.some(x => x.pid === r.pid)) : [];
+    if (left.length) {
+        console.log(`⚠ まだ動いています: ${left.map(r => `PID ${r.pid}`).join(', ')}`);
+        process.exit(1);
+    }
+    process.exit(failed ? 1 : 0);
 }
 
 // ---- リポジトリを見つける ----
@@ -155,7 +214,16 @@ try {
 }
 
 // ---- 既に動いていないか ----
-const already = (await running()).find(r => samePathish(repoOf(r.cmd), repo));
+const probe = await running();
+// 🚨 **二重起動の門が効かないことを黙って通さない。** 調べられない環境では
+//    `already` が常に false になり、同じリポジトリに2本目が立ち上がって
+//    watcher・キャッシュ・実行枠・監査が二重になる（6回目のレビュー）。
+if (!probe.supported) {
+    console.log(`⚠ 既に動いていないかを確認できません: ${probe.why}`);
+    console.log('  二重起動の門が効きません。同じリポジトリを2本見ると'
+        + 'watcher・キャッシュ・実行枠・監査が二重になります。');
+}
+const already = probe.list.find(r => samePathish(repoOf(r.cmd), repo));
 if (already) {
     console.log(`既に動いています → http://127.0.0.1:${already.port ?? '?'}`);
     console.log(`  PID ${already.pid}  repo ${repo}`);
@@ -183,7 +251,7 @@ if (await inUse(port)) {
     //    自分自身のこともある（二重起動の判定が外れていた頃はまさにそれで、
     //    「別のプロセス」という説明が事実と違っていた。#31）。
     //    分かる範囲で正体を出し、分からないなら分からないと言う。
-    const holder = (await running()).find(r => r.port === port);
+    const holder = (await running()).list.find(r => r.port === port);
     const who = holder
         ? `PID ${holder.pid} の kjp-edit（repo ${repoOf(holder.cmd) ?? '不明'}）`
         : '別のプロセス（正体は分かりません）';
@@ -198,6 +266,28 @@ if (await inUse(port)) {
 
 // ---- capability とトークン ----
 await mkdir(STATE_DIR, { recursive: true });
+
+// 🚨 **古い共用トークンを「読み取り専用」に降格させる（実行には引き継がない）。**
+//    以前は `~/.kjp-edit/token` を読み取りトンネルと実行の両方に渡していた。
+//    そのままファイル名を変えると、スマホのブックマークが黙って 401 になる。
+//    そこで古い値を `token-read` に引き継ぎ、**実行用は新しい値にする**
+//    （= 漏れているかもしれない古い値では実行できない）。
+{
+    const old = join(STATE_DIR, 'token');
+    const read = join(STATE_DIR, 'token-read');
+    if (existsSync(old) && !existsSync(read)) {
+        try {
+            await writeFile(read, await readFile(old, 'utf8'), { encoding: 'utf8', mode: 0o600 });
+            console.log('ℹ 読み取り用トークンを token-read に引き継ぎました'
+                + '（実行用は token-exec に分けました。古い値では実行できません）。');
+            console.log(`  古いファイルは使われません。消して構いません: ${old}`);
+        } catch (e) {
+            console.error(`⚠ 古いトークンを引き継げませんでした: ${e.message}`);
+            console.error('  読み取り用の URL は新しくなります（開き直してください）。');
+        }
+    }
+}
+
 // 🔒 ホスト名は**自動起動と同じ検証**を通す。片方だけ無検証という非対称が #29 の形。
 const hostCheck = collectHosts(argv);
 if (hostCheck.error !== undefined) {
@@ -209,7 +299,10 @@ if (hostCheck.error !== undefined) {
 //    引き継ぎは serveargs.mjs の純関数に集約している（テストで固定）。
 const args = serverArgs({
     argv, server: SERVER, repo, port,
-    tokenFile: join(STATE_DIR, 'token'),
+    // 🚨 **読み取り用と実行用を同じ値にしない**（6回目のレビュー）。
+    //    読み取り用の URL をスマホで開くことが、実行トークンを配ることになっていた。
+    tokenFile: join(STATE_DIR, 'token-read'),
+    execTokenFile: join(STATE_DIR, 'token-exec'),
     auditLog: join(STATE_DIR, 'exec-audit.jsonl'),
 });
 const wantExec = has('--exec');
@@ -227,4 +320,4 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 await writeFile(join(STATE_DIR, 'last.json'),
     `${JSON.stringify({ repo, port, exec: wantExec, write: wantWrite, pid: child.pid }, null, 1)}\n`,
     'utf8');
-void readFile; void existsSync; void dirname;
+void dirname;

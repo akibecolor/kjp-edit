@@ -20,8 +20,14 @@ import {
 const SERVER = '/x/v0/server.mjs';
 const base = extra => serverArgs({
     argv: extra, server: SERVER, repo: '/r', port: 7749,
-    tokenFile: '/s/token', auditLog: '/s/audit.jsonl',
+    tokenFile: '/s/token-read', execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
 });
+/** args から --token-file の値を取る。無ければ null
+ *  ⚠️ `indexOf` が -1 のときに +1 して 0 にしない（args[0] を値と誤読する） */
+const tokenFileOf = a => {
+    const i = a.indexOf('--token-file');
+    return i === -1 ? null : (a[i + 1] ?? null);
+};
 
 test('知らないオプションは黙って捨てずに止める', () => {
     const r = unknownFlag(['--nope'], SERVE_FLAGS);
@@ -102,6 +108,30 @@ test('実行とトンネルはトークンを永続化する（起動ごとに�
     // 読み取り専用でループバックだけなら永続化しない（要らない場所に鍵を置かない）
     assert.ok(!base([]).includes('--token-file'));
     assert.ok(!base(['--write']).includes('--token-file'));
+});
+
+/**
+ * 🚨 **読み取り用と実行用のトークンを同じ値にしない。**
+ *
+ * 以前は同じ `~/.kjp-edit/token` を両方に渡していたので、
+ * `serve.mjs --allow-host box.ts.net`（読み取り専用）が案内する `?token=…` は
+ * `serve.mjs --exec` のデーモンが受け付ける値と**バイト一致**していた。
+ * つまり「スマホで読み取り用の URL を1回開く」ことが、**実行トークンを
+ * 携帯のブラウザ・URL 履歴・トンネルのアクセスログに置く**ことと同義だった
+ * （Cookie に実行トークンを入れていたのと同じクラスの再発。6回目のレビュー）。
+ */
+test('🔒 読み取り用トンネルと実行でトークンのファイルを分ける', () => {
+    const read = tokenFileOf(base(['--allow-host', 'box.ts.net']));
+    const exec = tokenFileOf(base(['--exec']));
+    assert.equal(read, '/s/token-read');
+    assert.equal(exec, '/s/token-exec');
+    assert.notEqual(read, exec,
+        '読み取り用の URL を配ると実行トークンを配ることになる');
+
+    // 実行 + トンネルなら実行用（強い方）を使う。読み取り用に降格させない
+    assert.equal(tokenFileOf(base(['--exec', '--allow-host', 'box.ts.net'])), '/s/token-exec');
+    // --write は checkout だけなので起動ごとのランダムで足りる（鍵を置かない）
+    assert.equal(tokenFileOf(base(['--write'])), null);
 });
 
 test('--allow-host は値ごとサーバに引き継ぐ（再起動後だけ 403 になる形の回帰）', () => {

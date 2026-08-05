@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitArgv } from './argv.mjs';
+import { splitArgv, isChatArgv } from './argv.mjs';
 
 const a = s => splitArgv(s).argv;
 
@@ -62,4 +62,26 @@ test('閉じているクォートには警告を出さない', () => {
 
 test('シングルクォート内ではエスケープしない（sh と同じ）', () => {
     assert.deepEqual(a("echo 'a\\b'"), ['echo', 'a\\b']);
+});
+
+/**
+ * 🚨 **会話モードの判定を argv から復元できること。**
+ *
+ * 再接続で `chat` を渡していなかったので、次の送信で生のテキストが stdin に書かれ、
+ * `claude --input-format stream-json` が即 exit 1 で死んでいた（会話が丸ごと消える）。
+ * サーバは argv を返すので、**argv を根拠にすれば再接続でも復元できる**。
+ */
+test('isChatArgv: --input-format stream-json を会話モードとして見分ける', () => {
+    assert.equal(isChatArgv(['claude', '-p', '--input-format', 'stream-json',
+        '--output-format', 'stream-json']), true);
+    assert.equal(isChatArgv(['claude', '-p', '--input-format=stream-json']), true);
+    // 出力だけ stream-json なのは会話モードではない（stdin は生のまま）
+    assert.equal(isChatArgv(['claude', '-p', '--output-format', 'stream-json']), false);
+    assert.equal(isChatArgv(['npm', 'test']), false);
+    assert.equal(isChatArgv(['claude', '--input-format']), false, '値が無い形で落ちない');
+    assert.equal(isChatArgv(['claude', '--input-format', 'text']), false);
+    // 壊れた入力で投げない（サーバ由来の値をそのまま渡すので）
+    for (const bad of [null, undefined, 'string', 42, {}]) {
+        assert.equal(isChatArgv(bad), false, JSON.stringify(bad));
+    }
 });

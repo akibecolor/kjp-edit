@@ -110,7 +110,9 @@ before(async () => {
         });
         proc.stderr.on('data', d => { clearTimeout(t); reject(new Error(`サーバが失敗: ${d}`)); });
         proc.on('error', reject);
-    });
+    // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、
+    //    要約が出ないまま SIGKILL される（原因が消える）
+    }).catch(e => { try { proc.kill(); } catch { /* noop */ } throw e; });
 });
 
 after(async () => {
@@ -779,7 +781,8 @@ async function startWritable(extra = []) {
             if (m) { clearTimeout(t); resolve(m[0]); }
         });
         child.on('error', reject);
-    });
+    // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+    }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
     // トークン本体を提示して capability を確認する（Cookie では返らない）
     const s = await (await fetch(`${url}/api/v0/session`, {
         headers: { 'x-kjp-token': WRITE_TOKEN },
@@ -945,7 +948,8 @@ async function startExec(extra = []) {
             if (m) { clearTimeout(t); resolve(m[0]); }
         });
         child.on('error', reject);
-    });
+    // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+    }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
     return { child, url };
 }
 
@@ -972,17 +976,82 @@ test('🔒 --allow-exec なしでは exec の経路が存在しない', async ()
     assert.match((await res.json()).error, /--allow-exec/);
 });
 
-test('🔒 --allow-exec は 24 文字以上の --token 無しでは起動を拒否する', async () => {
-    for (const extra of [[], ['--token', 'short']]) {
+/**
+ * 🚨 **自動生成トークンで実行を許してはいけない。**
+ *
+ * 以前は長さだけを見ていて、しかもその検査が
+ * `if (opts.requireAuth && !opts.token) opts.token = randomBytes(32)` の**後**にあった。
+ * `--allow-host` は requireAuth を自動でオンにするので、
+ * **門が最も効くべきトンネル構成でだけ門が消えていた**
+ * （6回目のレビューが実測: 43文字の自動生成トークンで `POST /api/v0/exec` が 200）。
+ * 見るべきは長さではなく **`--token` / `--token-file` で明示したか**（+ 長さの下限）。
+ */
+test('🔒 --allow-exec は明示的なトークン無しでは起動を拒否する（自動生成では通さない）', async () => {
+    const cases = [
+        [[], 'トークン無し'],
+        [['--token', 'short'], '短いトークン'],
+        // 🚨 ここが抜けていた。requireAuth が自動生成を先に走らせる経路
+        [['--require-auth'], '--require-auth の自動生成'],
+        [['--allow-host', 'x.example'], '--allow-host（requireAuth を自動オン）'],
+        [['--require-auth', '--token', 'short'], '自動生成 + 短いトークン'],
+    ];
+    for (const [extra, label] of cases) {
         const child = spawn(process.execPath,
             [SERVER, '--repo', repo, '--port', '0', '--allow-exec', ...extra],
             { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
         child.stderr.setEncoding('utf8');
+        child.stdout.setEncoding('utf8');
         let err = '';
+        let out = '';
         child.stderr.on('data', d => { err += d; });
-        const code = await new Promise(r => child.on('close', r));
-        assert.equal(code, 1, `起動してしまった: token=${extra[1] ?? 'なし'}`);
-        assert.match(err, /--token/);
+        child.stdout.on('data', d => { out += d; });
+        // ⚠️ 拒否されないとサーバは listen し続けるので、素の await にしない
+        const code = await Promise.race([
+            new Promise(r => child.on('close', r)),
+            new Promise(r => setTimeout(() => r('running'), 15000)),
+        ]);
+        child.kill();
+        assert.equal(code, 1,
+            `起動してしまった（${label}）— 自動生成トークンで実行が引ける:\n${out}`);
+        assert.match(err, /--token/, label);
+    }
+});
+
+// 明示したなら通る（門が全部を拒否していないこと。片側だけの検査にしない）
+test('🔒 --allow-exec は --token / --token-file を明示すれば起動する', async () => {
+    const outside = join(repo, '..', `${repo.split(/[\\/]/).pop()}-exec-tok`);
+    const cases = [
+        ['--token', EXEC_TOKEN],
+        ['--token-file', outside],
+    ];
+    try {
+        for (const extra of cases) {
+            const child = spawn(process.execPath,
+                [SERVER, '--repo', repo, '--port', '0', '--allow-exec', ...extra,
+                    // トンネル構成でも通ること（requireAuth が絡んでも門が壊れない）
+                    '--allow-host', 'x.example'],
+                { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+            child.stdout.setEncoding('utf8');
+            child.stderr.setEncoding('utf8');
+            let out = '';
+            let err = '';
+            child.stdout.on('data', d => { out += d; });
+            child.stderr.on('data', d => { err += d; });
+            const started = await Promise.race([
+                new Promise(r => {
+                    const iv = setInterval(() => {
+                        if (/http:\/\/127\.0\.0\.1:\d+/.test(out)) { clearInterval(iv); r(true); }
+                    }, 50);
+                    setTimeout(() => { clearInterval(iv); r(false); }, 15000);
+                }),
+                new Promise(r => child.on('close', () => r(false))),
+            ]);
+            child.kill();
+            assert.ok(started,
+                `明示したのに起動しない（${extra[0]}）:\n${out}\n${err}`);
+        }
+    } finally {
+        await rm(outside, { force: true });
     }
 });
 
@@ -1068,7 +1137,8 @@ test('🚨 exec: 準備に失敗しても枠を返す（500 を上限回踏ん�
             if (m) { clearTimeout(t); res(m[0]); }
         });
         child.on('error', rej);
-    });
+    // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+    }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
     const post = () => fetch(`${url}/api/v0/exec`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
@@ -2244,28 +2314,48 @@ async function startAuthServer(extra) {
         + `\n  argv: ${extra.join(' ') || '(なし)'}`
         + `\n  stdout: ${banner.trim() || '(空)'}`
         + `\n  stderr: ${errOut.trim() || '(空)'}\n  ${exited ?? '(まだ生きている)'}`;
-    // 🚨 **固定時間で待たない（CLAUDE.md）。** 以前は URL が出てから 400ms 待って
-    //    banner を確定させていたが、トークンの案内は**別のチャンクで来る**ので、
-    //    遅い CI では取り逃す。すると `banner()` から token が取れず、
-    //    テストは「起動しなかった」ではなく**401 の山**になって原因が分かりにくい。
-    //    認証が要る構成のときは**トークンの案内が出るまで待つ**（出るものを待つ）。
+    // 🚨 **トークンの案内は URL とは別のチャンクで来る。** 以前は URL が出てから
+    //    固定 400ms 待っていたので、遅い CI では取り逃して `banner()` から token が
+    //    取れず、テストは「起動しなかった」ではなく**401 の山**になっていた。
+    // 🚨 **かわりに「出るまで待つ」だけにしてもいけない。** 案内を出さない変異を
+    //    掛けたとき、**永久に待って `node --test` ごとハングした**（CI で HUNG）。
+    //    テスト側には `assert.ok(m, 'トークン付き URL が案内されない')` があるので、
+    //    **来れば即座に、来なければ短い猶予で先に進む**のが正しい
+    //    （待ちを失敗にせず、assert に判定させる）。
     const wantsToken = extra.some(a => ['--require-auth', '--allow-host', '--allow-write',
         '--allow-exec', '--token-file', '--token'].includes(a));
     const port = await Promise.race([
         new Promise((res, rej) => {
+            // ⚠️ **絶対時間で待たない。** 「URL が出てから固定 3 秒」にしたら、
+            //    30本のサーバが同時に立ち上がる全体実行で足りなくなり、
+            //    トークンを取り逃してテストが落ちた（#34 と同型の flake を自分で作った）。
+            //    バナーは1 tick で書かれるので、**stdout が落ち着いたら揃っている**。
+            //    「最後のデータから 300ms 動きが無い」を合図にする（負荷に自動追従する）。
+            let idle = null;
+            let cap = null;
+            const settle = port => { clearTimeout(idle); clearTimeout(cap); res(port); };
             child.stdout.on('data', d => {
                 banner += d;
                 const m = banner.match(/http:\/\/127\.0\.0\.1:(\d+)/);
                 if (!m) return;
-                if (wantsToken && !/\?token=[A-Za-z0-9_-]+/.test(banner)) return;
-                res(Number(m[1]));
+                if (!wantsToken || /\?token=[A-Za-z0-9_-]+/.test(banner)) { settle(Number(m[1])); return; }
+                clearTimeout(idle);
+                idle = setTimeout(() => settle(Number(m[1])), 300);
+                // 上限。ここに達したら**待ちを失敗にせず assert に判定させる**
+                // （待ちを失敗にすると、案内を出さない変異でハングした。CI で HUNG）
+                cap ??= setTimeout(() => settle(Number(m[1])), 15000);
             });
             child.on('error', e => rej(new Error(`${why()}\n  spawn: ${e.message}`)));
             // 起動前に落ちたら待たずに失敗させる（20秒待つ意味がない）
             child.on('exit', () => setTimeout(() => rej(new Error(why())), 50));
         }),
         new Promise((_, rej) => setTimeout(() => rej(new Error(why())), 20000)),
-    ]);
+    // 🚨 **待ちが失敗したら子を殺す。** 呼び出し側の `finally { s.child.kill() }` は
+    //    `s` に代入される前に throw すると走らないので、**サーバが生き残る**。
+    //    子の stdio パイプは親のイベントループを生かし続けるので、
+    //    `node --test` が永久に終わらず**要約が出ないまま SIGKILL される**
+    //    （原因が完全に消える形。CI で HUNG として実際に出た）。
+    ]).catch(err => { try { child.kill(); } catch { /* noop */ } throw err; });
     return { child, port, banner: () => banner, stderr: () => errOut };
 }
 
@@ -2567,7 +2657,8 @@ test('🚨 ハンドラが throw しても 500 を返してデーモンが生き
             if (m) { clearTimeout(t); res(m[0]); }
         });
         child.on('error', rej);
-    });
+    // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+    }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
     try {
         // ⚠️ 2つの層を別々に測る。`/__throw` は**内側の try より手前**で投げるので
         //    top-level `.catch()` だけが受け止める。`/__throw-inner` は内側。
@@ -2786,7 +2877,8 @@ test('--repo にサブディレクトリを渡すとリポジトリのルート�
                 if (m && /repo:/.test(buf)) { clearTimeout(t); res({ url: m[0], banner: buf }); }
             });
             child.on('error', rej);
-        });
+        // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+        }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
         assert.match(banner, /ルートに解決しました/, `正規化のログが無い: ${banner}`);
         const s = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
         // ⚠️ ルートに正規化しないと merge-tree が cwd 相対で `../shared.txt` を返し、
@@ -2895,7 +2987,8 @@ test('🔒 --token-file: 無ければ生成し、リポジトリの中は拒否�
                 if (m) { clearTimeout(t); res(m[0]); }
             });
             child.on('error', rej);
-        });
+        // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+        }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
         const { readFile } = await import('node:fs/promises');
         const tok = (await readFile(outside, 'utf8')).trim();
         assert.ok(tok.length >= 24, `短いトークンが書かれた: ${tok.length} 文字`);
@@ -2926,7 +3019,8 @@ test('🔒 --token-file: 無ければ生成し、リポジトリの中は拒否�
                 if (/http:\/\/127\.0\.0\.1:\d+/.test(buf)) { clearTimeout(t); res(); }
             });
             child.on('error', rej);
-        });
+        // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+        }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
         assert.equal((await readFile(outside, 'utf8')).trim(), first,
             '再起動でトークンが変わった（永続化できていない）');
     } finally {
@@ -3214,7 +3308,8 @@ test('解決できない --base を渡してもエンドポイントは生きて
                 if (m) { clearTimeout(t); resolve(m[0]); }
             });
             child.on('error', reject);
-        });
+        // 🚨 待ちが失敗したら子を殺す。子の stdio パイプが node --test を生かし続け、要約が出ないまま SIGKILL される（原因が消える）
+        }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
         const res = await fetch(`${url}/api/v0/state`);
         assert.equal(res.status, 200, '壊れた --base で 500 にしてはいけない');
         const s = await res.json();

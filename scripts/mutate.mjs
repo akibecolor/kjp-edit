@@ -195,6 +195,34 @@ const MUTANTS = [
     },
     // 5回目のレビューの BLOCKING 2件（どちらも直前の修正による回帰）
     {
+        // 🚨 6回目のレビュー: この門は自動生成より**後**にあったので、
+        //    `--allow-host`（requireAuth を自動オン）を並べると消えていた
+        name: 'exec-token-explicit',
+        why: '実行の門を「明示的に決めたか」ではなく長さだけで見る'
+            + '（requireAuth の自動生成トークン 43 文字が条件を満たす）',
+        // ⚠️ **門を自動生成より前に置いた今は冗長。** その位置では `opts.token` は
+        //    `--token` / `--token-file` でしか埋まらないので、長さの検査だけでも同じ結果になる。
+        //    残す理由: **本体の守りは「順序」**で、順序が戻ったときにこれが第二の砦になる
+        //    （順序そのものは `exec-token-gate-order` が測っている）。
+        defensive: '門が自動生成より前にある限り冗長（その位置では token は明示でしか埋まらない）。'
+            + '順序が戻ったときに効く第二の砦として残す。順序は exec-token-gate-order が測る',
+        file: 'v0/server.mjs',
+        from: 'if (opts.allowExec && (!opts.tokenExplicit || !opts.token || opts.token.length < 24)) {',
+        to: 'if (opts.allowExec && (!opts.token || opts.token.length < 24)) {',
+        gone: '!opts.tokenExplicit',
+        pattern: '自動生成では通さない',
+    },
+    {
+        name: 'exec-token-gate-order',
+        why: '実行の門を自動生成より後ろに戻す（同じ穴が順序で復活する）',
+        file: 'v0/server.mjs',
+        from: `if (opts.allowExec && (!opts.tokenExplicit || !opts.token || opts.token.length < 24)) {`,
+        to: `if (opts.requireAuth && !opts.token) opts.token = randomBytes(32).toString('base64url');
+if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
+        gone: 'if (opts.allowExec && (!opts.tokenExplicit',
+        pattern: '自動生成では通さない',
+    },
+    {
         name: 'token-url-for-write-exec',
         why: '書き込み・実行を有効にしてもトークン付き URL を表示しない'
             + '（ブラウザが入手する経路が無いので UI から必ず 403。有効に見えて動かない）',
@@ -707,12 +735,24 @@ const MUTANTS = [
         testFile: 'scripts/serveargs.test.mjs',
     },
     {
+        name: 'serve-token-separate',
+        why: '読み取り用トンネルと実行で同じトークンファイルを使う'
+            + '（読み取り用の URL をスマホで開くことが実行トークンを配ることになる。6回目のレビュー）',
+        file: 'scripts/serveargs.mjs',
+        from: '    const file = wantExec ? execTokenFile : tokenFile;',
+        to: '    const file = tokenFile;',
+        gone: 'wantExec ? execTokenFile : tokenFile',
+        pattern: '読み取り用トンネルと実行でトークンのファイルを分ける',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
         name: 'serve-token-persist',
         why: 'トークンを永続化しない（遠隔から使えず「楽な場所に置く」方向へ流れる）',
         file: 'scripts/serveargs.mjs',
-        from: "    if ((hosts.length > 0 || wantExec) && tokenFile) args.push('--token-file', tokenFile);",
+        // ⚠️ トークンを読み取り用と実行用に分けたので字面が変わった（6回目のレビュー）
+        from: "    if ((hosts.length > 0 || wantExec) && file) args.push('--token-file', file);",
         to: '    /* 変異: 永続化しない */',
-        gone: "args.push('--token-file', tokenFile)",
+        gone: "args.push('--token-file', file)",
         pattern: '実行とトンネルはトークンを永続化する',
         testFile: 'scripts/serveargs.test.mjs',
     },
@@ -825,6 +865,28 @@ const MUTANTS = [
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
+    },
+    {
+        name: 'chat-argv-detect',
+        why: '会話モードを argv から見分けない（再接続で生のテキストを stdin に書き、'
+            + 'claude が exit 1 で死んで会話の文脈が丸ごと消える。6回目のレビュー）',
+        file: 'v0/argv.mjs',
+        from: "        if (argv[i] === '--input-format' && argv[i + 1] === 'stream-json') return true;",
+        to: '        /* 変異: 会話モードを見分けない */',
+        gone: "argv[i] === '--input-format'",
+        pattern: 'isChatArgv',
+        testFile: 'v0/argv.test.mjs',
+    },
+    {
+        name: 'chat-array-guard',
+        why: 'content が配列でない行で feed が投げる'
+            + '（購読ループが抜けて「停止」表示になるのにセッションは走り続ける）',
+        file: 'v0/chatfilter.mjs',
+        from: '                const blocks = Array.isArray(r.message?.content) ? r.message.content : null;',
+        to: '                const blocks = r.message?.content ?? null;',
+        gone: 'Array.isArray(r.message?.content)',
+        pattern: '壊れた行でも feed が投げない',
+        testFile: 'v0/chatfilter.test.mjs',
     },
     {
         name: 'chat-flush-tail',
@@ -1138,8 +1200,22 @@ if (args.includes('--list')) {
 }
 // ⚠️ `--shard 2/4` の値は名前の指定ではない。除かないと
 //    「一致する変異がありません: 2/4」になる（実際に踏んだ）
-const shardValueIdx = args.indexOf('--shard') + 1;
+// 🚨 **`indexOf` が -1 のときに +1 して 0 にしてはいけない。** `--shard` が無いと
+//    `i !== 0` が最初の名前を落とし、**指定した変異が黙って走らなかった**
+//    （3件指定して2件しか出ず、走っていない1件を「確認済み」と読みかけた）。
+const shardIdx = args.indexOf('--shard');
+const shardValueIdx = shardIdx === -1 ? -1 : shardIdx + 1;
 const want = args.filter((a, i) => !a.startsWith('--') && i !== shardValueIdx);
+// 🚨 **指定した名前が1つでも見つからなければ止める。** 黙って少ない件数を走らせると、
+//    走っていない変異を「確認済み」と読んでしまう（実際にそう読みかけた）。
+{
+    const unknown = want.filter(w => !MUTANTS.some(m => m.name === w));
+    if (unknown.length) {
+        console.error(`✖ そんな名前の変異はありません: ${unknown.join(', ')}`);
+        console.error('  一覧: node scripts/mutate.mjs --list');
+        process.exit(1);
+    }
+}
 let targets = want.length ? MUTANTS.filter(m => want.includes(m.name)) : MUTANTS;
 
 /**
@@ -1216,6 +1292,18 @@ function runTest(m) {
 const pending = new Map();   // file -> bak
 
 /**
+ * 結果。**handlers より前に宣言する。**
+ * 🚨 途中で落ちると要約が1行も出ず、**結果が不明なのを緑と読める**状態になる
+ *    （適用側の共有違反でクラッシュして実際にそうなった）。落ちても必ず告知する。
+ */
+const results = [];
+function announcePartial(why) {
+    console.error(`
+✖ 途中で終わりました（${why}）。${results.length} 件まで実行。`
+        + '**結果は不明です**（全件走っていません）。');
+}
+
+/**
  * 控えから戻す。
  *
  * ⚠️ **Windows では一時的に失敗する。** テストが終わった直後は
@@ -1223,6 +1311,27 @@ const pending = new Map();   // file -> bak
  *    `UNKNOWN (-4094)`（共有違反）で落ちる。**1回で諦めると
  *    変異が残ったままになる**ので短い間隔で数回試す（実際に踏んだ）。
  */
+/**
+ * 書き換えを**適用する**側も retry する。
+ *
+ * ⚠️ 復元だけ retry していたので、**適用が共有違反で落ちて全件が中断**した
+ *    （`writeFileSync ... UNKNOWN (-4094)` on `v0/git.mjs`。砦が復元したので
+ *     ソースは無傷だったが、**要約が出ないまま終わった = 結果が不明**になった）。
+ *    Windows では直前のテストがまだファイルを開いていることがある。
+ */
+function writeFileRetry(file, text) {
+    let last = null;
+    for (let i = 0; i < 20; i++) {
+        try { writeFileSync(file, text, 'utf8'); return true; } catch (e) {
+            last = e;
+            const until = Date.now() + 100;
+            while (Date.now() < until) { /* 短いスピン */ }
+        }
+    }
+    console.error(`✖ ${file} に書けません: ${last?.message}`);
+    return false;
+}
+
 function restoreFile(file, bak) {
     let last = null;
     for (let i = 0; i < 20; i++) {
@@ -1250,16 +1359,18 @@ function restoreAll(why) {
     pending.clear();
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(sig, () => { restoreAll(`シグナル ${sig}`); process.exit(130); });
+    process.on(sig, () => { restoreAll(`シグナル ${sig}`); announcePartial(sig); process.exit(130); });
 }
 process.on('uncaughtException', e => {
     restoreAll('uncaught');
     console.error(e);
+    announcePartial('uncaught');
     process.exit(1);
 });
 process.on('unhandledRejection', e => {
     restoreAll('unhandledRejection');
     console.error(e);
+    announcePartial('unhandledRejection');
     process.exit(1);
 });
 
@@ -1293,7 +1404,6 @@ process.on('unhandledRejection', e => {
     }
 }
 
-const results = [];
 for (const m of targets) {
     if (m.platforms && !m.platforms.includes(process.platform)) {
         results.push({ m, status: 'SKIP', note: `このプラットフォームでは通らない経路（${m.platforms.join('/')} 用）` });
@@ -1327,7 +1437,11 @@ for (const m of targets) {
             mutated = mutated.replace(extra.from, extra.to);
         }
         if (mutated === null) continue;
-        writeFileSync(m.file, mutated, 'utf8');
+        // ⚠️ ここで落ちると全件が中断して**結果が不明**になる（実際に踏んだ）
+        if (!writeFileRetry(m.file, mutated)) {
+            results.push({ m, status: 'STALE', note: '書き換えを適用できなかった（ファイルが掴まれている）' });
+            continue;
+        }
         if (readFileSync(m.file, 'utf8').includes(m.gone)) {
             results.push({ m, status: 'STALE', note: '書き換えが効いていない（gone の判定が甘い）' });
             continue;

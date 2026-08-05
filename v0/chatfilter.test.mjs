@@ -106,6 +106,33 @@ test('result と system/init は専用の表示にする', () => {
     assert.match(c.out[2][1], /エラー/);
 });
 
+/**
+ * 🚨 **feed は投げてはいけない。**
+ *
+ * `content` が配列でない形が来ると `.filter` が TypeError を投げ、それが購読ループを
+ * 抜けて finally の `onState({running:false})` に落ちる。結果、**ペインは「停止」表示
+ * なのにセッションは走り続け、そのペインからは止められない**（絶対上限まで）。
+ * `transcript.mjs` は同じ形を `Array.isArray` で守っている = この形が来ると知っていた。
+ */
+test('🚨 壊れた行でも feed が投げない（「停止」表示なのに走り続ける状態を作らない）', () => {
+    const broken = [
+        { type: 'assistant', message: { content: 'ただの文字列' } },
+        { type: 'assistant', message: { content: 42 } },
+        { type: 'assistant', message: { content: null } },
+        { type: 'assistant', message: {} },
+        { type: 'assistant' },
+        { type: 'assistant', message: { content: [null, 'x', 7] } },
+        { type: 'assistant', message: { content: [{ type: 'text' }] } },
+    ];
+    for (const r of broken) {
+        const c = collect();
+        assert.doesNotThrow(() => c.feed(`${JSON.stringify(r)}\n`),
+            `feed が投げた: ${JSON.stringify(r)}`);
+        // 捨てない（何か1行は出る）
+        assert.ok(c.out.length >= 1, `黙って捨てている: ${JSON.stringify(r)}`);
+    }
+});
+
 test('tool_use は名前だけ出す（入力は出さない）', () => {
     const c = collect();
     c.feed(`${JSON.stringify({

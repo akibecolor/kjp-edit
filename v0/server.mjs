@@ -37,6 +37,8 @@ function parseArgs(argv) {
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
+        // 「トークンを明示的に決めたか」。長さでは判定できない（自動生成も43文字）
+        tokenExplicit: false,
         // 🚨 切断で子プロセスを殺すのをやめた代わりの制約（#17）。
         //    猶予は「スマホがタブを止めて戻ってくる」までを吸収する長さにする。
         //    終了後の保持は「出力を読みに戻れる」ための時間。
@@ -82,9 +84,11 @@ function parseArgs(argv) {
         // 検査専用（`--layout-probe` と同じ扱い。ヘルプには出さない）
         else if (a === '--exec-stream-delay') opts.execStreamDelayMs = num('--exec-stream-delay', 0, 60000);
         else if (a === '--exec-retain') opts.execRetainMs = num('--exec-retain', 1, 86400) * 1000;
-        else if (a === '--token') opts.token = argv[++i];
+        // 🚨 「明示的に決めた」ことを記録する。長さだけを見ると、
+        //    自動生成（32バイト = 43文字）が条件を満たしてしまう（6回目のレビュー）
+        else if (a === '--token') { opts.token = argv[++i]; opts.tokenExplicit = true; }
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
-        else if (a === '--token-file') opts.tokenFile = resolve(argv[++i]);
+        else if (a === '--token-file') { opts.tokenFile = resolve(argv[++i]); opts.tokenExplicit = true; }
         else if (a === '--require-auth') opts.requireAuth = true;
         // ⚠️ 明示的に切る道を残す。ただし --allow-host と併用したら起動を止める
         //    （黙って無認証でトンネルに出す状態を作らない）。
@@ -1895,22 +1899,34 @@ if (opts.requireAuth === false && opts.allowHosts.size > 0) {
     console.error('  ループバックだけで使うなら --allow-host を外してください。\n');
     process.exit(1);
 }
+// 🚨 **実行の門は自動生成より「前」に置く。**
+//    以前は `requireAuth && !opts.token` の自動生成が先にあったので、
+//    `--allow-exec --require-auth` や `--allow-exec --allow-host <name>` では
+//    **門が消えて自動生成トークンで起動できた**（6回目のレビューが実測。
+//    43文字の自動生成トークンで `POST /api/v0/exec` が 200 を返した）。
+//    しかも `--allow-host` は requireAuth を自動でオンにするので、
+//    **門が最も効くべきトンネル構成でだけ門が無い**という最悪の形だった。
+//    ここで見るのは「値の長さ」ではなく **`--token` / `--token-file` で
+//    明示的に決めたか**（それが「有効化を必ず意識的な操作にする」という趣旨）。
+//    ⚠️ **明示だけでは足りない。長さの下限も残す**（`--token short` を通してしまった）。
+//       「明示的に決めたこと」と「推測されない長さ」は別の要求。
+if (opts.allowExec && (!opts.tokenExplicit || !opts.token || opts.token.length < 24)) {
+    console.error('\n✖ --allow-exec には --token（24 文字以上）か --token-file が必要です。');
+    console.error('  実行を遠隔から引けるようにするので、トークンは明示的に決めてください');
+    console.error('  （自動生成では通しません。--require-auth や --allow-host を');
+    console.error('   一緒に付けても同じです）。\n');
+    console.error('  生成例:');
+    console.error('      node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
+    console.error('');
+    console.error('  起動例:');
+    console.error('      node v0/server.mjs --allow-exec --token <生成した値>');
+    console.error('      node v0/server.mjs --allow-exec --token-file ~/.kjp-edit/token-exec\n');
+    process.exit(1);
+}
+
 // 認証するならトークンが要る（書き込み・実行を使わない場合も）
 if (opts.requireAuth && !opts.token) {
     opts.token = randomBytes(32).toString('base64url');
-}
-
-if (opts.allowExec) {
-    if (!opts.token || opts.token.length < 24) {
-        console.error('\n✖ --allow-exec には 24 文字以上の --token が必要です。');
-        console.error('  実行を遠隔から引けるようにするので、トークンは明示的に決めてください。\n');
-        console.error('  生成例:');
-        console.error('      node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
-        console.error('');
-        console.error('  起動例:');
-        console.error('      node v0/server.mjs --allow-exec --token <生成した値>\n');
-        process.exit(1);
-    }
 }
 // 書き込みだけなら起動ごとのランダムで十分（再起動で無効化される）
 if (opts.allowWrite && !opts.token) {

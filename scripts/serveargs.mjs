@@ -92,7 +92,7 @@ export function collectHosts(argv) {
  * 🔒 ここが capability の分界。**`--exec` は `--write` を含むが、逆は含まない。**
  *    観測（`--watch` / `--agents-text`）はどちらとも独立で、既定では付けない。
  */
-export function serverArgs({ argv, server, repo, port, tokenFile, auditLog }) {
+export function serverArgs({ argv, server, repo, port, tokenFile, execTokenFile, auditLog }) {
     const has = f => argv.includes(f);
     const args = [server, '--repo', repo, '--port', String(port)];
     const wantExec = has('--exec');
@@ -100,9 +100,18 @@ export function serverArgs({ argv, server, repo, port, tokenFile, auditLog }) {
     if (wantWrite) args.push('--allow-write');
 
     const hosts = collectHosts(argv).hosts ?? [];
+    // 🚨 **読み取り用と実行用でトークンのファイルを分ける。**
+    //    以前は同じ `~/.kjp-edit/token` を両方に渡していたので、
+    //    `serve.mjs --allow-host box.ts.net`（読み取り専用）が案内する `?token=…` は
+    //    `serve.mjs --exec` のデーモンが受け付ける値と**バイト一致**していた。
+    //    つまり「スマホで読み取り用の URL を1回開く」ことが、
+    //    **実行トークンを携帯のブラウザ・URL 履歴・トンネルのログに置く**ことと同義だった
+    //    （Cookie に実行トークンを入れていたのと同じクラスの再発。今回は自分の別デーモン宛。
+    //     6回目のレビュー）。**capability ごとに別の資格情報にする。**
     // 🔒 `--allow-host` を付けると読み取りにも認証が要る。トークンが起動ごとに
     //    変わると開き直すたびに URL を探すので、トンネルを使うなら必ず永続化する。
-    if ((hosts.length > 0 || wantExec) && tokenFile) args.push('--token-file', tokenFile);
+    const file = wantExec ? execTokenFile : tokenFile;
+    if ((hosts.length > 0 || wantExec) && file) args.push('--token-file', file);
     if (wantExec) {
         args.push('--allow-exec');
         if (auditLog) args.push('--audit-log', auditLog);
