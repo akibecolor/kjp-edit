@@ -257,25 +257,42 @@ try {
         timer = setTimeout(() => done(rej)(new Error(`${method} が返らない`)), 240000);
     });
 
+    // 🚨 **すべての評価に retry を付ける。** ページの初期描画や自動更新と重なると
+    //    `Execution context was destroyed` で落ちる。`MEASURE` にだけ retry を
+    //    付けていたので、後から足した IME の評価が **CI（macOS / Windows）でだけ**
+    //    落ちた（手元は速いので再現しない）。**1箇所で扱う。**
+    let nextId = 1;
+    const evaluate = async (expression, tries = 3) => {
+        for (let i = 0; i < tries; i++) {
+            try {
+                const got = await send(nextId++, 'Runtime.evaluate',
+                    { expression, awaitPromise: true, returnByValue: true });
+                return got?.result?.value;
+            } catch (e) {
+                if (!/context was destroyed/i.test(e.message) || i === tries - 1) throw e;
+                await sleep(1500);
+            }
+        }
+        return undefined;   // ここには来ない（上で throw する）
+    };
+
+    // ⚠️ **ページが落ち着くのを待ってから評価する。** 読み込み中に評価すると
+    //    そのあとの遷移で context が捨てられる。
+    await evaluate(`(async () => {
+      for (let i = 0; i < 300; i++) {
+        if (document.readyState === 'complete') return true;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return false;
+    })()`);
+
     // 🚨 IME の検査は**描画の計測より前**に走らせる（12,000行流した後だと
     //    端末の文字量で副作用を判定できない）
-    const ime = (await send(10, 'Runtime.evaluate',
-        { expression: IME_CHECK, awaitPromise: true, returnByValue: true }))?.result?.value;
+    const ime = await evaluate(IME_CHECK);
 
-    // ⚠️ ページの再描画と重なると `Execution context was destroyed` になる。
-    //    1回だけやり直す（それでも駄目なら失敗として出す）
-    let r;
-    try {
-        r = await send(1, 'Runtime.evaluate',
-            { expression: MEASURE, awaitPromise: true, returnByValue: true });
-    } catch (e) {
-        if (!/context was destroyed/i.test(e.message)) throw e;
-        await sleep(1500);
-        r = await send(2, 'Runtime.evaluate',
-            { expression: MEASURE, awaitPromise: true, returnByValue: true });
-    }
-    const probe = r?.result?.value;
-    if (!probe) throw new Error(`計測結果が取れない: ${JSON.stringify(r).slice(0, 200)}`);
+    const probeValue = await evaluate(MEASURE);
+    const probe = probeValue;
+    if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
     if (probe.error) throw new Error(probe.error);
 
     const problems = [];
