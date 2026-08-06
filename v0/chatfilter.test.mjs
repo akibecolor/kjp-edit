@@ -160,13 +160,15 @@ test('chatGlance: 応答の終わりが分かる（打ってよい合図）', ()
     assert.match(g.text, /応答おわり/);
 });
 
-test('chatGlance: 走っているツールの名前を返す（何をしているかが分かる）', () => {
+test('🚨 chatGlance: 本文とツール名の両方を返す（本文だけ落とさない）', () => {
     const g = chatGlance(JSON.stringify({
         type: 'assistant',
         message: { content: [{ type: 'text', text: '調べます' }, { type: 'tool_use', name: 'Bash' }] },
     }));
     assert.equal(g.interpreted, true);
-    assert.match(g.text, /Bash/);
+    // 最後の1行だけにすると `· Bash` になり、**何を言われているかが消える**
+    assert.match(g.text, /調べます/, '本文が落ちている（打つべきか判断できない）');
+    assert.match(g.text, /Bash/, '走っているツールが見えない');
 });
 
 test('🚨 chatGlance: 先頭が切れていても、後ろから見て解釈できた行を使う', () => {

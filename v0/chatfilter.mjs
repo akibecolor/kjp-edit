@@ -94,8 +94,11 @@ export function chatGlance(raw) {
         let r;
         try { r = JSON.parse(lines[i]); } catch { continue; }   // 切れた行は飛ばす
         const got = chatRecordLines(r);
-        const last = got[got.length - 1];
-        if (last) return { text: last.text.trim(), interpreted: true };
+        // 🚨 **本文とツール名の両方を出す。** 最後の1行だけにすると、
+        //    text と tool_use が同じレコードに入っている形で**本文が消え**、
+        //    `· Bash` だけになる（「〜しますか？」が読めず、打つべきか判断できない）。
+        const text = got.map(o => o.text.trim()).filter(Boolean).join(' ');
+        if (text) return { text, interpreted: true };
     }
     return { text: lines[lines.length - 1] ?? '', interpreted: false };
 }
