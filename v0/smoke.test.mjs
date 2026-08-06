@@ -5859,3 +5859,132 @@ test('同じ場所を2回渡したら1本にまとめる（キャッシュが2�
             `重複がまとめられていない: ${JSON.stringify(d.repos.map(r => r.path))}`);
     } finally { child.kill(); }
 });
+
+/**
+ * 🚨 **`include.path` で filter を `.git` の外に置いても潰す（9回目のレビュー。BLOCKING）。**
+ *
+ * 8回目で入れた対策は「設定ファイルの場所が `.git` の中か」で判定していたので、
+ * `.git/config` の `include.path` で **worktree 直下のファイル**を引くだけで
+ * **capability ゼロの任意コード実行がそのまま復活**していた（実測で marker が2回）。
+ * 判定を許可リストに反転した（`--show-scope` が `system` / `global` と言うもの以外は
+ * すべてリポジトリ側）。`--show-scope` は include で引かれた値も `local` と報告する（実測）。
+ */
+test('🚨 include.path で外に置いた filter も潰す（capability ゼロの RCE）', async () => {
+    const marker = join(repo, 'inc-filter-ran.txt').split(sep).join('/');
+    const cfg = join(repo, 'inc-evil.cfg');
+    const target = join(repo, 'inc-filtered.txt');
+    try {
+        await writeFile(target, 'aaaa\n', 'utf8');
+        await writeFile(join(repo, '.gitattributes'), 'inc-filtered.txt filter=incevil\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: include filter のテスト用'], repo);
+        // 🚨 filter の定義を **.git の外**に置き、include.path で引く
+        await writeFile(cfg,
+            `[filter "incevil"]\n\tclean = sh -c "printf ran > '${marker}'; cat"\n`, 'utf8');
+        await g(['config', 'include.path', '../inc-evil.cfg'], repo);
+        // 同じ長さで書き換え、mtime を古くして stat cache を無効化する
+        await writeFile(target, 'bbbb\n', 'utf8');
+        const old = new Date(Date.now() - 86400000);
+        await (await import('node:fs/promises')).utimes(target, old, old);
+
+        const s = await state();
+        await new Promise(r => setTimeout(r, 400));
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(join(repo, 'inc-filter-ran.txt')), false,
+            'include.path 経由の filter が実行された（capability ゼロで任意コード実行）');
+        // 潰したことを告知している（名前も出す）
+        const notices = s.errors.filter(e => /を無効化して読みました/.test(e.message));
+        assert.equal(notices.length, 1, `告知が1件でない: ${JSON.stringify(s.errors)}`);
+        assert.match(notices[0].message, /incevil/, '何を無効化したのか言っていない');
+    } finally {
+        await g(['config', '--unset', 'include.path'], repo).catch(() => {});
+        await rm(cfg, { force: true }).catch(() => {});
+        await rm(join(repo, 'inc-filter-ran.txt'), { force: true }).catch(() => {});
+        await rm(target, { force: true }).catch(() => {});
+        await rm(join(repo, '.gitattributes'), { force: true }).catch(() => {});
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: include filter の後片付け'], repo).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **filter の門は dirty の門より前（9回目のレビュー。BLOCKING）。**
+ *
+ * 以前は dirty の判定が先で、その `worktreeStatus()` に filter の名前を渡していなかったので、
+ * **「filter は任意コマンドを起動するので断ります」と 409 で言う前に1回実行していた。**
+ * 応答の文面と実際に起きたことが違うのは、このリポジトリが最も重いとする嘘。
+ */
+test('🚨 merge が filter を断るとき、その前に filter を実行していない', async () => {
+    const { child, url } = await startWritable();
+    const stem = repo.split(sep).pop();
+    const wt = join(repo, '..', `${stem}-fgo`);
+    const marker = join(repo, 'fgo-ran.txt').split(sep).join('/');
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'fgo', wt, 'main'], repo);
+        // 対象の worktree に「中身を比べる」状況を作る（同じ長さで書き換え + 古い mtime）
+        await writeFile(join(wt, '.gitattributes'), 'fgo.txt filter=fgoevil\n', 'utf8');
+        await writeFile(join(wt, 'fgo.txt'), 'aaaa\n', 'utf8');
+        await g(['add', '-A'], wt);
+        await g(['commit', '-q', '-m', 'fgo seed'], wt);
+        await g(['config', 'filter.fgoevil.clean', `sh -c "printf ran > '${marker}'; cat"`], repo);
+        await writeFile(join(wt, 'fgo.txt'), 'bbbb\n', 'utf8');
+        const old = new Date(Date.now() - 86400000);
+        await (await import('node:fs/promises')).utimes(join(wt, 'fgo.txt'), old, old);
+
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': WRITE_TOKEN,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: wt, branch: 'agent-a' }),
+        });
+        assert.equal(r.status, 409, 'filter があるのに取り込んだ');
+        assert.match((await r.json()).error, /filter/, '断った理由が filter でない');
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(join(repo, 'fgo-ran.txt')), false,
+            '断る前に filter を実行した（応答の文面と実際に起きたことが違う）');
+    } finally {
+        child.kill();
+        await g(['config', '--unset', 'filter.fgoevil.clean'], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'fgo'], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+        await rm(join(repo, 'fgo-ran.txt'), { force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🔒 **checkout も filter を断る（9回目のレビュー。SERIOUS）。**
+ *
+ * `git checkout` は作業ツリーを書き換えるので **smudge filter を起動する** =
+ * `--allow-write` だけでリポジトリ設定の任意コマンドが走る。
+ * merge には門を付けたのに checkout には1つも無かった。
+ */
+test('🔒 checkout: リポジトリ設定の filter があるときは切り替えない', async () => {
+    const { child, url, session } = await startWritable();
+    const stem = repo.split(sep).pop();
+    const wt = join(repo, '..', `${stem}-cof`);
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'cof', wt, 'main'], repo);
+        await g(['config', 'filter.cofevil.clean', 'false'], repo);
+        const r = await fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                [session.tokenHeader]: session.token,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: wt, ref: 'main' }),
+        });
+        assert.equal(r.status, 409, 'filter があるのに checkout した（smudge が走る）');
+        assert.match((await r.json()).error, /filter/);
+    } finally {
+        child.kill();
+        await g(['config', '--unset', 'filter.cofevil.clean'], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'cof'], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+    }
+});

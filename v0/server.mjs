@@ -510,7 +510,7 @@ async function collectFresh(repo) {
     //    `core.fsmonitor` と同じクラスの穴で、`git status` が作業ツリーと index を
     //    比べるときに clean filter を実行する（実測で marker が書かれた。8回目のレビュー）。
     //    ⚠️ 1リポジトリあたり 2 spawn（--local と --worktree）。worktree の本数には比例しない。
-    const filters = await repoFilterNames(cwd, common);
+    const filters = await repoFilterNames(cwd);
     if (filters.length) {
         errors.push({
             scope: 'repo',
@@ -2676,8 +2676,29 @@ async function handleRequest(req, res) {
                 return;
             }
 
+            // 🚨 **filter の門は dirty の門より前に置く（9回目のレビュー。BLOCKING）。**
+            //    以前は dirty の判定が先で、その `worktreeStatus()` に filter の名前を
+            //    渡していなかったので、**「filter は任意コマンドを起動するので断ります」と
+            //    409 で言う前に、その任意コマンドを1回実行していた**
+            //    （実測: merge を断った後に marker が書かれていた）。
+            //    応答の文面と実際に起きたことが違うのは、このリポジトリが最も重いとする嘘。
+            //    ⚠️ **順序そのものが守り**なので変異で測る（`merge-filter-gate-order`）。
+            // 2b. 🔒 **`.gitattributes` の filter も同じ理由で断る。**
+            //     読み取り経路では `cat` に潰して読むが、**取り込みでは潰せない** —
+            //     smudge を潰したまま merge すると**作業ツリーに書かれる中身が変わる**
+            //     （git-lfs ならポインタのまま実体を上書きする）。潰すのも走らせるのも
+            //     危ないので、driver と同じ「実行そのものを断る」に倒す（8回目のレビュー）。
+            const filterNames = await repoFilterNames(wt.path);
+            if (filterNames.length) {
+                denyJson(res, 409,
+                    `リポジトリ設定の filter があります（${filterNames.map(f => f.name).join(', ')}）。`
+                    + ' filter は任意コマンドを起動し、無効化すると作業ツリーの中身が変わるので、'
+                    + '画面からの取り込みは行いません。端末で実行してください');
+                return;
+            }
+
             // 4. dirty なら拒否（未コミットの変更を巻き込まない）
-            const st = await worktreeStatus(wt.path).catch(() => null);
+            const st = await worktreeStatus(wt.path, filterNames).catch(() => null);
             if (st === null) {
                 denyJson(res, 409, '作業ツリーの状態を確認できませんでした（取り込みません）');
                 return;
@@ -2695,20 +2716,6 @@ async function handleRequest(req, res) {
                 denyJson(res, 409,
                     `カスタム merge driver が設定されています（${drivers.join(', ')}）。`
                     + ' driver はリポジトリ設定の任意コマンドを起動するので、'
-                    + '画面からの取り込みは行いません。端末で実行してください');
-                return;
-            }
-
-            // 2b. 🔒 **`.gitattributes` の filter も同じ理由で断る。**
-            //     読み取り経路では `cat` に潰して読むが、**取り込みでは潰せない** —
-            //     smudge を潰したまま merge すると**作業ツリーに書かれる中身が変わる**
-            //     （git-lfs ならポインタのまま実体を上書きする）。潰すのも走らせるのも
-            //     危ないので、driver と同じ「実行そのものを断る」に倒す（8回目のレビュー）。
-            const filterNames = await repoFilterNames(wt.path, await commonDir(wt.path));
-            if (filterNames.length) {
-                denyJson(res, 409,
-                    `リポジトリ設定の filter があります（${filterNames.map(f => f.name).join(', ')}）。`
-                    + ' filter は任意コマンドを起動し、無効化すると作業ツリーの中身が変わるので、'
                     + '画面からの取り込みは行いません。端末で実行してください');
                 return;
             }
@@ -2859,6 +2866,23 @@ async function handleRequest(req, res) {
             if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
             if (wt.bare) { denyJson(res, 400, 'bare worktree では checkout できません'); return; }
             if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
+
+            // 🔒 **filter があるなら checkout もしない（9回目のレビュー。SERIOUS）。**
+            //    `git checkout` は作業ツリーを書き換えるので **smudge filter を起動する**
+            //    = リポジトリ設定の任意コマンドが `--allow-write` だけで走る。
+            //    merge には同じ門を付けたのに、checkout には1つも無かった
+            //    （「規則を書いた場所から遠いコードには適用し忘れる」の再発）。
+            //    ⚠️ **シーケンサの判定より前**に置く。あとの判定は git を呼ぶので、
+            //    後ろに置くと「断る」と言う前に filter が走りうる（merge で実際に踏んだ）。
+            const coFilters = await repoFilterNames(wt.path);
+            if (coFilters.length) {
+                denyJson(res, 409,
+                    `リポジトリ設定の filter があります（${coFilters.map(f => f.name).join(', ')}）。`
+                    + ' checkout は作業ツリーを書き換えるので smudge filter'
+                    + '（リポジトリ設定の任意コマンド）が走ります。'
+                    + '画面からの切り替えは行いません。端末で実行してください');
+                return;
+            }
 
             const refs = await refMap(repo);
             if (!resolveRef(refs, ref)) {

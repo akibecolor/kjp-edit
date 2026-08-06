@@ -705,36 +705,41 @@ export function filterNeutralizeArgs(filters) {
  *     index のポインタと作業ツリーの実体を比べることになる）。
  *    どちらを潰したかは呼び出し側が告知する。
  */
-export async function repoFilterNames(cwd, commonDirPath = null) {
+export async function repoFilterNames(cwd) {
     /** name → process が設定されているか（潰し方が変わるので分ける） */
     const found = new Map();
     try {
-        // ⚠️ **1回の spawn で済ませる。** `--local` と `--worktree` を別々に呼ぶと
-        //    1回の収集で 2 プロセス増え、`stats.gitSpawns` の予算テストが落ちる
-        //    （worktree 本数に比例しない固定費でも、増やす前に測る規則）。
-        //    `--show-origin` で出所を見て、**リポジトリの中の設定ファイルだけ**採る。
+        // 🚨 **判定は「出所のパス」ではなく git が言う scope で行う（9回目のレビュー。BLOCKING）。**
+        //
+        //    以前は `--show-origin` の**ファイルの場所**が `.git` の中かで採否を決めていた。
+        //    ところが `.git/config` の `include.path` は**`.git` の外のファイル**を読めるので、
+        //    filter の定義を worktree 直下（`<repo>/evil.cfg`）に置くだけで
+        //    「リポジトリの中ではない」と判定され、**capability ゼロの任意コード実行が
+        //    そのまま復活していた**（実測: フラグ0個のデーモンに state を1回投げて marker が
+        //    2回書かれ、告知は0件。merge の門も 200 で通過）。
+        //    `--local` で列挙しても取れない（include された値は local スコープの
+        //    ファイルに帰属しないので exit 1 になる。実測）。
+        //
+        //    ⚠️ **許可リストに反転する。** `--show-scope` は include で引かれた値
+        //    （2段でも）を `local` と報告する（実測）。だから
+        //    **`system` / `global` 以外はすべてリポジトリ側**として扱う。
+        //    知らない scope（`command` など、将来増えるもの）も**保守的に潰す側**へ。
+        // ⚠️ spawn は1回のまま（`stats.gitSpawns` の予算を増やさない）。
         const out = await git(
-            ['config', '--show-origin', '--get-regexp',
+            ['config', '--show-scope', '--get-regexp',
                 '^filter\\..*\\.(clean|smudge|process)$'],
             { cwd, allowExit: [0, 1] },   // 1 = 該当なし
         );
         for (const raw of out.split('\n')) {
             const l = raw.trim();
             if (!l) continue;
-            // 形: `file:<path>\tfilter.<name>.<key> <value>`
-            const m = /^file:(.+?)\t+filter\.(.+?)\.(clean|smudge|process)(?:\s|$)/.exec(l);
+            // 形: `<scope>\tfilter.<name>.<key> <value>`
+            const m = /^([a-z]+)\t+filter\.(.+?)\.(clean|smudge|process)(?:\s|$)/.exec(l);
             if (!m) continue;
-            const [, rawOrigin, name, key] = m;
-            // ⚠️ **`--show-origin` は相対パスを返す**（リポジトリの中で走らせると
-            //    `file:.git/config`）。解決せずに比べると照合が必ず外れ、
-            //    **潰す対象が空になって守りが消える**（実測で踏んだ）。
-            const origin = resolve(cwd, rawOrigin);
-            // 🔒 global / system の filter は潰さない（利用者自身の設定。
-            //    潰すと git-lfs のリポジトリで status が全ファイル「変更」になる）。
-            //    リポジトリの中（`.git/config` と `config.worktree`）だけを対象にする。
-            const inRepo = (commonDirPath && containsPath(resolve(cwd, commonDirPath), origin))
-                || containsPath(join(cwd, '.git'), origin);
-            if (!inRepo) continue;
+            const [, scope, name, key] = m;
+            // 🔒 利用者自身の設定（git-lfs など）は潰さない。潰すと lfs の
+            //    リポジトリで status が全ファイル「変更」になり、観測が嘘になる
+            if (scope === 'system' || scope === 'global') continue;
             const prev = found.get(name) ?? false;
             found.set(name, prev || key === 'process');
         }

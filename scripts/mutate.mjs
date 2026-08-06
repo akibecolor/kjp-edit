@@ -89,11 +89,58 @@ const MUTANTS = [
         pattern: 'リポジトリ設定の filter を実行しない',
     },
     {
+        // 🚨 9回目のレビュー: include.path で .git の外に置くと判定が外れ、
+        //    capability ゼロの RCE が復活していた（8回目の対策の回避）
+        name: 'filter-scope-allowlist',
+        why: 'filter の帰属を許可リスト（system/global 以外はリポジトリ側）で判定しない'
+            + '（include.path で .git の外に置くだけで capability ゼロの任意コード実行）',
+        file: 'v0/git.mjs',
+        from: "            if (scope === 'system' || scope === 'global') continue;",
+        // ⚠️ `scope !== 'local'` では**元のバグを再現しない**（include も local と
+        //    報告されるので通ってしまい SURVIVED になった）。local を落として測る
+        to: "            if (scope !== 'worktree') continue;   /* 変異: local を捨てる */",
+        gone: "scope === 'system' || scope === 'global'",
+        pattern: 'include.path で外に置いた filter',
+    },
+    {
+        name: 'merge-filter-gate-order',
+        why: 'filter の門を無効化し、dirty の判定に filter を渡さない'
+            + '（「filter は任意コマンドを起動するので断る」と言う前に1回実行する形に戻す）',
+        file: 'v0/server.mjs',
+        // ⚠️ **`worktreeStatus` の引数だけを外しても SURVIVED する**（門が先に 409 を返すので
+        //    その status に到達しない。実測）。門の無効化と**対にして**測る。
+        //    `also` は「同じ守りが二重で、片方ずつでは測れない」ときの仕組み。
+        from: '            const coFilters = await repoFilterNames(wt.path);',
+        to: '            const coFilters = [];   /* 変異(1/2): checkout の門も外す */',
+        gone: 'const coFilters = await repoFilterNames(wt.path);',
+        also: [
+            {
+                from: '            if (filterNames.length) {\n                denyJson(res, 409,',
+                to: '            if (false) {\n                denyJson(res, 409,',
+            },
+            {
+                from: '            const st = await worktreeStatus(wt.path, filterNames).catch(() => null);',
+                to: '            const st = await worktreeStatus(wt.path).catch(() => null);',
+            },
+        ],
+        pattern: 'その前に filter を実行していない',
+    },
+    {
+        name: 'checkout-refuses-filter',
+        why: 'filter があるリポジトリでも checkout する'
+            + '（作業ツリーを書き換えるので smudge = 任意コマンドが --allow-write だけで走る）',
+        file: 'v0/server.mjs',
+        from: '            const coFilters = await repoFilterNames(wt.path);',
+        to: '            const coFilters = [];   /* 変異: filter を見ない */',
+        gone: 'const coFilters = await repoFilterNames(wt.path);',
+        pattern: 'checkout: リポジトリ設定の filter',
+    },
+    {
         name: 'merge-refuses-filter',
         why: 'filter があるリポジトリでも取り込む'
             + '（任意コマンドが走る。潰すと作業ツリーの中身が変わるので断るしかない）',
         file: 'v0/server.mjs',
-        from: '            const filterNames = await repoFilterNames(wt.path, await commonDir(wt.path));',
+        from: '            const filterNames = await repoFilterNames(wt.path);',
         to: '            const filterNames = [];   /* 変異: filter を見ない */',
         gone: 'const filterNames = await repoFilterNames(wt.path',
         pattern: 'merge: リポジトリ設定の filter があるときは実行しない',
