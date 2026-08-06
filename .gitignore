@@ -37,3 +37,6 @@ yarn-error.log*
 #    プロセスが即死して finally が走らず、これが残ったまま
 #    `git add -A` でコミットに混入した。二度と入らないようにする。
 *.mutate-bak
+
+# エージェントが使う一時 worktree（git add -A で本体に混入させない）
+.claude/worktrees/

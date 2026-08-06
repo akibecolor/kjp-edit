@@ -6,7 +6,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { winQuote, repoOf, samePathish, trimTrailingSep } from './winargs.mjs';
+import {
+    winQuote, repoOf, samePathish, trimTrailingSep, parseProcPairs, descendantsOf,
+} from './winargs.mjs';
 
 // 実測で使う形。バックスラッシュを直接書く（ここはソースなのでエスケープ表記でよい）
 const SPACED_TRAILING = 'C:\\Users\\a b\\kjp-editor\\';
@@ -97,4 +99,39 @@ test('trimTrailingSep: 末尾のセパレータだけを落とす', () => {
     assert.equal(trimTrailingSep(SPACED_TRAILING), SPACED);
     assert.equal(trimTrailingSep('C:/a/b//'), 'C:/a/b');
     assert.equal(trimTrailingSep('C:/a/b'), 'C:/a/b');
+});
+
+// ---------------------------------------------------------------------------
+// parseProcPairs / descendantsOf
+// 🚨 `--stop` は `taskkill /T /F` で**木ごと**落とすので、道連れになるのは
+//    デーモンだけではない（`claude -p` / `npm test` の子孫が全部死ぬ）。
+//    「止めます」と言う前に何本巻き込むかを見せるために木を辿る（8回目のレビュー）。
+// ---------------------------------------------------------------------------
+
+test('descendantsOf: 孫まで全部数える（子だけ見て「巻き込むのは1本」と言わない）', () => {
+    const pairs = [
+        { pid: 100, ppid: 1 },     // デーモン
+        { pid: 200, ppid: 100 },   // cmd /c npm test
+        { pid: 300, ppid: 200 },   // その子
+        { pid: 400, ppid: 100 },   // claude -p
+        { pid: 500, ppid: 9 },     // 無関係
+    ];
+    assert.deepEqual(descendantsOf(pairs, 100).sort((a, b) => a - b), [200, 300, 400]);
+    assert.deepEqual(descendantsOf(pairs, 400), []);
+    assert.deepEqual(descendantsOf(pairs, 999), [], '知らない pid でも投げない');
+    assert.deepEqual(descendantsOf(null, 1), []);
+});
+
+test('🚨 descendantsOf: 循環した親子関係で無限ループしない', () => {
+    // Windows は pid を再利用するので、死んだ親の pid を持つプロセスが輪を作りうる
+    const pairs = [{ pid: 1, ppid: 2 }, { pid: 2, ppid: 1 }, { pid: 3, ppid: 2 }];
+    assert.deepEqual(descendantsOf(pairs, 1).sort((a, b) => a - b), [2, 3]);
+});
+
+test('parseProcPairs: 数値でない行は捨てる', () => {
+    assert.deepEqual(parseProcPairs('10\t4\r\n20\t10\n'),
+        [{ pid: 10, ppid: 4 }, { pid: 20, ppid: 10 }]);
+    assert.deepEqual(parseProcPairs('警告: なにか\n10\t4\n'), [{ pid: 10, ppid: 4 }]);
+    assert.deepEqual(parseProcPairs(''), []);
+    assert.deepEqual(parseProcPairs(null), []);
 });

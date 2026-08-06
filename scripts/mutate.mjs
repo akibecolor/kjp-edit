@@ -932,6 +932,178 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: '自動起動は capability と引き継ぎを',
         testFile: 'scripts/serveargs.test.mjs',
     },
+    // ---- 実行の絶対上限（--timeout）と「既に動いています」の差分、--stop の対象 ----
+    // 🚨 8回目のレビュー: `--timeout` は純関数を全部テストしていたのに
+    //    **serve.mjs がそれを渡していることを誰も見ていなかった**（1行消しても 24 テスト
+    //    全部緑・変異0件）。差分の門は capability の**名前**しか比べておらず、
+    //    `--stop` はマシン上の全デーモンを止めるのに repo を出していなかった。
+    {
+        name: 'serve-exec-timeout-forward',
+        why: 'serverArgs が --exec-timeout を組み立てない（--timeout を打っても 600 秒のまま）',
+        file: 'scripts/serveargs.mjs',
+        from: "            args.push('--exec-timeout', String(execTimeout));",
+        to: '            /* 変異: 上限を渡さない */',
+        gone: "args.push('--exec-timeout'",
+        pattern: '--timeout で絶対上限をサーバに渡す',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 🚨 これが指摘の本体。**純関数を全部テストしても「呼んでいない」は見えない**
+        name: 'serve-passes-exec-timeout',
+        why: 'serve.mjs が上限をサーバに渡さない'
+            + '（serve.mjs --exec --timeout 3600 が黙って 600 秒で起動し、'
+            + '「回答が書かれる直前に SIGKILL」が復活する）',
+        file: 'scripts/serve.mjs',
+        from: '    execTimeout: timeoutCheck.seconds,',
+        to: '    /* 変異: 上限を渡さない */',
+        gone: 'execTimeout: timeoutCheck.seconds',
+        pattern: 'serve.mjs の --timeout が実際にサーバに届く',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-timeout-value-missing',
+        why: '--timeout の値が無い形を既定に落とす（延ばしたつもりで 600 秒のまま起動）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (raw === undefined || String(raw).startsWith('-')) return { error: raw ?? '(無し)' };",
+        to: '    /* 変異: 値が無い形を見ない */',
+        gone: "String(raw).startsWith('-')",
+        pattern: '--timeout の値が無い形を既定に落とさない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-timeout-value-gate',
+        why: 'serve.mjs が --timeout の値を検証しない（壊れた値が黙って既定になる）',
+        file: 'scripts/serve.mjs',
+        from: `if (timeoutCheck.error !== undefined) {
+    console.error(\`\\n✖ --timeout には 10〜86400（秒）を指定してください\`
+        + \`（受け取った値: \${timeoutCheck.error}）\`);
+    console.error('  上限そのものは外せません（取り残しの唯一の歯止めなので）。\\n');
+    process.exit(1);
+}`,
+        to: '/* 変異: 値を検証しない */',
+        gone: '--timeout には 10〜86400',
+        pattern: '--timeout が効かない組み合わせを黙って捨てない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-timeout-needs-exec',
+        why: '--exec 無しの --timeout を黙って捨てる（打った上限が効かないことが分からない）',
+        file: 'scripts/serve.mjs',
+        from: `    console.log('⚠ --timeout は --exec が無いと効きません'
+        + '（実行が無効なので実行の上限もありません）。');`,
+        to: '    /* 変異: 効かないことを言わない */',
+        gone: '--timeout は --exec が無いと効きません',
+        pattern: '--timeout が効かない組み合わせを黙って捨てない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-already-timeout-diff',
+        why: '「既に動いています」で上限の違いを見ない'
+            + '（--timeout 3600 を打っても 600 秒のデーモンに案内して exit 0）',
+        file: 'scripts/serveargs.mjs',
+        from: `    if (req.execTimeout !== null && req.execTimeout !== run.execTimeout) {
+        diffs.push({
+            what: '--exec-timeout',
+            want: \`\${req.execTimeout} 秒\`,
+            have: run.execTimeout === null ? 'サーバ既定（600 秒）' : \`\${run.execTimeout} 秒\`,
+        });
+    }`,
+        to: '    /* 変異: 上限の違いを見ない */',
+        gone: "what: '--exec-timeout'",
+        pattern: '「既に動いています」の差分は値まで見る',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-already-host-diff',
+        why: '「既に動いています」で許可ホストの**値**を見ない'
+            + '（box-a が動いているのに box-b を要求して exit 0 = スマホからは 403 のまま）',
+        file: 'scripts/serveargs.mjs',
+        from: `    for (const h of req.hosts) {
+        if (!run.hosts.some(x => low(x) === low(h))) {
+            diffs.push({
+                what: '--allow-host',
+                want: h,
+                have: run.hosts.length ? run.hosts.join(', ') : 'ループバックのみ',
+            });
+        }
+    }`,
+        to: '    /* 変異: 許可ホストの値を見ない */',
+        gone: 'low(x) === low(h)',
+        pattern: '「既に動いています」の差分は値まで見る',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 純関数を全部テストしても「呼んでいない」は検出できないので、配線も外す
+        name: 'serve-calls-config-diff',
+        why: 'serve.mjs が差分の門を呼ばない（要求が黙って無効になる。純関数は緑のまま）',
+        file: 'scripts/serve.mjs',
+        from: '    const diffs = configDiff(argv, already.cmd);',
+        to: '    const diffs = [];   /* 変異: 差分を見ない */',
+        gone: 'configDiff(argv, already.cmd)',
+        pattern: '既に動いているデーモンとの差分で止まり',
+        testFile: 'scripts/serveargs.test.mjs',
+        platforms: ['win32'],   // running() は今のところ PowerShell 経由だけ
+    },
+    {
+        name: 'serve-describe-exec-timeout',
+        why: '動いている実行デーモンの上限を出さない'
+            + '（「上限の話は1文字も出ない」= 打った --timeout が効いていないことに気付けない）',
+        file: 'scripts/serveargs.mjs',
+        from: `    if (caps.includes('--allow-exec')) {
+        parts.push(execTimeout === null ? '上限 サーバ既定（600秒）' : \`上限 \${execTimeout}秒\`);
+    }`,
+        to: '    /* 変異: 上限を出さない */',
+        gone: '上限 ${execTimeout}秒',
+        pattern: '動いている実行デーモンの上限を必ず見せる',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-stop-scope',
+        why: '--stop がマシン上の全デーモンを対象にする'
+            + '（repo B で 8 分走っている会話セッションが無言で消える。taskkill /T なので子孫も）',
+        file: 'scripts/serveargs.mjs',
+        from: `        if (samePathish(repoOf(r?.cmd), repo)) targets.push(r);
+        else others.push(r);`,
+        to: '        targets.push(r);   /* 変異: repo で絞らない */',
+        gone: 'samePathish(repoOf(r?.cmd), repo)',
+        pattern: '--stop の既定はカレントのリポジトリだけ',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-stop-shows-repo',
+        why: '--stop が止める相手の repo と capability を出さない'
+            + '（他のリポジトリを道連れにしても気付けない。--status は出しているので非対称）',
+        file: 'scripts/serve.mjs',
+        from: `    const line = (r, note) => \`  PID \${r.pid}  port \${r.port ?? '?'}  \${describeCaps(r.cmd)}\`
+        + \`\${note}  \${repoOf(r.cmd) ?? '(repo 不明)'}\`;`,
+        to: "    const line = (r, note) => `  PID ${r.pid}  port ${r.port ?? '?'}${note}`;",
+        gone: "(repo 不明)",
+        pattern: '既に動いているデーモンとの差分で止まり',
+        testFile: 'scripts/serveargs.test.mjs',
+        platforms: ['win32'],
+    },
+    {
+        name: 'serve-stop-unknown-not-ok',
+        why: '--stop の数え直しで「調べられない」を「止まりました」と読む'
+            + '（2回目の PowerShell が失敗すると何も言わず exit 0。#31 と同型）',
+        file: 'scripts/serveargs.mjs',
+        from: '    if (!after?.supported) return { exit: 1, unknown: true, left: [] };',
+        to: '    /* 変異: 調べられないのを成功にする */',
+        gone: 'unknown: true',
+        pattern: '--stop は「調べられない」を「止まりました」と読まない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'serve-all-requires-stop',
+        why: '--all を --stop 無しでも受け付ける'
+            + '（「全部止めるつもり」で打った --all が**起動**になる）',
+        file: 'scripts/serve.mjs',
+        from: "if (has('--all') && !has('--stop')) {",
+        to: 'if (false) {',
+        gone: "has('--all') && !has('--stop')",
+        pattern: '--all を --stop 無しで受け付けない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
     {
         // #3 の予算。**`node --test` ではなく実ブラウザの検査に掛ける**
         name: 'render-raf-batch',

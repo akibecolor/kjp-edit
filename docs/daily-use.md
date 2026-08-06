@@ -8,11 +8,13 @@
 ## 起動
 
 ```bash
-node scripts/serve.mjs              # カレントのリポジトリを読み取り専用で
-node scripts/serve.mjs --write      # checkout も
-node scripts/serve.mjs --exec       # 任意コマンドの実行も（🚨 遠隔コード実行）
-node scripts/serve.mjs --status     # 動いているものを一覧
-node scripts/serve.mjs --stop       # 止める
+node scripts/serve.mjs                     # カレントのリポジトリを読み取り専用で
+node scripts/serve.mjs --write             # checkout も
+node scripts/serve.mjs --exec              # 任意コマンドの実行も（🚨 遠隔コード実行）
+node scripts/serve.mjs --exec --timeout 3600   # 実行の絶対上限を延ばす（既定 600 秒）
+node scripts/serve.mjs --status            # 動いているものを一覧
+node scripts/serve.mjs --stop              # **カレントのリポジトリの**デーモンを止める
+node scripts/serve.mjs --stop --all        # マシン上の全デーモンを止める
 ```
 
 素の `node v0/server.mjs` で困っていたことを吸収している:
@@ -23,6 +25,30 @@ node scripts/serve.mjs --stop       # 止める
 | サブディレクトリから起動すると失敗する | `rev-parse --show-toplevel` でリポジトリのルートを自動で見つける |
 | ポートが埋まっていると起動できない | 空きを探す。ただし**黙って変えず必ず表示する** |
 | 実行を使うたびトークンを貼り直す | `--exec` のとき `~/.kjp-edit/token-exec` に永続化する |
+
+🚨 **既に動いていたときは「設定が同じか」を値まで見て、違えば止める**（8回目のレビュー）。
+以前は capability の**名前**しか比べていなかったので、
+`--timeout 3600` を付けて起動し直したつもりが「既に動いています → URL」で exit 0 になり、
+**前のデーモンが 600 秒のまま**走り続けていた（`--timeout` を足した理由そのものが消える）。
+`--allow-host box-b` も同じで、動いているのが `box-a` なら**スマホからは 403 のまま**。
+今は違いを並べて exit 1 する:
+
+```
+✖ 要求した設定が動いているものと違います:
+    --exec-timeout: 要求 7200 秒 / 動いているもの 3600 秒
+```
+
+🚨 **`--stop` はカレントのリポジトリだけを止める**（8回目のレビュー）。
+以前はマシン上の全デーモンを `taskkill /T /F` していたのに、止めた対象の repo を
+出していなかった。`/T` なので走っている exec の子（`claude -p` / `npm test`）まで死ぬので、
+repo A の作業を終えて `--stop` を打つと **repo B の会話セッションが無言で消えていた**。
+今は止める前に対象を出す（repo / port / capability / 巻き込む子孫の数）:
+
+```
+これを止めます（1 本。子プロセスも一緒に落ちます）:
+  PID 40692  port 7749  🚨 実行（任意コマンド） / 上限 3600秒 / ループバックのみ  子孫 2 個  C:/src/repo
+  PID 19124  port 57189  読み取り専用 / ループバックのみ  ← 別のリポジトリなので止めません
+```
 
 ⚠️ `--repo` にサブディレクトリを渡した場合も**ルートに正規化する**。
 これをしないと `merge-tree` が cwd 相対で衝突パスを返して `../shared.txt` になり、

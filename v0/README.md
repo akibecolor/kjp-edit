@@ -9,7 +9,8 @@
 ```bash
 node scripts/serve.mjs                # ← 普段はこれ（手順は docs/daily-use.md）
 node scripts/serve.mjs --watch        # + エージェントの活動を観測する
-node scripts/serve.mjs --status       # 動いているものを一覧 / --stop で止める
+node scripts/serve.mjs --status       # 動いているものを一覧
+node scripts/serve.mjs --stop         # このリポジトリのものを止める（全部なら --stop --all）
 node scripts/autostart.mjs install    # ログオン時に自動起動（既定は読み取り専用）
 ```
 → http://127.0.0.1:7749
