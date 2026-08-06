@@ -161,11 +161,17 @@ let failed = false;
 }
 
 // 2. ユニットテスト
+// ⚠️ **上限は「遅い」ことを隠すためではなく、ハングを失敗として観測するため。**
+//    `serveargs.test.mjs` に**実際に serve.mjs を起動して配線を測る**テストが入った
+//    （純関数を全部テストしても「呼んでいない」は見えない。8回目のレビュー）。
+//    Windows の起動口は 1回の探索ごとに PowerShell の CIM クエリを待つので
+//    1テストで 25 秒かかる（CI の Windows は更に遅い）。上限が 30 秒だと
+//    **配線のテストだけが SIGKILL され、原因が消える**ので広げてある。
 {
     const r = await run(
-        ['--test', '--test-timeout=30000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'v0/chatfilter.test.mjs',
+        ['--test', '--test-timeout=90000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'v0/chatfilter.test.mjs',
             'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs'],
-        { timeout: 60_000 },
+        { timeout: 240_000 },
     );
     const s = summarizeTests(r.output);
     const ok = r.code === 0;

@@ -11,9 +11,12 @@
 //
 // ⚠️ ここは**起動前**に走るので、`v0/` のモジュールに依存しない（サーバを読み込まない）。
 
+// ⚠️ `winargs.mjs` も純関数だけ（`v0/` には触らない）。`--stop` の対象を repo で絞るのに使う
+import { repoOf, samePathish } from './winargs.mjs';
+
 /** 起動口が受け付けるフラグ。ここに無いものは黙って捨てずに止める */
 export const SERVE_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text', '--timeout', '--status', '--stop', '--help', '-h']);
+    '--watch', '--agents-text', '--timeout', '--status', '--stop', '--all', '--help', '-h']);
 
 /** 自動起動の登録が受け付けるフラグ（`--status` 等はサブコマンドなので入らない） */
 export const AUTOSTART_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
@@ -79,6 +82,25 @@ export function checkTimeout(raw) {
     // 下限 10 秒（打ち間違いで即殺す状態を作らない）/ 上限 24 時間
     if (!Number.isFinite(n) || n < 10 || n > 86400) return { error: String(raw) };
     return { seconds: n };
+}
+
+/**
+ * argv から `--timeout <秒>` を取り出して検証する。
+ *
+ * 🚨 **値が無い形を黙って既定に落とさない。** `serve.mjs --exec --timeout`（値を忘れた）や
+ *    `--timeout --allow-host box` は、打った本人は上限を延ばしたつもりなのに
+ *    **600 秒のまま起動する**（`val()` が次のトークンを取れないと既定に落ちるため）。
+ *    「打ったフラグを黙って捨てない」（#30）を値の側でも守る。
+ * @returns {{seconds: number|null} | {error: string}} 指定が無ければ seconds: null
+ */
+export function timeoutFrom(argv) {
+    const a = Array.isArray(argv) ? argv : [];
+    const i = a.indexOf('--timeout');
+    if (i === -1) return { seconds: null };
+    const raw = a[i + 1];
+    // ⚠️ 次がフラグなら値ではない（`--timeout --exec` を 0 秒や既定と読まない）
+    if (raw === undefined || String(raw).startsWith('-')) return { error: raw ?? '(無し)' };
+    return checkTimeout(raw);
 }
 
 /**
@@ -223,16 +245,147 @@ export function requestedCaps(argv) {
     return out;
 }
 
+/**
+ * 動いているデーモンのコマンド行から**値まで含む設定**を読む。
+ *
+ * 🚨 **名前の集合だけ比べると、値を持つフラグが黙って無効になる**（8回目のレビュー）。
+ *    `--timeout 3600` を付けて起動し直したつもりが「既に動いています」で exit 0 になり、
+ *    前のデーモンが 600 秒のまま走り続けていた（`--timeout` を足した理由そのものが消える。
+ *    実測で 551 秒でまだ走っていた仕事が、この経路で無言で旧設定に戻る）。
+ *    `--allow-host box-b` も同じで、動いているのが box-a なら**スマホからは 403 のまま**
+ *    （c0948ea の「再起動後だけ 403」と同型）。
+ * @param {string} cmd 動いているプロセスのコマンド行
+ * @returns {{caps: string[], hosts: string[], execTimeout: number|null}}
+ *   execTimeout は `--exec-timeout` が無ければ null（= サーバの既定 600 秒）
+ */
+export function runningConfig(cmd) {
+    // ⚠️ 正規表現でコマンド行を舐めない（`--allow-hostx` に当たる）。値は**次のトークン**。
+    //    ホスト名と秒数は空白を含みえないので、空白で切って読めば足りる。
+    const tokens = String(cmd ?? '').split(/\s+/);
+    const hosts = [];
+    let execTimeout = null;
+    for (let i = 0; i < tokens.length; i++) {
+        if (tokens[i] === '--allow-host' && tokens[i + 1]) hosts.push(tokens[i + 1]);
+        else if (tokens[i] === '--exec-timeout' && /^\d+$/.test(tokens[i + 1] ?? '')) {
+            execTimeout = Number(tokens[i + 1]);
+        }
+    }
+    return { caps: runningCaps(cmd), hosts, execTimeout };
+}
+
+/**
+ * この起動口の argv が要求している設定（値まで）。
+ *
+ * ⚠️ `--allow-host` は**名前ではなく値**で比べる（名前だけだと box-a と box-b が同じに見える）。
+ * ⚠️ `--exec` が無ければ上限はサーバに渡らない（`serverArgs` が付けない）ので、
+ *    要求として数えない。数えると「読み取り専用のつもりの起動」が毎回差分で止まる。
+ */
+export function requestedConfig(argv) {
+    const a = Array.isArray(argv) ? argv : [];
+    const caps = requestedCaps(a).filter(c => c !== '--allow-host');
+    const t = a.includes('--exec') ? timeoutFrom(a) : { seconds: null };
+    return {
+        caps,
+        hosts: collectHosts(a).hosts ?? [],
+        execTimeout: t.seconds ?? null,
+    };
+}
+
+/**
+ * 要求した設定と、動いているデーモンの設定の差分。
+ *
+ * 🚨 **空なら「打ったものは全部効いている」と言えること**が、この関数の約束。
+ *    以前は capability の**名前**しか比べていなかったので、`--timeout` は集合に入らず
+ *    `--allow-host` は値を見ず、`missing=[]` で exit 0 = **黙って無効**だった。
+ * @returns {{what: string, want: string, have: string}[]} 空なら差分なし
+ */
+export function configDiff(argv, cmd) {
+    const req = requestedConfig(argv);
+    const run = runningConfig(cmd);
+    const diffs = [];
+    for (const c of req.caps) {
+        if (!run.caps.includes(c)) diffs.push({ what: c, want: '有効', have: '無効' });
+    }
+    // ⚠️ ホスト名は大文字小文字を区別しない（DNS 名なので）
+    const low = s => String(s).toLowerCase();
+    for (const h of req.hosts) {
+        if (!run.hosts.some(x => low(x) === low(h))) {
+            diffs.push({
+                what: '--allow-host',
+                want: h,
+                have: run.hosts.length ? run.hosts.join(', ') : 'ループバックのみ',
+            });
+        }
+    }
+    // 値が違えば差分。**長い方に丸めない**（打った値が効いていないことは事実）
+    if (req.execTimeout !== null && req.execTimeout !== run.execTimeout) {
+        diffs.push({
+            what: '--exec-timeout',
+            want: `${req.execTimeout} 秒`,
+            have: run.execTimeout === null ? 'サーバ既定（600 秒）' : `${run.execTimeout} 秒`,
+        });
+    }
+    return diffs;
+}
+
+/**
+ * `--stop` が止める対象を選ぶ。
+ *
+ * 🚨 **既定はカレントのリポジトリだけにする**（8回目のレビュー）。以前は
+ *    「node.exe で cmdline に v0/server.mjs を含むもの」を全部 `taskkill /T /F` していた。
+ *    `/T` なので走っている exec の子（`claude -p` / `npm test`）も死ぬのに、
+ *    出力は PID と port だけで**どのリポジトリを止めたかを一言も言わなかった**。
+ *    N 個のエージェントを並行で回す前提のツールで、repo A の作業を終えて `--stop` を打つと
+ *    **repo B で 8 分走っている会話セッションが無言で消える**。
+ *    マシン上の全部を止めるのは `--stop --all` で明示させる。
+ * @param {{pid:number, port:number|null, cmd:string}[]} list
+ * @param {string|null} repo カレントのリポジトリ（`all` のときは見ない）
+ * @returns {{targets: object[], others: object[]}} others = 止めないもの（必ず見せる）
+ */
+export function stopTargets(list, repo, all = false) {
+    const items = Array.isArray(list) ? list : [];
+    if (all) return { targets: items, others: [] };
+    const targets = [];
+    const others = [];
+    for (const r of items) {
+        if (samePathish(repoOf(r?.cmd), repo)) targets.push(r);
+        else others.push(r);
+    }
+    return { targets, others };
+}
+
+/**
+ * `--stop` の結末を決める（純関数にして「調べられない」を測れるようにする）。
+ *
+ * 🚨 **「調べられない」を「止まりました」と読まない。** 数え直しは
+ *    `const left = after.supported ? … : []` だったので、2回目の PowerShell が失敗すると
+ *    `left=[]` → **何も言わずに exit 0**。「調べられない」を「無い」と言わないために
+ *    30 行上で潰した #31 と同型の穴が、同じ関数の中に残っていた（8回目のレビュー）。
+ * @param {{after: {supported: boolean, list?: object[]}, targets: object[], failed?: number}} o
+ * @returns {{exit: number, unknown: boolean, left: number[]}}
+ */
+export function stopOutcome({ after, targets, failed = 0 }) {
+    if (!after?.supported) return { exit: 1, unknown: true, left: [] };
+    const t = Array.isArray(targets) ? targets : [];
+    const left = (after.list ?? []).filter(r => t.some(x => x.pid === r.pid)).map(r => r.pid);
+    return { exit: left.length || failed ? 1 : 0, unknown: false, left };
+}
+
 /** 人が読む形にする（`--status` と「既に動いています」で同じ言い方をする） */
 export function describeCaps(cmd) {
-    const caps = runningCaps(cmd);
+    const { caps, hosts, execTimeout } = runningConfig(cmd);
     const parts = [];
     if (caps.includes('--allow-exec')) parts.push('🚨 実行（任意コマンド）');
     else if (caps.includes('--allow-write')) parts.push('書き込み（checkout）');
     else parts.push('読み取り専用');
+    // 🚨 **実行の絶対上限を必ず出す。** ここは「何が有効か」を確認する唯一の手段で、
+    //    上限は**投げた仕事が完走するか**を決める。出さないと
+    //    `--timeout 3600` を打ったのに 600 秒のデーモンに案内されたことが分からない。
+    if (caps.includes('--allow-exec')) {
+        parts.push(execTimeout === null ? '上限 サーバ既定（600秒）' : `上限 ${execTimeout}秒`);
+    }
     if (caps.includes('--allow-transcript-text')) parts.push('活動観測+発話');
     else if (caps.includes('--watch-agents')) parts.push('活動観測');
-    const hosts = [...String(cmd ?? '').matchAll(/--allow-host\s+(\S+)/g)].map(m => m[1]);
     parts.push(hosts.length ? `Host許可: ${hosts.join(', ')}` : 'ループバックのみ');
     return parts.join(' / ');
 }

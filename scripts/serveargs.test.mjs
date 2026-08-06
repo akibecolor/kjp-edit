@@ -9,13 +9,17 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer, createConnection } from 'node:net';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import {
     SERVE_FLAGS, AUTOSTART_FLAGS, unknownFlag, checkPort, checkHost,
-    collectHosts, serverArgs, autostartServeArgs, checkTimeout,
+    collectHosts, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
     runningCaps, requestedCaps, describeCaps,
+    runningConfig, requestedConfig, configDiff, stopTargets, stopOutcome,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
@@ -198,11 +202,11 @@ test('自動起動は壊れたホスト名を登録しない', () => {
 //    ⚠️ ここで見るのは**最初に通る門**だけにする。後ろの門（--port / --allow-host）は
 //       git と PowerShell を叩いてからなので、ユニットの速さを壊す（smoke の仕事）。
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-function runScript(script, args) {
+function runScript(script, args, env = {}) {
     return new Promise(resolve => {
         const p = spawn(process.execPath, [join(ROOT, 'scripts', script), ...args], {
             cwd: ROOT, shell: false, windowsHide: true,
-            env: { ...process.env, NO_COLOR: '1' },
+            env: { ...process.env, NO_COLOR: '1', ...env },
         });
         let out = '';
         p.stdout.on('data', d => { out += d; });
@@ -322,4 +326,338 @@ test('🚨 自動起動の登録に --timeout を引き継ぐ（再起動後だ�
     const i = r.args.indexOf('--timeout');
     assert.notEqual(i, -1, `引き継いでいない: ${r.args.join(' ')}`);
     assert.equal(r.args[i + 1], '3600');
+});
+
+test('🚨 --timeout の値が無い形を既定に落とさない', () => {
+    assert.deepEqual(timeoutFrom(['--exec', '--timeout', '3600']), { seconds: 3600 });
+    assert.deepEqual(timeoutFrom(['--exec']), { seconds: null });
+    assert.deepEqual(timeoutFrom([]), { seconds: null });
+    assert.deepEqual(timeoutFrom(null), { seconds: null }, '壊れた入力で投げない');
+    // 🚨 値を忘れた形。以前の `val()` は次のトークンが無いと**既定に落ちていた**ので、
+    //    「上限を延ばしたつもりで 600 秒のまま起動」になっていた
+    assert.notEqual(timeoutFrom(['--exec', '--timeout']).error, undefined, '値なしを通した');
+    assert.notEqual(timeoutFrom(['--timeout', '--exec']).error, undefined, '次のフラグを値と読んだ');
+    assert.equal(timeoutFrom(['--timeout', '5']).error, '5', '範囲の検証を通っていない');
+});
+
+/* ===== 「既に動いています」の差分（8回目のレビュー） =====
+   🚨 capability の**名前**しか比べていなかったので、`--timeout` は集合に入らず
+      `--allow-host` は値を見ていなかった。`--timeout 3600` を付けて起動し直したつもりが
+      「既に動いています → URL」で exit 0 になり、**前のデーモンが 600 秒のまま**
+      走り続けていた（実測 551 秒でまだ走っていた仕事が、この経路で無言で旧設定に戻る）。 */
+
+const RUNNING_EXEC = 'node C:/x/v0/server.mjs --repo C:/r --port 7749 --allow-write'
+    + ' --allow-exec --token-file C:/s/token-exec --audit-log C:/s/a.jsonl'
+    + ' --exec-timeout 3600 --allow-host box-a.ts.net';
+
+test('動いているデーモンの設定を値まで読む（上限と許可ホスト）', () => {
+    const c = runningConfig(RUNNING_EXEC);
+    assert.equal(c.execTimeout, 3600);
+    assert.deepEqual(c.hosts, ['box-a.ts.net']);
+    // --exec-timeout が無ければ「サーバの既定」= null。0 と混同しない
+    assert.equal(runningConfig('node v0/server.mjs --allow-exec').execTimeout, null);
+    // ⚠️ 部分一致で拾わない
+    assert.equal(runningConfig('node v0/server.mjs --exec-timeoutx 99').execTimeout, null);
+    assert.deepEqual(runningConfig('node v0/server.mjs --allow-hostx y').hosts, []);
+    assert.equal(runningConfig(null).execTimeout, null, '壊れた入力で投げない');
+});
+
+test('🚨 「既に動いています」の差分は値まで見る（上限とホスト）', () => {
+    // (1) 上限だけが違う。以前はここが missing=[] で **exit 0 = 黙って無効**だった
+    const t = configDiff(['--exec', '--timeout', '7200'], RUNNING_EXEC);
+    assert.equal(t.length, 1, `上限の違いを1件だけ出すこと: ${JSON.stringify(t)}`);
+    assert.equal(t[0].what, '--exec-timeout');
+    assert.match(t[0].want, /7200/);
+    assert.match(t[0].have, /3600/);
+
+    // (2) ホストが違う（c0948ea の「再起動後だけ 403」と同型。名前だけでは同じに見える）
+    const h = configDiff(['--exec', '--timeout', '3600', '--allow-host', 'box-b.ts.net'],
+        RUNNING_EXEC);
+    assert.deepEqual(h.map(d => d.what), ['--allow-host']);
+    assert.match(h[0].have, /box-a\.ts\.net/, '動いている許可ホストを出していない');
+
+    // (3) 同じ設定なら差分は無い（毎回止めさせる形にはしない）
+    assert.deepEqual(configDiff(['--exec', '--timeout', '3600', '--allow-host', 'BOX-A.ts.net'],
+        RUNNING_EXEC), [], 'ホスト名は大文字小文字を区別しない');
+    assert.deepEqual(configDiff(['--exec'], RUNNING_EXEC), [],
+        '上限を要求していないのに差分を出してはいけない');
+
+    // (4) capability の差分は今まで通り出す（読み取り専用のデーモンに --exec を要求）
+    assert.deepEqual(configDiff(['--exec'], 'node v0/server.mjs --repo C:/r').map(d => d.what)
+        .sort(), ['--allow-exec', '--allow-write']);
+
+    // (5) 上限は --exec と一緒でなければサーバに渡らないので要求として数えない
+    assert.deepEqual(configDiff(['--timeout', '7200'], 'node v0/server.mjs --repo C:/r'), []);
+    assert.equal(requestedConfig(['--timeout', '7200']).execTimeout, null);
+});
+
+test('🚨 動いている実行デーモンの上限を必ず見せる（--status と同じ言い方で）', () => {
+    // 上限が出ないと、`--timeout 3600` を打った人が 600 秒のデーモンに案内されたことに
+    // 気付けない（「上限の話は1文字も出ない」が指摘の本体）
+    assert.match(describeCaps(RUNNING_EXEC), /上限 3600秒/);
+    assert.match(describeCaps('node v0/server.mjs --allow-exec --allow-write'),
+        /上限 サーバ既定/, '既定であることを言っていない');
+    // 実行が無効なら上限の話はしない（意味が無いので）
+    assert.doesNotMatch(describeCaps('node v0/server.mjs --allow-write'), /上限/);
+});
+
+/* ===== --stop の対象（8回目のレビュー） =====
+   🚨 `--stop` はマシン上の全デーモンを `taskkill /T /F` していたのに、
+      止めた対象の repo を出さなかった。N 個のエージェントを並行で回す前提のツールで、
+      repo A の作業を終えて --stop を打つと **repo B で 8 分走っている会話セッションが
+      無言で消える**（/T なので claude -p の子孫まで死ぬ）。 */
+
+const D = (pid, repo, extra = '') => ({
+    pid, port: 7749 + pid, cmd: `node C:/x/v0/server.mjs --repo ${repo} ${extra}`,
+});
+
+test('🚨 --stop の既定はカレントのリポジトリだけ（他のリポジトリを道連れにしない）', () => {
+    const list = [D(1, 'C:/a'), D(2, 'C:/b'), D(3, 'C:/A')];
+    const r = stopTargets(list, 'C:/a');
+    assert.deepEqual(r.targets.map(x => x.pid), [1, 3], '同じ repo（表記違いを含む）だけ止める');
+    assert.deepEqual(r.others.map(x => x.pid), [2],
+        '止めない相手を返していない（見せられないと「止めたのに動いている」になる）');
+    // --all のときだけマシン上の全部
+    assert.deepEqual(stopTargets(list, 'C:/a', true).targets.map(x => x.pid), [1, 2, 3]);
+    assert.deepEqual(stopTargets(list, 'C:/a', true).others, []);
+    // repo が分からない相手を「同じ repo」と読まない
+    assert.deepEqual(stopTargets([{ pid: 9, cmd: 'node v0/server.mjs' }], 'C:/a').targets, []);
+    assert.deepEqual(stopTargets(null, 'C:/a').targets, [], '壊れた入力で投げない');
+});
+
+test('🚨 --stop は「調べられない」を「止まりました」と読まない', () => {
+    const targets = [D(1, 'C:/a')];
+    // 🚨 以前は `after.supported ? … : []` だったので、2回目の PowerShell が失敗すると
+    //    left=[] → **何も言わず exit 0**（#31 と同型が同じ関数の中に残っていた）
+    const unknown = stopOutcome({ after: { supported: false }, targets });
+    assert.equal(unknown.exit, 1, '確認できていないのに成功にしている');
+    assert.equal(unknown.unknown, true);
+
+    const gone = stopOutcome({ after: { supported: true, list: [] }, targets });
+    assert.deepEqual(gone, { exit: 0, unknown: false, left: [] });
+
+    const left = stopOutcome({ after: { supported: true, list: [D(1, 'C:/a')] }, targets });
+    assert.equal(left.exit, 1);
+    assert.deepEqual(left.left, [1]);
+    // taskkill が失敗していれば、消えて見えても成功にしない
+    assert.equal(stopOutcome({ after: { supported: true, list: [] }, targets, failed: 1 }).exit, 1);
+});
+
+// ---- 起動口の配線（速い方。git も PowerShell も叩かない門）----
+
+test('serve.mjs は --all を --stop 無しで受け付けない（配線）', async () => {
+    // 🚨 SERVE_FLAGS に入れた瞬間に「知っているが何もしないフラグ」になるので、
+    //    ここで止めないと `--all`（全部止めるつもり）が**起動**になる
+    const r = await runScript('serve.mjs', ['--all', '--repo', NO_REPO]);
+    assert.equal(r.code, 1, `止めていない: ${r.out}`);
+    assert.match(r.out, /--all は --stop と一緒/, '門より先に別の検証で落ちている');
+});
+
+test('serve.mjs は --timeout が効かない組み合わせを黙って捨てない（配線）', async () => {
+    // `--exec` が無いと上限はサーバに渡らない。**エラーにはしない**（自動起動の登録に
+    // 残っていると「ログオン後だけ起動しない」になる）が、必ず言う
+    const r = await runScript('serve.mjs', ['--timeout', '3600', '--repo', NO_REPO]);
+    assert.match(r.out, /--timeout は --exec が無いと効きません/, '黙って捨てている');
+    // 値の検証も「既に動いています」より前に通す（デーモンが動いていると
+    // 以前は --timeout abc が一言も言われず exit 0 だった）
+    const bad = await runScript('serve.mjs', ['--timeout', 'abc', '--repo', NO_REPO]);
+    assert.equal(bad.code, 1, `止めていない: ${bad.out}`);
+    assert.match(bad.out, /--timeout には 10〜86400/);
+    assert.doesNotMatch(bad.out, /git リポジトリが見つかりません/,
+        '値の検証が repo の解決より後ろにある（既に動いていると黙って通る形）');
+});
+
+test('serve.mjs は --stop の対象を決められなければ何も止めない（配線）', async () => {
+    // 🚨 以前はカレントが git リポジトリでなくても**マシン上の全デーモンを止めた**。
+    //    対象が決まらないなら何もしない（`--all` で明示させる）
+    const r = await runScript('serve.mjs', ['--stop', '--repo', NO_REPO]);
+    assert.equal(r.code, 1, `何かを止めようとした: ${r.out}`);
+    assert.match(r.out, /git リポジトリの中ではありません/);
+    assert.match(r.out, /--stop --all/, '全部止める方法を示していない');
+});
+
+/* ===== 実起動でしか測れない配線（8回目のレビュー） =====
+   🚨 `--timeout` は純関数（`serverArgs` / `checkTimeout`）を全部テストしていたのに、
+      **serve.mjs がそれを渡していることを誰も見ていなかった**。1行消しても 24 テスト
+      全部緑で、変異も0件。落とすと `serve.mjs --exec --timeout 3600` が黙って
+      600 秒で起動し、「回答が書かれる直前に SIGKILL」が復活する。
+   ⚠️ 字面（`assert.match(src, /execTimeout/)`）では測らない。**実際に起動して、
+      サーバが受け取った値を言わせる**（起動時に「上限 Ns」と出す）。 */
+
+/** 空いている port を1つ借りる（借りて即返す。高い番号なので実用上ぶつからない） */
+function freePort() {
+    return new Promise((resolve, reject) => {
+        const s = createServer();
+        s.on('error', reject);
+        s.listen(0, '127.0.0.1', () => {
+            const { port } = s.address();
+            s.close(() => resolve(port));
+        });
+    });
+}
+
+function runGit(args, cwd) {
+    return new Promise((resolve, reject) => {
+        execFile('git', args, { cwd, windowsHide: true, encoding: 'utf8' },
+            (e, out) => (e ? reject(e) : resolve(String(out).trim())));
+    });
+}
+
+/**
+ * 一時リポジトリの名前で照合して、そのリポジトリを見ている node を全部拾う。
+ *
+ * 🚨 **`tag` が空だと `-like '**'` が全部の node.exe に当たる**（他のエージェントの
+ *    検査サーバまで殺す）。呼ぶ前に必ず形を確かめる。
+ * 🚨 **「調べられない」を「残っていない」と読まない**（残るとポートを塞ぐ）。
+ */
+function daemonsFor(tag) {
+    assert.match(tag, /^kjp-wire-[a-z]+-[A-Za-z0-9]+$/, '掃除の照合に使う名前が一意でない');
+    const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" '
+        + `| Where-Object { $_.CommandLine -like '*${tag}*' } | ForEach-Object { $_.ProcessId }`;
+    return new Promise(resolve => {
+        execFile('powershell', ['-NoProfile', '-Command', ps],
+            { windowsHide: true, encoding: 'utf8' }, (e, out) => resolve(e
+                ? { supported: false, pids: [] }
+                : {
+                    supported: true,
+                    pids: String(out).split('\n').map(s => s.trim())
+                        .filter(s => /^\d+$/.test(s)).map(Number),
+                }));
+    });
+}
+
+function taskkill(pid) {
+    return new Promise(resolve => {
+        execFile('taskkill', ['/PID', String(pid), '/T', '/F'],
+            { windowsHide: true, encoding: 'utf8' }, () => resolve());
+    });
+}
+
+function portBusy(port) {
+    return new Promise(resolve => {
+        const s = createConnection({ host: '127.0.0.1', port });
+        const done = v => { s.destroy(); resolve(v); };
+        s.on('connect', () => done(true));
+        s.on('error', () => done(false));
+        setTimeout(() => done(false), 1000);
+    });
+}
+
+/**
+ * 検証用に立てたものを**必ず**片付ける。残った文言を返す（null なら綺麗）。
+ *
+ * ⚠️ 掴んだ PID を殺すだけでは足りない。門を外す変異は**2本目のデーモンを立てる**ので、
+ *    一時リポジトリの名前で照合して全部落とす（CLAUDE.md スクリプト規則6）。
+ */
+async function cleanup(tag, child, port) {
+    if (process.platform === 'win32') {
+        const found = await daemonsFor(tag);
+        for (const pid of found.pids) await taskkill(pid);
+        const left = await daemonsFor(tag);
+        if (!found.supported || !left.supported) {
+            return '検証用サーバを片付けられたか確認できませんでした（PowerShell が失敗）';
+        }
+        if (left.pids.length) return `検証用サーバが残りました: PID ${left.pids.join(', ')}`;
+        return null;
+    }
+    if (child && child.exitCode === null) child.kill('SIGTERM');
+    const deadline = Date.now() + 5000;
+    while (child && child.exitCode === null && Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 50));
+    }
+    if (await portBusy(port)) return `検証用サーバが port ${port} を掴んだままです`;
+    return null;
+}
+
+/**
+ * 一時リポジトリ・一時 HOME で `serve.mjs` を実起動し、起動を待って body を呼ぶ。
+ *
+ * ⚠️ `~/.kjp-edit` を汚さないため HOME/USERPROFILE を一時ディレクトリに向ける
+ *    （`os.homedir()` は Windows では USERPROFILE、POSIX では HOME を見る）。
+ * ⚠️ **固定時間で待たない**（起動は git と PowerShell の探索を待つ。CLAUDE.md）。
+ */
+async function withDaemon(extra, body) {
+    const home = await mkdtemp(join(tmpdir(), 'kjp-wire-home-'));
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-wire-repo-'));
+    const tag = dir.split(/[\\/]/).pop();
+    const env = { HOME: home, USERPROFILE: home };
+    let child = null;
+    let port = 0;
+    let err = null;
+    try {
+        await runGit(['init', '-q', '-b', 'main'], dir);
+        const repo = await runGit(['rev-parse', '--show-toplevel'], dir);
+        port = await freePort();
+        child = spawn(process.execPath, [join(ROOT, 'scripts', 'serve.mjs'),
+            '--repo', dir, '--port', String(port), '--exec', ...extra], {
+            cwd: ROOT, shell: false, windowsHide: true,
+            env: { ...process.env, NO_COLOR: '1', ...env },
+        });
+        let out = '';
+        let exited = null;
+        child.stdout.on('data', d => { out += d; });
+        child.stderr.on('data', d => { out += d; });
+        child.on('error', e => { out += `\n[spawn 失敗] ${e.message}`; exited = -1; });
+        child.on('close', c => { exited = c ?? 0; });
+        const deadline = Date.now() + 25_000;
+        while (!/上限 \d+s/.test(out) && exited === null && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        assert.match(out, /上限 \d+s/, `サーバが起動していない (exit=${exited})`);
+        await body({ repo, dir, tag, env, port, out: () => out });
+    } catch (e) { err = e; }
+    const leak = await cleanup(tag, child, port);
+    await rm(home, { recursive: true, force: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    if (err) {
+        if (leak) err.message += `\n（さらに）${leak}`;
+        throw err;
+    }
+    if (leak) throw new Error(leak);
+}
+
+test('🚨 serve.mjs の --timeout が実際にサーバに届く（実起動）', async () => {
+    await withDaemon(['--timeout', '3600'], ({ out }) => {
+        // サーバは起動時に受け取った上限を言う。600 なら渡っていない
+        const m = /上限 (\d+)s/.exec(out());
+        assert.equal(m?.[1], '3600',
+            `サーバに --exec-timeout が届いていない（既定のまま起動した）:\n${out()}`);
+    });
+});
+
+test('🚨 既に動いているデーモンとの差分で止まり、--stop が対象を見せる（実起動）', async () => {
+    // `running()` は今のところ PowerShell 経由だけなので、差分の門も --stop も
+    // Windows でしか通らない経路（**スキップしていることは告知される**）
+    if (process.platform !== 'win32') return;
+    await withDaemon(['--timeout', '3600'], async ({ dir, tag, env }) => {
+        // (1) 上限とホストが違えば止める（以前は missing=[] で exit 0 = 黙って無効）
+        const bad = await runScript('serve.mjs',
+            ['--repo', dir, '--exec', '--timeout', '7200', '--allow-host', 'box-b.ts.net'], env);
+        assert.equal(bad.code, 1, `黙って通した（要求が無効になる）:\n${bad.out}`);
+        assert.match(bad.out, /--exec-timeout: 要求 7200 秒/, `上限の差分を出していない:\n${bad.out}`);
+        assert.match(bad.out, /--allow-host: 要求 box-b\.ts\.net/, `ホストの差分を出していない:\n${bad.out}`);
+
+        // (2) 🚨 **値の検証は「既に動いています」より前**。以前は門が後ろにあったので、
+        //     デーモンが動いている間は壊れた値が**一言も言われないまま exit 0** だった
+        const invalid = await runScript('serve.mjs',
+            ['--repo', dir, '--exec', '--timeout', 'abc'], env);
+        assert.equal(invalid.code, 1,
+            `既に動いているときに値の検証が飛ばされている:\n${invalid.out}`);
+        assert.match(invalid.out, /--timeout には 10〜86400/);
+
+        // (3) 同じ設定なら今まで通り URL を案内して終わる（毎回止めさせる形にしない）
+        const same = await runScript('serve.mjs', ['--repo', dir, '--exec', '--timeout', '3600'], env);
+        assert.equal(same.code, 0, `同じ設定なのに止めた:\n${same.out}`);
+        assert.match(same.out, /既に動いています/);
+        assert.match(same.out, /上限 3600秒/, '動いているものの上限を出していない');
+
+        // (4) `--stop` は止める前に repo と capability と巻き込む本数を見せる
+        const stop = await runScript('serve.mjs', ['--stop', '--repo', dir], env);
+        assert.match(stop.out, /これを止めます/, `止める対象を見せていない:\n${stop.out}`);
+        assert.ok(stop.out.includes(tag),
+            `止める対象の repo を出していない（他のリポジトリを道連れにしても気付けない）:\n${stop.out}`);
+        assert.match(stop.out, /実行（任意コマンド）/, `止める対象の capability を出していない:\n${stop.out}`);
+        assert.match(stop.out, /子孫 \d+ 個/, `巻き込む子プロセスの数を出していない:\n${stop.out}`);
+        assert.equal(stop.code, 0, `止められなかった:\n${stop.out}`);
+    });
 });

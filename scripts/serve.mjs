@@ -28,12 +28,12 @@ import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 // 🚨 Windows のコマンドラインを作る／読む規則は共有モジュールに集約している
 //    （純粋な関数なのでユニットテストで固定できる。scripts/winargs.test.mjs）
-import { repoOf, samePathish } from './winargs.mjs';
+import { repoOf, samePathish, parseProcPairs, descendantsOf } from './winargs.mjs';
 // 🚨 argv の組み立てと門は純関数に切り出してテストで固定している
 //    （scripts/serveargs.test.mjs。#45 まではここに検査が1件も無かった）
 import {
-    SERVE_FLAGS, unknownFlag, checkPort, checkTimeout, collectHosts, serverArgs,
-    runningCaps, requestedCaps, describeCaps,
+    SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, serverArgs,
+    configDiff, describeCaps, stopTargets, stopOutcome,
 } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -50,15 +50,19 @@ const val = (f, d) => {
 
 if (has('--help') || has('-h')) {
     console.log(`使い方:
-  node scripts/serve.mjs [--repo <path>] [--port ${DEFAULT_PORT}]
+  node scripts/serve.mjs [--repo <path>] [--port ${DEFAULT_PORT}] [--timeout <秒>]
                          [--write] [--exec] [--allow-host <name>]
-  node scripts/serve.mjs --status | --stop
+  node scripts/serve.mjs --status | --stop [--all]
 
   --write        checkout を有効にする
   --exec         任意コマンドの実行も有効にする（🚨 遠隔コード実行になる）
+  --timeout      実行の絶対上限（秒。既定 600。--exec と一緒に使う）
   --allow-host   トンネル経由のホスト名を許可する（既定はループバックのみ）
   --watch        エージェントの活動を観測する（リポジトリ外の記録を読む）
   --agents-text  発話とコマンド行も出す（--watch を含む。トンネル越しに読まれます）
+  --stop         **カレントのリポジトリの**デーモンを止める（子プロセスも一緒に落ちます）
+  --all          --stop に付けると、マシン上の全デーモンを止める
+                 （他のリポジトリで走っているセッションも道連れになります）
 
   状態は ${STATE_DIR} に置く（トークン・実行の監査ログ）。`);
     process.exit(0);
@@ -100,6 +104,79 @@ function inUse(port) {
         console.error('  サーバに直接渡したいなら node v0/server.mjs を使ってください\n');
         process.exit(1);
     }
+}
+
+// 🚨 **`--all` は `--stop` の修飾。単独で打たれたら黙って捨てない。**
+//    SERVE_FLAGS に入れた瞬間に「知っているが何もしないフラグ」になるので、
+//    ここで止めないと `serve.mjs --all`（全部止めるつもり）が**起動**になる。
+if (has('--all') && !has('--stop')) {
+    console.error('\n✖ --all は --stop と一緒にしか使えません（単独では何もしません）');
+    console.error('      node scripts/serve.mjs --stop        # このリポジトリのものだけ');
+    console.error('      node scripts/serve.mjs --stop --all  # マシン上の全部\n');
+    process.exit(1);
+}
+
+// ---- 打った値を先に検証する（黙って既定に落とさない） ----
+// 🚨 **「既に動いています」より前に検証する。** 以前は port / timeout / host の検証が
+//    二重起動の門の**後ろ**にあったので、デーモンが動いている間は
+//    `--timeout abc` も `--port 99999` も**一言も言われないまま exit 0** していた
+//    （打った値が捨てられたことが分からない = #30 と同じ形。8回目のレビュー）。
+//    門はフォールバックより前に置く。
+const portCheck = checkPort(val('--port', undefined), DEFAULT_PORT);
+if (portCheck.error !== undefined) {
+    console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
+    process.exit(1);
+}
+// ---- 実行セッションの絶対上限（既定 600 秒はエージェントの仕事に足りない） ----
+const timeoutCheck = timeoutFrom(argv);
+if (timeoutCheck.error !== undefined) {
+    console.error(`\n✖ --timeout には 10〜86400（秒）を指定してください`
+        + `（受け取った値: ${timeoutCheck.error}）`);
+    console.error('  上限そのものは外せません（取り残しの唯一の歯止めなので）。\n');
+    process.exit(1);
+}
+// ⚠️ `--timeout` は実行の上限なので `--exec` が無ければサーバに渡らない。
+//    **エラーにはしない**（自動起動の登録に残っていると「ログオン後だけ起動しない」に
+//    なる）が、黙って捨てもしない。
+if (timeoutCheck.seconds !== null && !has('--exec')) {
+    console.log('⚠ --timeout は --exec が無いと効きません'
+        + '（実行が無効なので実行の上限もありません）。');
+}
+// 🔒 ホスト名は**自動起動と同じ検証**を通す。片方だけ無検証という非対称が #29 の形。
+const hostCheck = collectHosts(argv);
+if (hostCheck.error !== undefined) {
+    console.error('\n✖ --allow-host にはホスト名を指定してください'
+        + `（受け取った値: ${hostCheck.error ?? '(無し)'}）\n`);
+    process.exit(1);
+}
+
+/** そのディレクトリを含むリポジトリのルート。見つからなければ null */
+async function topLevel(where) {
+    try { return await git(['rev-parse', '--show-toplevel'], where); } catch { return null; }
+}
+
+/**
+ * 対象の pid の**子孫の数**を数える（`taskkill /T` で一緒に落ちるもの）。
+ *
+ * 🚨 **「調べられない」を 0 と言わない**（`running()` と同じ型にする）。
+ *    0 と言うと「巻き込むものは無い」という**断言**になる。
+ */
+async function descendantCounts(pids) {
+    if (process.platform !== 'win32') {
+        return { supported: false, counts: new Map(), why: `${process.platform} では実装がありません` };
+    }
+    const ps = 'Get-CimInstance Win32_Process | ForEach-Object '
+        + '{ "$($_.ProcessId)`t$($_.ParentProcessId)" }';
+    const out = await new Promise(res => {
+        execFile('powershell', ['-NoProfile', '-Command', ps],
+            { windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+            (e, stdout) => res(e ? null : stdout));
+    });
+    if (out === null) return { supported: false, counts: new Map(), why: 'PowerShell が失敗しました' };
+    const pairs = parseProcPairs(out);
+    const counts = new Map();
+    for (const pid of pids) counts.set(pid, descendantsOf(pairs, pid).length);
+    return { supported: true, counts };
 }
 
 /**
@@ -154,26 +231,35 @@ if (has('--status')) {
         process.exit(1);
     }
     if (!list.length) { console.log('動いている kjp-edit はありません'); process.exit(0); }
+    // 🚨 **何が有効かを全部出す。** 観測フラグを落としていたのが #30、`--allow-host`
+    //    （**誰が届くか**を決める唯一のフラグ）を落としていたのが 7回目のレビュー、
+    //    実行の絶対上限（**投げた仕事が完走するか**）を落としていたのが 8回目のレビュー。
+    //    ⚠️ **「既に動いています」と同じ関数で言う。** 以前はここだけ自前で組み立てて
+    //       いたので、片方に足した情報がもう片方から抜けるという非対称が繰り返し起きた。
     for (const r of list) {
-        const repo = repoOf(r.cmd) ?? '(cwd)';
-        const caps = [r.cmd.includes('--allow-exec') && '実行', r.cmd.includes('--allow-write') && '書き込み']
-            .filter(Boolean).join('+') || '読み取り専用';
-        // 何が有効かを全部出す（観測フラグを落としていたのが #30）
-        const watch = r.cmd.includes('--allow-transcript-text') ? ' 活動観測+発話'
-            : r.cmd.includes('--watch-agents') ? ' 活動観測' : '';
-        // 🚨 **`--allow-host` を必ず出す。** ここは「何が有効か」を確認する唯一の手段で、
-        //    Host 許可は**誰が届くか**を決める唯一のフラグ。これが無いと
-        //    tailnet 全体から読めるデーモンとループバック専用が同じ1行に見える。
-        //    `autostart.mjs` の status は出しているので、片方だけ欠けた非対称だった。
-        //    ⚠️ 1件だけ出して省略しない（複数指定できる）。
-        const hosts = [...r.cmd.matchAll(/--allow-host\s+(\S+)/g)].map(m => m[1]);
-        const hostPart = hosts.length ? `  Host許可: ${hosts.join(', ')}` : '  ループバックのみ';
-        console.log(`PID ${r.pid}  port ${r.port ?? '?'}  ${caps}${watch}${hostPart}  ${repo}`);
+        console.log(`PID ${r.pid}  port ${r.port ?? '?'}  ${describeCaps(r.cmd)}`
+            + `  ${repoOf(r.cmd) ?? '(cwd)'}`);
     }
     process.exit(0);
 }
 
 if (has('--stop')) {
+    // 🚨 **既定はカレントのリポジトリだけを止める**（8回目のレビュー）。
+    //    N 個のエージェントを並行で回す前提のツールなので、repo A の作業を終えて
+    //    `--stop` を打つと **repo B で走っている会話セッションが無言で消えていた**
+    //    （`taskkill /T` なので `claude -p` の子孫まで落ちる）。
+    const wantAll = has('--all');
+    let scope = null;
+    if (!wantAll) {
+        scope = await topLevel(val('--repo', process.cwd()));
+        if (!scope) {
+            console.error('\n✖ git リポジトリの中ではありません（どのデーモンを止めるか決められません）');
+            console.error('  リポジトリを指定するか、マシン上の全部を止めると明示してください:');
+            console.error('      node scripts/serve.mjs --stop --repo <path>');
+            console.error('      node scripts/serve.mjs --stop --all\n');
+            process.exit(1);
+        }
+    }
     const { supported, list, why } = await running();
     if (!supported) {
         console.log(`⚠ 何を止めればよいか分かりませんでした: ${why}`);
@@ -181,7 +267,36 @@ if (has('--stop')) {
         console.log('      pkill -f v0/server.mjs   # 木ごと止めるなら pkill -f -g <pgid>');
         process.exit(1);
     }
-    if (!list.length) { console.log('動いている kjp-edit はありません'); process.exit(0); }
+    const { targets, others } = stopTargets(list, scope, wantAll);
+    /** 止める／止めない相手を1行で出す（**repo を必ず添える**） */
+    const line = (r, note) => `  PID ${r.pid}  port ${r.port ?? '?'}  ${describeCaps(r.cmd)}`
+        + `${note}  ${repoOf(r.cmd) ?? '(repo 不明)'}`;
+    if (!targets.length) {
+        console.log(wantAll
+            ? '動いている kjp-edit はありません'
+            : `このリポジトリの kjp-edit は動いていません: ${scope}`);
+        // ⚠️ 「無い」と言った直後に、**止めない相手が居ることを必ず言う**
+        //    （「--stop したのに動いている」の原因がこれになる）
+        for (const r of others) console.log(line(r, '  ← 別のリポジトリなので止めません'));
+        if (others.length) console.log('  マシン上の全部を止めるなら: node scripts/serve.mjs --stop --all');
+        process.exit(0);
+    }
+    // 🚨 **道連れにする前に見せる。** 以前の出力は PID と port だけで、
+    //    どのリポジトリを止めたか・何本の子孫を巻き込むかを一言も言わなかった
+    //    （`--status` は repo を出しているので片方だけ欠けた非対称）。
+    const kids = await descendantCounts(targets.map(r => r.pid));
+    console.log(`これを止めます（${targets.length} 本。子プロセスも一緒に落ちます）:`);
+    for (const r of targets) {
+        const n = kids.supported
+            ? `  子孫 ${kids.counts.get(r.pid) ?? 0} 個`
+            : '  子孫の数は不明';
+        console.log(line(r, n));
+    }
+    if (!kids.supported) {
+        console.log(`  ⚠ 巻き込む子プロセスの数は調べられませんでした: ${kids.why}`);
+    }
+    if (wantAll) console.log('  （--all なので他のリポジトリのデーモンも含みます）');
+    for (const r of others) console.log(line(r, '  ← 別のリポジトリなので止めません'));
     // 🚨 **`process.kill(pid)` では孫が残る。** Windows の `process.kill` は
     //    TerminateProcess 相当なので、対象の `process.on('SIGTERM')` が**走らない**。
     //    そのハンドラが `killTree()`（`taskkill /T /F`）を呼ぶ唯一の場所なので、
@@ -191,7 +306,7 @@ if (has('--stop')) {
     //    その1プロセスしか殺さない」と自分で書いてあるのに、停止経路がそれを迂回していた。
     //    「停止しました」と書く前に本当に停止したかを確かめる（6回目のレビュー）。
     let failed = 0;
-    for (const r of list) {
+    for (const r of targets) {
         const killed = await new Promise(res => {
             execFile('taskkill', ['/PID', String(r.pid), '/T', '/F'],
                 { windowsHide: true, encoding: 'utf8' }, e => res(!e));
@@ -205,20 +320,23 @@ if (has('--stop')) {
     }
     // 本当に消えたかを確かめてから終わる（「止めたつもり」を作らない）
     const after = await running();
-    const left = after.supported ? after.list.filter(r => list.some(x => x.pid === r.pid)) : [];
-    if (left.length) {
-        console.log(`⚠ まだ動いています: ${left.map(r => `PID ${r.pid}`).join(', ')}`);
-        process.exit(1);
+    const outcome = stopOutcome({ after, targets, failed });
+    // 🚨 **「調べられない」を「止まりました」と読まない**（#31 と同型が同じ関数の中に残っていた）
+    if (outcome.unknown) {
+        console.log(`⚠ 止まったかどうか確認できませんでした: ${after.why}`);
+        console.log('  「停止しました」とは言えません。確認してください:');
+        console.log('      node scripts/serve.mjs --status');
+    } else if (outcome.left.length) {
+        console.log(`⚠ まだ動いています: ${outcome.left.map(p => `PID ${p}`).join(', ')}`);
     }
-    process.exit(failed ? 1 : 0);
+    process.exit(outcome.exit);
 }
 
 // ---- リポジトリを見つける ----
-let repo = val('--repo', process.cwd());
-try {
-    repo = await git(['rev-parse', '--show-toplevel'], repo);
-} catch {
-    console.error(`\n✖ git リポジトリが見つかりません: ${repo}`);
+const asked = val('--repo', process.cwd());
+const repo = await topLevel(asked);
+if (!repo) {
+    console.error(`\n✖ git リポジトリが見つかりません: ${asked}`);
     console.error('  --repo でパスを指定してください\n');
     process.exit(1);
 }
@@ -242,40 +360,32 @@ if (already) {
     //    （読み取り専用のつもり）が「既に動いています → URL」と出して exit 0 し、
     //    **案内した先が RCE 可能なデーモンであることを1文字も言わなかった**。
     console.log(`  動いているもの: ${describeCaps(already.cmd)}`);
-    // 🚨 **打ったフラグを黙って捨てない**（#30 と同じ根拠）。今回要求した capability が
-    //    動いているものに無いなら、exit 0 にせず**差分を並べて**止めて入れ直させる。
-    const missing = requestedCaps(argv).filter(c => !runningCaps(already.cmd).includes(c));
-    if (missing.length) {
-        console.error(`
-✖ 要求した capability が動いているものに含まれていません: ${missing.join(', ')}`);
+    // 🚨 **打ったフラグを黙って捨てない**（#30 と同じ根拠）。しかも**値まで比べる**。
+    //    capability の名前だけ比べていたので `--timeout 3600` は集合に入らず、
+    //    `--allow-host box-b` は値を見ていなかった = **要求が黙って無効**だった
+    //    （前のデーモンが 600 秒のまま／スマホからは 403 のまま。8回目のレビュー）。
+    const diffs = configDiff(argv, already.cmd);
+    if (diffs.length) {
+        console.error('\n✖ 要求した設定が動いているものと違います:');
+        for (const d of diffs) {
+            console.error(`    ${d.what}: 要求 ${d.want} / 動いているもの ${d.have}`);
+        }
         console.error('  黙って無視すると「打ったのに効かない」状態になります。');
         console.error('  入れ直してください:');
-        console.error('      node scripts/serve.mjs --stop');
         // ⚠️ 打った引数をそのまま見せる（スクリプトの絶対パスは出さない。読みにくいだけ）
-        const shown = argv.map(a => (/[\s"]/.test(a) ? JSON.stringify(a) : a)).join(' ');
-        console.error(`      node scripts/serve.mjs ${shown}\n`);
+        const q = a => (/[\s"]/.test(a) ? JSON.stringify(a) : a);
+        console.error(`      node scripts/serve.mjs --stop --repo ${q(repo)}`);
+        console.error(`      node scripts/serve.mjs ${argv.map(q).join(' ')}\n`);
         process.exit(1);
     }
-    console.log('  止めるには: node scripts/serve.mjs --stop');
+    // ⚠️ `--stop` は**カレントのリポジトリ**が対象なので、repo を添えて案内する
+    //    （別の場所から打つと「止めたのに動いている」になる）
+    console.log(`  止めるには: node scripts/serve.mjs --stop --repo ${repo}`);
     process.exit(0);
 }
 
-// ---- ポートを決める（黙って変えない） ----
-const portCheck = checkPort(val('--port', undefined), DEFAULT_PORT);
-if (portCheck.error !== undefined) {
-    console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
-    process.exit(1);
-}
+// ---- ポートを決める（黙って変えない。値の検証は起動口の入口で済ませてある） ----
 let port = portCheck.port;
-
-// ---- 実行セッションの絶対上限（既定 600 秒はエージェントの仕事に足りない） ----
-const timeoutCheck = checkTimeout(val('--timeout', undefined));
-if (timeoutCheck.error !== undefined) {
-    console.error(`\n✖ --timeout には 10〜86400（秒）を指定してください`
-        + `（受け取った値: ${timeoutCheck.error}）`);
-    console.error('  上限そのものは外せません（取り残しの唯一の歯止めなので）。\n');
-    process.exit(1);
-}
 if (await inUse(port)) {
     let found = null;
     for (let p = port + 1; p <= port + 20; p++) {
@@ -297,7 +407,10 @@ if (await inUse(port)) {
     if (holder) {
         console.log('  同じリポジトリを見ているなら2本目は不要です'
             + '（watcher・キャッシュ・実行枠が二重になります）。');
-        console.log('  止めるには: node scripts/serve.mjs --stop');
+        // ⚠️ 掴んでいるのは**別のリポジトリ**のデーモンかもしれない。`--stop` は
+        //    カレントのリポジトリだけを止めるので、相手の repo を添えて案内する
+        console.log('  止めるには: node scripts/serve.mjs --stop --repo '
+            + `${repoOf(holder.cmd) ?? '<path>'}`);
     }
     port = found;
 }
@@ -326,13 +439,6 @@ await mkdir(STATE_DIR, { recursive: true });
     }
 }
 
-// 🔒 ホスト名は**自動起動と同じ検証**を通す。片方だけ無検証という非対称が #29 の形。
-const hostCheck = collectHosts(argv);
-if (hostCheck.error !== undefined) {
-    console.error('\n✖ --allow-host にはホスト名を指定してください'
-        + `（受け取った値: ${hostCheck.error ?? '(無し)'}）\n`);
-    process.exit(1);
-}
 // 🔒 capability の分界（--exec ⊃ --write、観測は独立）と、トークンの永続化、
 //    引き継ぎは serveargs.mjs の純関数に集約している（テストで固定）。
 const args = serverArgs({
