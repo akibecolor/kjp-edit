@@ -104,40 +104,75 @@ export function chatGlance(raw) {
 }
 
 /**
+ * 🚨 **送った1行を「会話」として見せる（封筒を見せない）。**
+ *
+ * 会話モードでは UI が stream-json の封筒を組み立てて送るので、入力の反響
+ * （`{t:"in"}`）をそのまま出すと
+ * `▸ {"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}`
+ * になる。**打った本人にも何を打ったのか読めない**（実機で指摘された）。
+ *
+ * ⚠️ 解釈できなければ null を返す（呼び出し側が生のまま出す。捨てない）。
+ * @param {string} raw 送った1行
+ * @returns {string|null} 本文だけ
+ */
+export function chatInputText(raw) {
+    let r;
+    try { r = JSON.parse(String(raw ?? '')); } catch { return null; }
+    if (r?.type !== 'user') return null;
+    const blocks = Array.isArray(r.message?.content) ? r.message.content : null;
+    if (blocks === null) return typeof r.message?.content === 'string' ? r.message.content : null;
+    const t = blocks.filter(b => b?.type === 'text')
+        .map(b => (typeof b.text === 'string' ? b.text : '')).join('');
+    return t.trim() ? t.trim() : null;
+}
+
+/**
  * @param {(cls: string, text: string) => void} line 1行を端末に出す
  * @returns {{feed: (raw: string) => void, flush: () => void}}
  */
 export function makeChatFilter(line) {
     let buf = '';
     /**
-     * 🚨 **同じ告知の連続をまとめる（実機で踏んだ）。**
+     * 🚨 **告知は種別ごとに1回だけ。あとは数える（実機で2回直した）。**
      *
-     * `thinking` や `stream_event` は**トークンごとに1レコード来る**ので、
-     * 「表示していません」を1件1行で出すと**画面が告知で埋まり、
-     * 肝心の応答が押し出される**（スマホの実画面の8割がこれになった）。
+     * 1件1行で告知すると、`thinking` / `stream_event` は**トークンごとに来る**ので
+     * 画面が告知で埋まり応答が押し出された（実測で56行中24行）。
+     * 連続をまとめる形にしたが、`user`（`--replay-user-messages` の再送）と
+     * `rate_limit_event` は**本物の応答の合間に挟まる**ので連続にならず、
+     * 会話の間に告知が刺し込まれ続けた（「構造データは見せ方として不要」と指摘された）。
      *
-     * ⚠️ **黙って捨てない約束は守る。** 最初の1件は即座に出し、
-     *    続く同じ告知は数えて「同上 ×N」として出す（件数は必ず見せる）。
+     * ⚠️ **黙って捨てない約束は守る。** 種別ごとに最初の1回は出し、
+     *    残りは数えて **`flush()` で合計を出す**（件数を必ず見せる）。
      * ⚠️ 応答本文とツール名（`· Bash`）は**待たせない**。読む対象なので、
      *    まとめ待ちで遅らせると「止まっている」ように見える。
      */
-    let run = null;   // {cls, text, extra}
-    const endRun = () => {
-        if (run !== null && run.extra > 0) {
-            line(run.cls, `  （同上 ×${run.extra} を省略）\n`);
-        }
-        run = null;
-    };
+    const skipped = new Map();   // 告知の文 → 出さなかった件数
     const emit = o => {
         if (o.kind === 'skip') {
-            if (run !== null && run.text === o.text) { run.extra++; return; }
-            endRun();
-            line(o.cls, `${o.text}\n`);
-            run = { cls: o.cls, text: o.text, extra: 0 };
+            const seen = skipped.get(o.text);
+            if (seen === undefined) {
+                skipped.set(o.text, 0);
+                // 括弧を二重にしない（`（…）（…）` は読みにくい）
+                line(o.cls, `${o.text.replace(/）\s*$/, '。以降は数えるだけ）')}\n`);
+                return;
+            }
+            skipped.set(o.text, seen + 1);
             return;
         }
-        endRun();
         line(o.cls, `${o.text}\n`);
+    };
+    /** 出さなかった件数の合計。**数えたまま黙って終わらない。** */
+    const endSkips = () => {
+        const rest = [...skipped].filter(([, n]) => n > 0);
+        if (!rest.length) return;
+        skipped.clear();
+        // 種別だけを並べる（文をそのまま繰り返すと読めない）
+        const parts = rest.map(([text, n]) => {
+            const kind = text.replace(/^\s*（/, '').replace(/）\s*$/, '')
+                .replace(/\s*は表示していません\s*$/, '');
+            return `${kind} ×${n}`;
+        });
+        line('d', `  （出さなかった行: ${parts.join(' / ')}）\n`);
     };
     const feed = raw => {
         buf += raw;
@@ -160,7 +195,7 @@ export function makeChatFilter(line) {
         const rest = buf;
         buf = '';
         if (rest.trim()) emit({ cls: '', text: rest });
-        endRun();
+        endSkips();
     };
     return { feed, flush };
 }

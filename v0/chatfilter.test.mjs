@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeChatFilter, chatGlance } from './chatfilter.mjs';
+import { makeChatFilter, chatGlance, chatInputText } from './chatfilter.mjs';
 
 /** 出力を集める。`[cls, text]` の配列で返す */
 function collect() {
@@ -199,16 +199,43 @@ test('chatGlance: 何も無いときは空文字（例外を投げない）', ()
 
 const skip = (type, subtype) => `${JSON.stringify({ type, subtype })}\n`;
 
-test('🚨 同じ告知が連続したら「同上 ×N」でまとめる（件数を隠さない）', () => {
+test('🚨 同じ告知は種別ごとに1回だけ出し、残りは数える（件数を隠さない）', () => {
     const c = collect();
     for (let i = 0; i < 40; i++) c.feed(skip('system', 'thinking_tokens'));
     c.feed(assistant('できました'));
-    const texts = c.out.map(([, t]) => t);
-    // 最初の1件 + まとめ1行 + 応答本文 = 3行（40行にならない）
-    assert.equal(texts.length, 3, `行が減っていない: ${JSON.stringify(texts)}`);
+    let texts = c.out.map(([, t]) => t);
+    // 告知1行 + 応答本文 = 2行（40行にならない）
+    assert.equal(texts.length, 2, `行が減っていない: ${JSON.stringify(texts)}`);
     assert.match(texts[0], /system\/thinking_tokens は表示していません/);
-    assert.match(texts[1], /×39/, `件数が出ていない: ${texts[1]}`);
-    assert.match(texts[2], /できました/);
+    assert.match(texts[0], /数えるだけ/, '以降を数えることを言っていない');
+    assert.match(texts[1], /できました/);
+    // 数えたまま黙って終わらない
+    c.flush();
+    texts = c.out.map(([, t]) => t);
+    assert.match(texts[texts.length - 1], /×39/, `件数が出ていない: ${texts[texts.length - 1]}`);
+});
+
+/**
+ * 🚨 **実機で指摘された形の回帰テスト。**
+ *
+ * `user`（`--replay-user-messages` の再送）と `rate_limit_event` は
+ * **本物の応答の合間に挟まる**ので「連続をまとめる」では減らず、
+ * 会話の間に告知が刺し込まれ続けていた
+ * （「チャットの構造データが流れてくるのは、見せ方として不要」）。
+ */
+test('🚨 応答の合間に挟まる告知が繰り返し出ない（会話が読める）', () => {
+    const c = collect();
+    for (let i = 0; i < 5; i++) {
+        c.feed(skip('user'));
+        c.feed(assistant(`応答${i}`));
+        c.feed(skip('rate_limit_event'));
+    }
+    const texts = c.out.map(([, t]) => t);
+    const notices = texts.filter(t => /表示していません/.test(t));
+    assert.equal(notices.length, 2,
+        `告知が繰り返し出ている（種別ごとに1回のはず）: ${JSON.stringify(texts)}`);
+    // 応答は5件すべて出ている（減らしてはいけないのは本文の側）
+    assert.equal(texts.filter(t => /^応答/.test(t)).length, 5, JSON.stringify(texts));
 });
 
 test('🚨 応答本文とツール名はまとめ待ちで遅らせない', () => {
@@ -235,17 +262,42 @@ test('🚨 数えたまま黙って終わらない（flush でまとめを出す
     assert.match(texts[1], /×4/);
 });
 
-test('違う告知が挟まったら別の run として数える', () => {
+test('種別ごとに件数を分けて数える（まとめて1つにしない）', () => {
     const c = collect();
     c.feed(skip('system', 'thinking_tokens'));
     c.feed(skip('system', 'thinking_tokens'));
     c.feed(skip('rate_limit_event'));
     c.feed(skip('rate_limit_event'));
+    c.feed(skip('rate_limit_event'));
     c.flush();
     const texts = c.out.map(([, t]) => t);
-    assert.match(texts[0], /thinking_tokens/);
-    assert.match(texts[1], /×1/);
-    assert.match(texts[2], /rate_limit_event/);
-    assert.match(texts[3], /×1/);
-    assert.equal(texts.length, 4, JSON.stringify(texts));
+    // 告知2行（種別ごと）+ 合計1行
+    assert.equal(texts.length, 3, JSON.stringify(texts));
+    const sum = texts[2];
+    assert.match(sum, /thinking_tokens[^/]*×1/, `内訳が合わない: ${sum}`);
+    assert.match(sum, /rate_limit_event[^/]*×2/, `内訳が合わない: ${sum}`);
+});
+
+/* ===== 送った行を「会話」として見せる（封筒を見せない） ===== */
+
+test('🚨 chatInputText: stream-json の封筒から本文だけ取る', () => {
+    const line = JSON.stringify({
+        type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+    });
+    assert.equal(chatInputText(line), 'hi');
+});
+
+test('chatInputText: 解釈できなければ null（呼び出し側が生のまま出す）', () => {
+    assert.equal(chatInputText('ただの行'), null);
+    assert.equal(chatInputText(JSON.stringify({ type: 'other' })), null);
+    assert.equal(chatInputText(''), null);
+    assert.equal(chatInputText(null), null);
+    // content が配列でない形でも投げない
+    assert.equal(chatInputText(JSON.stringify({ type: 'user', message: { content: 42 } })), null);
+});
+
+test('chatInputText: content が文字列の形も読む', () => {
+    assert.equal(
+        chatInputText(JSON.stringify({ type: 'user', message: { content: 'そのまま' } })),
+        'そのまま');
 });

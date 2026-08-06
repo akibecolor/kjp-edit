@@ -74,3 +74,38 @@ export function isChatArgv(argv) {
     }
     return argv.includes('--input-format=stream-json');
 }
+
+/**
+ * 🚨 **argv を画面に出すための1行にする（上限つき）。**
+ *
+ * 監視盤とコンソールは argv をそのまま `join(' ')` で出していたので、
+ * `node -e '<スクリプト>'` のような**巨大な引数がそのまま流れ込み**、
+ * スマホの狭い画面では**1セッションの行が画面数枚分**になった（実機で指摘された）。
+ * 改行を含む引数もそのまま出ていた。
+ *
+ * ⚠️ **省略したら必ず告知する**（`clipped` を返す。呼び出し側が言う）。
+ *    黙って縮めると「これが全部のコマンドだ」と読める。
+ * ⚠️ 引数ごとに縮める。**末尾のフラグ（`--input-format stream-json` など）を
+ *    落とさない**ため（先頭から一定文字数で切ると、何のモードで動いているか消える）。
+ *
+ * @param {string[]} argv
+ * @param {{maxArg?: number, maxTotal?: number}} [limits]
+ * @returns {{text: string, clipped: boolean}}
+ */
+export function argvSummary(argv, { maxArg = 48, maxTotal = 300 } = {}) {
+    const list = Array.isArray(argv) ? argv : [];
+    let clipped = false;
+    const parts = list.map(a => {
+        // 改行やタブを含む引数（`-e` のスクリプト）は1行に潰す
+        const flat = String(a ?? '').replace(/\s+/g, ' ').trim();
+        if (flat.length <= maxArg) return flat;
+        clipped = true;
+        return `${flat.slice(0, maxArg)}…(${flat.length}文字)`;
+    });
+    let text = parts.join(' ');
+    if (text.length > maxTotal) {
+        text = `${text.slice(0, maxTotal)}…`;
+        clipped = true;
+    }
+    return { text, clipped };
+}

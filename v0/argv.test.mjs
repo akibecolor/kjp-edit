@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitArgv, isChatArgv } from './argv.mjs';
+import { splitArgv, isChatArgv, argvSummary } from './argv.mjs';
 
 const a = s => splitArgv(s).argv;
 
@@ -84,4 +84,42 @@ test('isChatArgv: --input-format stream-json を会話モードとして見分�
     for (const bad of [null, undefined, 'string', 42, {}]) {
         assert.equal(isChatArgv(bad), false, JSON.stringify(bad));
     }
+});
+
+/* ===== 画面に出す argv の1行（上限つき） =====
+   🚨 実機で `node -e '<スクリプト>'` の引数が丸ごと流れ、
+      スマホでは1セッションの行が画面数枚分になった。 */
+
+test('🚨 argvSummary: 巨大な引数を縮め、文字数を告げる', () => {
+    const big = 'x'.repeat(2000);
+    const r = argvSummary(['node', '-e', big, '--input-format', 'stream-json']);
+    assert.equal(r.clipped, true, '省略したのに告げていない');
+    assert.ok(r.text.length < 200, `縮まっていない: ${r.text.length} 文字`);
+    assert.match(r.text, /…\(2000文字\)/, `元の長さを言っていない: ${r.text}`);
+    // 🚨 末尾のフラグを落とさない（何のモードで動いているかが消える）
+    assert.match(r.text, /--input-format stream-json$/,
+        `末尾のフラグが消えている: ${r.text}`);
+});
+
+test('argvSummary: 改行を含む引数を1行に潰す', () => {
+    const r = argvSummary(['node', '-e', 'a\nb\nc']);
+    assert.ok(!r.text.includes('\n'), `改行が残っている: ${JSON.stringify(r.text)}`);
+    assert.match(r.text, /a b c/);
+});
+
+test('argvSummary: 短い argv はそのまま（余計な省略をしない）', () => {
+    const r = argvSummary(['git', 'status', '--short']);
+    assert.deepEqual(r, { text: 'git status --short', clipped: false });
+});
+
+test('argvSummary: 壊れた入力でも投げない', () => {
+    for (const bad of [null, undefined, 'string', 42, [null, undefined, 7]]) {
+        assert.doesNotThrow(() => argvSummary(bad), JSON.stringify(bad));
+    }
+});
+
+test('argvSummary: 引数が多すぎるときは全体も縮めて告げる', () => {
+    const r = argvSummary(Array.from({ length: 40 }, (_, i) => `--flag-${i}`));
+    assert.equal(r.clipped, true);
+    assert.ok(r.text.length <= 301, `全体の上限が効いていない: ${r.text.length}`);
 });

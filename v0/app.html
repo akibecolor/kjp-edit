@@ -255,10 +255,10 @@
 // 行割れ・マルチバイト割れの処理は共有モジュール（unit テストと同じコード）
 import { parseNdjson } from './ndjson.mjs';
 // argv の分割も共有モジュール（app.html の中だとテストできない）
-import { splitArgv, isChatArgv } from './argv.mjs';
+import { splitArgv, isChatArgv, argvSummary } from './argv.mjs';
 // 会話モードの出力の解釈も同じ理由で外に出した。
 // **中に書いていたので「捨てない」という約束が破れていたのに気付けなかった**（#44）
-import { makeChatFilter, chatGlance } from './chatfilter.mjs';
+import { makeChatFilter, chatGlance, chatInputText } from './chatfilter.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -578,7 +578,12 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     seq: () => lastSeq,
   });
   publish();
-  line('d', attach ? `↻ セッション ${attach.id} に再接続\n` : `$ ${argv.join(' ')}\n`);
+  if (attach) line('d', `↻ セッション ${attach.id} に再接続\n`);
+  else {
+    // 🚨 監視盤と同じ上限をかける（長い引数で端末が埋まる）。省略は必ず言う
+    const shown = argvSummary(argv);
+    line('d', `$ ${shown.text}${shown.clipped ? '  ← 長いので省略' : ''}\n`);
+  }
   try {
     const res = await fetch(attach ? `/api/v0/exec/${attach.id}/stream` : '/api/v0/exec', {
       method: 'POST',
@@ -615,7 +620,14 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
         }
         continue;
       }
-      if (ev.t === 'in') line('i', `▸ ${ev.d}`);
+      // 🚨 **送った中身を「会話」として出す（封筒を見せない）。**
+      //    会話モードでは UI が stream-json を組み立てて送るので、そのまま出すと
+      //    `▸ {"type":"user","message":{...}}` になり、**打った本人にも読めない**。
+      //    ⚠️ 解釈できなければ生のまま出す（捨てない）。
+      if (ev.t === 'in') {
+        const asText = chatFilter ? chatInputText(ev.d) : null;
+        line('i', `▸ ${asText ?? ev.d}${asText ? '\n' : ''}`);
+      }
       else if (ev.t === 'note') line('d', `${ev.d}\n`);
       // 🚨 **フィルタの失敗で購読ループを終わらせない。** 例外が抜けると finally の
       //    `onState({running:false})` が走り、**「停止」表示なのに走り続けている**
@@ -1049,7 +1061,7 @@ function monitorGlance(x, chat) {
   const flat = g.text.replace(/\s+/g, ' ').trim();
   const cut = flat.length > 200 ? `…${flat.slice(-200)}` : flat;
   return `› ${cut}`
-    + (chat && !g.interpreted ? '  ← 解釈できない行をそのまま出しています' : '')
+    + (chat && !g.interpreted ? '  ← 解釈できない行' : '')
     + (x.lastOutputMasked ? '  ← 出力の秘密は落としています' : '');
 }
 
@@ -1191,8 +1203,13 @@ async function renderMonitor() {
         el('span', null, `  ${bits.join(' / ')}`),
       );
       // argv（秘密はサーバ側でマスク済み。マスクしたことも出す）
-      row.cmd.textContent = `$ ${(x.argv ?? []).join(' ')}`
-        + (x.argvMasked ? '  ← コマンド行の秘密は落としています' : '');
+      // 🚨 **上限をかける。** `node -e '<スクリプト>'` のような巨大な引数を
+      //    そのまま出していたので、狭い画面では1セッションの行が画面数枚分になった。
+      //    省略したことは必ず言う（「これが全部のコマンド」と読ませない）。
+      const cmd = argvSummary(x.argv ?? []);
+      row.cmd.textContent = `$ ${cmd.text}`
+        + (cmd.clipped ? '  ← 長いので省略' : '')
+        + (x.argvMasked ? '  ← 秘密は落としています' : '');
       // 🚨 **最後の出力を出す。** これが無いと「どれに入力すべきか」が分からない。
       //    ⚠️ 会話モードの出力は**1行1レコードの JSON** なので、生で出すと読めない
       //    （並列で回すための画面なのに目的が失われる）。`chatGlance` で1行にする。

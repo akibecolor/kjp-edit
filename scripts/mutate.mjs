@@ -1059,7 +1059,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         // ⚠️ 解釈を `chatRecordLines`（純関数）に出したのでインデントが変わった
         from: '        const blocks = Array.isArray(r.message?.content) ? r.message.content : null;',
         to: '        const blocks = r.message?.content ?? null;',
-        gone: 'Array.isArray(r.message?.content)',
+        // ⚠️ `chatInputText` にも同じ式ができたので**インデントまで含めて一意にする**
+        //    （素の式だと書き換え後も残って STALE になる。記録済みの罠）
+        gone: '        const blocks = Array.isArray(r.message?.content)',
         pattern: '壊れた行でも feed が投げない',
         testFile: 'v0/chatfilter.test.mjs',
     },
@@ -1083,7 +1085,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         // ⚠️ 告知に kind:'skip' を付けた（まとめる対象を字面でなく構造で選ぶため）
         from: "    return [{ cls: 'd', kind: 'skip', text: `  （${kind} は表示していません）` }];",
         to: '    return [];   /* 変異: 知らない type を捨てる */',
-        gone: 'は表示していません',
+        // ⚠️ 合計を組み立てる側にも同じ語が出たので、**式ごと**一意にする
+        gone: '（${kind} は表示していません）',
         pattern: '知らない type を黙って捨てず',
         testFile: 'v0/chatfilter.test.mjs',
     },
@@ -1391,6 +1394,28 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: '中継の申告',
     },
     {
+        // 🚨 実機で「1セッションの行が画面数枚分」になった形
+        name: 'argv-summary-limit',
+        why: '画面に出す argv に上限をかけない'
+            + '（`node -e <スクリプト>` が丸ごと流れ、狭い画面で行が画面数枚分になる）',
+        file: 'v0/argv.mjs',
+        from: '        if (flat.length <= maxArg) return flat;',
+        to: '        return flat;   /* 変異: 引数を縮めない */',
+        gone: 'flat.length <= maxArg',
+        pattern: '巨大な引数を縮め',
+        testFile: 'v0/argv.test.mjs',
+    },
+    {
+        name: 'argv-summary-keeps-tail',
+        why: '先頭から一律に切る（末尾のフラグが消え、何のモードで動いているか分からなくなる）',
+        file: 'v0/argv.mjs',
+        from: "    let text = parts.join(' ');",
+        to: "    let text = list.join(' ');   /* 変異: 引数ごとの縮めを捨てる */",
+        gone: "let text = parts.join(' ')",
+        pattern: '巨大な引数を縮め',
+        testFile: 'v0/argv.test.mjs',
+    },
+    {
         // 🚨 監視盤（N 個のエージェントを1画面で見る）の守り
         name: 'monitor-requires-exec',
         why: '全セッションの状態と出力を exec の関門なしで返す'
@@ -1473,14 +1498,37 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/execsession.test.mjs',
     },
     {
-        name: 'chat-skip-coalesce-count',
-        why: 'まとめた件数を出さない'
-            + '（thinking の連続を黙って消すことになり、「捨てない」約束が破れる）',
+        name: 'chat-skip-count-total',
+        why: '出さなかった件数の合計を出さない'
+            + '（数えたまま黙って終わる = 「捨てない」約束が破れる）',
         file: 'v0/chatfilter.mjs',
-        from: '            line(run.cls, `  （同上 ×${run.extra} を省略）\\n`);',
-        to: '            /* 変異: 省略した件数を出さない */',
-        gone: '同上 ×${run.extra} を省略',
-        pattern: '同じ告知が連続したら',
+        from: "        line('d', `  （出さなかった行: ${parts.join(' / ')}）\\n`);",
+        to: '        /* 変異: 合計を出さない */',
+        gone: '出さなかった行: ${parts',
+        pattern: '同じ告知は種別ごとに1回だけ',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        // 🚨 実機で「会話の間に構造データの告知が刺し込まれ続ける」と指摘された形
+        name: 'chat-skip-once-per-kind',
+        why: '告知を種別ごとに1回に絞らない'
+            + '（user の再送や rate_limit_event が応答の合間に挟まり、会話が読めない）',
+        file: 'v0/chatfilter.mjs',
+        from: '            const seen = skipped.get(o.text);',
+        to: '            const seen = undefined;   /* 変異: 毎回告知する */',
+        gone: 'const seen = skipped.get(o.text);',
+        pattern: '応答の合間に挟まる告知',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        name: 'chat-input-envelope',
+        why: '送った行を封筒のまま出す'
+            + '（`▸ {"type":"user","message":…}` になり、打った本人にも読めない）',
+        file: 'v0/chatfilter.mjs',
+        from: "    return t.trim() ? t.trim() : null;",
+        to: '    return null;   /* 変異: 本文を取り出さない */',
+        gone: 't.trim() ? t.trim() : null',
+        pattern: '封筒から本文だけ取る',
         testFile: 'v0/chatfilter.test.mjs',
     },
     {
