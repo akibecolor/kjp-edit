@@ -167,6 +167,14 @@
   @media (prefers-color-scheme: light) {
     .diff .add { color: #0a7a5e; } .diff .del { color: #b3261e; }
   }
+  /* 最小エディタ（--allow-write の枠内）。
+     ⚠️ soft wrap のままにする（`white-space: pre` にすると狭い画面で
+        横スクロールが必要になり、スマホから読めなくなる）。 */
+  textarea.edit { flex: 1 1 auto; min-height: 6rem; width: 100%; resize: none;
+    font: inherit; font-size: 12px; background: var(--bg); color: var(--fg);
+    border: 0; border-top: 1px solid var(--line); padding: .3rem .5rem; }
+  .editdiff { flex: 0 1 45%; overflow: auto; border-top: 1px solid var(--line); }
+
   /* ⚠️ overflow-wrap が無いと `--allow-transcript-text` のような長い語で
      行が箱より広くなり、狭い画面で**注意書き自体が読めなくなる**（実測）。
      省略の告知が読めないのは、告知が無いのと同じ。 */
@@ -283,6 +291,9 @@ import { pathLabel } from './pathlabel.mjs';
 // 取り込みの応答の解釈も外に出した（「失敗しても数え直す」「半端な状態の告知は
 // 再描画で消さない」は、壊れても静かなので字面ではなく挙動で固定する。8回目のレビュー）
 import { mergeOutcome } from './mergeresult.mjs';
+// 保存前に見せる差分。編集中の内容はまだどこにも無いので `git diff` に渡せない
+// （渡すには「先に書く」しかなく、「書く前に見せる」と矛盾する）
+import { diffLines } from './linediff.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -643,6 +654,138 @@ async function loadDiff(holder, base, ref, path) {
   } catch (e) {
     holder.replaceChildren(el('div', 'note warn', `取得できませんでした: ${e.message}`));
   }
+}
+
+/* ===== 最小エディタ（--allow-write の枠内） =====
+ *
+ * 🚨 **自動更新で編集中の textarea を作り直さない。**
+ *    差分ペインの中身は毎回 `replaceChildren` で作り直しているので、素のままだと
+ *    15 秒ごとに**打っている途中の内容が消える**（監視盤の行で実際に踏んだのと
+ *    同じ形。`docs/review-ui-conflicts.md`）。`obj.editing` が真のあいだ、
+ *    そのペインは作り直さない（走っているコンソールを作り直さないのと同じ扱い）。
+ *    ⚠️ この守りは **`v0/render-check.mjs` が実ブラウザで測っている**
+ *       （字面の検査では「行を残したまま到達不能にする変更」が見えない）。
+ *
+ * 🚨 **409（他が書き換えた）は文言をそのまま見せる。** 「保存できませんでした」に
+ *    丸めると、一番大事な事実（**別のエージェントが同じファイルを書いた**）が消える。
+ *    N 本の worktree が並行に動く前提のツールでは、それが知りたい情報そのもの。
+ */
+function openEditor(obj, wt, path) {
+  obj.editing = true;
+  const wrap = el('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;height:100%';
+  const bar = el('div', 'cmdbar');
+  const where = el('span', 'wrmsg');
+  where.textContent = path;
+  where.title = `${wt.path} / ${path}`;
+  const bDiff = el('button', null, '差分を見る');
+  const bSave = el('button', null, '保存');
+  const bReload = el('button', null, '読み直す（編集を捨てる）');
+  const bClose = el('button', null, '閉じる');
+  bar.append(where, bDiff, bSave, bReload, bClose);
+  const msg = el('div', 'note editmsg');
+  const ta = el('textarea', 'edit');
+  ta.spellcheck = false;
+  const diffBox = el('div', 'editdiff');
+  diffBox.hidden = true;
+  wrap.append(bar, msg, ta, diffBox);
+  obj.body.replaceChildren(wrap);
+
+  // 読んだときの状態。**oid が楽観ロックの鍵**（サーバが計算した値をそのまま返す）
+  let base = null;
+  const setMsg = (text, bad) => {
+    msg.className = `note editmsg${bad ? ' warn' : ''}`;
+    msg.textContent = text;
+  };
+  const post = (route, payload) => fetch(route, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      [session.tokenHeader]: session.token ?? '',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const fetchBase = async () => {
+    setMsg(`読み込み中: ${path}`);
+    ta.disabled = true;
+    try {
+      const r = await post('/api/v0/file', { worktree: wt.path, path });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      base = { text: d.text, oid: d.oid, eol: d.eol, bom: d.bom };
+      ta.value = d.text;
+      ta.disabled = false;
+      // ⚠️ 「自動更新が止まっている」ことを言う。黙って止めると
+      //    「他の画面は更新されているのにここだけ古い」と読まれる
+      setMsg(`${d.bytes} バイト / 改行 ${String(d.eol).toUpperCase()}`
+        + `${d.bom ? ' / BOM あり' : ''}`
+        + ' — 編集中はこのペインの自動更新を止めています');
+    } catch (e) {
+      base = null;
+      setMsg(`✖ 開けませんでした: ${e.message}`, true);
+    }
+  };
+
+  bDiff.addEventListener('click', () => {
+    if (!base) { setMsg('✖ まだ読み込めていません', true); return; }
+    const r = diffLines(base.text, ta.value);
+    const box = el('div');
+    if (!r.lines.length) {
+      box.append(el('div', 'note', '(差分なし — 読んだときと同じ内容です)'));
+    } else {
+      box.append(renderDiff(r.lines.join('\n')));
+    }
+    // 打ち切り・見えない変更は必ず告知する
+    if (r.approx) box.append(el('div', 'note warn', `⚠ ${r.why}`));
+    if (r.trailingNewlineChanged) {
+      box.append(el('div', 'note warn',
+        '⚠ 末尾の改行の有無が変わります（行の差分としては見えません）'));
+    }
+    box.append(el('div', 'note',
+      `+${r.added} / -${r.removed} 行。保存すると改行は ${String(base.eol).toUpperCase()} で書きます`
+      + `${base.bom ? '（BOM も保ちます）' : ''}。`));
+    diffBox.replaceChildren(box);
+    diffBox.hidden = false;
+  });
+
+  bSave.addEventListener('click', async () => {
+    if (!base) { setMsg('✖ まだ読み込めていません', true); return; }
+    bSave.disabled = true;
+    setMsg('保存中…');
+    try {
+      const r = await post('/api/v0/write', {
+        worktree: wt.path, path, text: ta.value, baseOid: base.oid,
+      });
+      const d = await r.json();
+      if (r.status === 409) {
+        // 🚨 **そのまま見せる。** 丸めない（上の関数コメント参照）
+        setMsg(`✖ ${d.error} — 「読み直す」で今の内容を取り直せます`, true);
+        return;
+      }
+      if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+      // 続けて編集できるように、新しい oid を掴み直す
+      base = { ...base, oid: d.oid, text: ta.value };
+      setMsg(`✔ 保存しました（${d.bytes} バイト / 改行 ${String(d.eol).toUpperCase()}`
+        + `${d.bom ? ' / BOM あり' : ''}）`);
+      diffBox.hidden = true;
+      // 状態（変更 N 件など）を取り直す。**編集中のペインは作り直されない**
+      await load(true);
+    } catch (e) {
+      setMsg(`✖ 保存できませんでした: ${e.message}`, true);
+    } finally {
+      bSave.disabled = false;
+    }
+  });
+
+  bReload.addEventListener('click', () => { diffBox.hidden = true; fetchBase(); });
+  bClose.addEventListener('click', () => {
+    obj.editing = false;
+    // 閉じたら通常の差分表示に戻す（次の描画で作り直される）
+    load(true);
+  });
+
+  fetchBase();
 }
 
 /* ===== コンソール ===== */
@@ -2063,13 +2206,23 @@ function render(s) {
   const withFiles = s.worktrees.filter(w => w.files?.length);
   const picks = withFiles.slice(0, MAX_DIFF_PANES);
   if (!picks.length && s.worktrees.length) picks.push(s.worktrees[0]);
-  const diffIds = new Set(picks.map(w => `diff-${w.path}`));
+  // 🚨 **編集中のペインは上限からはみ出しても落とさない。** 別の worktree が
+  //    コミット済み差分を持った瞬間に上限（MAX_DIFF_PANES）で押し出されると、
+  //    dropPanes が**打っている途中の内容ごとペインを捨てる**。
+  const editingIds = [...panes]
+    .filter(([id, o]) => id.startsWith('diff-') && o.editing)
+    .map(([id]) => id);
+  const diffIds = new Set([...picks.map(w => `diff-${w.path}`), ...editingIds]);
   dropPanes('diff-', diffIds);
   for (const wt of picks) {
     const id = `diff-${wt.path}`;
     const obj = ensurePane($('#diffs'), id, '差分', [['br', wt.branch ?? wt.name]]);
     obj.p.dataset.wt = wt.path;
     obj.wt = wt;
+    // 🚨 **編集中は作り直さない**（textarea を捨てると打っている途中の内容が消える）。
+    //    走っているコンソールを作り直さないのと同じ理由。
+    //    ⚠️ ヘッダのタグは上の ensurePane が更新するので、状態表示は古くならない。
+    if (obj.editing) continue;
     const files = (wt.files ?? []).slice(0, 6);
     const tabs = el('div', 'tabs');
     const holder = el('div');
@@ -2092,7 +2245,27 @@ function render(s) {
     if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
     const wrap = el('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;height:100%';
-    wrap.append(tabs, holder);
+    wrap.append(tabs);
+    // 🚨 **押せるのに必ず失敗する操作を描かない。** 保存は生の鍵（`presented:'token'`）を
+    //    要求するので、**読み取り用の鍵しか持っていない相手には必ず 403** になる。
+    //    ⚠️ `session.token` で判定してはいけない（案内の URL で渡るのは
+    //       読み取り専用の派生秘密で、それも `session.token` に入る。
+    //       checkout / 取り込みと同じく `canMutate` で判定する）。
+    if (session.allowWrite && files.length && !wt.bare && !wt.prunable) {
+      if (session.canMutate) {
+        const eb = el('button', null, '編集');
+        eb.title = '選択中のファイルを編集する（保存前に差分を確認できます）';
+        eb.addEventListener('click', () => {
+          if (obj.sel) openEditor(obj, wt, obj.sel);
+        });
+        tabs.append(eb);
+      } else {
+        wrap.append(el('div', 'note warn',
+          '⚠ 編集には書き込みの鍵が要ります。'
+          + ' 鍵は URL に載せていないので、コンソールの「鍵を貼る」から渡してください'));
+      }
+    }
+    wrap.append(holder);
     obj.body.replaceChildren(wrap);
     if (initial) { obj.sel = initial; obj.selWt = wt.path; loadDiff(holder, s.base, wt.branch ?? wt.head, initial); }
     else holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
@@ -2100,6 +2273,8 @@ function render(s) {
   // 🚨 **前回の告知を消してから足す。** 消していなかったので、自動更新のたびに
   //    「他 N 本は…」が1行ずつ増え続けていた（ペインを並べ直す側で告知を
   //    末尾へ回すようにして初めて気付いた）。
+  // ⚠️ 並べ替えは applyLayout が持つ（以前ここで arrangeRow していた）。
+  //    編集中のペインは `diffIds` に入れて dropPanes から守るだけでよい。
   clearNotices($('#diffs'));
   if (withFiles.length > MAX_DIFF_PANES) {
     $('#diffs').append(el('div', 'note',

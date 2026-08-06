@@ -171,6 +171,7 @@ let failed = false;
     const r = await run(
         ['--test', '--test-timeout=90000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'v0/chatfilter.test.mjs', 'v0/panelayout.test.mjs',
             'v0/mergeresult.test.mjs',
+            'v0/writefile.test.mjs', 'v0/linediff.test.mjs',
             'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs'],
         { timeout: 240_000 },
     );
