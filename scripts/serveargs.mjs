@@ -382,7 +382,7 @@ export function describeCaps(cmd) {
     const { caps, hosts, execTimeout } = runningConfig(cmd);
     const parts = [];
     if (caps.includes('--allow-exec')) parts.push('🚨 実行（任意コマンド）');
-    else if (caps.includes('--allow-write')) parts.push('書き込み（checkout）');
+    else if (caps.includes('--allow-write')) parts.push('書き込み（checkout / 編集）');
     else parts.push('読み取り専用');
     // 🚨 **実行の絶対上限を必ず出す。** ここは「何が有効か」を確認する唯一の手段で、
     //    上限は**投げた仕事が完走するか**を決める。出さないと

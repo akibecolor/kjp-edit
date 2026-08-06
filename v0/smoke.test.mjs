@@ -14,9 +14,9 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { request as httpRequest, Agent as HttpAgent } from 'node:http';
 import { connect as netConnect } from 'node:net';
-import { mkdtemp, rm, writeFile, mkdir, rename } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, mkdir, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('./server.mjs', import.meta.url));
@@ -1949,6 +1949,461 @@ test('🚨 checkout はシーケンサ停止中を拒否する（git は通し�
         await g(['merge', '--abort'], wt).catch(() => {});
         await g(['checkout', '-q', '--force', 'agent-a'], wt).catch(() => {});
     }
+});
+
+// ---------------------------------------------------------------------------
+// 🔒 最小エディタ（/api/v0/file と /api/v0/write）。
+//    **v0 で初めて「作業ツリーにファイルの中身を書く」経路**なので、
+//    門（capability / token / method / Sec-Fetch-Site / Host / パスの形 /
+//    既知の worktree / 追跡下 / 実体 / 楽観ロック）を全部固定する。
+//    ⚠️ 門を外したときにここが落ちることは scripts/mutate.mjs が確かめている
+//       （落ちない検査は無意味）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 編集の検査用に、使い捨ての worktree を1本作る。
+ *
+ * ⚠️ **必ず finally で消す。** 既存のテストは worktree の本数（3本）と
+ *    衝突予測のペアを assert しているので、残すと**別のテストが落ちる**。
+ * @param {object} files `{ tracked: {path: 中身}, untracked: {path: 中身} }`
+ */
+async function withEditWorktree(name, files, fn) {
+    const stem = repo.split(/[\\/]/).pop();
+    const dir = join(repo, '..', `${stem}-${name}`);
+    const branch = `ed-${name}`;
+    try {
+        await g(['worktree', 'add', '-q', '-b', branch, dir, 'main'], repo);
+        for (const [p, body] of Object.entries(files.tracked ?? {})) {
+            const full = join(dir, p);
+            await mkdir(dirname(full), { recursive: true });
+            await writeFile(full, body);
+        }
+        await g(['add', '-A'], dir);
+        await g(['commit', '-q', '-m', `検査用: ${name}`], dir);
+        // 🚨 未追跡のファイルは**コミットの後**に置く（add -A で追跡させない）
+        for (const [p, body] of Object.entries(files.untracked ?? {})) {
+            const full = join(dir, p);
+            await mkdir(dirname(full), { recursive: true });
+            await writeFile(full, body);
+        }
+        await fn(dir);
+    } finally {
+        await g(['worktree', 'remove', '--force', dir], repo).catch(() => {});
+        await g(['branch', '-D', branch], repo).catch(() => {});
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
+/** 編集経路への POST（トークンつき） */
+function editPost(url, route, payload, headers = {}) {
+    return fetch(`${url}${route}`, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-kjp-token': WRITE_TOKEN,
+            'sec-fetch-site': 'same-origin',
+            ...headers,
+        },
+        body: JSON.stringify(payload),
+    });
+}
+
+test('🔒 write: --allow-write なしでは経路が存在しない', async () => {
+    // 読む側（/api/v0/file）も write の capability の中に置いている。
+    // 作業ツリーを fs で読む唯一の経路なので、読み取り専用のデーモンには存在しない。
+    for (const route of ['/api/v0/file', '/api/v0/write']) {
+        const r = await fetch(`${baseUrl}${route}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ worktree: repo, path: 'README.md', text: 'x\n' }),
+        });
+        assert.equal(r.status, 403, `${route} が --allow-write なしで通った`);
+        assert.match((await r.json()).error, /--allow-write/);
+    }
+    // 書き込みが無効なら中身も変わっていない（数え直す）
+    assert.equal(await readFile(join(repo, 'README.md'), 'utf8'), '# smoke\n');
+});
+
+test('🔒 write: 関門（token / method / Sec-Fetch-Site / Host）を要求する', async () => {
+    const { child, url } = await startWritable();
+    try {
+        await withEditWorktree('gate', { tracked: { 'edit.txt': 'a\nb\n' } }, async dir => {
+            const body = JSON.stringify({
+                worktree: dir, path: 'edit.txt', text: 'hacked\n',
+                baseOid: '0000000000000000000000000000000000000000',
+            });
+            // トークン無し
+            let r = await fetch(`${url}/api/v0/write`, {
+                method: 'POST', headers: { 'content-type': 'application/json' }, body,
+            });
+            assert.equal(r.status, 403, 'トークン無しが通った');
+            assert.match((await r.json()).error, /token/i);
+            // トークンが違う
+            r = await fetch(`${url}/api/v0/write`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': 'wrong' },
+                body,
+            });
+            assert.equal(r.status, 403, '誤ったトークンが通った');
+            // GET では副作用を起こさない
+            r = await fetch(`${url}/api/v0/write`, { headers: { 'x-kjp-token': WRITE_TOKEN } });
+            assert.equal(r.status, 405, 'GET が通った');
+            // 別サイト起点
+            r = await fetch(`${url}/api/v0/write`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-kjp-token': WRITE_TOKEN, 'sec-fetch-site': 'cross-site',
+                },
+                body,
+            });
+            assert.equal(r.status, 403, 'cross-site が通った');
+            // Host が攻撃者ドメイン（入口の検証が編集経路にも効く）
+            // ⚠️ Host の検証は fetch では書けない（undici が上書きを許さない）ので
+            //    node:http の request を使う。GET でも入口の 403 は測れる。
+            r = await rawGet(`${url}/api/v0/write`, { host: 'evil.example' });
+            assert.equal(r.status, 403, 'evil.example が通った');
+            // 読む側（/api/v0/file）も同じ門を通る
+            const rf = await fetch(`${url}/api/v0/file`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ worktree: dir, path: 'edit.txt' }),
+            });
+            assert.equal(rf.status, 403, '/api/v0/file がトークン無しで読めた');
+            // どれも中身を変えていない
+            assert.equal(await readFile(join(dir, 'edit.txt'), 'utf8'), 'a\nb\n');
+        });
+    } finally {
+        child.kill();
+    }
+});
+
+test('🚨 write: 門の順序（認可が追跡チェックより前）', async () => {
+    // 🚨 **順序そのものが守り。** 認可を後ろに回すと、認可を持たない相手が
+    //    エラーメッセージの違いから「そのパスが追跡されているか」を引き出せる
+    //    （`--allow-exec` の門が自動生成より後ろにあって消えていたのと同じ型）。
+    //    未追跡のパスを**トークン無しで**投げて、返るのが 403（認可）であって
+    //    400（追跡されていない）でないことを見る。
+    const { child, url } = await startWritable();
+    try {
+        await withEditWorktree('order', {
+            tracked: { 'edit.txt': 'a\n' },
+            untracked: { '.env': 'SECRET=1\n' },
+        }, async dir => {
+            for (const route of ['/api/v0/file', '/api/v0/write']) {
+                const r = await fetch(`${url}${route}`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({
+                        worktree: dir, path: '.env', text: 'x\n',
+                        baseOid: '0000000000000000000000000000000000000000',
+                    }),
+                });
+                const d = await r.json();
+                assert.equal(r.status, 403,
+                    `${route}: 認可より先にパスを調べている（存在の走査ができる）: ${JSON.stringify(d)}`);
+                assert.match(d.error, /token/i,
+                    '認可以外の理由で断っている = 門の順序が入れ替わっている');
+                assert.doesNotMatch(d.error, /追跡/,
+                    '未認可の相手に「追跡されているか」を教えている');
+            }
+        });
+    } finally {
+        child.kill();
+    }
+});
+
+test('🔒 write: 未追跡ファイルを拒否する（.env に触れる経路を作らない）', async () => {
+    const { child, url } = await startWritable();
+    try {
+        await withEditWorktree('untracked', {
+            tracked: { 'edit.txt': 'a\n' },
+            untracked: { '.env': 'SECRET=abc\n' },
+        }, async dir => {
+            // 読むのも拒否する（中身が漏れない）
+            const rf = await editPost(url, '/api/v0/file', { worktree: dir, path: '.env' });
+            assert.equal(rf.status, 400, '未追跡ファイルが読めた');
+            const df = await rf.json();
+            assert.match(df.error, /追跡下にありません/);
+            assert.doesNotMatch(JSON.stringify(df), /SECRET/, '中身が応答に漏れている');
+            // 書くのも拒否する
+            const rw = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: '.env', text: 'SECRET=overwritten\n',
+                baseOid: '0000000000000000000000000000000000000000',
+            });
+            assert.equal(rw.status, 400, '未追跡ファイルに書けた');
+            assert.match((await rw.json()).error, /追跡下にありません/);
+            // **数え直す**: 中身が変わっていないこと
+            assert.equal(await readFile(join(dir, '.env'), 'utf8'), 'SECRET=abc\n');
+            // 追跡されているファイルは読める（この検査が「全部拒否」で緑になっていないこと）
+            const ok = await editPost(url, '/api/v0/file', { worktree: dir, path: 'edit.txt' });
+            assert.equal(ok.status, 200, '追跡下のファイルも読めていない（検査が空振り）');
+        });
+    } finally {
+        child.kill();
+    }
+});
+
+test('🔒 write: ../ と絶対パスとドライブレターを拒否する', async () => {
+    const { child, url } = await startWritable();
+    const outside = join(repo, '..', 'kjp-must-not-be-written.txt');
+    try {
+        await rm(outside, { force: true }).catch(() => {});
+        await withEditWorktree('paths', { tracked: { 'edit.txt': 'a\n' } }, async dir => {
+            const bad = [
+                '../kjp-must-not-be-written.txt',
+                '../../kjp-must-not-be-written.txt',
+                'sub/../../kjp-must-not-be-written.txt',
+                join(dir, 'edit.txt'),        // 絶対パス（Windows ならドライブレター付き）
+                '/etc/passwd',
+                'C:/Windows/System32/drivers/etc/hosts',
+                '-oProxyCommand=x',           // 先頭 `-`（オプション注入）
+                ':(exclude)edit.txt',         // pathspec magic
+                'edit.txt\u0000.png',         // NUL
+                '',
+            ];
+            for (const p of bad) {
+                const r = await editPost(url, '/api/v0/write', {
+                    worktree: dir, path: p, text: 'written\n',
+                    baseOid: '0000000000000000000000000000000000000000',
+                });
+                assert.equal(r.status, 400, `拒否されなかった: ${JSON.stringify(p)}`);
+                assert.match((await r.json()).error, /path が不正です/,
+                    `別の理由で断っている（isSafeRepoPath を測れていない）: ${JSON.stringify(p)}`);
+            }
+            // **数え直す**: リポジトリ外にファイルが作られていないこと
+            await assert.rejects(readFile(outside, 'utf8'),
+                'リポジトリ外にファイルが作られた');
+        });
+    } finally {
+        child.kill();
+        await rm(outside, { force: true }).catch(() => {});
+    }
+});
+
+test('🔒 write: 既知の worktree 以外を対象にできない', async () => {
+    const { child, url } = await startWritable();
+    try {
+        for (const bad of [tmpdir(), `${repo}-not-a-worktree`, '']) {
+            const r = await editPost(url, '/api/v0/write', {
+                worktree: bad, path: 'edit.txt', text: 'x\n',
+                baseOid: '0000000000000000000000000000000000000000',
+            });
+            assert.equal(r.status, 400, `既知でない worktree が通った: ${bad}`);
+            assert.match((await r.json()).error, /既知の worktree ではありません/);
+        }
+    } finally {
+        child.kill();
+    }
+});
+
+test('🚨 write: 並行書き換えを 409 で拒否する（楽観ロック）', async () => {
+    // 🚨 **このツールの核心。** 開いてから保存するまでの間に、その worktree の
+    //    エージェント自身がファイルを書き換えているのが**普通の状態**。
+    //    黙って上書きしたら観測ツールとして最悪。
+    const { child, url } = await startWritable();
+    try {
+        await withEditWorktree('lock', { tracked: { 'edit.txt': 'one\ntwo\n' } }, async dir => {
+            const f = join(dir, 'edit.txt');
+            const opened = await (await editPost(url, '/api/v0/file',
+                { worktree: dir, path: 'edit.txt' })).json();
+            assert.equal(opened.text, 'one\ntwo\n');
+            assert.match(opened.oid, /^[0-9a-f]{40}$/);
+
+            // ここで**別のエージェントが書いた**ことにする
+            await writeFile(f, 'written by another agent\n', 'utf8');
+
+            const r = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: 'edit.txt',
+                text: `${opened.text}three\n`, baseOid: opened.oid,
+            });
+            assert.equal(r.status, 409, '黙って上書きした（並行書き換えを検出していない）');
+            const d = await r.json();
+            assert.match(d.error, /他が書き換えました。読み直してください/,
+                '文言が「何が起きたか」を言っていない');
+            // **数え直す**: 相手の書いた内容が残っていること
+            assert.equal(await readFile(f, 'utf8'), 'written by another agent\n',
+                '409 を返したのに上書きしている');
+
+            // 読み直せば保存できる（ロックが厳しすぎて何も保存できない状態でないこと）
+            const again = await (await editPost(url, '/api/v0/file',
+                { worktree: dir, path: 'edit.txt' })).json();
+            const ok = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: 'edit.txt',
+                text: `${again.text}mine\n`, baseOid: again.oid,
+            });
+            assert.equal(ok.status, 200, `読み直しても保存できない: ${await ok.text()}`);
+            assert.equal(await readFile(f, 'utf8'), 'written by another agent\nmine\n');
+
+            // baseOid を付けない／形が違う要求は 400（比較の前に形を見る）
+            for (const baseOid of [undefined, '', 'not-an-oid', 'ABCDEF']) {
+                const r2 = await editPost(url, '/api/v0/write',
+                    { worktree: dir, path: 'edit.txt', text: 'x\n', baseOid });
+                assert.equal(r2.status, 400, `baseOid ${JSON.stringify(baseOid)} が通った`);
+                assert.match((await r2.json()).error, /baseOid/);
+            }
+            assert.equal(await readFile(f, 'utf8'), 'written by another agent\nmine\n',
+                'baseOid が不正なのに書いている');
+        });
+    } finally {
+        child.kill();
+    }
+});
+
+test('write: CRLF と BOM と日本語ファイル名を保つ（触っていない行を変えない）', async () => {
+    const { child, url } = await startWritable();
+    try {
+        await withEditWorktree('eol', {
+            tracked: {
+                'crlf.txt': Buffer.from('a\r\nb\r\n'),
+                'lf.txt': 'a\nb\n',
+                'bom.txt': Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]),
+                    Buffer.from('a\r\n')]),
+                'mixed.txt': Buffer.from('a\r\nb\nc\r\n'),
+                // E1/E3 日本語＋空白のファイル名
+                '日本語フォルダ/テスト ファイル.txt': 'ふが\n',
+            },
+        }, async dir => {
+            const save = async (path, add) => {
+                const opened = await (await editPost(url, '/api/v0/file',
+                    { worktree: dir, path })).json();
+                const r = await editPost(url, '/api/v0/write', {
+                    worktree: dir, path, text: `${opened.text}${add}`, baseOid: opened.oid,
+                });
+                return { opened, status: r.status, body: await r.json() };
+            };
+
+            // CRLF のファイルは CRLF のまま（LF が1つも混ざらない）
+            let s = await save('crlf.txt', 'c\n');
+            assert.equal(s.status, 200, JSON.stringify(s.body));
+            assert.equal(s.opened.eol, 'crlf');
+            const crlf = await readFile(join(dir, 'crlf.txt'));
+            assert.equal(crlf.toString('utf8'), 'a\r\nb\r\nc\r\n',
+                'CRLF が保たれていない（全行が変更になる）');
+
+            // LF のファイルに CRLF は入らない
+            s = await save('lf.txt', 'c\n');
+            assert.equal(s.status, 200, JSON.stringify(s.body));
+            assert.equal((await readFile(join(dir, 'lf.txt'))).toString('utf8'), 'a\nb\nc\n');
+
+            // BOM は保つ（1つだけ）
+            s = await save('bom.txt', 'x\n');
+            assert.equal(s.opened.bom, true);
+            assert.equal(s.status, 200, JSON.stringify(s.body));
+            const bom = await readFile(join(dir, 'bom.txt'));
+            assert.deepEqual([...bom.subarray(0, 3)], [0xEF, 0xBB, 0xBF], 'BOM が消えた');
+            assert.equal(bom.toString('utf8').replace(/^\uFEFF/, ''), 'a\r\nx\r\n');
+            assert.equal([...bom].filter((_, i) => i < 6).join(','), '239,187,191,97,13,10',
+                'BOM が二重になっている');
+
+            // 日本語＋空白のファイル名（E1/E3）
+            s = await save('日本語フォルダ/テスト ファイル.txt', 'ほげ\n');
+            assert.equal(s.status, 200, JSON.stringify(s.body));
+            assert.equal(
+                await readFile(join(dir, '日本語フォルダ', 'テスト ファイル.txt'), 'utf8'),
+                'ふが\nほげ\n');
+
+            // 🚨 改行コードが混在しているファイルは**推測して直さない**（409 で断る）
+            const mixed = await editPost(url, '/api/v0/file',
+                { worktree: dir, path: 'mixed.txt' });
+            assert.equal(mixed.status, 409, '混在しているのに開いた（保存で全行が変わる）');
+            assert.match((await mixed.json()).error, /改行コードが混在/);
+            assert.equal((await readFile(join(dir, 'mixed.txt'))).toString('utf8'),
+                'a\r\nb\nc\r\n', '断ったのに書き換えている');
+        });
+    } finally {
+        child.kill();
+    }
+});
+
+test('🔒 write: 監査に残すが、中身は残さない', async () => {
+    const auditPath = join(repo, '..', `kjp-write-audit-${process.pid}.jsonl`);
+    const { child, url } = await startWritable(['--audit-log', auditPath]);
+    const SECRETISH = 'CONTENT-MUST-NOT-BE-LOGGED-42';
+    try {
+        await withEditWorktree('audit', { tracked: { 'edit.txt': 'a\n' } }, async dir => {
+            const opened = await (await editPost(url, '/api/v0/file',
+                { worktree: dir, path: 'edit.txt' })).json();
+            const r = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: 'edit.txt',
+                text: `${SECRETISH}\n`, baseOid: opened.oid,
+            });
+            assert.equal(r.status, 200, await r.text());
+            // 並行書き換えの記録も出す（後から事故を追うのに一番効く）
+            await writeFile(join(dir, 'edit.txt'), 'someone else\n', 'utf8');
+            const c = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: 'edit.txt', text: 'x\n', baseOid: opened.oid,
+            });
+            assert.equal(c.status, 409);
+
+            const log = await readFile(auditPath, 'utf8');
+            const rows = log.split('\n').filter(Boolean).map(l => JSON.parse(l));
+            const wrote = rows.find(x => x.event === 'write');
+            assert.ok(wrote, `write の記録が無い: ${log}`);
+            assert.equal(wrote.path, 'edit.txt');
+            assert.equal(wrote.bytes, `${SECRETISH}\n`.length);
+            assert.ok(wrote.worktree.endsWith('-audit'), `worktree が無い: ${log}`);
+            assert.ok(rows.some(x => x.event === 'write-conflict'),
+                `並行書き換えの記録が無い: ${log}`);
+            // 🔒 **中身は残さない**（記録が秘密の持ち出し口になる。T5 と同じ理屈）
+            assert.doesNotMatch(log, new RegExp(SECRETISH),
+                '監査ログに書いた中身が入っている');
+            assert.doesNotMatch(log, /"text"/, '監査ログに text フィールドがある');
+        });
+    } finally {
+        child.kill();
+        await rm(auditPath, { force: true }).catch(() => {});
+    }
+});
+
+test('🔒 write: シンボリックリンクは編集しない（実体がリポジトリ外を指しうる）', async t => {
+    // 追跡下でも中身が symlink なら実体は worktree の外にありうる
+    // （`git update-index --cacheinfo 120000` でコミットできる）。
+    // ⚠️ Windows では symlink の作成に権限が要る。作れなければ**測れていないと言う**
+    //    （緑にして「守った」と読まない）。
+    const { symlink } = await import('node:fs/promises');
+    const { child, url } = await startWritable();
+    const outside = join(repo, '..', `kjp-symlink-target-${process.pid}.txt`);
+    try {
+        await writeFile(outside, 'outside secret\n', 'utf8');
+        await withEditWorktree('symlink', { tracked: { 'edit.txt': 'a\n' } }, async dir => {
+            const link = join(dir, 'link.txt');
+            try {
+                await symlink(outside, link);
+            } catch (err) {
+                t.skip(`symlink を作れないので測れません: ${err.code ?? err.message}`);
+                return;
+            }
+            await g(['add', '-A'], dir);
+            await g(['commit', '-q', '-m', 'symlink を追加'], dir);
+            for (const route of ['/api/v0/file', '/api/v0/write']) {
+                const r = await editPost(url, route, {
+                    worktree: dir, path: 'link.txt', text: 'overwritten\n',
+                    baseOid: '0000000000000000000000000000000000000000',
+                });
+                assert.equal(r.status, 400, `${route}: symlink が通った`);
+                const d = await r.json();
+                assert.match(d.error, /シンボリックリンク|worktree の外/);
+                assert.doesNotMatch(JSON.stringify(d), /outside secret/,
+                    'リンク先の中身が漏れている');
+            }
+            assert.equal(await readFile(outside, 'utf8'), 'outside secret\n',
+                'リポジトリ外のファイルが書き換えられた');
+        });
+    } finally {
+        child.kill();
+        await rm(outside, { force: true }).catch(() => {});
+    }
+});
+
+test('UI: 編集器が使うモジュール（linediff.mjs）が配信される', async () => {
+    // 1本でも 404 だとモジュール全体が実行されず**ページが真っ白**になる。
+    // 一覧は app.html から読む検査（上）が持っているが、この経路だけは
+    // 「編集器を足したのに配信の許可リストに足し忘れる」形で壊れるので名指しで見る。
+    const r = await fetch(`${baseUrl}/linediff.mjs`);
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('content-type'), /javascript/);
+    assert.match(await r.text(), /export function diffLines/);
 });
 
 // ---------------------------------------------------------------------------
@@ -4761,6 +5216,72 @@ test('🚨 status がリポジトリ設定の filter を実行しない（capabi
 });
 
 /**
+ * 🚨 **編集の経路も filter を実行しない（`status` と同じクラスの穴を作っていないこと）。**
+ *
+ * `POST /api/v0/file` は `fs` で読み、`POST /api/v0/write` は `fs` で書くので
+ * filter は通らない**はず**。だが「はず」はコメントであってテストではない。
+ * 追跡確認のために `git ls-files` を1回起動しているので、**そこが content
+ * conversion を伴わないこと**を実測で固定する（`status` は伴うので実行された）。
+ *
+ * 🚨 **空振り防止に positive control を置く。** 素の `git status` で marker が
+ * 書かれることを先に確かめる（`sh` が使えない環境なら filter そのものが走らないので、
+ * 「守った」ではなく「攻撃を送れていない」を見てしまう）。
+ */
+test('🚨 write: 編集の経路がリポジトリ設定の filter を実行しない', async () => {
+    // ⚠️ git の設定に入れる値なので区切りを / に直す（バックスラッシュはエスケープ扱い）
+    const marker = join(repo, 'filter-ran-write.txt').split(sep).join('/');
+    const target = join(repo, 'filtered-write.txt');
+    const { existsSync } = await import('node:fs');
+    let child = null;
+    try {
+        await writeFile(target, 'aaaa\n', 'utf8');
+        await writeFile(join(repo, '.gitattributes'), 'filtered-write.txt filter=evil\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: 編集経路の filter テスト用'], repo);
+        await g(['config', 'filter.evil.clean', `sh -c "printf ran > '${marker}'; cat"`], repo);
+        // 同じ長さで書き換える（サイズが違うと git は中身を比べない = filter が走らない）
+        await writeFile(target, 'bbbb\n', 'utf8');
+
+        // ---- positive control: この環境では filter が**実際に走る**
+        await g(['status', '--porcelain'], repo);
+        assert.equal(existsSync(marker), true,
+            'filter が走らない環境なので、この検査は何も測れていない（空振り）');
+        await rm(marker, { force: true });
+
+        // ---- 本題: 編集の2経路を通しても marker が書かれないこと
+        const started = await startWritable();
+        child = started.child;
+        const url = started.url;
+        const opened = await editPost(url, '/api/v0/file',
+            { worktree: repo, path: 'filtered-write.txt' });
+        // ⚠️ 本文は1回しか読めない。assert のメッセージの中で await res.text() を
+        //    書くとテンプレートが先に評価されて body を消費し、後続が
+        //    「Body is unusable」で落ちる（CLAUDE.md に書いてある罠を踏んだ）
+        const d = await opened.json();
+        assert.equal(opened.status, 200, JSON.stringify(d));
+        // fs で読んでいるので**作業ツリーの中身**が返る（index の中身ではない）
+        assert.equal(d.text, 'bbbb\n');
+        const wrote = await editPost(url, '/api/v0/write', {
+            worktree: repo, path: 'filtered-write.txt', text: 'cccc\n', baseOid: d.oid,
+        });
+        const dw = await wrote.json();
+        assert.equal(wrote.status, 200, JSON.stringify(dw));
+        await new Promise(r => setTimeout(r, 400));
+        assert.equal(existsSync(marker), false,
+            '編集の経路から filter が実行された（capability を1段上げる穴）');
+        assert.equal(await readFile(target, 'utf8'), 'cccc\n');
+    } finally {
+        child?.kill();
+        await g(['config', '--unset', 'filter.evil.clean'], repo).catch(() => {});
+        await rm(marker, { force: true }).catch(() => {});
+        await rm(target, { force: true }).catch(() => {});
+        await rm(join(repo, '.gitattributes'), { force: true }).catch(() => {});
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: 編集経路の filter テスト後片付け'], repo).catch(() => {});
+    }
+});
+
+/**
  * 🔒 **案内の URL に「実行できる鍵」を載せない（8回目のレビュー。SERIOUS）。**
  *
  * `--exec` のデーモンでは秘密が1本だったので、「スマホで1回開いてください」と
@@ -4812,6 +5333,25 @@ test('🔒 案内の URL の鍵では実行できない（読み取りだけ通�
         });
         assert.equal(ex.status, 403, `URL の鍵で実行できてしまった: ${ex.status}`);
         await ex.text();
+
+        // 🔒 **編集（作業ツリーへの書き込み）も通らない。**
+        //    ⚠️ 経路を足したときにここへ足し忘れると、この分界だけ穴が残る
+        //    （`--no-textconv` が `core.fsmonitor` と同じコミットなのに
+        //     片方しか測られていなかったのと同じ形）。
+        //    読む側も**作業ツリーを fs で読む**ので、読み取り用の鍵では通してはいけない。
+        for (const route of ['/api/v0/file', '/api/v0/write']) {
+            const w = await fetch(`${url}${route}`, {
+                method: 'POST', headers: H(urlKey),
+                body: JSON.stringify({
+                    worktree: repo, path: 'README.md', text: 'overwritten\n',
+                    baseOid: '0000000000000000000000000000000000000000',
+                }),
+            });
+            assert.equal(w.status, 403, `URL の鍵で ${route} が通った: ${w.status}`);
+            await w.text();
+        }
+        // **数え直す**: 中身が変わっていないこと（生トークンで通ることは別のテストが測る）
+        assert.equal(await readFile(join(repo, 'README.md'), 'utf8'), '# smoke\n');
 
         // 🔒 鍵の払い出しも通らない（ここが通ると1往復で昇格できる）
         const ses = await fetch(`${url}/api/v0/session`, { headers: H(urlKey) });

@@ -12,16 +12,20 @@
 
 import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, open, lstat } from 'node:fs/promises';
+import { constants as FS } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve, relative } from 'node:path';
 import {
     git, listWorktrees, log, aheadBehind, commonDir,
     changedFiles, worktreeStatus, sequencerState,
-    refMap, resolveRef, worktreeGitDirs, stats,
-    showBlob, fileDiff, toNFC, samePath, containsPath, isSafeRef, mergePreview, mergeDriverNames,
-    repoFilterNames,
+    refMap, resolveRef, worktreeGitDirs, stats, splitZ,
+    showBlob, fileDiff, toNFC, samePath, containsPath, isSafeRepoPath, isSafeRef,
+    mergePreview, mergeDriverNames, repoFilterNames,
 } from './git.mjs';
+import {
+    blobOid, inspectBytes, toEditorText, encodeForWorktree, MAX_EDIT_BYTES,
+} from './writefile.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
 import { collectAgents, transcriptRoot, maskSecrets } from './transcript.mjs';
@@ -111,7 +115,7 @@ function parseArgs(argv) {
         else if (a === '--help' || a === '-h') {
             console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
-            console.log('       --allow-write        checkout 等の書き込み操作を有効にする（既定オフ）');
+            console.log('       --allow-write        checkout と追跡ファイルの編集・保存を有効にする（既定オフ）');
             console.log('       --allow-exec         任意コマンドの実行を有効にする（既定オフ。--token 必須）');
             console.log('       --exec-timeout <秒>  実行の上限時間（既定 600）');
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
@@ -1336,6 +1340,158 @@ function requireExec(req, res) {
 }
 
 /**
+ * 🔒 **作業ツリーにファイルを書く経路の関門。`/api/v0/file` と `/api/v0/write` の
+ *    両方が必ずここを通る**（副作用のある経路を足すときは経路を散らさない、の実装）。
+ *
+ * v0 で**初めて「作業ツリーにファイルの中身を書く」経路**なので、
+ * 認可を通った後も次の順序で必ず絞る。**順序そのものが守りの本体**:
+ *
+ *   1. `isSafeRepoPath()` — `..` / 絶対パス / ドライブレター / 先頭 `-` /
+ *      NUL / pathspec magic を弾く。**最初に置く理由**: これを通っていない値を
+ *      git にも fs にも渡さない（後段は全部この値を使う）
+ *   2. 対象 worktree が**既知**で bare でも prunable でもないこと。
+ *      **fs に触る前に置く理由**: 知らないディレクトリを基準にパスを解決しない
+ *   3. **git の追跡下にあること**（`ls-files --error-unmatch`）。
+ *      **fs で開く前に置く理由**: これが「未追跡の `.env` に触れる経路を作らない」
+ *      という不変条件の本体。読むのも書くのも「コミットに入っているもの」に限る
+ *   4. **実体が worktree の中にあること**（`realpath` 包含 + symlink の拒否）。
+ *      追跡下でも**中身が symlink なら実体はリポジトリ外にありうる**
+ *      （`git update-index --cacheinfo 120000` でコミットできる）。
+ *      `containsPath()` は realpath するので 8.3 短縮名 / symlink / 大文字小文字を吸収する
+ *   5. 中身を読む（上限 / バイナリ / 改行コードの混在を拒否）
+ *
+ * 🚨 **`fs` で読む唯一の経路。** `git cat-file` 経由という読み取り側の不変条件
+ *    （CLAUDE.md）をここだけ破る。理由: エディタは**未コミットの現在の中身**を
+ *    見せなければならず、それは git のオブジェクトDB に無い。代わりに
+ *    「`--allow-write` の capability + トークン + 追跡下 + realpath 包含」の
+ *    4つを全部要求する。読み取り専用のデーモン（capability 無し）からは
+ *    この経路そのものが存在しない。
+ *
+ * ⚠️ **返した `fh` は呼び出し側が必ず閉じる。** 失敗時はここで閉じて null を返す。
+ * ⚠️ 検査と `open` の間にディレクトリを差し替える競争は塞げていない
+ *    （`O_NOFOLLOW` は最終要素にしか効かず、Windows には無い）。
+ *    同じマシンで動く別のプロセスが敵なら防げない — この経路は
+ *    「同じマシンの自分のエージェント群」を前提にしている。
+ *
+ * @returns {Promise<null|{wt: object, rel: string, abs: string, fh: object,
+ *                         buf: Buffer, info: object}>}
+ */
+async function requireEditTarget(req, res, body, { forWrite }) {
+    // ---- 1. パスの形
+    const rel = toNFC(String(body.path ?? ''));
+    if (!isSafeRepoPath(rel)) {
+        denyJson(res, 400, `path が不正です: ${rel.slice(0, 120)}`);
+        return null;
+    }
+    // ---- 2. 対象 worktree（既知のものだけ。ここを緩めるとリポジトリ外に書ける）
+    const wantPath = toNFC(String(body.worktree ?? ''));
+    const worktrees = await listWorktrees(opts.repo);
+    const wt = worktrees.find(w => samePath(w.path, wantPath));
+    if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return null; }
+    if (wt.bare) { denyJson(res, 400, 'bare worktree にはファイルを書けません'); return null; }
+    if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return null; }
+
+    // ---- 3. git の追跡下にあること（未追跡は拒否）
+    // ⚠️ `--error-unmatch` は一致しないと exit 1。失敗と区別するため allowExit で受ける。
+    // ⚠️ **出力に「まさにそのパス」が含まれることまで見る。** ディレクトリを渡すと
+    //    その下のファイルが並んで exit 0 になるので、`code === 0` だけでは足りない。
+    // 🔒 **内容を変換しない git コマンドだけを使う。** `status` / `diff` / `add` は
+    //    作業ツリーと index の中身を比べるので **`.gitattributes` の clean filter
+    //    （= リポジトリ設定の任意コマンド）を起動する**（8回目のレビューの BLOCKING）。
+    //    `ls-files` は index を読むだけで content conversion を伴わない。
+    //    ここに1つ変換を伴う呼び出しを足すと、この経路が capability を1段上げる。
+    let ls;
+    try {
+        ls = await git(['ls-files', '--error-unmatch', '-z', '--', rel],
+            { cwd: wt.path, allowExit: [0, 1], withCode: true });
+    } catch (err) {
+        denyJson(res, 500, `追跡状態を確認できませんでした（書きません）: ${err.message}`);
+        return null;
+    }
+    if (ls.code !== 0 || !splitZ(ls.stdout).map(p => toNFC(p)).includes(rel)) {
+        denyJson(res, 400,
+            `git の追跡下にありません: ${rel}。`
+            + ' 画面から編集できるのは追跡されているファイルだけです'
+            + '（未追跡の .env などに触れる経路を作らないため）');
+        return null;
+    }
+
+    // ---- 4. 実体が worktree の中にあること
+    // ⚠️ **`insideRepoGate()` で代用してはいけない**（同じ判断ではない）。
+    //    あれは「秘密の置き場所がリポジトリの**どこか**に入っていないか」を
+    //    起動時に1回見る門で、**どの worktree でも / `.git` の中でも真**になる。
+    //    ここが要るのは「**この** worktree の中か」で、`.git` の中も他の worktree も
+    //    通してはいけない。極性（外にあれ / 中にあれ）も逆。共通化すると緩む。
+    const abs = join(wt.path, rel);
+    if (!containsPath(wt.path, abs)) {
+        denyJson(res, 400, `実体が worktree の外を指しています: ${rel}`);
+        return null;
+    }
+    let lst;
+    try {
+        lst = await lstat(abs);
+    } catch (err) {
+        denyJson(res, 409,
+            `作業ツリーにファイルがありません（${err.code ?? err.message}）: ${rel}`);
+        return null;
+    }
+    if (lst.isSymbolicLink()) {
+        denyJson(res, 400,
+            `シンボリックリンクは編集しません: ${rel}（実体がどこを指すか保証できません）`);
+        return null;
+    }
+    if (!lst.isFile()) {
+        denyJson(res, 400, `通常のファイルではありません: ${rel}`);
+        return null;
+    }
+
+    // ---- 5. 中身
+    // 🔒 `O_NOFOLLOW` を足す（POSIX のみ。最終要素の symlink 差し替えを atomic に弾く）
+    const flags = (forWrite ? FS.O_RDWR : FS.O_RDONLY) | (FS.O_NOFOLLOW ?? 0);
+    let fh;
+    try {
+        fh = await open(abs, flags);
+    } catch (err) {
+        denyJson(res, 409,
+            `開けませんでした（${err.code ?? err.message}）: ${rel}`
+            + (err.code === 'EACCES' || err.code === 'EPERM'
+                ? '。読み取り専用のファイルは画面から編集できません' : ''));
+        return null;
+    }
+    const fail = async (code, msg) => {
+        await fh.close().catch(() => { /* 既に閉じている */ });
+        denyJson(res, code, msg);
+        return null;
+    };
+    try {
+        // fstat（開いたハンドル自身を見る）。パスをもう一度辿らないので差し替えに強い
+        const st = await fh.stat();
+        if (!st.isFile()) return fail(400, `通常のファイルではありません: ${rel}`);
+        if (st.size > MAX_EDIT_BYTES) {
+            return fail(413,
+                `${MAX_EDIT_BYTES} バイトを超えるファイルは画面から編集しません`
+                + `（${st.size} バイト）`);
+        }
+        const buf = await fh.readFile();
+        const info = inspectBytes(buf);
+        if (info.binary) {
+            return fail(400, `バイナリファイルは編集しません: ${rel}`);
+        }
+        if (info.mixed) {
+            // 🚨 「分からないなら分からないと言う」。どちらに寄せても
+            //    **触っていない行が変わる**ので、推測して直さない。
+            return fail(409,
+                `改行コードが混在しています（CRLF ${info.counts.crlf} / LF ${info.counts.lf}`
+                + ` / CR ${info.counts.cr}）。どちらに寄せても触っていない行が変わるので、`
+                + '画面からは編集しません。端末で揃えてください');
+        }
+        return { wt, rel, abs, fh, buf, info };
+    } catch (err) {
+        return fail(500, `読めませんでした（書きません）: ${err.message}`);
+    }
+}
+
+/**
  * 実行の監査ログ。1行1JSON で $GIT_DIR に追記する（追跡されない場所）。
  * 何をいつ走らせたかが残らないと、後から事故を追えない。
  */
@@ -1663,6 +1819,16 @@ function startExecSweeper() {
     // ⚠️ unref しておく。これだけでイベントループを生かし続けない
     sweepTimer.unref?.();
 }
+
+/**
+ * 保存の本文の上限。
+ *
+ * ⚠️ 中身の上限（`MAX_EDIT_BYTES` = 512KB）より大きくする必要がある。
+ *    JSON の文字列エスケープで最悪 6倍（`\u00xx`）に膨らむので、
+ *    ここを 512KB にすると**上限ぎりぎりのファイルが保存できない**。
+ *    大きすぎる中身は本文を読んだ後に 413 で断る（理由が分かる形で返す）。
+ */
+const MAX_WRITE_BODY_BYTES = 4 * 1024 * 1024;
 
 /** JSON ボディを読む。上限付き（無制限に読むと DoS になる）。 */
 function readJson(req, maxBytes = 64 * 1024) {
@@ -2592,6 +2758,136 @@ async function handleRequest(req, res) {
             return;
         }
 
+        /**
+         * 🔒 **最小エディタ（`--allow-write` の枠内）。**
+         *
+         *   `POST /api/v0/file`  … 編集のために作業ツリーの中身を読む
+         *   `POST /api/v0/write` … 作業ツリーに書く
+         *
+         * なぜ2つとも POST か: どちらも `requireMutation()`（`--allow-write` /
+         * POST / same-origin / `X-Kjp-Token`）を通す。読む側も **write の
+         * capability の中**に置くのが分界の要点で、読み取り専用のデーモンからは
+         * 経路そのものが存在しない（`fs` で作業ツリーを読むのはここだけ）。
+         *
+         * 🚨 **なぜ楽観ロックが核心か。** このツールは
+         * 「N 個のエージェントが N 個の worktree で並行に動く」前提で作っている。
+         * 画面で開いてから保存するまでの間に、そのエージェント自身がファイルを
+         * 書き換えているのが**普通の状態**。読んだときの中身のハッシュ（`baseOid`）を
+         * 突き合わせて、食い違ったら **409 で断る**。
+         * 黙って上書きするのは、観測ツールとしては最悪の誤り
+         * （「止めたつもりで走り続けている」と同じクラス）。
+         *
+         * ⚠️ `--allow-exec` は要らない。書き込みと実行は別の capability
+         *    （ファイルを書けることと任意コマンドが動くことは危険度が桁違い）。
+         */
+        if (url.pathname === '/api/v0/file' || url.pathname === '/api/v0/write') {
+            const forWrite = url.pathname === '/api/v0/write';
+            // 🚨 **門の順序: 認可を最初に置く（本文を読む前）。** ここを後ろに回すと
+            //    (a) 認可を持たない相手がエラーメッセージの違いから
+            //        「そのパスが追跡されているか」を引き出せる（存在の走査）
+            //    (b) 未認可の相手に大きな本文を送らせることになる
+            //    ので、**フォールバックや解析より前**に置く。順序は変異で測っている
+            //    （`write-gate-order`）。
+            if (!requireMutation(req, res)) return;   // ← 門1: 認可
+            let body;
+            try {
+                body = await readJson(req, forWrite ? MAX_WRITE_BODY_BYTES : 64 * 1024);
+            } catch (err) {
+                denyJson(res, err.tooLarge ? 413 : 400, err.message);
+                return;
+            }
+            // ← 門2〜5: パスの形 / 既知の worktree / 追跡下 / 実体と中身
+            const t = await requireEditTarget(req, res, body, { forWrite });
+            if (!t) return;                          // ← 応答は関門が書いている
+            try {
+                if (!forWrite) {
+                    res.writeHead(200, {
+                        'content-type': 'application/json; charset=utf-8',
+                        'cache-control': 'no-store',
+                    });
+                    res.end(JSON.stringify({
+                        ok: true,
+                        worktree: t.wt.path,
+                        path: t.rel,
+                        // ⚠️ LF に畳んだテキストを返す（textarea の value は LF）。
+                        //    書き戻すときに元の流儀へ戻すのはサーバの責任にする
+                        //    （クライアントに改行コードを持たせると必ず壊れる）。
+                        text: toEditorText(t.buf),
+                        oid: t.info.oid,
+                        eol: t.info.eol,
+                        bom: t.info.bom,
+                        bytes: t.info.bytes,
+                    }));
+                    return;
+                }
+                const text = typeof body.text === 'string' ? body.text : null;
+                if (text === null) { denyJson(res, 400, 'text（文字列）が必要です'); return; }
+                // NUL を書くとバイナリファイルになる（もう画面から開けなくなる）
+                if (text.includes('\0')) {
+                    denyJson(res, 400, 'NUL を含む内容は書きません');
+                    return;
+                }
+                // 🔒 **楽観ロック。** 形の検証を先にする（40桁 hex 以外は比較に入れない）
+                const baseOid = String(body.baseOid ?? '');
+                if (!/^[0-9a-f]{40}$/.test(baseOid)) {
+                    denyJson(res, 400,
+                        'baseOid（読んだときの oid）が必要です。'
+                        + ' POST /api/v0/file で読み直してから保存してください');
+                    return;
+                }
+                if (baseOid !== t.info.oid) {
+                    // 🔒 **記録に残す（中身は残さない）。** 並行して書いている相手が
+                    //    いたことは、後から事故を追うのに一番効く情報。
+                    await auditExec({
+                        event: 'write-conflict', worktree: t.wt.path, path: t.rel,
+                        expected: baseOid, actual: t.info.oid, ...originHint(req),
+                    });
+                    denyJson(res, 409,
+                        '他が書き換えました。読み直してください'
+                        + `（読んだとき ${baseOid.slice(0, 8)} / 今 ${t.info.oid.slice(0, 8)}）`);
+                    return;
+                }
+                const next = encodeForWorktree(text, t.info);
+                if (next.length > MAX_EDIT_BYTES) {
+                    denyJson(res, 413,
+                        `${MAX_EDIT_BYTES} バイトを超える内容は書きません（${next.length} バイト）`);
+                    return;
+                }
+                // 🚨 **書いてから縮める。** 先に truncate(0) すると、その間に落ちた場合に
+                //    **空のファイル**が残る（中身が消える）。この順なら最悪でも
+                //    「新しい中身 + 古い末尾」で、git から見て回復できる。
+                await t.fh.write(next, 0, next.length, 0);
+                await t.fh.truncate(next.length);
+                // 🔒 監査に残す。**中身は残さない**（記録が秘密の持ち出し口になる）。
+                //    残すのは「いつ・どの worktree の・どのパスを・何バイト」だけ。
+                await auditExec({
+                    event: 'write', worktree: t.wt.path, path: t.rel,
+                    bytes: next.length, eol: t.info.eol, bom: t.info.bom,
+                    ...originHint(req),
+                });
+                cached = null;   // 作業ツリーが変わったのでキャッシュを捨てる
+                res.writeHead(200, {
+                    'content-type': 'application/json; charset=utf-8',
+                    'cache-control': 'no-store',
+                });
+                res.end(JSON.stringify({
+                    ok: true,
+                    worktree: t.wt.path,
+                    path: t.rel,
+                    bytes: next.length,
+                    // 次の保存のための新しい oid（読み直さずに続けて編集できる）
+                    oid: blobOid(next),
+                    eol: t.info.eol,
+                    bom: t.info.bom,
+                }));
+            } finally {
+                // ⚠️ 開いたハンドルは必ず閉じる（Windows では開いたままだと
+                //    他のプロセスが書けなくなる）
+                await t.fh.close().catch(() => { /* 既に閉じている */ });
+            }
+            return;
+        }
+
         // ファイルの中身と差分。**追跡されている内容だけ**を返す（git オブジェクト経由）。
         // fs で読まないので、リポジトリ外や未追跡の秘密ファイルには触れない。
         // 引数の検証は git.mjs の isSafeRef / isSafeRepoPath が持つ。
@@ -2618,7 +2914,8 @@ async function handleRequest(req, res) {
         // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
         if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs'
             || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'
-            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs') {
+            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'
+            || url.pathname === '/linediff.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',
@@ -2945,9 +3242,12 @@ server.listen(opts.port, '127.0.0.1', () => {
         console.log(`   上限 ${opts.execTimeoutMs / 1000}s / 同時 ${MAX_CONCURRENT_EXEC} 本`);
     } else if (opts.allowWrite) {
         console.log('');
-        console.log('⚠️ 書き込み有効 (--allow-write)。checkout が可能です。');
+        console.log('⚠️ 書き込み有効 (--allow-write)。checkout と'
+            + '追跡ファイルの編集・保存が可能です。');
         console.log('   トンネルを開けている場合、そのトンネルに届く相手は');
-        console.log('   ブランチを切り替えられます。読み取りだけで良いなら外してください。');
+        console.log('   ブランチを切り替え、追跡されているファイルを書き換えられます。');
+        console.log('   読み取りだけで良いなら外してください。');
+        console.log(`   監査ログ: ${opts.auditLog ?? '<GIT_DIR>/kjp-exec-audit.jsonl（書いた相手が消せます）'}`);
     } else {
         console.log('読み取り専用（書き込みは --allow-write で有効化）');
     }

@@ -482,6 +482,118 @@ const READKEY_CHECK = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **編集器（最小エディタ）を実ブラウザで測る。**
+ *
+ * 測るのは3つ。どれも**字面では測れない**:
+ *
+ * 1. **自動更新で編集中の textarea を作り直さない。** 差分ペインの中身は毎回
+ *    `replaceChildren` で作り直しているので、`obj.editing` の守りを外すと
+ *    **打っている途中の内容が消える**（監視盤の行と同じ型の事故）。
+ *    要素の同一性・値・**同じ textarea が増えていないこと**を一緒に見る
+ *    （作り直す変異は古い要素を DOM に残すので、同一性だけでは見抜けない）。
+ * 2. **保存する前に差分が見える。** 「何が変わるか分からないまま書かない」が
+ *    この機能の前提条件。
+ * 3. **保存が実際に作業ツリーへ届く**（呼び出し側がファイルを読んで確かめる）。
+ *
+ * ⚠️ `ta.value = …` の後に `input` イベントを撃つ（値の代入だけでは
+ *    リスナが走らない。監視盤の検査でこれを踏んだ）。
+ */
+const EDITOR_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  let btn = null;
+  for (let i = 0; i < 300 && !btn; i++) {
+    btn = [...document.querySelectorAll('.tabs button')].find(b => b.textContent === '編集');
+    if (!btn) await wait(100);
+  }
+  if (!btn) {
+    return { error: '編集ボタンが描かれていない（--allow-write / トークン / 差分のあるファイルを確認）' };
+  }
+  btn.click();
+  const tasOf = () => [...document.querySelectorAll('textarea.edit')];
+  let ta = null;
+  for (let i = 0; i < 300; i++) {
+    ta = tasOf()[0] ?? null;
+    if (ta && ta.value && !ta.disabled) break;
+    await wait(100);
+  }
+  if (!ta || !ta.value) {
+    return { error: '編集器に中身が出ない: ' + (document.querySelector('.editmsg')?.textContent ?? '(告知なし)') };
+  }
+  const loaded = ta.value;
+  const MARK = 'EDITED-BY-RENDER-CHECK-42';
+  ta.value = loaded + MARK + String.fromCharCode(10);
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  // 自動更新（再読込）が来ても、打っている途中の内容が消えてはいけない
+  document.getElementById('refresh').click();
+  await wait(3000);
+  const after = tasOf();
+  // 保存前に差分を見せる
+  const dbtn = [...document.querySelectorAll('button')].find(b => b.textContent === '差分を見る');
+  if (dbtn) dbtn.click();
+  await wait(400);
+  const diffText = document.querySelector('.editdiff')?.textContent ?? '';
+  // 保存
+  const sbtn = [...document.querySelectorAll('button')].find(b => b.textContent === '保存');
+  if (!sbtn) return { error: '保存ボタンが無い' };
+  sbtn.click();
+  let saved = '';
+  for (let i = 0; i < 300; i++) {
+    saved = document.querySelector('.editmsg')?.textContent ?? '';
+    if (/保存しました|✖/.test(saved)) break;
+    await wait(100);
+  }
+  return {
+    loaded,
+    mark: MARK,
+    want: loaded + MARK + String.fromCharCode(10),
+    kept: after[0] ? after[0].value : null,
+    reused: Boolean(after[0]) && after[0] === ta,
+    count: after.length,
+    diffText: diffText.slice(0, 400),
+    saved,
+  };
+})()`;
+
+/**
+ * 🚨 **読み取り用の鍵しか無いタブで「編集」を出さないこと。**
+ *
+ * 案内の URL に載るのは読み取り専用の派生秘密なので、`session.token` の有無で
+ * 判定すると**読み取り用の鍵でも真**になり、押しても必ず 403 の「編集」を出す
+ * （このリポジトリが BLOCKING として扱ってきた「有効に見えて動かない」形）。
+ * 判定は `session.canMutate`（= 生の鍵を提示したか）でなければならない。
+ *
+ * ⚠️ **字面では測れない。** `canMutate` を `token` に戻しても行は残る。
+ * ⚠️ `READKEY_CHECK` と同じ「鍵を捨てて読み込み直した」状態で測る（前段が要る）。
+ */
+const EDITOR_READKEY_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const drawn = e => e.getClientRects().length > 0;
+  const panesOf = () => [...document.querySelectorAll('[data-pane-id]')]
+    .filter(p => p.dataset.paneId.startsWith('diff-'));
+  let note = '', tabs = 0;
+  for (let i = 0; i < 100; i++) {
+    const ps = panesOf();
+    tabs = ps.reduce((n, p) => n + [...p.querySelectorAll('.tabs button')].filter(drawn).length, 0);
+    note = ps.flatMap(p => [...p.querySelectorAll('.note')]).filter(drawn)
+      .map(e => e.textContent ?? '').join(' | ');
+    if (tabs > 0 && note) break;
+    await wait(200);
+  }
+  return {
+    // 🚨 前提の確認: このタブが**鍵を持っている**こと（持っていないなら
+    //    「token の有無で判定する」退行を再現できない = 何も測れていない）
+    heldToken: (() => { try { return sessionStorage.getItem('kjp_token'); } catch { return null; } })(),
+    // 🚨 測る対象が描かれていること自体を確かめる（差分ペインとタブが無いなら空振り）
+    panes: panesOf().length,
+    tabs,
+    hasEditButton: panesOf().some(p => [...p.querySelectorAll('.tabs button')]
+      .filter(drawn).some(b => b.textContent === '編集')),
+    said: /鍵/.test(note),
+    sample: note.replace(/\\s+/g, ' ').slice(0, 200),
+  };
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -504,6 +616,17 @@ try {
         join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`)], repo);
     await writeFile(join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`, 'f.txt'),
         'changed but not committed\n', 'utf8');
+
+    // 🚨 **編集器を測るには「コミット済み差分のあるファイル」が1本必要。**
+    //    編集の入口は差分ペインのタブなので、差分が無いと**ボタンが描かれず、
+    //    何も測らないまま緑になる**（layout-check がコマンドバーを
+    //    「測っている」と嘘をついていたのと同じ形）。
+    const edWt = join(repo, '..', `${repo.split(/[\\/]/).pop()}-ed`);
+    await g(['worktree', 'add', '-q', '-b', 'editable', edWt], repo);
+    const edFile = join(edWt, 'edit-me.txt');
+    await writeFile(edFile, 'one\ntwo\nthree\n', 'utf8');
+    await g(['add', '-A'], edWt);
+    await g(['commit', '-q', '-m', 'edit target'], edWt);
 
     // 実行を有効にしないとコンソールペインが描かれない = 計測対象が出ない
     server = spawn(process.execPath,
@@ -721,6 +844,11 @@ try {
             headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
         }).catch(() => {});
     }
+    // 🚨 編集器は**描画の計測より前**（12,000行流した後だと自動更新が重くなり、
+    //    「作り直されたか」を待つ時間の意味が変わる）
+    const editor = await evaluate(EDITOR_CHECK);
+    // 保存が**実際に作業ツリーへ届いた**ことは、ブラウザではなくここで確かめる
+    const onDisk = await readFile(edFile, 'utf8').catch(e => `(読めない: ${e.message})`);
 
     // 🚨 ドラッグの検査は**描画の計測より前**（12,000行流した後だと端末の
     //    文字量が動き続けて「移動の後に増えたか」を測れない）。
@@ -753,6 +881,47 @@ try {
       return false;
     })()`);
     const readkey = await evaluate(READKEY_CHECK);
+
+    /**
+     * 🚨 **「読み取り用の鍵を持っている」状態を作ってから、編集の入口を測る。**
+     *
+     * 上の READKEY の前段は鍵を**捨てる**ので `session.token === null` になり、
+     * 「`canMutate` の代わりに `token` の有無で判定する」退行を**再現できない**
+     * （最初そう書いて、変異 `editor-key-gate` が SURVIVED した。
+     *  「何も測っていないのに緑」の実例をここで1つ作っていた）。
+     * 案内の URL に載る**読み取り専用の派生秘密**を sessionStorage に入れて
+     * 読み込み直す = スマホが案内の URL を1回開いた状態。この状態では
+     * `session.token` は**非 null** で `presented === 'read'` になる。
+     */
+    const readSecret = /\?token=([A-Za-z0-9._~-]+)/.exec(banner)?.[1] ?? null;
+    let editorReadKey = { error: '案内の URL から読み取り用の鍵を取れなかった' };
+    if (readSecret === TOKEN) {
+        // ⚠️ 一致していたらこの検査は何も測れない（その事実は smoke 側が落とす）
+        editorReadKey = { error: '案内の URL に生の鍵が載っているので、読み取り鍵の状態を作れない' };
+    } else if (readSecret !== null) {
+        await evaluate(`(() => {
+          try { sessionStorage.setItem('kjp_token', ${JSON.stringify(readSecret)}); }
+          catch (e) { /* 使えない環境 */ }
+          location.reload();
+          return true;
+        })()`).catch(() => { /* reload で実行コンテキストが消えるのは正常 */ });
+        await sleep(1500);
+        await evaluate(`(async () => {
+          for (let i = 0; i < 300; i++) {
+            if (document.readyState === 'complete') return true;
+            await new Promise(r => setTimeout(r, 100));
+          }
+          return false;
+        })()`);
+        editorReadKey = await evaluate(EDITOR_READKEY_CHECK);
+        // 🚨 前提が成立したことを確かめる（鍵が入っていないなら測れていない）
+        if (editorReadKey && !editorReadKey.error && editorReadKey.heldToken !== readSecret) {
+            editorReadKey = {
+                error: '読み取り用の鍵をタブに入れられなかった'
+                    + `（held=${JSON.stringify(editorReadKey.heldToken)}）`,
+            };
+        }
+    }
     if (probe.error) throw new Error(probe.error);
 
     const problems = [];
@@ -899,6 +1068,53 @@ try {
                 + `（コンソールが ${dragLive.resetHost} に残っている = 直し方が無い）`);
         }
     }
+    // 🚨 編集器: 「打っている途中が消えない」「保存前に差分が見える」
+    //    「保存が作業ツリーに届く」を実挙動で確かめる
+    if (!editor || editor.error) {
+        problems.push(`編集器を測れなかった: ${editor?.error ?? '結果が取れない'}`);
+    } else {
+        if (!editor.reused) {
+            problems.push('自動更新で編集中の textarea を作り直している'
+                + `（打っている途中の内容が消える）: textarea ${editor.count} 個`);
+        }
+        if (editor.count !== 1) {
+            problems.push('自動更新で編集器の textarea が増えている'
+                + `（作り直した要素が溜まる）: ${editor.count} 個`);
+        }
+        if (editor.kept !== editor.want) {
+            problems.push('自動更新で編集中の内容が変わった'
+                + `: ${JSON.stringify(editor.kept)} ≠ ${JSON.stringify(editor.want)}`);
+        }
+        if (!editor.diffText.includes(editor.mark) || !editor.diffText.includes('+')) {
+            problems.push('保存する前に差分が見えていない'
+                + `（何が変わるか分からないまま書くことになる）: ${JSON.stringify(editor.diffText)}`);
+        }
+        if (!/保存しました/.test(editor.saved)) {
+            problems.push(`保存できなかった: ${JSON.stringify(editor.saved)}`);
+        }
+        if (!onDisk.includes(editor.mark)) {
+            problems.push('「保存しました」と出たのに作業ツリーに届いていない'
+                + `: ${JSON.stringify(onDisk.slice(0, 120))}`);
+        }
+    }
+    // 🚨 読み取り用の鍵だけのタブ（= 案内の URL を開いたスマホ）で
+    //    「押しても必ず 403 の編集」を出していないこと
+    if (!editorReadKey || editorReadKey.error) {
+        problems.push(`読み取り鍵での編集の入口を測れなかった: ${editorReadKey?.error ?? '結果が取れない'}`);
+    } else if (editorReadKey.tabs === 0) {
+        // 測る対象が描かれていないなら「出ていない」ではなく「測れていない」
+        problems.push('差分ペインのタブが1つも描かれていないので、'
+            + `編集の入口を測れていない（ペイン ${editorReadKey.panes} 個）`);
+    } else {
+        if (editorReadKey.hasEditButton) {
+            problems.push('読み取り用の鍵しか無いのに「編集」ボタンが出ている'
+                + '（押すと必ず 403 = 有効に見えて動かない）');
+        }
+        if (!editorReadKey.said) {
+            problems.push('読み取り用の鍵では編集できない理由を言っていない'
+                + `（黙って消すと「機能が無い」と読まれる）: ${JSON.stringify(editorReadKey.sample)}`);
+        }
+    }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {
         problems.push(`最長ブロック ${probe.maxBlockMs}ms > 予算 ${BUDGET_MAX_BLOCK_MS}ms`
             + '（UI が固まって停止ボタンも自動更新も効かない）');
@@ -964,6 +1180,14 @@ try {
     console.log(`   ドラッグ: ${dragLive?.fromHost} → ${dragLive?.movedTo}`
         + ` / 移動後の出力 ${dragLive?.lenMoved} → ${dragLive?.lenAfter} 文字`
         + ` / 戻し先 ${dragLive?.resetHost}`);
+    // 🚨 **測った対象を必ず出す。** 「編集器を測っている」が嘘になっていないかは
+    //    件数と結果の文言で分かる形にする（layout-check の教訓）。
+    console.log(`   編集器: textarea ${editor?.count ?? '(測れず)'} 個 / `
+        + `使い回し ${editor?.reused ?? '(測れず)'} / 保存 ${
+            JSON.stringify((editor?.saved ?? '(測れず)').slice(0, 40))}`);
+    console.log(`   読み取り鍵のみ: タブ ${editorReadKey?.tabs ?? '(測れず)'} 個 / `
+        + `編集ボタン ${editorReadKey?.hasEditButton ?? '(測れず)'} / `
+        + `理由を言った ${editorReadKey?.said ?? '(測れず)'}`);
     for (const p of problems) console.log(`   ${p}`);
     process.exitCode = problems.length ? 1 : 0;
 } catch (e) {
@@ -989,6 +1213,7 @@ try {
     };
     // ⚠️ worktree は repo の**外**（兄弟）に作ったので個別に消す
     await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`));
+    await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-ed`));
     await rmRetry(repo);
     await rmRetry(profile);
 }

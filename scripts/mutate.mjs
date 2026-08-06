@@ -1333,10 +1333,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'UI が import する共有モジュールを配信しない（import が1本 404 になると'
             + 'モジュール全体が実行されず**ページが真っ白**になる）',
         file: 'v0/server.mjs',
-        // ⚠️ 並列で足した3つのモジュール（panelayout / pathlabel / mergeresult）が
-        //    同じ条件に来たので、行をまたぐ形になった。**改行込みで一意に指定する**
+        // ⚠️ 並列で足した4つのモジュール（panelayout / pathlabel / mergeresult /
+        //    linediff）が同じ条件に来たので、行をまたぐ形になった。
+        //    **改行込みで一意に指定する**
         from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'\n"
-            + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs') {",
+            + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'\n"
+            + "            || url.pathname === '/linediff.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
@@ -2554,6 +2556,160 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         gone: '            t = realpathSync.native(t);',
         pattern: 'シンボリックリンク越し',
         testFile: 'v0/paths.test.mjs',
+    },
+
+    // -----------------------------------------------------------------------
+    // 🔒 最小エディタ（/api/v0/file と /api/v0/write）。
+    //    **v0 で初めて「作業ツリーにファイルの中身を書く」経路**なので、
+    //    門を1つずつ外して、対応するスモークテストが実際に落ちることを確かめる。
+    // -----------------------------------------------------------------------
+    {
+        name: 'write-auth-gate',
+        why: '編集経路の認可を外す（トークン無し・GET・別サイト起点で作業ツリーに書ける）',
+        file: 'v0/server.mjs',
+        // ⚠️ merge / checkout にも同じ呼び出しがあるので、末尾のコメントで一意にする
+        from: '            if (!requireMutation(req, res)) return;   // ← 門1: 認可\n',
+        to: '',
+        gone: '// ← 門1: 認可',
+        pattern: 'write: 関門',
+    },
+    {
+        name: 'write-gate-order',
+        why: '認可をパス・追跡チェックの**後ろ**に回す'
+            + '（未認可の相手がエラーの違いから「そのパスが追跡されているか」を引き出せる）',
+        // 🚨 順序そのものが守り。`--allow-exec` の門が自動生成より後ろにあって
+        //    消えていたのと同じ型なので、**順序を変異で測る**。
+        file: 'v0/server.mjs',
+        from: '            if (!requireMutation(req, res)) return;   // ← 門1: 認可\n',
+        to: '',
+        also: [{
+            from: '            if (!t) return;                          // ← 応答は関門が書いている',
+            to: '            if (!t) return;\n            if (!requireMutation(req, res)) return;',
+        }],
+        gone: '// ← 門1: 認可',
+        pattern: 'write: 門の順序',
+    },
+    {
+        name: 'write-path-validation',
+        why: 'パスの形の検証を外す（`..` / 絶対パス / 先頭 `-` / NUL / pathspec magic が通る）',
+        file: 'v0/server.mjs',
+        from: '    if (!isSafeRepoPath(rel)) {',
+        to: '    if (false) {',
+        gone: 'if (!isSafeRepoPath(rel)) {',
+        pattern: 'write: ../ と絶対パス',
+    },
+    {
+        name: 'write-tracked-check',
+        why: 'git の追跡下かを見ない（未追跡の .env を読み書きできる）',
+        file: 'v0/server.mjs',
+        from: '    if (ls.code !== 0 || !splitZ(ls.stdout).map(p => toNFC(p)).includes(rel)) {',
+        to: '    if (false) {',
+        gone: 'ls.code !== 0 ||',
+        pattern: 'write: 未追跡ファイル',
+    },
+    {
+        name: 'write-optimistic-lock',
+        why: '楽観ロックを外す（別のエージェントが書いた内容を黙って上書きする）',
+        file: 'v0/server.mjs',
+        from: '                if (baseOid !== t.info.oid) {',
+        to: '                if (false) {',
+        gone: 'if (baseOid !== t.info.oid) {',
+        pattern: 'write: 並行書き換え',
+    },
+    {
+        name: 'write-eol-preserve',
+        why: '改行コードと BOM を保たない（保存するたびに全行が変更になり、'
+            + '並行して動いている別のエージェントと必ず衝突する）',
+        file: 'v0/writefile.mjs',
+        from: `    const out = eol === 'crlf'
+        ? lf.replace(/\\n/g, '\\r\\n')
+        : eol === 'cr' ? lf.replace(/\\n/g, '\\r') : lf;`,
+        to: '    const out = lf;',
+        gone: "eol === 'crlf'",
+        pattern: 'write: CRLF と BOM',
+    },
+    {
+        name: 'write-audit-no-content',
+        why: '監査ログに書いた中身を残す（記録が read 権限からの秘密の持ち出し口になる）',
+        file: 'v0/server.mjs',
+        from: `                    event: 'write', worktree: t.wt.path, path: t.rel,
+                    bytes: next.length, eol: t.info.eol, bom: t.info.bom,`,
+        to: `                    event: 'write', worktree: t.wt.path, path: t.rel, text,
+                    bytes: next.length, eol: t.info.eol, bom: t.info.bom,`,
+        gone: "event: 'write', worktree: t.wt.path, path: t.rel,\n",
+        pattern: 'write: 監査に残すが',
+    },
+    {
+        name: 'write-symlink-containment',
+        why: 'symlink と realpath 包含の検査を外す'
+            + '（追跡された symlink 経由でリポジトリ外のファイルを読み書きできる）',
+        file: 'v0/server.mjs',
+        from: `    if (!containsPath(wt.path, abs)) {
+        denyJson(res, 400, \`実体が worktree の外を指しています: \${rel}\`);
+        return null;
+    }`,
+        to: '    /* 変異: 実体が worktree の中かを見ない */',
+        // ⚠️ 同じ守りが3段（realpath 包含 / lstat / O_NOFOLLOW）あるので束ねて外す。
+        //    1段だけ外すと `open` が ELOOP で落ちて別の理由の 409 になり、
+        //    **「リポジトリ外が読めた」という本当の危険を測れない**。
+        also: [
+            { from: '    if (lst.isSymbolicLink()) {', to: '    if (false) {' },
+            {
+                from: '    const flags = (forWrite ? FS.O_RDWR : FS.O_RDONLY) | (FS.O_NOFOLLOW ?? 0);',
+                to: '    const flags = forWrite ? FS.O_RDWR : FS.O_RDONLY;',
+            },
+        ],
+        // ⚠️ Windows では symlink を作れない（EPERM）ので測れない。
+        //    テスト側も t.skip() で「測れていない」と出す。ubuntu / macOS CI が測る。
+        platforms: ['linux', 'darwin'],
+        gone: 'if (!containsPath(wt.path, abs)) {',
+        pattern: 'write: シンボリックリンク',
+    },
+    {
+        name: 'write-tracked-check-converts-content',
+        why: '追跡確認に「内容を変換する」git 呼び出しを足す'
+            + '（`.gitattributes` の clean filter = リポジトリ設定の任意コマンドが起動する）',
+        // 🚨 これは**足す**変異。守りは「変換を伴うコマンドを使わないこと」なので、
+        //    外すべき行が無い。代わりに、その約束を書いたコメントを消して
+        //    `git diff`（clean filter を通す）を1回足す。
+        file: 'v0/server.mjs',
+        from: `    // 🔒 **内容を変換しない git コマンドだけを使う。** \`status\` / \`diff\` / \`add\` は
+    //    作業ツリーと index の中身を比べるので **\`.gitattributes\` の clean filter
+    //    （= リポジトリ設定の任意コマンド）を起動する**（8回目のレビューの BLOCKING）。
+    //    \`ls-files\` は index を読むだけで content conversion を伴わない。
+    //    ここに1つ変換を伴う呼び出しを足すと、この経路が capability を1段上げる。
+    let ls;
+    try {`,
+        to: `    let ls;
+    try {
+        await git(['diff', '--quiet', '--', rel], { cwd: wt.path, allowExit: [0, 1] });`,
+        gone: '内容を変換しない git コマンドだけを使う',
+        pattern: 'write: 編集の経路',
+    },
+    {
+        name: 'editor-key-gate',
+        why: '編集の入口を `canMutate`（生の鍵）ではなく `token` の有無で出す'
+            + '（案内の URL に載る読み取り用の鍵でも真になるので、'
+            + '押すと必ず 403 の「編集」をスマホに出す）',
+        // 🚨 実ブラウザで測る。`--require-auth` + 鍵を捨てて読み込み直した状態で、
+        //    編集ボタンが出ていないことを見ている（字面では測れない）。
+        file: 'v0/app.html',
+        from: '      if (session.canMutate) {\n        const eb = el(\'button\', null, \'編集\');',
+        to: '      if (session.token) {\n        const eb = el(\'button\', null, \'編集\');',
+        gone: "if (session.canMutate) {\n        const eb",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'editor-pane-rebuild',
+        why: '自動更新で編集中のペインを作り直す（打っている途中の内容が消える）',
+        // 🚨 **実ブラウザで測る（`script`）。** 字面の検査では
+        //    「行を残したまま到達不能にする変更」が見えないので、
+        //    textarea の同一性・値・件数を実際に測っている検査を走らせる。
+        file: 'v0/app.html',
+        from: '    if (obj.editing) continue;',
+        to: '    /* 変異: 編集中でも作り直す */',
+        gone: 'if (obj.editing) continue;',
+        script: 'v0/render-check.mjs',
     },
 ];
 
