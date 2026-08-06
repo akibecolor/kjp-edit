@@ -3245,9 +3245,18 @@ test('🚨 --allow-write だけでも、ブラウザがトークンを入手で�
         assert.ok(m, '書き込みを有効にしたのにトークン付き URL が案内されない'
             + `（UI から checkout が絶対にできない）:\n${s.banner()}`);
         const token = m[1];
-        // 案内された URL でトークンが取れる（= ページが sessionStorage に持てる）
-        const sess = JSON.parse((await authGet(s.port, `/api/v0/session?token=${token}`)).body);
-        assert.equal(sess.token, token, '案内された URL でトークンが取れない');
+        // 🔒 **URL の鍵では取れない**（URL は履歴・ブックマークに残るので、
+        //    そこに載る値から書き込みの鍵を取れてはいけない。8回目のレビュー）
+        const viaUrl = JSON.parse((await authGet(s.port, `/api/v0/session?token=${token}`)).body);
+        assert.equal(viaUrl.token, null, 'URL の鍵で書き込みの鍵が取れてしまう');
+        assert.equal(viaUrl.allowWrite, true, 'capability の表示は URL の鍵でも出す');
+        // 貼り付け用の生の鍵が案内に出ていて、それでは取れる
+        // （= 画面の「鍵を貼る」でページが sessionStorage に持てる）
+        const raw = /^\s{5}([A-Za-z0-9._~-]{20,})\s*$/m.exec(s.banner())?.[1];
+        assert.ok(raw && raw !== token,
+            `貼り付け用の鍵が案内に出ていない（UI から checkout が絶対にできない）:\n${s.banner()}`);
+        const sess = JSON.parse((await authGet(s.port, `/api/v0/session?token=${raw}`)).body);
+        assert.equal(sess.token, raw, '貼り付け用の鍵でも取れない');
         assert.equal(sess.allowWrite, true);
         // 提示しなければ返らない（Cookie 経由の取り戻しは塞いだまま）
         const anon = JSON.parse((await authGet(s.port, '/api/v0/session')).body);
@@ -3274,20 +3283,26 @@ test('既定（ループバックのみ）では読み取りに認証を要求�
 });
 
 test('🔒 --require-auth: トークンが無い / 違うと 401、Cookie とヘッダで通る', async () => {
-    const s = await startAuthServer(['--require-auth']);
+    // ⚠️ 生の鍵を明示する（案内の URL に載るのは**読み取り専用の派生秘密**に
+    //    なったので、URL からは生の鍵が取れない。8回目のレビュー）
+    const RAW = 'smoke-auth-raw-token-0123456789ab';
+    const s = await startAuthServer(['--require-auth', '--token', RAW]);
     try {
         const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
-        assert.ok(token && token.length >= 24, `起動時にトークン付き URL が出ていない: ${s.banner()}`);
+        assert.ok(token && token.length >= 24, `起動時に鍵付き URL が出ていない: ${s.banner()}`);
+        assert.notEqual(token, RAW, '案内の URL に生の鍵が載っている');
 
         assert.equal((await authGet(s.port, '/api/v0/state')).code, 401, 'トークン無しが通った');
         assert.equal((await authGet(s.port, '/api/v0/state',
             { 'x-kjp-token': 'wrong-value-0123456789abc' })).code, 401, '誤ったトークンが通った');
+        // 読み取り用の鍵でも、生の鍵でも読める（どちらも読み取りの資格）
         assert.equal((await authGet(s.port, '/api/v0/state', { 'x-kjp-token': token })).code, 200);
+        assert.equal((await authGet(s.port, '/api/v0/state', { 'x-kjp-token': RAW })).code, 200);
 
-        // 🚨 **Cookie には生のトークンを入れない**（ポート分離が無いので
+        // 🚨 **Cookie には生の鍵を入れない**（ポート分離が無いので
         //    他のローカルサービスに渡る）。ブートストラップが焼いた値だけが通る
-        const raw = await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${token}` });
-        assert.equal(raw.code, 401, 'Cookie に生のトークンを入れて通ってしまった');
+        const raw = await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${RAW}` });
+        assert.equal(raw.code, 401, 'Cookie に生の鍵を入れて通ってしまった');
         const baked = /kjp_auth=([^;]+)/.exec((await authGet(s.port, `/?token=${token}`)).setCookie)?.[1];
         assert.ok(baked, 'Cookie が焼かれていない');
         assert.equal((await authGet(s.port, '/api/v0/state', { cookie: `kjp_auth=${baked}` })).code, 200,
@@ -3366,13 +3381,19 @@ test('🚨 Cookie の値は実行トークンと別で、実行には使えな�
         });
         assert.equal(asHeader.status, 403,
             `Cookie の値で実行できてしまった（分離できていない）: ${asHeader.status}`);
-        // Cookie を持っていない相手は入口で 401（こちらも通してはいけない）
+        // ⚠️ **Cookie の値をヘッダに詰めた要求は入口を通る（403 で止まる）。**
+        //    8回目のレビューで、案内の URL に載せる鍵を**読み取り専用の派生秘密**に
+        //    変えた。その値は Cookie と同じなので、ヘッダで来ても**読み取りとしては
+        //    正式に受理する**（スマホがこの値をヘッダで送って読む）。
+        //    露出は増えていない: Cookie を受け取った相手は元々読み取りができる。
+        //    **重要なのは実行が 403 で止まること**（上の asHeader と同じ）。
         const noCookie = await fetch('http://127.0.0.1:' + s.port + '/api/v0/exec', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-kjp-token': decodeURIComponent(cookieVal) },
             body: JSON.stringify({ worktree: repo, argv: ['git', 'status'] }),
         });
-        assert.equal(noCookie.status, 401);
+        assert.equal(noCookie.status, 403,
+            `読み取り用の鍵で実行できてしまった: ${noCookie.status}`);
 
         // 🚨 **これが4回目のレビューの BLOCKING 本体。**
         //    以前は /api/v0/session が Cookie 認証の要求に実行トークンを返していた。
@@ -3407,7 +3428,9 @@ test('Cookie の値は再起動をまたいで同じ（--token-file なら開き
 });
 
 test('🔒 ?token= は読み取り用の Cookie を焼き、ページ本体を返す', async () => {
-    const s = await startAuthServer(['--require-auth']);
+    // ⚠️ `--allow-write` を付ける（貼り付け用の生の鍵が案内に出るのはそのときだけ。
+    //    Cookie と比べる対象がそれなので、付けないと比較が空振りする）
+    const s = await startAuthServer(['--require-auth', '--allow-write']);
     try {
         const token = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
         const boot = await authGet(s.port, `/?token=${token}`);
@@ -3421,9 +3444,15 @@ test('🔒 ?token= は読み取り用の Cookie を焼き、ページ本体を�
         assert.match(boot.setCookie, /SameSite=Strict/, 'Cookie が SameSite=Strict でない');
         // ⚠️ Secure を付けると http のループバックで保存されず、ローカルで動かなくなる
         assert.ok(!/Secure/.test(boot.setCookie), 'Secure が付いている');
-        // 焼かれるのは読み取り用の別の秘密（実行トークンではない）
+        // 焼かれるのは読み取り用の別の秘密（書き込み・実行の鍵ではない）
         const cookieVal = decodeURIComponent(/kjp_auth=([^;]+)/.exec(boot.setCookie)?.[1] ?? '');
-        assert.notEqual(cookieVal, token, 'Cookie に実行トークンが入っている');
+        const raw = /^\s{5}([A-Za-z0-9._~-]{20,})\s*$/m.exec(s.banner())?.[1];
+        assert.ok(raw, `貼り付け用の鍵が案内に出ていない: ${JSON.stringify(s.banner())}`);
+        assert.notEqual(cookieVal, raw, 'Cookie に書き込み・実行の鍵が入っている');
+        // ⚠️ 案内の URL の鍵は**Cookie と同じ読み取り用の値**（8回目のレビューの設計）。
+        //    ここが違う値になったら、URL に別の秘密が載っている＝設計が戻っている
+        assert.equal(cookieVal, token,
+            '案内の URL の鍵が Cookie と別（URL に別の秘密を載せている）');
         // 🚨 **ここで JS の字面を assert しない。** 以前は
         //    `/sessionStorage\.setItem\(TOKEN_KEY, t\)/` などの**文字列一致**で見ていたが、
         //    ページの JS を1度も走らせていないので、行を残したまま到達不能にする変更
@@ -3444,9 +3473,27 @@ test('🚨 --require-auth では /api/v0/session が無認証でトークンを�
         assert.equal(anon.code, 401, '無認証でトークンを払い出している');
         assert.ok(!anon.body.includes(token), '401 の本文にトークンが入っている');
 
+        // 🔒 **案内の URL の鍵（読み取り専用の派生秘密）では払い出さない。**
+        //    以前はここで「払い出された値 === 案内の URL の値」を固定していた =
+        //    **指摘された挙動そのものをテストが承認していた**（8回目のレビュー）。
+        //    URL は履歴・ブックマークに残るので、そこに載る値で
+        //    書き込みの鍵が取れてはいけない。
         const ok = await authGet(s.port, '/api/v0/session', { 'x-kjp-token': token });
-        assert.equal(ok.code, 200);
-        assert.equal(JSON.parse(ok.body).token, token, '認証済みにトークンを返していない');
+        assert.equal(ok.code, 200, '読み取り用の鍵で /api/v0/session が読めない');
+        const body = JSON.parse(ok.body);
+        assert.equal(body.presented, 'read', `presented が read でない: ${body.presented}`);
+        assert.equal(body.token, null,
+            '案内の URL の鍵で書き込みの鍵を払い出している（URL から昇格できる）');
+
+        // 生トークンなら払い出す（守りが広すぎないことも見る）
+        const raw = /^\s{5}([A-Za-z0-9._~-]{20,})\s*$/m.exec(s.banner())?.[1];
+        assert.ok(raw && raw !== token,
+            `案内に貼り付け用の鍵が出ていない: ${JSON.stringify(s.banner())}`);
+        const full = await authGet(s.port, '/api/v0/session', { 'x-kjp-token': raw });
+        assert.equal(full.code, 200);
+        const fb = JSON.parse(full.body);
+        assert.equal(fb.presented, 'token');
+        assert.equal(fb.token, raw, '生トークンを提示したのに払い出していない');
     } finally { s.child.kill(); }
 });
 
@@ -4273,5 +4320,76 @@ test('🚨 status がリポジトリ設定の filter を実行しない（capabi
         await rm(join(repo, '.gitattributes'), { force: true });
         await g(['add', '-A'], repo).catch(() => {});
         await g(['commit', '-q', '-m', 'chore: filter のテスト後片付け'], repo).catch(() => {});
+    }
+});
+
+/**
+ * 🔒 **案内の URL に「実行できる鍵」を載せない（8回目のレビュー。SERIOUS）。**
+ *
+ * `--exec` のデーモンでは秘密が1本だったので、「スマホで1回開いてください」と
+ * 案内する URL に**任意コード実行の資格情報が平文で載っていた**。
+ * URL はアドレスバーに出て、入力履歴に入り、ブックマーク（クラウド同期）に残り、
+ * クエリを記録する中継にも残る。`history.replaceState` では消せない。
+ *
+ * 案内の URL に載るのは**読み取り専用の派生秘密**だけで、
+ * それでは exec / checkout / 鍵の払い出しが通らないことを固定する。
+ */
+test('🔒 案内の URL の鍵では実行できない（読み取りだけ通る）', async () => {
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec',
+            '--token', EXEC_TOKEN, '--allow-host', 'box.example.net'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    let banner = '';
+    try {
+        const url = await new Promise((res, rej) => {
+            const t = setTimeout(() => rej(new Error(`起動しなかった: ${banner}`)), 15000);
+            child.stdout.on('data', d => {
+                banner += d;
+                const m = banner.match(/http:\/\/127\.0\.0\.1:\d+/);
+                if (m) { clearTimeout(t); setTimeout(() => res(m[0]), 300); }
+            });
+            child.on('error', rej);
+        });
+        // 案内された URL から鍵を取り出す
+        const m = /\?token=([A-Za-z0-9._~-]+)/.exec(banner);
+        assert.ok(m, `案内の URL に ?token= が無い: ${banner}`);
+        const urlKey = m[1];
+        // 🚨 **これが生トークンと一致してはいけない**（一致していたのが指摘の本体）
+        assert.notEqual(urlKey, EXEC_TOKEN,
+            '案内の URL に実行トークンがそのまま載っている（履歴とブックマークに残る）');
+
+        const H = k => ({
+            'content-type': 'application/json', 'x-kjp-token': k,
+            'sec-fetch-site': 'same-origin',
+        });
+        // 読み取りは通る（そのための鍵なので）
+        const read = await fetch(`${url}/api/v0/state?fresh=1`, { headers: H(urlKey) });
+        assert.equal(read.status, 200, `URL の鍵で読めない: ${read.status}`);
+        await read.text();
+
+        // 🔒 実行は通らない
+        const ex = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST', headers: H(urlKey),
+            body: JSON.stringify({ worktree: repo, argv: ['git', '--version'] }),
+        });
+        assert.equal(ex.status, 403, `URL の鍵で実行できてしまった: ${ex.status}`);
+        await ex.text();
+
+        // 🔒 鍵の払い出しも通らない（ここが通ると1往復で昇格できる）
+        const ses = await fetch(`${url}/api/v0/session`, { headers: H(urlKey) });
+        const sj = await ses.json();
+        assert.equal(sj.token, null, 'URL の鍵で実行トークンを払い出している');
+        assert.equal(sj.presented, 'read', `presented が read でない: ${sj.presented}`);
+
+        // 生トークンなら実行できる（守りが広すぎないことも見る）
+        const ok = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST', headers: H(EXEC_TOKEN),
+            body: JSON.stringify({ worktree: repo, argv: ['git', '--version'] }),
+        });
+        assert.equal(ok.status, 200, `生トークンで実行できない: ${ok.status}`);
+        await ok.text();
+    } finally {
+        child.kill();
     }
 });

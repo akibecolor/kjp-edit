@@ -1403,6 +1403,28 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/paths.test.mjs',
     },
     {
+        // 🚨 8回目のレビュー: 案内の URL に実行トークンが載っていた
+        //    （スマホの履歴・ブックマークに RCE の資格情報を置かせていた）
+        name: 'bootstrap-url-read-only',
+        why: '案内の URL に生トークンを載せる'
+            + '（URL は履歴・ブックマーク・中継のログに残るので消せない）',
+        file: 'v0/server.mjs',
+        from: '        const readKey = cookieSecret();',
+        to: '        const readKey = opts.token;   /* 変異: 生トークンを載せる */',
+        gone: 'const readKey = cookieSecret();',
+        pattern: '案内の URL の鍵では実行できない',
+    },
+    {
+        name: 'read-secret-cannot-exec',
+        why: '読み取り用の派生秘密でも exec の関門を通す（分界が消える）',
+        file: 'v0/server.mjs',
+        from: 'function presentedToken(req, url) {\n    return tokenMatches(req.headers[TOKEN_HEADER])',
+        to: 'function presentedToken(req, url) {\n    if (presentedReadSecret(req, url)) return true;   /* 変異: 読み取り鍵も通す */\n'
+            + '    return tokenMatches(req.headers[TOKEN_HEADER])',
+        gone: 'function presentedToken(req, url) {\n    return tokenMatches',
+        pattern: '案内の URL の鍵では実行できない',
+    },
+    {
         name: 'exec-argv-cookie-gate',
         why: 'Cookie だけの相手に exec の argv を出す'
             + '（コマンド行に秘密が載りうるので「read は読み取りまで」が崩れる）',

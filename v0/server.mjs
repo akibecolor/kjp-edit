@@ -957,6 +957,26 @@ function presentedToken(req, url) {
         || tokenMatches(url.searchParams.get('token'));
 }
 
+/**
+ * 🔒 **読み取り専用の派生秘密が提示されたか。**
+ *
+ * 案内の URL（`?token=…`）に載せるのはこの値だけにする。**生トークンは載せない。**
+ * 理由（8回目のレビュー。SERIOUS）: `--exec` のデーモンでは秘密が1本だったので、
+ * 「スマホで1回開いてください」と案内する URL に**任意コード実行の資格情報が
+ * 平文で載っていた**。URL はアドレスバーに出て、オムニボックスの履歴に入り、
+ * ブックマーク（= クラウド同期）に残り、クエリを記録する中継にも残る。
+ * ページ側の `history.replaceState` はカレントの履歴エントリを差し替えるだけで、
+ * それらは消せない。
+ * 6回目に token-read / token-write / token-exec を分けたが、分界は**デーモン間**
+ * にしか効いておらず、実際に使う `--exec` 1本の中では read と exec が同じ値だった。
+ */
+function presentedReadSecret(req, url) {
+    const s = cookieSecret();
+    if (!s) return false;
+    return secretMatches(req.headers[TOKEN_HEADER], s)
+        || secretMatches(url.searchParams.get('token'), s);
+}
+
 function authed(req, url) {
     if (!opts.requireAuth) return true;
     // 🚨 Cookie は**読み取り用の別の秘密**とだけ照合する。
@@ -965,6 +985,9 @@ function authed(req, url) {
     // ⚠️ **「どれか1本が合っていれば通す」。** 偽 Cookie を先頭に置くだけで
     //    締め出せてはいけない（#43）。合っていない本数は通す理由にもならない。
     return readCookies(req, AUTH_COOKIE).some(v => secretMatches(v, cookieSecret()))
+        // 🔒 案内の URL に載せる読み取り専用の派生秘密。これで**読み取りだけ**通る
+        //    （exec / checkout / トークン払い出しは presentedToken = 生トークンのみ）
+        || presentedReadSecret(req, url)
         || tokenMatches(req.headers[TOKEN_HEADER])
         || tokenMatches(url.searchParams.get('token'));
 }
@@ -1511,6 +1534,13 @@ async function handleRequest(req, res) {
                 //     他のポートからは読めない。Cookie との決定的な違い）。
                 token: opts.allowWrite && sameOrigin && presentedToken(req, url)
                     ? opts.token : null,
+                // 🔒 **どちらの秘密で来たかを伝える。**
+                //    案内の URL には読み取り専用の派生秘密しか載せないので、
+                //    ページはそれを「読める鍵」として保持するが、
+                //    **書き込み・実行の鍵と混同してはいけない**
+                //    （混同すると「有効に見えて必ず 403」の状態を作る）。
+                presented: presentedToken(req, url) ? 'token'
+                    : (presentedReadSecret(req, url) ? 'read' : 'none'),
             }));
             return;
         }
@@ -2414,10 +2444,22 @@ server.listen(opts.port, '127.0.0.1', () => {
         console.log('');
         if (opts.requireAuth) console.log('🔒 読み取りにもトークンが必要です (--require-auth)。');
         else console.log('🔑 書き込み・実行にはトークンが必要です。');
-        console.log('   **この URL を1回開いてください**（ブラウザがトークンを保持します）:');
-        console.log(`     http://127.0.0.1:${port}/?token=${opts.token}`);
+        // 🔒 **案内の URL に生トークンを載せない（8回目のレビュー）。**
+        //    URL はアドレスバー・入力履歴・ブックマーク（クラウド同期）・
+        //    中継のログに残る。載せるのは**読み取り専用の派生秘密**だけにして、
+        //    書き込み・実行の鍵は画面に貼る操作で渡す（履歴に残らない）。
+        const readKey = cookieSecret();
+        console.log('   **この URL を1回開いてください**（読み取り用。ブラウザが保持します）:');
+        console.log(`     http://127.0.0.1:${port}/?token=${readKey}`);
         for (const h of opts.allowHosts) {
-            console.log(`     https://${h}/?token=${opts.token}`);
+            console.log(`     https://${h}/?token=${readKey}`);
+        }
+        if (opts.allowWrite || opts.allowExec) {
+            console.log('');
+            console.log(`   ${opts.allowExec ? '🚨 実行' : '⚠️ 書き込み'}に使う鍵は URL に載せません`
+                + '（履歴とブックマークに残るため）。');
+            console.log('   画面の「鍵を貼る」に1回貼ってください（そのタブだけが持ちます）:');
+            console.log(`     ${opts.token}`);
         }
         if (opts.tokenFile) console.log(`   トークンの置き場所: ${opts.tokenFile}`);
         else console.log('   ⚠️ 再起動すると変わります（--token-file で固定できます）');

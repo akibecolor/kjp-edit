@@ -683,15 +683,56 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
  *   サーバ側の子プロセスが --exec-timeout（既定600秒）まで残り、
  *   4回で MAX_CONCURRENT_EXEC を食い尽くす（レビューで実測）。
  */
+/**
+ * 🔒 **書き込み・実行の鍵を貼る口。**
+ *
+ * 案内の URL に載せるのは読み取り専用の派生秘密だけにしたので（8回目のレビュー）、
+ * 書き込み・実行の鍵はここから渡す。**URL に入れないので履歴に残らない。**
+ * 保存先は sessionStorage（**ポートを含むオリジン単位**なので、Cookie と違って
+ * 他ポートのページからは読めない）。タブを閉じれば消える。
+ */
+function keyPasteBox() {
+  const bar = el('div', 'cmdbar');
+  const inp = el('input');
+  inp.type = 'password';         // 肩越しに見えない（スマホで貼ることが多い）
+  inp.placeholder = '実行・書き込みの鍵を貼る';
+  inp.spellcheck = false;
+  const btn = el('button', null, '鍵を貼る');
+  const msg = el('div', 'wrmsg');
+  const apply = () => {
+    const v = inp.value.trim();
+    if (!v) return;
+    // ⚠️ 検証はサーバに任せる（ここで形を判定すると「正しいのに弾く」が起きる）。
+    //    入れ替えたら読み直す（capability の判定は起動時に1回だけなので）。
+    try { sessionStorage.setItem(TOKEN_KEY, v); } catch {
+      msg.className = 'wrmsg bad';
+      msg.textContent = 'このブラウザでは保存できません（プライベートモード？）';
+      return;
+    }
+    inp.value = '';
+    location.reload();
+  };
+  btn.addEventListener('click', apply);
+  // ⚠️ IME の変換確定 Enter で貼らない（半端な値が入る）
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) apply();
+  });
+  bar.append(inp, btn);
+  const box = el('div');
+  box.append(bar, msg);
+  return box;
+}
+
 function consoleBody(wt, paneObj) {
   const box = el('div');
   box.style.cssText = 'display:flex;flex-direction:column;height:100%';
-  // 🚨 同じ理由で、トークンが無いなら実行のバーも出さない（必ず 403 になる）
-  if (session.allowExec && !session.token) {
+  // 🚨 同じ理由で、実行の鍵が無いなら実行のバーも出さない（必ず 403 になる）
+  if (session.allowExec && !session.canMutate) {
     box.append(el('div', 'note warn',
-      '⚠ 実行はトークンが無いので使えません。'
-      + ' 起動時に表示された ?token=… 付きの URL を開き直してください'
-      + '（トークンはこのタブだけが持ちます。Cookie には入れません）。'));
+      '⚠ 実行の鍵をこのタブが持っていません。'
+      + ' 🔒 実行の鍵は URL に載せていません（履歴・ブックマーク・中継のログに残るため）。'
+      + ' 起動時に表示された鍵を下に貼ってください（このタブだけが持ちます）。'));
+    box.append(keyPasteBox());
     return box;
   }
   if (!session.allowExec) {
@@ -1272,11 +1313,11 @@ async function renderMonitor() {
   if (!session.allowExec) return;   // 経路そのものが無い（--allow-exec 無し）
   const pane = ensurePane($('#left'), 'monitor', 'セッション監視', []);
   const ui = monitorMount(pane);
-  if (!session.token) {
+  if (!session.canMutate) {
     // 有効に見えるのに 403 を返す状態を作らない
     ui.status.className = 'note warn';
-    ui.status.textContent = '⚠ 監視はトークンが無いので使えません。'
-      + ' 起動時に表示された ?token=… 付きの URL を開き直してください';
+    ui.status.textContent = '⚠ 監視は実行の鍵が要ります。'
+      + ' 鍵は URL に載せていないので、コンソールの「鍵を貼る」から渡してください';
     return;
   }
   if (monitorBusy) return;   // 重なった更新で二重に数えない
@@ -1532,7 +1573,7 @@ function render(s) {
     //    それでもフォームを出していたので「有効に見えて動かない」状態だった
     //    （レビューで実測。BLOCKING）。
     if (session.allowWrite && !wt.bare && !wt.prunable) {
-      if (session.token) c.append(checkoutForm(wt, s));
+      if (session.canMutate) c.append(checkoutForm(wt, s));
       else if (!wt.prunable) {
         c.append(el('div', 'note warn',
           '⚠ checkout はトークンが無いので使えません。'
@@ -1623,7 +1664,7 @@ function render(s) {
       // 🚨 **提案だけで終わらせない。** ここが「見えるがやれることが少ない」の中心だった。
       //    押せるのは `--allow-write` があるときだけ。サーバ側は
       //    「衝突しないと予測できたもの」しか実行しない（それ以外は 409 で理由を返す）。
-      if (session.allowWrite && session.token) {
+      if (session.allowWrite && session.canMutate) {
         const target = (state?.worktrees ?? []).find(w => w.shortBranch === state?.base)
           ?? (state?.worktrees ?? [])[0];
         if (target) {
@@ -1670,10 +1711,10 @@ function render(s) {
           }
           if (row.querySelector('button')) d.append(row);
         }
-      } else if (session.allowWrite && !session.token) {
+      } else if (session.allowWrite && !session.canMutate) {
         d.append(el('div', 'note warn',
-          '⚠ 取り込みはトークンが無いので使えません。'
-          + ' 起動時に表示された ?token=… 付きの URL を開き直してください'));
+          '⚠ 取り込みには書き込みの鍵が要ります。'
+          + ' 鍵は URL に載せていないので、コンソールの「鍵を貼る」から渡してください'));
       } else {
         d.append(el('div', 'note',
           '（画面から取り込むには --write が必要です。今は読み取り専用です）'));
@@ -1925,10 +1966,21 @@ try {
     session = { ...session, ...got, token: got.token ?? session.token };
   }
 } catch { /* 観測のみで動く */ }
+/**
+ * 🔒 **読み取り用の鍵と、書き込み・実行の鍵を混同しない。**
+ *
+ * 案内の URL（`?token=…`）に載るのは**読み取り専用の派生秘密**だけになった
+ * （URL は履歴・ブックマーク・中継のログに残るので、実行の鍵は載せられない。
+ *  8回目のレビュー）。読み取り用の鍵でも `session.token` には入る（ヘッダで送って
+ * 読むために要る）ので、**それを「書ける鍵」と読むと「有効に見えて必ず 403」**に
+ * なる（このリポジトリが BLOCKING として扱ってきた形）。
+ * サーバが `presented` でどちらか教えるので、書き込み系の UI はこれで判定する。
+ */
+session.canMutate = session.presented === 'token';
 const cap = $('#cap');
-// ⚠️ **「有効」と「使える」を分ける。** トークンが無いと有効でも必ず 403 になるので、
-//    バッジで区別する（「有効」だけ出して押せない状態が BLOCKING だった）
-const usable = !!session.token;
+// ⚠️ **「有効」と「使える」を分ける。** 鍵が無い / 読み取り用しか無いと
+//    有効でも必ず 403 になるので、バッジで区別する
+const usable = session.canMutate;
 if (session.allowExec) {
   cap.hidden = false; cap.className = 'cap x';
   cap.textContent = usable ? '🚨 実行有効' : '🚨 実行有効（トークン未取得）';
@@ -1945,7 +1997,7 @@ setInterval(() => load(), 15000);
 //    見に来た時に古い状態が出る（並列で回すときに一番知りたいのがそこ）。
 //    行は id 単位で使い回すので、打っている途中の入力は消えない。
 //    ⚠️ 経路は exec の関門なので、トークンが無い状態では投げない（403 を量産しない）。
-if (session.allowExec && session.token) {
+if (session.allowExec && session.canMutate) {
   setInterval(() => { renderMonitor().catch(() => { /* 他は描き続ける */ }); }, 4000);
 }
 </script>
