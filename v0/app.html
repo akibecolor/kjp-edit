@@ -530,7 +530,7 @@ function makeTermWriter(termEl, scrollEl) {
 }
 
 async function runExec(termEl, scrollEl, wt, argv, onState,
-  { attach = null, keepAlive = false, chat = false } = {}) {
+  { attach = null, keepAlive = false, chat = false, onActivity = null } = {}) {
   // 端末への追記は共通の書き手を使う（描画の計測も同じものを通る。#3）
   const writer = makeTermWriter(termEl, scrollEl);
   const line = writer.line;
@@ -603,6 +603,16 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
       if (ev.__parseError) { line('e', `(解析できない行: ${ev.__parseError.slice(0, 80)})\n`); continue; }
       // 通番を覚える。再接続で「続きから」貰うために必要
       if (typeof ev.n === 'number' && ev.n > lastSeq) lastSeq = ev.n;
+      // 🚨 心拍の材料。**出力が来ていること**と**出していない件数**を知らせる
+      //    （長い応答を書いている間の沈黙を「止まった」と読ませない）
+      if (onActivity) {
+        try {
+          onActivity({
+            visible: ev.t === 'out' || ev.t === 'err' || ev.t === 'in',
+            skipped: chatFilter?.skippedTotal?.() ?? 0,
+          });
+        } catch { /* 心拍で購読ループを壊さない */ }
+      }
       if (ev.t === 'session') {
         sessionId = ev.id;
         publish();
@@ -743,8 +753,59 @@ function consoleBody(wt, paneObj) {
   eofBtn.title = '標準入力を閉じる（入力待ちのプログラムを終わらせる）';
   inbar.append(inField, sendBtn, eofBtn);
 
+  /**
+   * 🚨 **「生きている合図」を出す固定の1行。**
+   *
+   * claude が長い応答を書いている間は**出力が1行も来ない**。`· Bash` も止まるので
+   * **止まったように見える**（実機で「正しい回答じゃない」と読まれた。答えは
+   * 沈黙のあとに届いていた）。しかも告知を種別ごと1回に絞ったので、
+   * 唯一の心拍（`thinking_tokens`）も消えていた。
+   *
+   * ⚠️ 端末（スクロール領域）ではなく**固定行**に出す。流れる行に出すと
+   *    上限のトリムで消え、追従判定も壊す。掴んで持ち、中身だけ書き換える。
+   * ⚠️ タイマーは**必ず解除する**（張ったまま忘れると、終わったペインが
+   *    イベントループを生かし続ける。実際に別の場所で踏んだ）。
+   */
+  const beat = el('div', 'note');
+  beat.hidden = true;
+  let beatTimer = null;
+  let lastLineAt = 0;
+  let startedAt = 0;
+  let skippedCount = 0;
+  /** 購読ループから呼ばれる（出力が来たこと・出さなかった件数） */
+  const onActivity = ({ visible, skipped }) => {
+    if (visible) lastLineAt = Date.now();
+    skippedCount = skipped ?? 0;
+  };
+  const stopBeat = () => {
+    if (beatTimer !== null) { clearInterval(beatTimer); beatTimer = null; }
+    beat.hidden = true;
+    // ⚠️ 中身も空にする。hidden でも textContent は残るので、
+    //    「見える文字」を数える検査や支援技術には「実行中」が居続ける
+    beat.textContent = '';
+  };
+  const tickBeat = () => {
+    const now = Date.now();
+    const since = Math.round((now - lastLineAt) / 1000);
+    const age = Math.round((now - startedAt) / 1000);
+    // 「出ていない」と「死んでいる」を区別できる形にする（数字を出す）
+    beat.textContent = `⏳ 実行中 ${age}秒`
+      + `（最後の出力から ${since}秒`
+      + (skippedCount > 0 ? ` / 出していない行 ${skippedCount}件` : '')
+      + '）';
+  };
+  const startBeat = () => {
+    startedAt = Date.now();
+    lastLineAt = Date.now();
+    beat.hidden = false;
+    tickBeat();
+    if (beatTimer === null) beatTimer = setInterval(tickBeat, 1000);
+  };
+
   let cur = null;
   const onState = st => {
+    if (st.running) startBeat();
+    else stopBeat();
     box.dataset.running = st.running ? '1' : '';
     stop.disabled = !st.running;
     input.disabled = st.running;
@@ -764,7 +825,7 @@ function consoleBody(wt, paneObj) {
   };
   const start = (opts) => {
     if (parsed.warning || !parsed.argv.length) return;
-    runExec(term, scroll, wt, parsed.argv, onState, opts);
+    runExec(term, scroll, wt, parsed.argv, onState, { ...opts, onActivity });
   };
 
   const send = async () => {
@@ -791,7 +852,8 @@ function consoleBody(wt, paneObj) {
   chatBtn.addEventListener('click', () => {
     // 会話は専用の argv で始める（入力欄の内容は使わない）
     // ⚠️ `chat` は argv から導く（渡す値と argv がずれない形にする）
-    runExec(term, scroll, wt, CHAT_ARGV, onState, { chat: isChatArgv(CHAT_ARGV), keepAlive: true });
+    runExec(term, scroll, wt, CHAT_ARGV, onState,
+      { chat: isChatArgv(CHAT_ARGV), keepAlive: true, onActivity });
   });
 
   /**
@@ -823,6 +885,8 @@ function consoleBody(wt, paneObj) {
           attach: { id: s.id, from: 0 },
           chat: isChatArgv(s.argv),
           keepAlive: s.keepAlive === true,
+          // 再接続でも心拍を出す（ここを忘れると「戻ったときだけ止まって見える」）
+          onActivity,
         });
       });
       const kb = el('button', null, '停止');
@@ -861,7 +925,7 @@ function consoleBody(wt, paneObj) {
     window.__kjpFeedTerm = s => probeWriter.line('', s);
   }
 
-  box.append(bar, peek, resume, scroll, inbar);
+  box.append(bar, peek, beat, resume, scroll, inbar);
   return box;
 }
 

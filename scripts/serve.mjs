@@ -32,7 +32,7 @@ import { repoOf, samePathish } from './winargs.mjs';
 // 🚨 argv の組み立てと門は純関数に切り出してテストで固定している
 //    （scripts/serveargs.test.mjs。#45 まではここに検査が1件も無かった）
 import {
-    SERVE_FLAGS, unknownFlag, checkPort, collectHosts, serverArgs,
+    SERVE_FLAGS, unknownFlag, checkPort, checkTimeout, collectHosts, serverArgs,
     runningCaps, requestedCaps, describeCaps,
 } from './serveargs.mjs';
 
@@ -267,6 +267,15 @@ if (portCheck.error !== undefined) {
     process.exit(1);
 }
 let port = portCheck.port;
+
+// ---- 実行セッションの絶対上限（既定 600 秒はエージェントの仕事に足りない） ----
+const timeoutCheck = checkTimeout(val('--timeout', undefined));
+if (timeoutCheck.error !== undefined) {
+    console.error(`\n✖ --timeout には 10〜86400（秒）を指定してください`
+        + `（受け取った値: ${timeoutCheck.error}）`);
+    console.error('  上限そのものは外せません（取り残しの唯一の歯止めなので）。\n');
+    process.exit(1);
+}
 if (await inUse(port)) {
     let found = null;
     for (let p = port + 1; p <= port + 20; p++) {
@@ -335,6 +344,7 @@ const args = serverArgs({
     writeTokenFile: join(STATE_DIR, 'token-write'),
     execTokenFile: join(STATE_DIR, 'token-exec'),
     auditLog: join(STATE_DIR, 'exec-audit.jsonl'),
+    execTimeout: timeoutCheck.seconds,
 });
 const wantExec = has('--exec');
 const wantWrite = wantExec || has('--write');

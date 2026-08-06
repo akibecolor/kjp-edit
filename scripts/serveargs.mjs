@@ -13,11 +13,11 @@
 
 /** 起動口が受け付けるフラグ。ここに無いものは黙って捨てずに止める */
 export const SERVE_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text', '--status', '--stop', '--help', '-h']);
+    '--watch', '--agents-text', '--timeout', '--status', '--stop', '--help', '-h']);
 
 /** 自動起動の登録が受け付けるフラグ（`--status` 等はサブコマンドなので入らない） */
 export const AUTOSTART_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text']);
+    '--watch', '--agents-text', '--timeout']);
 
 /**
  * サーバ側の名前 → この層での名前。
@@ -32,7 +32,7 @@ export const FLAG_ALIAS = {
 };
 
 /** 値を取るフラグ。次のトークンは値なので、フラグとして検査してはいけない */
-export const VALUE_FLAGS = new Set(['--repo', '--port', '--allow-host']);
+export const VALUE_FLAGS = new Set(['--repo', '--port', '--allow-host', '--timeout']);
 
 /**
  * 未知のフラグを探す。見つからなければ null。
@@ -60,6 +60,25 @@ export function checkPort(raw, def) {
     const n = Number(raw);
     if (!Number.isFinite(n) || n < 1 || n > 65535) return { error: String(raw) };
     return { port: n };
+}
+
+/**
+ * `--timeout <秒>` を検証する（実行セッションの絶対上限）。
+ *
+ * 🚨 **既定の 600 秒はエージェントの仕事に足りない。** 実測で「issue を洗って
+ *    優先度を付ける」が Bash/Read を20回して 551 秒の時点でまだ走っていた
+ *    （もう少しで SIGKILL されて回答が消えるところだった）。
+ * ⚠️ **上限そのものは消せない形にする。** これは取り残しの唯一の歯止めなので、
+ *    「無制限」は受け付けず、値を明示して延ばすだけにする。
+ * @returns {{seconds: number|null} | {error: string}} 指定が無ければ seconds: null
+ */
+export function checkTimeout(raw) {
+    if (raw === undefined || raw === null || raw === '') return { seconds: null };
+    if (!/^\d+$/.test(String(raw))) return { error: String(raw) };
+    const n = Number(raw);
+    // 下限 10 秒（打ち間違いで即殺す状態を作らない）/ 上限 24 時間
+    if (!Number.isFinite(n) || n < 10 || n > 86400) return { error: String(raw) };
+    return { seconds: n };
 }
 
 /**
@@ -94,6 +113,7 @@ export function collectHosts(argv) {
  */
 export function serverArgs({
     argv, server, repo, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
+    execTimeout = null,
 }) {
     const has = f => argv.includes(f);
     const args = [server, '--repo', repo, '--port', String(port)];
@@ -124,6 +144,15 @@ export function serverArgs({
     if (wantExec) {
         args.push('--allow-exec');
         if (auditLog) args.push('--audit-log', auditLog);
+        // 🚨 **絶対上限を起動口から延ばせるようにする。**
+        //    既定 600 秒はエージェントの仕事に足りない（実測: Bash/Read を20回する
+        //    「issue を洗って優先度を付ける」が 551 秒の時点でまだ走っていた）。
+        //    ⚠️ 上限そのものは消さない。**取り残しの唯一の歯止め**なので、
+        //    値を明示して延ばす形にする（`serve.mjs --exec --timeout 3600`）。
+        //    値の検証は呼び出し側（`checkTimeout`）。ここは組み立てるだけ。
+        if (execTimeout !== null && execTimeout !== undefined) {
+            args.push('--exec-timeout', String(execTimeout));
+        }
     }
     for (const h of hosts) args.push('--allow-host', h);
 
@@ -152,6 +181,14 @@ export function autostartServeArgs({ argv, repo, port }) {
     for (const h of hosts.hosts) args.push('--allow-host', h);
     if (has('--agents-text')) args.push('--agents-text');
     else if (has('--watch')) args.push('--watch');
+    // 🚨 **絶対上限も引き継ぐ。** 落とすと**再起動後だけ 600 秒に戻る**ので、
+    //    「同じ仕事が朝は完走したのに夕方は途中で殺される」になる（#45 と同型）
+    const i = argv.indexOf('--timeout');
+    if (i !== -1) {
+        const t = checkTimeout(argv[i + 1]);
+        if (t.error !== undefined) return { error: t.error };
+        if (t.seconds !== null) args.push('--timeout', String(t.seconds));
+    }
     return { args };
 }
 

@@ -197,5 +197,12 @@ export function makeChatFilter(line) {
         if (rest.trim()) emit({ cls: '', text: rest });
         endSkips();
     };
-    return { feed, flush };
+    /**
+     * 出さなかった行の合計。
+     * 🚨 **「生きている合図」を画面に出すために要る。** 告知を種別ごと1回に絞った
+     *    結果、長い応答を書いている間**画面が完全に沈黙**し、止まって見えるようになった
+     *    （実機で「正しい回答じゃない」と読まれた。答えは沈黙の後に届いていた）。
+     */
+    const skippedTotal = () => [...skipped.values()].reduce((a, b) => a + b + 1, 0);
+    return { feed, flush, skippedTotal };
 }

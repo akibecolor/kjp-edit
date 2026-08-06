@@ -216,6 +216,57 @@ const MONITOR_CHECK = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **「生きている合図」を実ブラウザで測る。**
+ *
+ * claude が長い応答を書いている間は**出力が1行も来ない**ので、画面が沈黙して
+ * 止まったように見える（実機で「正しい回答じゃない」と読まれた。答えは沈黙の
+ * あとに届いていた）。固定行の心拍が**実際に増えていく**ことを測る。
+ * 字面では測れない（`setInterval` を消しても行は残る）。
+ */
+const BEAT_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const cin = [...document.querySelectorAll('.cmdbar input')].find(e =>
+    e.closest('[data-pane-id]')?.dataset.paneId !== 'monitor' && !e.placeholder);
+  if (!cin) return { error: 'コンソールの入力欄が見つからない' };
+  for (let i = 0; i < 400 && cin.disabled; i++) await wait(100);
+  if (cin.disabled) return { error: 'コンソールが空かない' };
+  // 出力を出さずに走り続けるコマンド = 沈黙の再現
+  // ⚠️ 絶対パスを使わない（Windows のバックスラッシュを検査の文字列に持ち込まない）。
+  //    spawn は shell を経由しないが、実行ファイル名は PATH から解決される
+  cin.value = 'node -e "setTimeout(()=>{}, 15000)"';
+  cin.dispatchEvent(new Event('input', { bubbles: true }));
+  cin.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  // ⚠️ **描かれているものだけ数える**（hidden でも textContent は残る。
+  //    それを「消えていない」と読んで1往復無駄にした）。layout-check と同じ判定
+  const beatOf = () => [...document.querySelectorAll('.note')]
+    .filter(e => e.getClientRects().length > 0)
+    .map(e => e.textContent ?? '').find(t => t.includes('実行中')) ?? null;
+  let first = null;
+  for (let i = 0; i < 100 && first === null; i++) { await wait(100); first = beatOf(); }
+  if (first === null) return { error: '心拍の行が出ない（沈黙と停止を区別できない）' };
+  await wait(2600);
+  const second = beatOf();
+  // 停止して、心拍が消えることも見る（終わったのに「実行中」と言わない）
+  // ⚠️ 監視盤の停止ボタンを押さない。cmdbar の class は監視盤の行にもあるので、
+  //    素の querySelectorAll だと**別のセッションを止めて**「消えない」と誤判定する
+  //    （実際にこれで落ちた。しかも終了した行のボタンは disabled ではない）
+  //    ⚠️ ここはテンプレートリテラルの中。**バックティックを書くと構文エラー**になる
+  const stopBtn = [...(cin.closest('[data-pane-id]')?.querySelectorAll('.cmdbar button') ?? [])]
+    .find(b => b.textContent === '停止' && !b.disabled);
+  if (stopBtn) stopBtn.click();
+  let gone = false;
+  for (let i = 0; i < 100 && !gone; i++) { await wait(100); gone = beatOf() === null; }
+  const pane = cin.closest('[data-pane-id]');
+  return {
+    first, second, changed: first !== second, gone,
+    clicked: Boolean(stopBtn),
+    running: pane?.querySelector('[data-running]')?.dataset?.running ?? '(不明)',
+    beatNow: beatOf(),
+    tail: (pane?.querySelector('.term')?.textContent ?? '').slice(-160),
+  };
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -370,6 +421,10 @@ try {
     //    12,000行流した後だと自動更新が重くなって待ち時間の意味が変わる）
     const monitor = await evaluate(MONITOR_CHECK);
 
+    // 🚨 心拍は**監視盤の検査より後**に走らせる（先に走らせると、
+    //    15秒走るセッションが監視盤の行の数を変えて dupes の判定を乱す）
+    const beat = await evaluate(BEAT_CHECK);
+
     const probeValue = await evaluate(MEASURE);
     const probe = probeValue;
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
@@ -412,6 +467,20 @@ try {
         if (monitor.kept !== monitor.mark) {
             problems.push('自動更新で入力欄の中身が消えた'
                 + `: ${JSON.stringify(monitor.kept)} ≠ ${JSON.stringify(monitor.mark)}`);
+        }
+    }
+    // 🚨 心拍: 沈黙している間も「生きている」と分かること
+    if (!beat || beat.error) {
+        problems.push(`心拍を測れなかった: ${beat?.error ?? '結果が取れない'}`);
+    } else {
+        if (!beat.changed) {
+            problems.push('出力が来ない間、心拍が更新されない'
+                + `（沈黙と停止を区別できない）: ${JSON.stringify(beat.first)}`);
+        }
+        if (!beat.gone) {
+            problems.push('停止したのに「実行中」が残っている（走っていると誤読させる）'
+                + `: 停止を押せた=${beat.clicked} running=${JSON.stringify(beat.running)}`
+                + ` 心拍=${JSON.stringify(beat.beatNow)} 端末の末尾=${JSON.stringify(beat.tail)}`);
         }
     }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {

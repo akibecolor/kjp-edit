@@ -1543,6 +1543,26 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/execsession.test.mjs',
     },
     {
+        // 🚨 実機で「止まったように見える」と読まれた形（沈黙 = 停止ではない）
+        name: 'exec-heartbeat',
+        why: '出力が来ない間の心拍を出さない'
+            + '（claude が長い応答を書いている間、画面が沈黙して止まったように見える）',
+        file: 'v0/app.html',
+        from: '    if (beatTimer === null) beatTimer = setInterval(tickBeat, 1000);',
+        to: '    /* 変異: 心拍を刻まない */',
+        gone: 'beatTimer = setInterval(tickBeat, 1000)',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'exec-heartbeat-stops',
+        why: '終了しても心拍を消さない（止まったのに「実行中」と言い続ける）',
+        file: 'v0/app.html',
+        from: '    if (st.running) startBeat();\n    else stopBeat();',
+        to: '    if (st.running) startBeat();',
+        gone: 'else stopBeat();',
+        script: 'v0/render-check.mjs',
+    },
+    {
         // 🚨 これは**実ブラウザでしか測れない**（字面では入力が消えるのが見えない）
         name: 'monitor-row-reuse',
         why: '自動更新のたびに監視盤の行を作り直す'

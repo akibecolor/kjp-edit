@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import {
     SERVE_FLAGS, AUTOSTART_FLAGS, unknownFlag, checkPort, checkHost,
-    collectHosts, serverArgs, autostartServeArgs,
+    collectHosts, serverArgs, autostartServeArgs, checkTimeout,
     runningCaps, requestedCaps, describeCaps,
 } from './serveargs.mjs';
 
@@ -277,4 +277,49 @@ test('要求した capability をサーバ側の名前に直せる（差分を�
         .filter(c => !runningCaps('node v0/server.mjs --repo C:/r').includes(c));
     assert.deepEqual(missing.sort(), ['--allow-exec', '--allow-write'],
         '黙って無視すると「打ったのに効かない」状態になる');
+});
+
+/* ===== 実行セッションの絶対上限（--timeout） =====
+   🚨 既定 600 秒はエージェントの仕事に足りない（実測: Bash/Read を20回する仕事が
+      551 秒でまだ走っていた）。常用の起動口から延ばせないと、
+      「回答が書かれる直前に SIGKILL」が繰り返し起きる。 */
+
+test('🚨 --timeout で絶対上限をサーバに渡す', () => {
+    const a = serverArgs({
+        argv: ['--exec'], server: SERVER, repo: '/r', port: 7749,
+        tokenFile: '/s/token-read', writeTokenFile: '/s/token-write',
+        execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
+        execTimeout: 3600,
+    });
+    const i = a.indexOf('--exec-timeout');
+    assert.notEqual(i, -1, `渡していない: ${a.join(' ')}`);
+    assert.equal(a[i + 1], '3600');
+});
+
+test('--timeout を指定しなければサーバの既定に任せる（勝手に決めない）', () => {
+    assert.equal(base(['--exec']).includes('--exec-timeout'), false);
+});
+
+test('🚨 --timeout の値を検証する（上限そのものは外せない）', () => {
+    assert.deepEqual(checkTimeout(undefined), { seconds: null });
+    assert.deepEqual(checkTimeout(''), { seconds: null });
+    assert.deepEqual(checkTimeout('3600'), { seconds: 3600 });
+    for (const bad of ['0', '5', '-1', 'abc', '10.5', '86401', 'none', 'infinite']) {
+        assert.ok(checkTimeout(bad).error !== undefined, `通してはいけない: ${bad}`);
+    }
+});
+
+test('--timeout は起動口と自動起動の両方が受け付ける（片方だけにしない）', () => {
+    assert.ok(SERVE_FLAGS.has('--timeout'));
+    assert.ok(AUTOSTART_FLAGS.has('--timeout'), '自動起動で落ちると再起動後だけ短くなる');
+    // 値を取るフラグとして登録されていないと、値が「知らないフラグ」に見える
+    assert.equal(unknownFlag(['--timeout', '3600'], SERVE_FLAGS), null);
+});
+
+test('🚨 自動起動の登録に --timeout を引き継ぐ（再起動後だけ短くならない）', () => {
+    const r = autostartServeArgs({ argv: ['--exec', '--timeout', '3600'], repo: '/r', port: 7749 });
+    assert.deepEqual(r.error, undefined);
+    const i = r.args.indexOf('--timeout');
+    assert.notEqual(i, -1, `引き継いでいない: ${r.args.join(' ')}`);
+    assert.equal(r.args[i + 1], '3600');
 });

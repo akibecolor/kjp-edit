@@ -186,6 +186,65 @@ v0/server.mjs の parseArgs() と起動時の警告・拒否。
 - --token-file の権限と置き場所、リポジトリ内判定`,
     },
     {
+        key: 'mutation',
+        prompt: `**観点: 作業ツリーを書き換える経路（checkout / merge）。**
+
+見るもの: v0/server.mjs の /api/v0/merge と /api/v0/checkout、requireMutation()、
+mergePreview() / mergeDriverNames() / sequencerState() / worktreeStatus()、
+v0/mergeplan.mjs、v0/app.html の取り込みの導線。
+
+背景: **POST /api/v0/merge は2つ目の mutation 経路**（衝突を作りうる最初の操作）。
+門は「認可 → isSafeRef → 既知の worktree → bare/prunable → シーケンサ →
+dirty → merge driver → 衝突予測 → hooks 無効化」の順に並んでいる。
+「画面からは衝突しないと分かっている取り込みだけ行う」が約束。
+
+疑うこと:
+- **門の順序。** 認可より前に副作用（本文の読み込み・git の起動・一時ディレクトリ）が
+  起きないか。CLAUDE.md には「門をフォールバックより後ろに置いて消えた」実例がある
+- **TOCTOU。** merge-tree で予測した後、実際の \`git merge\` までに
+  作業ツリー / ブランチ / index が変わる窓。**同じ worktree に2本同時**に来たとき
+- **リポジトリ設定の任意コードが走る経路。** core.hooksPath を空にしても
+  gitattributes の filter/clean/smudge、textconv、core.fsmonitor、alias、
+  submodule の設定は残る。merge driver の検出（mergeDriverNames）が見ていない
+  設定の置き場所（$GIT_DIR/info/attributes、core.attributesFile、~/.gitattributes、
+  macro attribute、linked worktree の info/）はないか
+- detached HEAD / shortBranch が null / from が 'HEAD' に落ちるときの挙動
+- **各門を外したときに落ちるテストが実在するか。** scripts/mutate.mjs に
+  merge の門を外す変異が何件あるか数え、無い門を挙げてほしい
+  （CLAUDE.md: merge に checkout と同じ文言の門ができた瞬間に変異の置換先がずれた）
+- 監査ログ（auditExec）が実行の前に書かれているか、失敗・中断で何が残るか
+- fast-forward でない merge が**別のエージェントの作業を巻き込む**形はないか`,
+    },
+    {
+        key: 'monitor',
+        prompt: `**観点: セッション監視盤と、画面に出す文字列（#18 の続き）。**
+
+見るもの: v0/server.mjs の state payload の execSessions（requireAuth との条件式）、
+v0/app.html の監視盤、v0/chatfilter.mjs、v0/argv.mjs。
+
+背景: **全 worktree の全セッションを1画面に並べ、その行から直接 stdin を送れる**
+（1cec85b）。約束が3つ増えている:
+1. 監視盤は **--exec が要る**。読み取り用トークン（token-read）では出さない
+2. **自分が組み立てた構造データを画面にそのまま流さない**（0027647）
+3. **告知は種別ごとに1回だけ出し、残りは数えて合計を出す。捨てない**（7a1923a）
+
+疑うこと:
+- **1 の分界が本当に成立しているか。** requireAuth が false のとき（ループバックのみ +
+  --exec）に何が出るか。--write だけのデーモンに監視盤が現れない保証はどこか。
+  read で認証した要求と exec で認証した要求を payload が区別しているか
+- **「最後の出力」はコマンドの出力そのもの** = T5 相当。
+  --watch-agents の「自由文を1文字も通さない」という不変条件と衝突しないか。
+  「自分が起動したものだから別」という論理が全経路で成立しているか
+- 別の worktree / 別のセッションの行が混ざる、id を知った相手にできること
+- **3 が再び破れる形。** 種別が多い / 種別が増える / 合計が合わない /
+  告知自身がトリムで消える（一度踏んでいる）
+- argv や引数の clip と、clip したことの告知（切れた値を実行できると誤解させないか）
+- chatfilter の未知 type・改行で終わらない末尾行・control_response の扱いが
+  **全経路で**守られているか（「解釈できない行は出す」と書いてある）
+- 監視盤の更新間隔と払い出し量（v0/README.md に書いた値）が実測と合うか。
+  worktree と セッションが増えたときの payload サイズと git の起動数`,
+    },
+    {
         key: 'tests',
         prompt: `**観点: テストが本当に守りを検証しているか（偽陽性の探索）。**
 
