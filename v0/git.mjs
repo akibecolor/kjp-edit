@@ -592,7 +592,12 @@ export async function showBlob(cwd, ref, path) {
         let size = null;
         try { size = Number((await git(['cat-file', '-s', oid], { cwd })).trim()); } catch { /* 諦める */ }
         // binary は「読まなかったので分からない」。false と断定すると未知を偽る
-        return { path, ref, oid, size, tooLarge: true, binary: null, text: null };
+        // ⚠️ `limitBytes` を返すのは、**UI が上限を二重に書かないため**。
+        //    画面側に定数を写すと、片方だけ変えたときに告知の数字が嘘になる。
+        return {
+            path, ref, oid, size, tooLarge: true, binary: null, text: null,
+            limitBytes: MAX_BLOB_BYTES,
+        };
     }
     // サイズは読んだバイト数そのもの（別に問い合わせないので齟齬が起きない）
     const size = buf.length;

@@ -175,6 +175,24 @@
     border: 0; border-top: 1px solid var(--line); padding: .3rem .5rem; }
   .editdiff { flex: 0 1 45%; overflow: auto; border-top: 1px solid var(--line); }
 
+  /* 全文ビューア。差分と同じペインをタブで切り替える */
+  .viewbar { display: flex; gap: .25rem; padding: .2rem .3rem; flex: 0 0 auto;
+    align-items: center; flex-wrap: wrap;
+    background: var(--head); border-bottom: 1px solid var(--line); }
+  /* ボタンは縮ませない（狭いと「差/分」と縦に割れて読めなくなる。cmdbar と同じ理由） */
+  .viewbar button { font: inherit; font-size: 11px; padding: .1rem .5rem; background: var(--card);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 3px;
+    cursor: pointer; flex: 0 0 auto; white-space: nowrap; }
+  .viewbar button.on { color: var(--accent); border-color: var(--accent); }
+  .viewbar select { font: inherit; font-size: 11px; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; max-width: 9rem; flex: 0 1 auto; }
+  .viewbar .lbl { color: var(--dim); font-size: 10px; flex: 0 0 auto; }
+  .blob { white-space: pre; font-size: 12px; }
+  .blob .bl { padding: 0 .5rem; }
+  /* 行番号はコピーの対象から外す（選択すると本文に行番号が混ざる） */
+  .blob .ln { display: inline-block; min-width: 3.5em; text-align: right; padding-right: .7em;
+    color: var(--dim); user-select: none; -webkit-user-select: none; }
+
   /* ⚠️ overflow-wrap が無いと `--allow-transcript-text` のような長い語で
      行が箱より広くなり、狭い画面で**注意書き自体が読めなくなる**（実測）。
      省略の告知が読めないのは、告知が無いのと同じ。 */
@@ -294,6 +312,8 @@ import { mergeOutcome } from './mergeresult.mjs';
 // 保存前に見せる差分。編集中の内容はまだどこにも無いので `git diff` に渡せない
 // （渡すには「先に書く」しかなく、「書く前に見せる」と矛盾する）
 import { diffLines } from './linediff.mjs';
+// 全文ビューアの上限と告知も同じ理由で外に出してある（中だと測れない）
+import { planBlobView, MAX_VIEW_LINES } from './blobview.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -786,6 +806,53 @@ function openEditor(obj, wt, path) {
   });
 
   fetchBase();
+}
+
+/* ===== 全文ビューア ===== */
+/** 1行ぶん。行番号は別 span（コピーから外すため） */
+function blobRow(no, text) {
+  const row = el('div', 'bl');
+  // 空行を '' にすると行の高さが 0 になって行番号がずれる
+  row.append(el('span', 'ln', String(no)), el('span', 'lx', text === '' ? ' ' : text));
+  return row;
+}
+
+/**
+ * 全文を描く。**中身は `/api/v0/blob`（= `git cat-file`）から来たものだけ。**
+ *
+ * ⚠️ **1行ごとに DOM へ足して `scrollHeight` を読まない。** 強制同期レイアウトが
+ *    総文字数に対して二次になる（端末側で実測 12,000行 = 53.8秒、
+ *    その間 停止ボタンも自動更新も効かない）。fragment に組んで**1回だけ**入れる。
+ * 🚨 告知（省略・バイナリ・上限）は**実際に見える文字**として先頭に出す。
+ *    ここは端末と違って古い行を捨てないので、告知が消える経路は無い。
+ */
+function renderBlob(holder, plan) {
+  const box = el('div', 'blob');
+  for (const n of plan.notices) box.append(el('div', 'note warn', n));
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < plan.lines.length; i++) frag.append(blobRow(i + 1, plan.lines[i]));
+  box.append(frag);
+  holder.replaceChildren(box);
+}
+
+/**
+ * ファイルの中身を読んで描く。**差分ではなく全文。**
+ *
+ * ⚠️ ref / path はサーバの `isSafeRef` / `isSafeRepoPath` が検証する。
+ *    ここで別の経路（fs や自前のパス組み立て）を作らない —
+ *    未追跡の `.env` に触れる穴になる。
+ */
+async function loadBlob(holder, ref, path) {
+  holder.replaceChildren(el('div', 'note', `読み込み中: ${path}（${ref} の全文）`));
+  try {
+    const q = new URLSearchParams({ ref, path });
+    const res = await fetch(`/api/v0/blob?${q}`);
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+    renderBlob(holder, planBlobView(d));
+  } catch (e) {
+    holder.replaceChildren(el('div', 'note warn', `取得できませんでした: ${e.message}`));
+  }
 }
 
 /* ===== コンソール ===== */
@@ -2236,7 +2303,9 @@ function render(s) {
   dropPanes('diff-', diffIds);
   for (const wt of picks) {
     const id = `diff-${wt.path}`;
-    const obj = ensurePane($('#diffs'), id, '差分', [['br', wt.branch ?? wt.name]]);
+    // ⚠️ 見出しを「差分」固定にしない。全文も同じペインに出るので、
+    //    片方の名前だけを出すとヘッダが中身と食い違う
+    const obj = ensurePane($('#diffs'), id, '差分 / 全文', [['br', wt.branch ?? wt.name]]);
     obj.p.dataset.wt = wt.path;
     obj.wt = wt;
     // 🚨 **編集中は作り直さない**（textarea を捨てると打っている途中の内容が消える）。
@@ -2250,10 +2319,49 @@ function render(s) {
     // 復元キーは worktree+path。path だけだと同名ファイルで別 worktree に引き継がれる
     const prev = obj.selWt === wt.path ? obj.sel : null;
     const initial = files.find(f => f.path === prev)?.path ?? files[0]?.path;
+
+    // ---- 表示の切り替え（差分 / 全文）と、全文を読む ref ----
+    // 🚨 **選んだモードと ref を obj に持って復元する。** ペインの中身は
+    //    15 秒ごとの自動更新で作り直されるので、持たないと**読んでいる途中で
+    //    差分に戻り、ref も先頭に戻る**（`<select>` を作り直す形の事故と同型）。
+    const ownRef = wt.branch ?? wt.head;
+    const refs = [...new Set([ownRef, s.base,
+      ...s.worktrees.map(w => w.branch ?? w.head)].filter(Boolean))];
+    if (!refs.includes(obj.viewRef)) obj.viewRef = ownRef;
+    if (obj.mode !== 'blob') obj.mode = 'diff';
+    const viewbar = el('div', 'viewbar');
+    const bDiff = el('button', null, '差分');
+    bDiff.title = `${s.base ?? 'base'}...${ownRef} の差分`;
+    const bBlob = el('button', null, '全文');
+    bBlob.title = 'ファイルの中身（追跡されている内容だけ）';
+    const refSel = el('select');
+    for (const r of refs) refSel.append(el('option', null, r));
+    refSel.value = obj.viewRef;
+    refSel.title = '全文を読む ref';
+    viewbar.append(bDiff, bBlob, el('span', 'lbl', 'ref'), refSel);
+
+    /** 今のモードで描き直す。**タブの選択（obj.sel）は変えない。** */
+    const show = () => {
+      bDiff.classList.toggle('on', obj.mode === 'diff');
+      bBlob.classList.toggle('on', obj.mode === 'blob');
+      // ⚠️ ref は全文にしか効かない（差分は base...HEAD 固定）。
+      //    差分のときに選べる形にすると「選んだのに何も変わらない」になる
+      refSel.disabled = obj.mode !== 'blob';
+      if (!obj.sel) return;
+      if (obj.mode === 'blob') loadBlob(holder, obj.viewRef, obj.sel);
+      else loadDiff(holder, s.base, ownRef, obj.sel);
+    };
+    bDiff.addEventListener('click', () => { obj.mode = 'diff'; show(); });
+    bBlob.addEventListener('click', () => { obj.mode = 'blob'; show(); });
+    refSel.addEventListener('change', () => {
+      obj.viewRef = refSel.value;
+      if (obj.mode === 'blob') show();
+    });
+
     const openIn = path => {
       for (const o of tabs.children) o.classList.toggle('on', o.title === path);
       obj.sel = path; obj.selWt = wt.path;
-      loadDiff(holder, s.base, wt.branch ?? wt.head, path);
+      show();
     };
     obj.openIn = openIn;
     for (const f of files) {
@@ -2265,7 +2373,11 @@ function render(s) {
     if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
     const wrap = el('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;height:100%';
-    wrap.append(tabs);
+    // ⚠️ 並びは viewbar（差分/全文） → tabs（ファイルと「編集」） → holder。
+    //    編集を押すと `openEditor` が **`obj.body` ごと**置き換えるので、
+    //    そのあいだ viewbar も消える（`obj.editing` の間はペインを作り直さない =
+    //    打っている途中を捨てないため）。「閉じる」で戻り、`obj.mode` は残る。
+    wrap.append(viewbar, tabs);
     // 🚨 **押せるのに必ず失敗する操作を描かない。** 保存は生の鍵（`presented:'token'`）を
     //    要求するので、**読み取り用の鍵しか持っていない相手には必ず 403** になる。
     //    ⚠️ `session.token` で判定してはいけない（案内の URL で渡るのは
@@ -2287,8 +2399,44 @@ function render(s) {
     }
     wrap.append(holder);
     obj.body.replaceChildren(wrap);
-    if (initial) { obj.sel = initial; obj.selWt = wt.path; loadDiff(holder, s.base, wt.branch ?? wt.head, initial); }
-    else holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
+    if (initial) { obj.sel = initial; obj.selWt = wt.path; show(); }
+    else {
+      show();   // モードの見た目（どちらが選ばれているか）は中身が無くても出す
+      holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
+    }
+
+    // 🚨 **全文の描画予算を実ブラウザで測るための入口。**
+    //    `?probe=1` のときだけ出す。**UI と同じ `renderBlob` を通す**
+    //    （別経路を測ると「速い」という主張の根拠にならない）。
+    //    `void holder.offsetHeight` でレイアウトを確定させてから止める —
+    //    読まないと「組み立てただけ」の時間になり、実測が嘘になる。
+    // ⚠️ **毎回上書きする**（`__kjpFeedTerm` と違って一度だけにしない）。
+    //    ペインの中身は自動更新で作り直されるので、最初の holder を掴み続けると
+    //    **DOM から外れた要素を測る**ことになり、`offsetHeight` がレイアウトを
+    //    起こさないので「速い」という嘘の数字が出る。生きているかも返す。
+    if (window.__kjpProbe) {
+      window.__kjpRenderBlob = (nLines, maxLines) => {
+        const text = `${Array.from({ length: nLines },
+          (_, i) => `line ${i} ${'x'.repeat(40)}`).join('\n')}\n`;
+        const plan = planBlobView(
+          { path: 'probe', ref: 'probe', size: text.length, binary: false, tooLarge: false, text },
+          maxLines ? { maxLines } : {},
+        );
+        const t0 = performance.now();
+        renderBlob(holder, plan);
+        void holder.offsetHeight;
+        return {
+          ms: Math.round(performance.now() - t0),
+          rows: holder.querySelectorAll('.blob .bl').length,
+          maxViewLines: MAX_VIEW_LINES,
+          connected: holder.isConnected,
+          // ⚠️ 差分ペインが複数あると最後の1枚に束縛される。予算はどのペインでも
+          //    測れるが、**どこを測ったのかは出す**（黙って別の対象を測らない）
+          paneId: holder.closest('[data-pane-id]')?.dataset?.paneId ?? null,
+          text: (holder.textContent ?? '').slice(0, 200),
+        };
+      };
+    }
   }
   // 🚨 **前回の告知を消してから足す。** 消していなかったので、自動更新のたびに
   //    「他 N 本は…」が1行ずつ増え続けていた（ペインを並べ直す側で告知を

@@ -43,6 +43,17 @@ const MAX_SPANS = (() => {
     return Number(m[1]);
 })();
 
+// 全文ビューアの予算。**同じく上限は blobview.mjs から読む**（手で写さない）。
+const MAX_VIEW_LINES = (() => {
+    const src = readFileSync(join(ROOT, 'v0', 'blobview.mjs'), 'utf8');
+    const m = /export const MAX_VIEW_LINES = (\d+);/.exec(src);
+    if (!m) throw new Error('blobview.mjs に MAX_VIEW_LINES が無い（名前が変わった？）');
+    return Number(m[1]);
+})();
+// 上限を超える行数のファイルを用意して「切ったことを告知する」を実際に見る
+const BLOB_FILE_LINES = MAX_VIEW_LINES + 500;
+const BUDGET_BLOB_MS = 400;
+
 const CANDIDATES = process.platform === 'win32'
     ? ['C:/Program Files/Google/Chrome/Application/chrome.exe',
         'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe']
@@ -594,6 +605,97 @@ const EDITOR_READKEY_CHECK = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **全文ビューアを実ブラウザで測る。** 測るのは4つ、どれも字面では測れない:
+ *
+ * 1. **ファイラから押すと全文が出る**（差分ではなく中身が、行番号付きで）
+ * 2. **表示上限で切ったことが、実際に見える文字として出る**
+ *    （`dataset` のフラグを見るだけの検査は禁止。告知の要素を作らなくても通る）
+ * 3. **自動更新（15秒 / 再読込ボタン）で差分に戻らない** —
+ *    ペインの中身は作り直されるので、モードを持っていないと**読んでいる途中で
+ *    差分に戻る**。字面では完全に見えない
+ * 4. **描画の予算**（1行ごとに DOM へ足してレイアウトを起こすと二次になる。
+ *    同じ環境の実測で 4000 行 = 59 秒）
+ */
+const BLOB_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  // 🚨 **long.txt を持つペインを名指しで選ぶ。** 編集器の検査用に
+  //    コミット済み差分のある worktree が2本になったので、素朴に最初の差分ペインを
+  //    掴むと**別のペインで「全文」を押して、ファイラのクリックは long.txt の
+  //    ペインへ行く**（= 何も測らずに rows 0 で落ちる）。対象で選ぶ。
+  let target = null;
+  for (let i = 0; i < 400 && !target; i++) {
+    target = [...document.querySelectorAll('[data-pane-id^="diff-"]')]
+      .find(p => [...p.querySelectorAll('.tabs button')]
+        .some(b => (b.title ?? '').endsWith('long.txt'))) ?? null;
+    if (!target) await wait(100);
+  }
+  if (!target) return { error: 'long.txt のタブを持つ差分ペインが無い（検査の前提が崩れている）' };
+  const paneId = target.dataset.paneId;
+  const bar = target.querySelector('.viewbar');
+  if (!bar) return { error: '差分ペインに表示の切り替え（.viewbar）が無い' };
+  const paneOf = () => document.querySelector('[data-pane-id="' + paneId + '"]');
+  const btnOf = label => [...(paneOf()?.querySelectorAll('.viewbar button') ?? [])]
+    .find(b => b.textContent === label) ?? null;
+  const full = btnOf('全文');
+  if (!full) return { error: '「全文」ボタンが無い' };
+  full.click();
+  // 🚨 **ファイラから**押す（差分ペインのタブではなく、ファイラ経由で開けること）
+  const f = [...document.querySelectorAll('.tree .f')]
+    .find(e => (e.title ?? '').includes('long.txt'));
+  if (!f) return { error: 'ファイラに long.txt が無い（検査の前提が崩れている）' };
+  f.click();
+  let rows = 0;
+  for (let i = 0; i < 400; i++) {
+    rows = paneOf()?.querySelectorAll('.blob .bl').length ?? 0;
+    if (rows > 0) break;
+    await wait(100);
+  }
+  const pane = paneOf();
+  // ⚠️ **実際に見える文字**を読む（hidden でも textContent は残るので描かれているものだけ）
+  const notice = [...(pane?.querySelectorAll('.note') ?? [])]
+    .filter(e => e.getClientRects().length > 0)
+    .map(e => e.textContent ?? '').find(t => t.includes('行だけ表示')) ?? null;
+  const nums = [...(pane?.querySelectorAll('.blob .bl .ln') ?? [])].map(e => e.textContent);
+  const firstLineText = pane?.querySelector('.blob .bl .lx')?.textContent ?? null;
+  const stillDiff = (pane?.querySelectorAll('.diff div').length ?? 0) > 0;
+  // 3. 自動更新で差分に戻らないこと（再読込ボタンは load() → render() と同じ経路）
+  document.getElementById('refresh').click();
+  await wait(3500);
+  let afterRows = 0;
+  for (let i = 0; i < 100; i++) {
+    afterRows = paneOf()?.querySelectorAll('.blob .bl').length ?? 0;
+    if (afterRows > 0) break;
+    await wait(100);
+  }
+  const afterDiff = (paneOf()?.querySelectorAll('.diff div').length ?? 0) > 0;
+  // 4. 予算。**UI と同じ renderBlob を通す入口**で測る（3回の中央値）
+  if (typeof window.__kjpRenderBlob !== 'function') {
+    return { error: '描画予算の入口（__kjpRenderBlob）が無い' };
+  }
+  const shots = [];
+  for (let k = 0; k < 3; k++) {
+    shots.push(window.__kjpRenderBlob(${MAX_VIEW_LINES}));
+    // 🚨 **1回目で予算を超えたら繰り返さない。** 毎行レイアウトを起こす変異は
+    //    1回で約 59 秒かかるので、3回測ると検査自体が上限に達して
+    //    HUNG（= 落ちない検査）になり、変異が「守りを検証できていない」扱いになる。
+    //    超えた事実は1回で分かるので、そこで止めて失敗として返す。
+    if (shots[shots.length - 1].ms > ${BUDGET_BLOB_MS}) break;
+    await new Promise(r => requestAnimationFrame(r));
+  }
+  const ms = shots.map(s => s.ms).sort((a, b) => a - b);
+  return {
+    rows, notice, stillDiff, firstLineText,
+    firstNum: nums[0] ?? null, lastNum: nums[nums.length - 1] ?? null,
+    afterRows, afterDiff,
+    // 打ち切ったときは1件しか無いので、真ん中を取る（3件なら中央値）
+    budgetMs: ms[Math.floor(ms.length / 2)], budgetAll: ms,
+    budgetRows: shots[0].rows, connected: shots[0].connected,
+    maxViewLines: shots[0].maxViewLines,
+    paneId, budgetPaneId: shots[0].paneId,
+  };
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -627,6 +729,16 @@ try {
     await writeFile(edFile, 'one\ntwo\nthree\n', 'utf8');
     await g(['add', '-A'], edWt);
     await g(['commit', '-q', '-m', 'edit target'], edWt);
+
+    // 全文ビューアの検査用: **表示上限を超える行数のファイルを1つコミットする。**
+    // これが無いと「切ったことを告知する」を測れない（切る対象が無いので緑になる）。
+    // ⚠️ ファイラから開くので、コミット済み差分として出る worktree に置く。
+    const longWt = join(repo, '..', `${repo.split(/[\\/]/).pop()}-long`);
+    await g(['worktree', 'add', '-q', '-b', 'long-file', longWt], repo);
+    await writeFile(join(longWt, 'long.txt'),
+        `${Array.from({ length: BLOB_FILE_LINES }, (_, i) => `line ${i}`).join('\n')}\n`, 'utf8');
+    await g(['add', '-A'], longWt);
+    await g(['commit', '-q', '-m', 'long file'], longWt);
 
     // 実行を有効にしないとコンソールペインが描かれない = 計測対象が出ない
     server = spawn(process.execPath,
@@ -844,6 +956,24 @@ try {
             headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
         }).catch(() => {});
     }
+    // 🚨 **全文ビューアは編集器より前に置く。**
+    //    `EDITOR_CHECK` は「閉じる」を押さないので、終わったあとも `obj.editing` が
+    //    真のまま残る。`openEditor` は **`obj.body` ごと**置き換えるので、
+    //    そのペインからは **`.viewbar` が DOM から消える**。
+    //
+    //    ⚠️ **今は後ろに置いても通る。それは偶然なので前に置く。** 実測した:
+    //       編集器は最初に見つけた「編集」ボタン（= `editable` の worktree の
+    //       ペイン）を押すので、`long.txt` のペインは無傷のまま残る。だから
+    //       順序を入れ替えても両方緑になった（`✔ render` を確認済み）。
+    //       依存しているのは「2枚あるうちのどちらを先に掴むか」という**偶然**で、
+    //       `MAX_DIFF_PANES` が 1 になる / worktree 名の並びが変わるだけで壊れる。
+    //       壊れたときは「表示の切り替えが無い」という**別の原因に見える**失敗になる。
+    //    ⚠️ 描画の計測（12,000行）より前でもあること
+    //       （DOM が重くなると「開いたら出る」の待ち時間の意味が変わる）。
+    //    ⚠️ 鍵を捨てて読み込み直す `READKEY_CHECK` より前でもあること
+    //       （あれの後だと `?probe=1` の入口ごと作り直された状態を測る）。
+    const blob = await evaluate(BLOB_CHECK);
+
     // 🚨 編集器は**描画の計測より前**（12,000行流した後だと自動更新が重くなり、
     //    「作り直されたか」を待つ時間の意味が変わる）
     const editor = await evaluate(EDITOR_CHECK);
@@ -1115,6 +1245,56 @@ try {
                 + `（黙って消すと「機能が無い」と読まれる）: ${JSON.stringify(editorReadKey.sample)}`);
         }
     }
+    // 🚨 全文ビューア
+    if (!blob || blob.error) {
+        problems.push(`全文ビューアを測れなかった: ${blob?.error ?? '結果が取れない'}`);
+    } else {
+        if (blob.maxViewLines !== MAX_VIEW_LINES) {
+            problems.push('ページ側の上限と検査の上限が食い違っている'
+                + `（${blob.maxViewLines} ≠ ${MAX_VIEW_LINES}）= 別のものを測っている`);
+        }
+        if (blob.rows !== MAX_VIEW_LINES) {
+            problems.push(`ファイラから全文を開いた行数が ${blob.rows} 行`
+                + `（上限 ${MAX_VIEW_LINES} 行で切られていない / そもそも出ていない）`);
+        }
+        if (blob.stillDiff) {
+            problems.push('「全文」を選んだのに差分がまだ描かれている（切り替わっていない）');
+        }
+        // 行番号が無いと「何行目か」が分からない = ビューアとして用を成さない
+        if (blob.firstNum !== '1' || blob.lastNum !== String(MAX_VIEW_LINES)) {
+            problems.push('行番号が 1..上限 になっていない'
+                + `: 先頭 ${JSON.stringify(blob.firstNum)} / 末尾 ${JSON.stringify(blob.lastNum)}`);
+        }
+        // **差分ではなく中身**が出ていること（差分なら先頭に + が付く）
+        if (blob.firstLineText !== 'line 0') {
+            problems.push('全文の1行目が中身になっていない（差分を出している？）'
+                + `: ${JSON.stringify(blob.firstLineText)}`);
+        }
+        // 🚨 **見える文字**で告知を確かめる（フラグではなく）
+        if (!blob.notice) {
+            problems.push('上限で切ったのに告知が見えない（「全部見えている」と誤認させる）');
+        } else if (!new RegExp(`先頭 ${MAX_VIEW_LINES} 行`).test(blob.notice)
+            || !new RegExp(`全 ${BLOB_FILE_LINES} 行`).test(blob.notice)) {
+            problems.push(`告知に「どこまで / 全体で何行」が入っていない: ${blob.notice}`);
+        }
+        // 自動更新でモードが戻ると、読んでいる途中で差分に化ける
+        if (blob.afterRows === 0 || blob.afterDiff) {
+            problems.push('自動更新（再読込）で全文が差分に戻った'
+                + `（読んでいる途中で中身が入れ替わる）: 行 ${blob.afterRows} / 差分 ${blob.afterDiff}`);
+        }
+        // 予算。**DOM から外れた要素を測っていないことも確かめる**
+        //（外れていると offsetHeight がレイアウトを起こさず「速い」という嘘が出る）
+        if (!blob.connected) {
+            problems.push('描画予算の計測対象が DOM から外れている（測った時間に意味が無い）');
+        }
+        if (blob.budgetRows !== MAX_VIEW_LINES) {
+            problems.push(`予算の計測が ${blob.budgetRows} 行しか描いていない（上限は ${MAX_VIEW_LINES}）`);
+        }
+        if (blob.budgetMs > BUDGET_BLOB_MS) {
+            problems.push(`全文 ${MAX_VIEW_LINES} 行の描画 ${blob.budgetMs}ms > 予算 ${BUDGET_BLOB_MS}ms`
+                + `（1行ごとにレイアウトを起こしていると二次になる）: ${JSON.stringify(blob.budgetAll)}`);
+        }
+    }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {
         problems.push(`最長ブロック ${probe.maxBlockMs}ms > 予算 ${BUDGET_MAX_BLOCK_MS}ms`
             + '（UI が固まって停止ボタンも自動更新も効かない）');
@@ -1188,6 +1368,12 @@ try {
     console.log(`   読み取り鍵のみ: タブ ${editorReadKey?.tabs ?? '(測れず)'} 個 / `
         + `編集ボタン ${editorReadKey?.hasEditButton ?? '(測れず)'} / `
         + `理由を言った ${editorReadKey?.said ?? '(測れず)'}`);
+    if (blob && !blob.error) {
+        // ⚠️ **どのペインを測ったかも出す**（差分ペインが2枚あるので、
+        //    駆動した対象と予算の計測先が違っていたら目で気付ける形にする）
+        console.log(`   全文 ${blob.rows}/${BLOB_FILE_LINES} 行を描画 = ${blob.budgetMs}ms`
+            + `（予算 ${BUDGET_BLOB_MS}ms）/ 対象 ${blob.paneId} / 予算の対象 ${blob.budgetPaneId}`);
+    }
     for (const p of problems) console.log(`   ${p}`);
     process.exitCode = problems.length ? 1 : 0;
 } catch (e) {
@@ -1214,6 +1400,7 @@ try {
     // ⚠️ worktree は repo の**外**（兄弟）に作ったので個別に消す
     await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-unc`));
     await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-ed`));
+    await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-long`));
     await rmRetry(repo);
     await rmRetry(profile);
 }

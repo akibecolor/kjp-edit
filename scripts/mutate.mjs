@@ -1302,6 +1302,117 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         gone: 'notice.nextSibling?.remove()',
         script: 'v0/render-check.mjs',
     },
+    // ---- 全文ビューア -------------------------------------------------------
+    {
+        name: 'blob-view-line-limit',
+        why: '表示上限を外す（巨大なファイルを丸ごと DOM に入れて固まる。'
+            + '32000 行で実測 613ms、上限が無ければ行数に比例して伸び続ける）',
+        file: 'v0/blobview.mjs',
+        from: '    const truncated = totalLines > maxLines;',
+        to: '    const truncated = false;',
+        gone: 'totalLines > maxLines',
+        pattern: '表示上限で切ったら',
+        testFile: 'v0/blobview.test.mjs',
+    },
+    {
+        name: 'blob-view-limit-notice',
+        why: '切ったのに告知しない（「全部見えている」と誤認させる。'
+            + 'コードを読んでいるときに末尾が無いことに気付けない）',
+        file: 'v0/blobview.mjs',
+        from: `        notices.push(\`⚠ 行が多いので先頭 \${maxLines} 行だけ表示しています\`
+            + \`（全 \${totalLines} 行）。残り \${totalLines - maxLines} 行は表示していません。\`);`,
+        to: '        /* 変異: 切ったことを告知しない */',
+        gone: '行だけ表示しています',
+        pattern: '表示上限で切ったら',
+        testFile: 'v0/blobview.test.mjs',
+    },
+    {
+        // 🚨 **行を消さずに到達不能にする変異**（#41 と同じ型）。
+        //    `blobview.mjs` に告知は残っているのに、画面に出さない。
+        //    字面を見る検査では**完全に見えない**ので、実ブラウザで
+        //    「見える文字」を測っていることの確認になる。
+        name: 'blob-view-notice-not-drawn',
+        why: '告知を作っているのに描かない（planBlobView は正しいまま、'
+            + '画面には出ないので「全部見えている」に戻る）',
+        file: 'v0/app.html',
+        from: "  for (const n of plan.notices) box.append(el('div', 'note warn', n));",
+        to: "  for (const n of []) box.append(el('div', 'note warn', n));",
+        gone: 'for (const n of plan.notices)',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'blob-render-per-line-layout',
+        why: '1行ごとに DOM へ足してレイアウトを起こす（総文字数に対して二次。'
+            + '同じ環境の実測で 1000行 3.4秒 / 2000行 14.5秒 / 4000行 59.1秒）',
+        file: 'v0/app.html',
+        from: `  const frag = document.createDocumentFragment();
+  for (let i = 0; i < plan.lines.length; i++) frag.append(blobRow(i + 1, plan.lines[i]));
+  box.append(frag);
+  holder.replaceChildren(box);`,
+        to: `  holder.replaceChildren(box);
+  for (let i = 0; i < plan.lines.length; i++) {
+    box.append(blobRow(i + 1, plan.lines[i]));
+    void holder.scrollHeight;   /* 変異: 毎行 強制同期レイアウト */
+  }`,
+        gone: 'box.append(frag)',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'blob-view-mode-not-kept',
+        why: '選んだモードを覚えない（15 秒ごとの自動更新でペインを作り直すので、'
+            + '**読んでいる途中で全文が差分に戻る**）',
+        file: 'v0/app.html',
+        from: "    if (obj.mode !== 'blob') obj.mode = 'diff';",
+        to: "    obj.mode = 'diff';",
+        gone: "if (obj.mode !== 'blob')",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'blob-server-max-bytes',
+        why: '巨大な blob を全部メモリに読む（512KB の上限を外すと、'
+            + '1リクエストでリポジトリ内の最大ファイル分のメモリを取られる）',
+        file: 'v0/git.mjs',
+        from: "        buf = await git(['cat-file', 'blob', oid],\n"
+            + '            { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });',
+        to: "        buf = await git(['cat-file', 'blob', oid], { cwd, raw: true });",
+        // ⚠️ `maxBytes: MAX_BLOB_BYTES + 1024` は fileDiff にもある。
+        //    **インデントまで含めて一意にする**（同じ式が他所にできると SKIP に落ち、
+        //    守りが検証されないまま静かに続く）
+        gone: "'blob', oid],\n            { cwd, raw: true, maxBytes:",
+        pattern: 'サーバの上限を超えるファイルは中身を読まずに',
+    },
+    {
+        name: 'blob-path-validation',
+        why: 'blob の path 検証を外す（多重防御の手前側。git 側の失敗に頼ると'
+            + '「拒否した」と「たまたま見つからなかった」の区別が付かなくなる）',
+        file: 'v0/git.mjs',
+        from: "    if (!isSafeRepoPath(path)) throw new GitError(['blob'], 2, `path が不正です: ${path}`);",
+        to: '    /* 変異: path の検証を外す */',
+        // ⚠️ `isSafeRepoPath(path)` は fileDiff にもある。blob 側だけを一意に指す
+        gone: "isSafeRepoPath(path)) throw new GitError(['blob']",
+        pattern: 'リポジトリ外へ抜けようとする path を拒否する',
+    },
+    {
+        name: 'blob-ref-validation',
+        why: 'blob の ref 検証を外す（`main~1` や `@{1}` が通り、'
+            + '捨てたコミットの中身まで読める）',
+        file: 'v0/git.mjs',
+        from: "    if (!isSafeRef(ref)) throw new GitError(['blob'], 2, `ref が不正です: ${ref}`);",
+        to: '    /* 変異: ref の検証を外す */',
+        gone: 'isSafeRef(ref)) throw new GitError([\'blob\']',
+        pattern: 'blob: ref にオプションやリビジョン式を渡せない',
+    },
+    {
+        name: 'blob-tooLarge-binary-unknown',
+        why: '読まなかったのに binary: false と断定する'
+            + '（「調べられない」と「テキストである」を混同する。UI が'
+            + '「バイナリではありません」と嘘をつくことになる）',
+        file: 'v0/git.mjs',
+        from: '            path, ref, oid, size, tooLarge: true, binary: null, text: null,',
+        to: '            path, ref, oid, size, tooLarge: true, binary: false, text: null,',
+        gone: 'tooLarge: true, binary: null',
+        pattern: 'サーバの上限を超えるファイルは中身を読まずに',
+    },
     {
         name: 'transcript-type-allowlist',
         why: '走査するレコード種別の許可リストを外すと、'
@@ -1333,12 +1444,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'UI が import する共有モジュールを配信しない（import が1本 404 になると'
             + 'モジュール全体が実行されず**ページが真っ白**になる）',
         file: 'v0/server.mjs',
-        // ⚠️ 並列で足した4つのモジュール（panelayout / pathlabel / mergeresult /
-        //    linediff）が同じ条件に来たので、行をまたぐ形になった。
+        // ⚠️ 並列で足した5つのモジュール（panelayout / pathlabel / mergeresult /
+        //    linediff / blobview）が同じ条件に来たので、行をまたぐ形になった。
         //    **改行込みで一意に指定する**
         from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'\n"
             + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'\n"
-            + "            || url.pathname === '/linediff.mjs') {",
+            + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',

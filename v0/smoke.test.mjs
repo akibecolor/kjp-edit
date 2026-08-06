@@ -151,7 +151,8 @@ after(async () => {
         await rm(join(repo, '..', `${stem}-wt-${n}`), { recursive: true, force: true });
     }
     // basename 衝突テストが作るディレクトリ（テスト内で消し損ねた場合の保険）
-    for (const n of ['dup1', 'dup2']) {
+    // blobfx = 全文ビューアのフィクスチャ用（テスト内で畳むが、落ちたときの保険）
+    for (const n of ['dup1', 'dup2', 'blobfx']) {
         await rm(join(repo, '..', `${stem}-${n}`), { recursive: true, force: true });
     }
     await rm(repo, { recursive: true, force: true });
@@ -441,7 +442,93 @@ test('🔒 blob: リポジトリ外へ抜けようとする path を拒否する
         assert.ok(d.error, `error が返っていない: ${bad}`);
         // 中身が漏れていないこと
         assert.equal(d.text, undefined, `中身が返っている: ${bad}`);
+        // 🚨 **400 だけを見てはいけない。拒否理由を確認する。**
+        //    git 自身も `<rev>:<path>` を repo の中に限定するので、入口の検証を
+        //    丸ごと外しても全部 400（「見つかりません」）のまま緑で通り抜ける
+        //    （reflog の検証で同じ形の偽陽性を実際に踏んだ）。
+        //    多重防御の**手前側が生きていること**をここで固定する。
+        assert.match(d.error, /path が不正です/,
+            `入口の検証ではなく git 側の失敗で 400 になっている: ${bad} → ${d.error}`);
     }
+});
+
+// 🔒 ref も同じ。`main~1` のようなリビジョン式は git なら解決できてしまうので、
+//    「入口で弾いている」ことを理由の文言まで見て固定する。
+test('🔒 blob: ref にオプションやリビジョン式を渡せない', async () => {
+    for (const bad of ['--output=/tmp/x', 'main~1', 'main^{tree}', 'a b', 'x..y']) {
+        const q = new URLSearchParams({ ref: bad, path: 'shared.txt' });
+        const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+        assert.equal(res.status, 400, `拒否されていない: ${bad}`);
+        const d = await res.json();
+        assert.match(d.error, /ref が不正です/,
+            `入口の検証ではなく git 側の失敗で 400 になっている: ${bad} → ${d.error}`);
+        assert.equal(d.text, undefined, `中身が返っている: ${bad}`);
+    }
+});
+
+/**
+ * 全文ビューア用のフィクスチャ。**巨大ファイルとバイナリ**を含む
+ * コミットを1つ作る。
+ *
+ * ⚠️ **worktree を増やしたままにしない。** `worktrees.length === 3` を見ている
+ *    テストがあるので、一時 worktree でコミットしてから畳む（ブランチだけ残す）。
+ *    ブランチはどの worktree の HEAD からも到達できないのでグラフにも出ない。
+ */
+let blobFixtureWt = null;
+async function ensureBlobFixture() {
+    if (blobFixtureWt) return;
+    const stem = repo.split(/[\\/]/).pop();
+    const wt = join(repo, '..', `${stem}-blobfx`);
+    await g(['worktree', 'add', '-q', '-b', 'blob-fixture', wt], repo);
+    // サーバ側の上限（512KB）を確実に超える大きさ。中身は何でもよい
+    await writeFile(join(wt, 'big.txt'), 'a'.repeat(600 * 1024), 'utf8');
+    // ⚠️ **ソースに生の NUL を書かない**（git がこのテストファイルを binary と
+    //    判定して `git log -p` から見えなくなる。実際に v0/git.mjs でやった）。
+    //    バイト列を組み立てる。先頭 8000 バイトに NUL があれば git と同じ判定になる
+    await writeFile(join(wt, 'bin.dat'),
+        Buffer.concat([Buffer.from('PNGX'), Buffer.alloc(32, 0), Buffer.from('tail')]));
+    await g(['add', '-A'], wt);
+    await g(['commit', '-q', '-m', 'test: 大きいファイルとバイナリ'], wt);
+    await g(['worktree', 'remove', '--force', wt], repo);
+    blobFixtureWt = wt;
+}
+
+// 🔒 巨大ファイルでメモリを食い切らせない。**上限に達したら読むのをやめて、
+//    やめたことを言う**（size も binary も「読んでいないので分からない」を含む）。
+test('blob: サーバの上限を超えるファイルは中身を読まずに tooLarge を返す', async () => {
+    await ensureBlobFixture();
+    const q = new URLSearchParams({ ref: 'blob-fixture', path: 'big.txt' });
+    const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+    assert.equal(res.status, 200);
+    const d = await res.json();
+    assert.equal(d.tooLarge, true, `上限が効いていない: ${JSON.stringify(d).slice(0, 200)}`);
+    assert.equal(d.text, null, '上限を超えたのに中身が返っている');
+    // 「読まなかったので分からない」を false と偽らない
+    assert.equal(d.binary, null);
+    assert.equal(d.size, 600 * 1024);
+    // ⚠️ UI が上限を二重に書かないための値。無いと告知の数字が書けない
+    assert.equal(d.limitBytes, 512 * 1024, `limitBytes が返っていない: ${d.limitBytes}`);
+});
+
+test('blob: バイナリは中身を返さず binary で告知する', async () => {
+    await ensureBlobFixture();
+    const q = new URLSearchParams({ ref: 'blob-fixture', path: 'bin.dat' });
+    const res = await fetch(`${baseUrl}/api/v0/blob?${q}`);
+    assert.equal(res.status, 200);
+    const d = await res.json();
+    assert.equal(d.binary, true, `バイナリと判定されていない: ${JSON.stringify(d).slice(0, 200)}`);
+    assert.equal(d.tooLarge, false);
+    assert.equal(d.text, null, 'バイナリの中身が返っている');
+    assert.equal(d.size, 40);
+});
+
+test('blob: 上限内のテキストは全文が返る（全文ビューアが読むもの）', async () => {
+    await ensureBlobFixture();
+    const q = new URLSearchParams({ ref: 'blob-fixture', path: 'README.md' });
+    const d = await (await fetch(`${baseUrl}/api/v0/blob?${q}`)).json();
+    assert.equal(d.tooLarge, false);
+    assert.equal(d.binary, false);
+    assert.equal(d.text, '# smoke\n');
 });
 
 test('🔒 diff: ref にオプションやリビジョン式を渡せない', async () => {
