@@ -1085,7 +1085,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'UI が import する共有モジュールを配信しない（import が1本 404 になると'
             + 'モジュール全体が実行されず**ページが真っ白**になる）',
         file: 'v0/server.mjs',
-        from: "            || url.pathname === '/chatfilter.mjs') {",
+        from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
@@ -1536,6 +1536,99 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         //    順序で勝つ。守りの本体は「作者スタイルに規則があること」で、
         //    `!important` は順序が入れ替わったときの保険（順序が守りになっている例）。
         script: 'v0/layout-check.mjs',
+    },
+    // ---- ペインの並び替え（ドラッグ移動）。
+    //      🚨 **保存も復元も「行は残っているのに到達不能」という形で壊せる**ので、
+    //      layout-check が実ブラウザで掴んで動かし、自動更新を1回通し、
+    //      再読込してから並びを読む。ここはその検査が本当に落ちるかの確認。
+    {
+        name: 'pane-order-save',
+        why: 'ドラッグを確定しても localStorage に保存しない'
+            + '（再読込で並びが既定に戻る = 毎回並べ直すことになる）',
+        file: 'v0/app.html',
+        from: '      p.classList.remove(\'dragging\');\n      saveLayout();',
+        to: '      p.classList.remove(\'dragging\');\n      /* 変異: 並びを保存しない */',
+        gone: '      saveLayout();',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        name: 'pane-order-restore',
+        why: '起動時に保存された並びを読まない（保存はするので、'
+            + '「効いているのに次に効かない」形の壊れ方になる）',
+        file: 'v0/app.html',
+        from: 'let paneLayout = parseLayout(readStoredLayout());',
+        to: 'let paneLayout = parseLayout(null);   /* 変異: 保存を読まない */',
+        gone: 'parseLayout(readStoredLayout())',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        name: 'pane-order-apply',
+        why: '置き直すときに保存された順序を無視する'
+            + '（掴んで動かしても列の中の位置が変わらない）',
+        file: 'v0/app.html',
+        from: '    placePanes(hostEl(h), orderedIds(paneLayout, h, ids));',
+        to: '    placePanes(hostEl(h), ids);',
+        gone: 'orderedIds(paneLayout, h, ids)',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        // ⚠️ 最初は ensurePane 側（自動更新が既定の入れ物へ戻す形）に変異を置いたが
+        //    **SURVIVED した**。applyLayout が置き直すので観測可能な差が出ない
+        //    = そこに守りを二重に置く意味が無い（守りごと消して、置き場所の決定を
+        //    applyLayout の1箇所に集めた）。変異は**守りの本体**に当てる。
+        name: 'pane-order-host-override',
+        why: '保存された移動先ではなく既定の入れ物を使う（列をまたぐ移動ができない）',
+        file: 'v0/app.html',
+        from: '    byHost.get(hostOf(paneLayout, id, obj.defaultHost))?.push(id);',
+        to: '    byHost.get(obj.defaultHost)?.push(id);',
+        gone: 'hostOf(paneLayout, id, obj.defaultHost)',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        // 🚨 layout-check の合成 pointerup は click を生成しないので、
+        //    こちらは render-check（ブラウザと同じ順で click まで撃つ）で測る。
+        name: 'pane-drag-click-suppress',
+        why: 'ドラッグ直後の click を捨てない'
+            + '（並べ替えるたびにヘッダの開閉が起きてペインが畳まれる）',
+        file: 'v0/app.html',
+        from: '    if (drag.moved) { drag.moved = false; return; }',
+        to: '    /* 変異: ドラッグ直後の click を捨てない */',
+        gone: 'if (drag.moved) { drag.moved = false; return; }',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'pane-default-rank',
+        why: '既定の並びを「render が求めた順」にしない'
+            + '（後から増えた worktree のコンソールが、アルファベット順の途中ではなく'
+            + '必ず末尾に付く。以前 arrangeRow が毎回並べ直していた守り）',
+        file: 'v0/app.html',
+        from: '  obj.defaultRank = paneSeq++;',
+        to: '  obj.defaultRank = -paneSeq++;',
+        gone: 'obj.defaultRank = paneSeq++;',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        name: 'pane-order-forget-cap',
+        why: '覚えている id を上限で削らない'
+            + '（使い捨ての worktree の id が localStorage に永久に溜まる）',
+        file: 'v0/panelayout.mjs',
+        from: '    if (total <= cap) return layout;',
+        to: '    return layout;   /* 変異: 上限を無くす */',
+        gone: 'if (total <= cap) return layout;',
+        pattern: 'pruneLayout は上限を超えたときだけ',
+        testFile: 'v0/panelayout.test.mjs',
+    },
+    {
+        name: 'pane-order-single-host',
+        why: '入れ物をまたいで移したとき、元の入れ物の記録から消さない'
+            + '（1つの id が2箇所に載り、hostOf が PANE_HOSTS の順という'
+            + '無関係な理由で答えを決める）',
+        file: 'v0/panelayout.mjs',
+        from: '        out[h] = h === hostId ? [...ids] : (layout[h] ?? []).filter(id => !moved.has(id));',
+        to: '        out[h] = h === hostId ? [...ids] : [...(layout[h] ?? [])];',
+        gone: 'filter(id => !moved.has(id))',
+        pattern: 'setHostOrder は移した id を元の入れ物の記録から消す',
+        testFile: 'v0/panelayout.test.mjs',
     },
     {
         name: 'monitor-glance-raw',

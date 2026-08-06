@@ -228,12 +228,107 @@ const squashed = badges.filter(e => rect(e).width < 24)
 // **溢れも hidden も測らないまま緑**になる（実際にこの状態だった）。
 const cmdbars = [...doc.querySelectorAll('.cmdbar')].filter(drawn).length;
 const monitorRows = [...doc.querySelectorAll('[data-pane-id="monitor"] .ab')].filter(drawn).length;
+// 🚨 **手つかずの状態の計測は、下の並び替えより前に「値として」取る。**
+//    JSON を組み立てる式の中に doc.body.scrollWidth のような読み取りを残していたら、
+//    再読込で doc が捨てられた後に読むことになり、**worktree HEAD バッジが 0 個**
+//    （＝核心情報が消えたという偽の失敗）になった。溢れの判定も同じ経路で嘘になる。
+const bodyScroll = doc.body.scrollWidth, bodyClient = doc.body.clientWidth;
+const wtBadges = [...doc.querySelectorAll('.ref.wt')].filter(drawn).length;
+
+// ---- ペインの並び替え（ドラッグ移動）を実際に動かして測る ----
+// 🚨 **字面を assert しない。** 保存も復元も「行は残っているのに到達不能」という
+//    形で壊せるので、ヘッダを掴んで動かし、自動更新を1回通し、再読込してから
+//    実際の並びを読む。⚠️ ここは server.mjs のテンプレートリテラルの中なので
+//    **バックティックとドル記号+波括弧の補間を書かない**（前者は構文エラー、
+//    後者は server.mjs 側の式として評価される。この注意書き自体で踏んだ）。
+const paneOrder = (d, host) => [...d.querySelectorAll('#' + host + ' > .pane')]
+  .map(e => e.dataset.paneId);
+const fire = (target, type, x, y) => target.dispatchEvent(new win.PointerEvent(type, {
+  bubbles: true, cancelable: true, composed: true,
+  pointerId: 1, pointerType: 'mouse', isPrimary: true,
+  button: 0, buttons: type === 'pointerup' ? 0 : 1,
+  clientX: x, clientY: y,
+}));
+// ⚠️ 落とす先の座標は**入れ物の矩形**から取る。ペインの矩形は途中の
+//    pointermove で並びが変わると動くので、掴む前に取った値が嘘になる。
+const dragToTopOf = (paneEl, hostId) => {
+  const hd = paneEl.querySelector('header');
+  const from = hd.getBoundingClientRect();
+  const aim = () => doc.getElementById(hostId).getBoundingClientRect();
+  fire(hd, 'pointerdown', from.left + 8, from.top + 3);
+  fire(hd, 'pointermove', from.left + 8, from.top + 30);   // しきい値(6px)を越える
+  fire(hd, 'pointermove', aim().left + 8, aim().top + 1);   // 先頭ペインの中点より手前
+  fire(hd, 'pointerup', aim().left + 8, aim().top + 1);
+};
+const dragNote = [];
+const leftBefore = paneOrder(doc, 'left');
+const rightBefore = paneOrder(doc, 'right');
+if (leftBefore.length < 2) dragNote.push('left のペインが2本未満（列内の並び替えを測れない）');
+if (rightBefore.length < 1) dragNote.push('right のペインが無い（列をまたぐ移動を測れない）');
+if (leftBefore.length >= 2) {
+  const ps = [...doc.querySelectorAll('#left > .pane')];
+  dragToTopOf(ps[ps.length - 1], 'left');
+}
+if (rightBefore.length >= 1) {
+  dragToTopOf(doc.querySelector('#right > .pane'), 'left');
+}
+const leftAfterDrag = paneOrder(doc, 'left');
+const rightAfterDrag = paneOrder(doc, 'right');
+// 並べ替えた後の溢れ（幅の前提が並び順に依存していないか）
+const overDrag = [...doc.querySelectorAll('*')].filter(e => rect(e).right > vw + 1);
+const scrollDrag = doc.body.scrollWidth, clientDrag = doc.body.clientWidth;
+// 自動更新（ensurePane / dropPanes を通る）で並びが巻き戻らないこと。
+// ⚠️ render は .cards を作り直すので、**別のノードになったこと**で完了を知る
+//    （固定時間で待つと、処理を足したときに足りなくなる）。
+const cardsWas = doc.querySelector('.cards');
+doc.getElementById('refresh').click();
+for (let i = 0; i < 100; i++) {
+  const now = doc.querySelector('.cards');
+  if (now && now !== cardsWas) break;
+  await sleep(100);
+}
+const leftAfterRefresh = paneOrder(doc, 'left');
+// 🚨 並びが同じでも**作り直されている**ことがある（古い方が先に見つかるので
+//    並びだけ見ると使い回されているように読める）。同じ id の重複も数える。
+const allPanes = [...doc.querySelectorAll('.pane')];
+const paneDuplicates = allPanes.length
+  - new Set(allPanes.map(e => e.dataset.paneId)).size;
+// 再読込して、保存された並びが復元されること
+f.contentWindow.location.reload();
+await new Promise(r => f.addEventListener('load', r, { once: true }));
+let doc2 = f.contentDocument;
+for (let i = 0; i < 100; i++) {
+  doc2 = f.contentDocument;
+  if (doc2 && doc2.querySelector('.grow')
+    && paneOrder(doc2, 'left').length >= leftAfterRefresh.length) break;
+  await sleep(100);
+}
+const leftAfterReload = paneOrder(doc2, 'left');
+const rightAfterReload = paneOrder(doc2, 'right');
+// 「レイアウト」で既定の並びに戻れること。
+// ⚠️ 戻せないと、動かしすぎた画面を直す手段が無くなる（ペインを1つずつ
+//    元の列へ引きずるしかない）。既定の並びは **render が求めた順**なので、
+//    DOM に残っている今の順ではなく最初に測った順と一致しなければならない。
+doc2.getElementById('reset').click();
+await sleep(100);
+const leftAfterReset = paneOrder(doc2, 'left');
+const rightAfterReset = paneOrder(doc2, 'right');
+
 document.getElementById('out').textContent = JSON.stringify({
   innerWidth: vw,
+  dragNote,
+  leftBefore, leftAfterDrag, leftAfterRefresh, leftAfterReload, leftAfterReset,
+  rightBefore, rightAfterDrag, rightAfterReload, rightAfterReset,
+  paneDuplicates,
+  overflowingAfterDrag: overDrag.slice(0, 12).map(e => e.tagName
+    + (e.id ? '#' + e.id : '')),
+  overflowingAfterDragCount: overDrag.length,
+  bodyScrollWidthAfterDrag: scrollDrag,
+  bodyClientWidthAfterDrag: clientDrag,
   drawnCmdbars: cmdbars,
   drawnMonitorRows: monitorRows,
-  bodyScrollWidth: doc.body.scrollWidth,
-  bodyClientWidth: doc.body.clientWidth,
+  bodyScrollWidth: bodyScroll,
+  bodyClientWidth: bodyClient,
   overflowing: over.slice(0, 12),
   overflowingCount: over.length,
   hiddenButDrawn: hiddenButDrawn.slice(0, 12),
@@ -242,7 +337,7 @@ document.getElementById('out').textContent = JSON.stringify({
   squashedCount: squashed.length,
   visibleBadges: badges.length,
   // worktree HEAD バッジは狭い画面でも消してはいけない（このツールの核心情報）
-  visibleWorktreeBadges: [...doc.querySelectorAll('.ref.wt')].filter(drawn).length,
+  visibleWorktreeBadges: wtBadges,
 });
 </script>`;
 }
@@ -2197,7 +2292,7 @@ async function handleRequest(req, res) {
         // ブラウザと unit テストで共有しているモジュール。
         // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
         if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs'
-            || url.pathname === '/chatfilter.mjs') {
+            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',

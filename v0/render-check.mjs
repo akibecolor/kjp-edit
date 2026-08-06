@@ -370,6 +370,82 @@ const DUAL_CHECK = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **走っているコンソールをドラッグで壊さないことを実挙動で測る。**
+ *
+ * ペインを動かすのは `appendChild`（作り直しではない）なので購読は切れない —
+ * という**主張をコメントに書いても回帰は防げない**。実際に出力が出続けている
+ * コンソールを列をまたいで動かし、**そのあとも出力が増えること**を見る。
+ * 併せて、ドラッグ直後の click でペインが畳まれないことも見る
+ * （合成 pointerup では click が生成されないので、ブラウザと同じ順で自分で撃つ）。
+ * ⚠️ ここはテンプレートリテラルの中。**バックティックを書かない。**
+ */
+const DRAG_LIVE_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const cin = [...document.querySelectorAll('.cmdbar input')].find(e =>
+    e.closest('[data-pane-id]')?.dataset.paneId !== 'monitor' && !e.placeholder);
+  if (!cin) return { error: 'コンソールの入力欄が見つからない' };
+  // 走っている間は入力欄が disabled で Enter が効かない（前の検査の実行を待つ）
+  for (let i = 0; i < 400 && cin.disabled; i++) await wait(100);
+  if (cin.disabled) return { error: 'コンソールが空かない（前の実行が終わらない）' };
+  const pane = cin.closest('[data-pane-id]');
+  const paneId = pane.dataset.paneId;
+  const term = pane.querySelector('.term');
+  if (!term) return { error: 'コンソールの端末が無い' };
+  const fromHost = pane.parentElement?.id ?? '(親が無い)';
+  // 出力が少しずつ出続けるコマンド。**移動の後に増えたか**で購読の生死を測る
+  cin.value = 'node -e "let i=0;const t=setInterval(()=>{console.log(String(++i));if(i>=80)clearInterval(t)},100)"';
+  cin.dispatchEvent(new Event('input', { bubbles: true }));
+  cin.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  let len0 = 0;
+  for (let i = 0; i < 200 && len0 === 0; i++) {
+    len0 = term.textContent.length;
+    if (len0 === 0) await wait(100);
+  }
+  if (len0 === 0) return { error: '実行が始まらない（購読の生死を測れない）' };
+  const fire = (t, type, x, y) => t.dispatchEvent(new PointerEvent(type, {
+    bubbles: true, cancelable: true, composed: true,
+    pointerId: 1, pointerType: 'mouse', isPrimary: true,
+    button: 0, buttons: type === 'pointerup' ? 0 : 1, clientX: x, clientY: y,
+  }));
+  const hd = pane.querySelector('header');
+  const from = hd.getBoundingClientRect();
+  // ⚠️ 落とす先の座標は入れ物の矩形から取る（ペインの矩形は途中で動く）
+  const aim = () => document.getElementById('left').getBoundingClientRect();
+  fire(hd, 'pointerdown', from.left + 8, from.top + 3);
+  fire(hd, 'pointermove', from.left + 8, from.top + 30);
+  fire(hd, 'pointermove', aim().left + 8, aim().top + 1);
+  fire(hd, 'pointerup', aim().left + 8, aim().top + 1);
+  // ブラウザは pointerup のあとに click を出す。畳まれてはいけない
+  fire(hd, 'click', aim().left + 8, aim().top + 1);
+  const movedTo = pane.parentElement?.id ?? '(親が無い)';
+  const minimized = pane.classList.contains('min');
+  const lenMoved = term.textContent.length;
+  let lenAfter = lenMoved;
+  for (let i = 0; i < 100 && lenAfter <= lenMoved; i++) {
+    await wait(100);
+    lenAfter = term.textContent.length;
+  }
+  const stopBtn = [...pane.querySelectorAll('.cmdbar button')]
+    .find(b => b.textContent === '停止' && !b.disabled);
+  if (stopBtn) stopBtn.click();
+  // ⚠️ id に Windows のパスが入るので属性セレクタで数えない（\\ の扱いで壊れる）
+  const dupes = [...document.querySelectorAll('.pane')]
+    .filter(e => e.dataset.paneId === paneId).length;
+  const out = {
+    fromHost, movedTo, minimized, dupes,
+    sameTerm: pane.querySelector('.term') === term,
+    grew: lenAfter > lenMoved,
+    lenMoved, lenAfter,
+    stopped: Boolean(stopBtn),
+  };
+  // 後続の計測が同じ形の画面を見るように、並びを既定へ戻す
+  document.getElementById('reset').click();
+  await wait(300);
+  out.resetHost = pane.parentElement?.id ?? '(親が無い)';
+  return out;
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -576,6 +652,11 @@ try {
         }).catch(() => {});
     }
 
+    // 🚨 ドラッグの検査は**描画の計測より前**（12,000行流した後だと端末の
+    //    文字量が動き続けて「移動の後に増えたか」を測れない）。
+    //    心拍の検査の後に置く（あれが走らせたセッションが終わるのを待つ形になる）。
+    const dragLive = await evaluate(DRAG_LIVE_CHECK);
+
     const probeValue = await evaluate(MEASURE);
     const probe = probeValue;
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
@@ -683,6 +764,36 @@ try {
             problems.push(`入力欄が送信先を出していない: ${JSON.stringify(dual.placeholder)}`);
         }
     }
+    // 🚨 走っているコンソールをドラッグで壊していないこと（作り直しは購読を切る）
+    if (!dragLive || dragLive.error) {
+        problems.push(`ドラッグ移動を測れなかった: ${dragLive?.error ?? '結果が取れない'}`);
+    } else {
+        if (dragLive.movedTo !== 'left') {
+            problems.push('コンソールのペインが列をまたいで動かない'
+                + `（${dragLive.fromHost} → ${dragLive.movedTo}）`);
+        }
+        if (!dragLive.grew) {
+            problems.push('ペインを動かしたあと出力が増えない'
+                + '（購読が切れている = 動かすと走っている実行を見失う）'
+                + `: ${dragLive.lenMoved} → ${dragLive.lenAfter} 文字`);
+        }
+        if (!dragLive.sameTerm) {
+            problems.push('ペインを動かすときに中身を作り直している'
+                + '（それまでの出力が消え、購読も切れる）');
+        }
+        if (dragLive.dupes !== 1) {
+            problems.push(`同じ id のコンソールが ${dragLive.dupes} 個ある`
+                + '（動かすときに複製している）');
+        }
+        if (dragLive.minimized) {
+            problems.push('ドラッグ直後の click でペインが畳まれた'
+                + '（並べ替えるたびに中身が隠れる）');
+        }
+        if (dragLive.resetHost !== 'consoles') {
+            problems.push('「レイアウト」で並びが既定に戻らない'
+                + `（コンソールが ${dragLive.resetHost} に残っている = 直し方が無い）`);
+        }
+    }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {
         problems.push(`最長ブロック ${probe.maxBlockMs}ms > 予算 ${BUDGET_MAX_BLOCK_MS}ms`
             + '（UI が固まって停止ボタンも自動更新も効かない）');
@@ -728,6 +839,10 @@ try {
     console.log(problems.length ? '✖ render' : '✔ render');
     console.log(`   ${probe.lines} 行 = ${probe.totalMs}ms / `
         + `最長ブロック ${probe.maxBlockMs}ms / 残った要素 ${probe.spans}`);
+    // 🚨 **測った値を出す。** 「0 文字 → 0 文字」で緑になっていないかを目で見る
+    console.log(`   ドラッグ: ${dragLive?.fromHost} → ${dragLive?.movedTo}`
+        + ` / 移動後の出力 ${dragLive?.lenMoved} → ${dragLive?.lenAfter} 文字`
+        + ` / 戻し先 ${dragLive?.resetHost}`);
     for (const p of problems) console.log(`   ${p}`);
     process.exitCode = problems.length ? 1 : 0;
 } catch (e) {

@@ -163,7 +163,7 @@ let failed = false;
 // 2. ユニットテスト
 {
     const r = await run(
-        ['--test', '--test-timeout=30000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'v0/chatfilter.test.mjs',
+        ['--test', '--test-timeout=30000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'v0/chatfilter.test.mjs', 'v0/panelayout.test.mjs',
             'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs'],
         { timeout: 60_000 },
     );

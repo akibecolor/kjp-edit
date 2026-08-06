@@ -20,6 +20,11 @@
      abort していなかったのでサーバ側の子プロセスが 600 秒残り、
      4回の増減で実行枠（8）を使い切っていた（レビューで実測）。
   ⚠️ ペインを捨てる前に必ず `abort()` する（dropPanes を通す）。
+  ⚠️ **ペインの置き場所を決めるのは applyLayout だけ**（保存された配置 → 無ければ
+     ensurePane に渡された既定の入れ物）。ensurePane や描画の途中で
+     `host.append` を足すと、自動更新が利用者の移動を毎回巻き戻す。
+     移動は `appendChild` なので走っているコンソールの購読は切れない
+     （主張ではなく `render-check.mjs` が実測している）。
   ⚠️ 端末描画は requestAnimationFrame でまとめる。1件ごとに scrollHeight を
      読むと強制同期レイアウトで**総文字数に対して二次**になり、
      12,000 行で 54 秒・単一ブロック 28.9 秒（停止も更新も効かない）になった。
@@ -88,9 +93,13 @@
   .pane { display: flex; flex-direction: column; background: var(--card);
     border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
     flex: 1 1 auto; margin: 2px; }
+  /* ⚠️ `touch-action: none` が無いとタッチでは並び替えができない。
+     ブラウザがスクロールを始めた瞬間に pointercancel が飛び、pointermove が
+     1回も来ないまま終わる（スマホから使う前提なので、ここは譲れない）。
+     ヘッダは細い帯なので、スクロールの起点として失う面積は小さい。 */
   .pane > header { display: flex; align-items: center; gap: .3rem; flex: 0 0 auto;
     padding: .25rem .45rem; background: var(--head); border-bottom: 1px solid var(--line);
-    font-size: 11px; white-space: nowrap; cursor: pointer; }
+    font-size: 11px; white-space: nowrap; cursor: grab; touch-action: none; }
   /* ⚠️ タイトルは縮む側、タグとボタンは縮まない側。分けないと狭いペインで
      タグがタイトル文字に重なって読めなくなる。 */
   .pane > header .ttl { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
@@ -104,6 +113,11 @@
   .pane.max { position: fixed; inset: var(--bar) 0 0 0; z-index: 50; margin: 0; border-radius: 0; }
   .pane.min { flex: 0 0 auto; }
   .pane.min > .body { display: none; }
+  /* 掴んでいるペイン。⚠️ `pointer-events: none` は使わない。落とす先は
+     elementFromPoint ではなく入れ物の矩形から決めているので不要で、
+     付けると掴んでいるヘッダ自身がイベントを受け取れなくなる。 */
+  .pane.dragging { opacity: .55; }
+  .pane.dragging > header { cursor: grabbing; }
 
   .tag { border: 1px solid var(--line); border-radius: 3px; padding: 0 .3em;
     color: var(--dim); font-size: 10px; }
@@ -259,6 +273,10 @@ import { splitArgv, isChatArgv, argvSummary } from './argv.mjs';
 // 会話モードの出力の解釈も同じ理由で外に出した。
 // **中に書いていたので「捨てない」という約束が破れていたのに気付けなかった**（#44）
 import { makeChatFilter, chatGlance, chatInputText } from './chatfilter.mjs';
+// ペインの配置（ドラッグで決めた並び）の表現と永続化の形も同じ理由で外に出した
+import {
+  PANE_HOSTS, parseLayout, serializeLayout, hostOf, orderedIds, setHostOrder, pruneLayout,
+} from './panelayout.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -306,7 +324,185 @@ function wireSplit(sp) {
   });
 }
 
-/** ペインを作る。ヘッダのクリックで開閉、⛶ で最大化。 */
+/* ===== ペインの配置（ドラッグで並び替え、localStorage に覚える） =====
+   🚨 覚えるのは **data-pane-id（worktree の path 由来）** の一覧。
+      序数を保存すると、払い出し順が変わった瞬間に別のペインの位置を復元して
+      「ヘッダは agent-a なのに中身は agent-b」と同じ型の嘘になる。 */
+const ORDER_KEY = 'kjp-edit:pane-order:v1';
+
+/** ⚠️ localStorage は private mode や設定で throw する。
+    並びを覚えるという些末な機能のために UI 全体を失わない。 */
+function readStoredLayout() {
+  try { return localStorage.getItem(ORDER_KEY); } catch { return null; }
+}
+let paneLayout = parseLayout(readStoredLayout());
+
+function saveLayout() {
+  paneLayout = pruneLayout(paneLayout, new Set(panes.keys()));
+  try { localStorage.setItem(ORDER_KEY, serializeLayout(paneLayout)); } catch { /* 保存できなくても今の画面には効いている */ }
+}
+
+const hostEl = h => $('#' + h);
+
+/**
+ * 入れ物の中のペインを ids の順に並べ、必要ならスプリッタを挟む。
+ *
+ * ⚠️ `append` は既存の要素を**移動**する（作り直さない）。走っているコンソールの
+ *    購読も端末の中身も残る。作り直すと exec の購読が切れ、サーバ側の子は
+ *    切断後の猶予まで走り続ける。
+ */
+function placePanes(host, ids) {
+  // スプリッタは状態を持たないので作り直してよい
+  for (const sp of [...host.querySelectorAll(':scope > .split')]) sp.remove();
+  const rowward = host.classList.contains('row');
+  // ⚠️ 「他 N 本は表示していません」の告知はペインの**後ろ**に戻す。
+  //    ペインだけを append すると先に居た告知が先頭に残り、
+  //    ペインが1つも無いように読める（省略の告知が別の誤解を作る）。
+  const trailing = [...host.children].filter(n => !n.classList.contains('pane'));
+  let first = true;
+  for (const id of ids) {
+    const obj = panes.get(id);
+    if (!obj) continue;
+    if (rowward && !first) {
+      const sp = el('div', 'split x');
+      host.append(sp);
+      wireSplit(sp);
+    }
+    host.append(obj.p);
+    first = false;
+  }
+  for (const n of trailing) host.append(n);
+}
+
+/** 入れ物に前回置いた告知（省略の注意書き）を消す。ペインとスプリッタは残す */
+function clearNotices(host) {
+  for (const n of [...host.children]) {
+    if (!n.classList.contains('pane') && !n.classList.contains('split')) n.remove();
+  }
+}
+
+/** 全ペインを「保存された配置 → 無ければ既定の入れ物」に従って置き直す */
+function applyLayout() {
+  const byHost = new Map(PANE_HOSTS.map(h => [h, []]));
+  for (const [id, obj] of panes) {
+    byHost.get(hostOf(paneLayout, id, obj.defaultHost))?.push(id);
+  }
+  for (const h of PANE_HOSTS) {
+    const ids = byHost.get(h);
+    // 🚨 既定の並びは「作った順」ではなく「**render が求めた順**」。
+    //    worktree はアルファベット順で**中間に**挿入されるので、作った順だと
+    //    後から増えた1本が必ず末尾に付く（以前 arrangeRow が毎回並べ直していた
+    //    のはこのため。消したときに既定の並びが壊れる形で気付いた）。
+    ids.sort((a, b) => panes.get(a).defaultRank - panes.get(b).defaultRank);
+    placePanes(hostEl(h), orderedIds(paneLayout, h, ids));
+  }
+}
+
+// ⚠️ ensurePane ごとに applyLayout を呼ぶと、1回の描画でペイン本数の二乗だけ
+//    DOM を動かす。増減があった描画の**直後に1度だけ**走らせる。
+let layoutQueued = false;
+function scheduleLayout() {
+  if (layoutQueued) return;
+  layoutQueued = true;
+  queueMicrotask(() => { layoutQueued = false; applyLayout(); });
+}
+
+// これ未満の移動はドラッグではなくクリック（ヘッダの開閉）として扱う
+const DRAG_SLOP = 6;
+
+/**
+ * 座標がどの入れ物の上か。
+ *
+ * ⚠️ **`elementFromPoint` を使わない。** 掴んでいるペイン自身が最前面に写るし、
+ *    狭い画面では入れ物が縦に積まれて viewport の外まで伸びるので、
+ *    画面外の座標では null が返って移動できなくなる。矩形なら画面外も測れる。
+ */
+function hostAt(x, y) {
+  for (const h of PANE_HOSTS) {
+    const host = hostEl(h);
+    const r = host.getBoundingClientRect();
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return host;
+  }
+  return null;
+}
+
+/** 落とす先（入れ物と、その手前に挿すペイン）。中点を越えたら後ろに回る */
+function dropSpot(dragged, x, y) {
+  const host = hostAt(x, y);
+  if (!host) return null;
+  // ⚠️ 軸は入れ物の id ではなく実際の flex-direction で決める。
+  //    狭い画面の media query では `.row` も column になる（横に並んでいない）。
+  const vertical = getComputedStyle(host).flexDirection.startsWith('column');
+  for (const k of host.children) {
+    if (!k.classList.contains('pane') || k === dragged) continue;
+    const r = k.getBoundingClientRect();
+    const mid = vertical ? r.top + r.height / 2 : r.left + r.width / 2;
+    if ((vertical ? y : x) < mid) return { host, before: k };
+  }
+  return { host, before: null };
+}
+
+function commitMove(p, spot) {
+  const ids = [];
+  for (const k of spot.host.children) {
+    if (k.classList.contains('pane') && k !== p) ids.push(k.dataset.paneId);
+  }
+  const at = spot.before ? ids.indexOf(spot.before.dataset.paneId) : ids.length;
+  ids.splice(at, 0, p.dataset.paneId);
+  paneLayout = setHostOrder(paneLayout, spot.host.id, ids);
+  applyLayout();
+}
+
+/**
+ * ヘッダを掴んでペインを並び替える。マウスとタッチの両方（Pointer Events）。
+ *
+ * ⚠️ ヘッダのクリック（開閉）と取り違えないため、しきい値を越えるまで何もしない。
+ *    越えたら直後の click を1回だけ捨てる（並べ替えるたびに畳まれてしまう）。
+ */
+function wireDrag(p, h, drag, skip) {
+  h.addEventListener('pointerdown', e => {
+    if (skip.includes(e.target)) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    // 最大化中は画面全面なので、落とす先を選べない
+    if (p.classList.contains('max')) return;
+    drag.moved = false;
+    const x0 = e.clientX, y0 = e.clientY;
+    let started = false, last = '';
+    // ⚠️ 合成イベント（`--layout-probe` の検査）には対応する実ポインタが無いので
+    //    setPointerCapture は NotFoundError を投げる。実ポインタではペインの外に
+    //    出ても pointermove / pointerup が届くように掴むが、掴めなかった場合も
+    //    ヘッダ上のイベントで並び替えは動く。
+    try { h.setPointerCapture(e.pointerId); } catch { /* 実ポインタが無い */ }
+    const move = ev => {
+      if (!started) {
+        if (Math.abs(ev.clientX - x0) < DRAG_SLOP
+          && Math.abs(ev.clientY - y0) < DRAG_SLOP) return;
+        started = true;
+        drag.moved = true;
+        p.classList.add('dragging');
+      }
+      const spot = dropSpot(p, ev.clientX, ev.clientY);
+      if (!spot) return;
+      const key = `${spot.host.id}|${spot.before?.dataset.paneId ?? ''}`;
+      if (key === last) return;   // 同じ位置で置き直しを繰り返さない
+      last = key;
+      commitMove(p, spot);
+    };
+    const end = () => {
+      h.removeEventListener('pointermove', move);
+      h.removeEventListener('pointerup', end);
+      h.removeEventListener('pointercancel', end);
+      if (!started) return;
+      p.classList.remove('dragging');
+      saveLayout();
+    };
+    h.addEventListener('pointermove', move);
+    h.addEventListener('pointerup', end);
+    h.addEventListener('pointercancel', end);
+  });
+}
+
+/** ペインを作る。ヘッダのクリックで開閉、⛶ で最大化、ヘッダを掴むと並び替え。 */
 function pane(id, title, tags = []) {
   const p = el('div', 'pane');
   p.dataset.paneId = id;
@@ -322,10 +518,15 @@ function pane(id, title, tags = []) {
   const body = el('div', 'body');
   p.append(h, body);
 
+  // ⚠️ ドラッグで動かした直後の click で開閉すると、並べ替えるたびに畳まれる。
+  //    掴んだ時点で false に戻すので、click が来ないまま終わっても次は効く。
+  const drag = { moved: false };
   h.addEventListener('click', ev => {
     if (ev.target === bmin || ev.target === bmax) return;
+    if (drag.moved) { drag.moved = false; return; }
     p.classList.toggle('min');
   });
+  wireDrag(p, h, drag, [bmin, bmax]);
   bmin.addEventListener('click', ev => { ev.stopPropagation(); p.classList.toggle('min'); });
   bmax.addEventListener('click', ev => {
     ev.stopPropagation();
@@ -345,6 +546,11 @@ $('#reset').addEventListener('click', () => {
   for (const n of document.querySelectorAll('.col,.row,.pane')) {
     n.style.flex = ''; n.classList.remove('max', 'min');
   }
+  // 並びも既定に戻す。⚠️ 忘れた記憶を残すと「レイアウトを戻したのに
+  //    ペインが元の列に戻らない」という直し方の無い状態になる。
+  paneLayout = parseLayout(null);
+  try { localStorage.removeItem(ORDER_KEY); } catch { /* 元から書けていない */ }
+  applyLayout();
 });
 
 /* ===== グラフ ===== */
@@ -1105,17 +1311,31 @@ function checkoutForm(wt, s) {
       コンソールは worktree の集合が変わった時だけ作り直す。 */
 const panes = new Map();     // id -> {p, body, ttl, tagBox, abort?, holder?}
 
+// 「render が求めた順」を記録するための通し番号（applyLayout が既定の並びに使う）
+let paneSeq = 0;
+
 function ensurePane(host, id, title, tags) {
   let obj = panes.get(id);
   if (!obj) {
     obj = pane(id, title, tags);
+    obj.defaultHost = host.id;
     panes.set(id, obj);
+    // ここでは既定の入れ物に付けるだけ。**どこに置くかは applyLayout が決める**
+    // （保存された配置 → 無ければ既定）。描画の途中で親の無いペインを作らない。
     host.append(obj.p);
+    scheduleLayout();
   } else {
+    // 🚨 **ここで `host.append` してはいけない。** 以前はそうしていたので、
+    //    15秒ごとの自動更新が「利用者が移した先」を毎回巻き戻した。
+    //    置き場所の決定は applyLayout の1箇所に集める（散らすと片方を直しても
+    //    もう片方が巻き戻す）。
+    obj.defaultHost = host.id;
     obj.ttl.textContent = title;
     setTags(obj.tagBox, tags);
-    if (obj.p.parentElement !== host) host.append(obj.p);
   }
+  // ⚠️ **毎回付け替える。** 作った順に固定すると、後から増えた worktree が
+  //    アルファベット順の途中に入るべきなのに必ず末尾になる。
+  obj.defaultRank = paneSeq++;
   return obj;
 }
 
@@ -1132,24 +1352,8 @@ function dropPanes(prefix, keepIds) {
     try { obj.abort?.(); } catch { /* 既に終わっている */ }
     obj.p.remove();
     panes.delete(id);
-  }
-}
-
-/** ホスト内のペインを望む順序に並べ替え、間にスプリッタを入れる */
-function arrangeRow(host, ids) {
-  // スプリッタは作り直してよい（状態を持たないので）
-  for (const sp of [...host.querySelectorAll(':scope > .split')]) sp.remove();
-  let first = true;
-  for (const id of ids) {
-    const obj = panes.get(id);
-    if (!obj) continue;
-    if (!first) {
-      const sp = el('div', 'split x');
-      host.append(sp);
-      wireSplit(sp);
-    }
-    host.append(obj.p);        // append は既存要素を移動する
-    first = false;
+    // ⚠️ 捨てた分のスプリッタが余るので置き直す（placePanes が作り直す）
+    scheduleLayout();
   }
 }
 
@@ -1830,7 +2034,10 @@ function render(s) {
     if (initial) { obj.sel = initial; obj.selWt = wt.path; loadDiff(holder, s.base, wt.branch ?? wt.head, initial); }
     else holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
   }
-  arrangeRow($('#diffs'), picks.map(w => `diff-${w.path}`));
+  // 🚨 **前回の告知を消してから足す。** 消していなかったので、自動更新のたびに
+  //    「他 N 本は…」が1行ずつ増え続けていた（ペインを並べ直す側で告知を
+  //    末尾へ回すようにして初めて気付いた）。
+  clearNotices($('#diffs'));
   if (withFiles.length > MAX_DIFF_PANES) {
     $('#diffs').append(el('div', 'note',
       `他 ${withFiles.length - MAX_DIFF_PANES} 本の差分は表示していません（上限 ${MAX_DIFF_PANES}）。ファイラから開けます。`));
@@ -1857,7 +2064,7 @@ function render(s) {
     // ⚠️ 別の端末や再読込の前に始めたセッションはここからしか見つけられない
     obj.showSessions?.(s.execSessions);
   }
-  arrangeRow($('#consoles'), live.map(w => `console-${w.path}`));
+  clearNotices($('#consoles'));
   if (!live.length) {
     $('#consoles').append(el('div', 'empty', '実行できる worktree がありません'));
   } else if (allLive.length > MAX_CONSOLE_PANES) {

@@ -95,8 +95,12 @@ async function measure(width) {
         '--disable-extensions', '--disable-background-networking',
         // CI のコンテナでは sandbox が使えないことがある。ローカルでは付けない。
         ...(process.env.CI ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
+        // ⚠️ 予算が足りないと、ハーネスが `#out` を書く前に DOM が dump される。
+        //    そうなると全幅で「計測結果が取れなかった」になり、**何が壊れたのか
+        //    まったく分からない**（並び替えの計測でこれを踏んだ）。
+        //    ハーネスは自動更新1回と再読込1回を通すので 8000 では足りない。
         `--user-data-dir=${profile}`, '--window-size=1200,2100',
-        '--virtual-time-budget=8000', '--dump-dom',
+        '--virtual-time-budget=30000', '--dump-dom',
         `${baseUrl}/__probe?w=${width}&token=${TOKEN}`,
     ], { shell: false, windowsHide: true });
     let out = '';
@@ -210,10 +214,74 @@ try {
             problems.push(`幅 ${width}: 監視盤の行が1つも描かれていない`
                 + '（セッションを走らせて測る前提が崩れている）');
         }
+        // 🚨 **ペインの並び替え（ドラッグ移動）は実際に掴んで動かして測る。**
+        //    保存も復元も「行は残っているのに到達不能」という形で壊せるので、
+        //    字面ではなく副作用（並び順）だけを見る。
+        const before = problems.length;
+        if (!Array.isArray(r.dragNote)) {
+            problems.push(`幅 ${width}: 並び替えの計測が返っていない（ハーネスが古い）`);
+        } else if (r.dragNote.length) {
+            // 測れなかったことを緑と読まない
+            for (const n of r.dragNote) problems.push(`幅 ${width}: ${n}`);
+        } else {
+            const eq = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+            // 🚨 **既定の並びに絶対の目印を1つ置く。** 「動かす前と後で同じ」だけを
+            //    見ていると、既定の並びを決めている仕組み（render が求めた順）を
+            //    丸ごと壊しても両方が同じように壊れて緑になる。
+            //    worktree カードは一番見たいものなので、既定では #left の先頭。
+            if (r.leftBefore[0] !== 'worktrees') {
+                problems.push(`幅 ${width}: 既定の並びで #left の先頭が worktrees でない`
+                    + `（${r.leftBefore.join(',')}）`);
+            }
+            const wantHead = r.rightBefore[0];
+            const wantSecond = r.leftBefore[r.leftBefore.length - 1];
+            if (r.leftAfterDrag[0] !== wantHead) {
+                problems.push(`幅 ${width}: 列をまたぐ移動が効いていない`
+                    + `（#left の先頭が ${r.leftAfterDrag[0]}、期待 ${wantHead}）`);
+            }
+            if (r.rightAfterDrag.length !== 0) {
+                problems.push(`幅 ${width}: 移したペインが元の列に残っている`
+                    + `（#right: ${r.rightAfterDrag.join(',')}）`);
+            }
+            if (r.leftAfterDrag[1] !== wantSecond) {
+                problems.push(`幅 ${width}: 列の中の並び替えが効いていない`
+                    + `（2番目が ${r.leftAfterDrag[1]}、期待 ${wantSecond}）`);
+            }
+            // 自動更新でペインを作り直したり並びを戻したりしてはいけない
+            if (!eq(r.leftAfterRefresh, r.leftAfterDrag)) {
+                problems.push(`幅 ${width}: 自動更新で並びが変わった`
+                    + `（${r.leftAfterRefresh.join(',')} / 直後は ${r.leftAfterDrag.join(',')}）`);
+            }
+            if (r.paneDuplicates > 0) {
+                problems.push(`幅 ${width}: 同じ id のペインが ${r.paneDuplicates} 個多い`
+                    + '（差分更新ではなく作り直している）');
+            }
+            if (r.bodyScrollWidthAfterDrag > r.bodyClientWidthAfterDrag + 1) {
+                problems.push(`幅 ${width}: 並べ替えた後に body が横に溢れている `
+                    + `(${r.bodyScrollWidthAfterDrag} > ${r.bodyClientWidthAfterDrag})`
+                    + ` — ${r.overflowingAfterDrag.join(', ')}`);
+            }
+            if (!eq(r.leftAfterReload, r.leftAfterDrag)) {
+                problems.push(`幅 ${width}: 再読込で並びが復元されない`
+                    + `（${r.leftAfterReload.join(',')} / 期待 ${r.leftAfterDrag.join(',')}）`);
+            }
+            if (r.rightAfterReload.length !== 0) {
+                problems.push(`幅 ${width}: 再読込で移したペインが元の列に戻った`
+                    + `（#right: ${r.rightAfterReload.join(',')}）`);
+            }
+            // 「レイアウト」で既定に戻せること（動かしすぎた画面の唯一の直し方）
+            if (!eq(r.leftAfterReset, r.leftBefore) || !eq(r.rightAfterReset, r.rightBefore)) {
+                problems.push(`幅 ${width}: 「レイアウト」で既定の並びに戻らない`
+                    + `（#left ${r.leftAfterReset.join(',')} / 期待 ${r.leftBefore.join(',')}`
+                    + ` / #right ${r.rightAfterReset.join(',')}）`);
+            }
+        }
         lines.push(`  ${String(width).padStart(4)}px: 横溢れ ${overflows ? '✖' : 'なし'}`
             + ` / worktree HEAD ${r.visibleWorktreeBadges} 個・ref 込み ${r.visibleBadges} 個`
             + ` / 潰れ ${r.squashedCount} / viewport 超過 ${r.overflowingCount} 件`
-            + ` / コマンドバー ${r.drawnCmdbars} / 監視行 ${r.drawnMonitorRows}`);
+            + ` / コマンドバー ${r.drawnCmdbars} / 監視行 ${r.drawnMonitorRows}`
+            + ` / 並び替え ${problems.length === before ? '✔' : '✖'}`
+            + `（${(r.leftAfterReload ?? []).length} 本を復元）`);
     }
 } catch (err) {
     problems.push(err.message);
