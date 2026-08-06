@@ -258,7 +258,7 @@ import { parseNdjson } from './ndjson.mjs';
 import { splitArgv, isChatArgv } from './argv.mjs';
 // 会話モードの出力の解釈も同じ理由で外に出した。
 // **中に書いていたので「捨てない」という約束が破れていたのに気付けなかった**（#44）
-import { makeChatFilter } from './chatfilter.mjs';
+import { makeChatFilter, chatGlance } from './chatfilter.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -999,6 +999,219 @@ function wtTags(wt) {
  * ⚠️ **ただしパスは自由文**（ファイル名は任意の文字列）。160 文字で切って
  *    `pathClipped` で告知する（#38。docs/agent-observation.md に残るリスクを書いた）。
  */
+/**
+ * 🚨 **全セッションの監視盤（N 個の Claude を並列で回すため）。**
+ *
+ * worktree ごとのコンソールは既にあるが、**どのペインを見ればよいかが分からない**
+ * のが並列運用の一番の障害だった（「見えるがやれることが少ない」の中身）。
+ * ここでは購読せずに全セッションの状態と**最後の出力**を並べ、
+ * そのまま**入力**と**停止**ができる。
+ *
+ * ⚠️ 出力はコマンドの結果なので、経路は exec の関門越し（`/api/v0/exec/list`）。
+ *    トークンが無いときは「使えない」と1行出す（有効に見えて 403 を作らない）。
+ */
+/**
+ * 監視盤の掴んでいる要素。
+ *
+ * 🚨 **行は id 単位で使い回す。**（`docs/review-ui-conflicts.md` の規則）
+ *    自動更新のたびに作り直すと、**打っている途中の入力が消え**、
+ *    さらに送信先の対象がずれる。行は Map で持ち、
+ *    要素は後から `querySelector` で探さずオブジェクトに持つ。
+ */
+const monitorRows = new Map();
+let monitorUI = null;
+let monitorBusy = false;
+
+function monitorMount(pane) {
+  // ペインが捨てられて作り直されたら、掴んでいた要素は使えない
+  if (monitorUI && pane.body.contains(monitorUI.list)) return monitorUI;
+  const status = el('div', 'note');
+  const list = el('div');
+  list.style.padding = '0 .4rem .4rem';
+  pane.body.replaceChildren(status, list);
+  monitorRows.clear();
+  monitorUI = { status, list };
+  return monitorUI;
+}
+
+/**
+ * 監視盤の1行に出す「最後の出力」。
+ *
+ * 🚨 会話モードは `chatGlance` で1行にする（生の stream-json は読めない）。
+ * ⚠️ **解釈できなかったことを隠さない。** 生のまま出して、そう告げる。
+ * @param {object} x セッション（`/api/v0/exec/list` の1件）
+ * @param {boolean} chat 会話モードか（argv から判定済み）
+ */
+function monitorGlance(x, chat) {
+  if (!x.lastOutput) return '';
+  const g = chat ? chatGlance(x.lastOutput) : { text: x.lastOutput, interpreted: true };
+  // 1行に潰す（行の構造が要るのは解釈側だけ。表示は狭い箱に収める）
+  const flat = g.text.replace(/\s+/g, ' ').trim();
+  const cut = flat.length > 200 ? `…${flat.slice(-200)}` : flat;
+  return `› ${cut}`
+    + (chat && !g.interpreted ? '  ← 解釈できない行をそのまま出しています' : '')
+    + (x.lastOutputMasked ? '  ← 出力の秘密は落としています' : '');
+}
+
+function monitorRow(x) {
+  const found = monitorRows.get(x.id);
+  if (found) return found;
+  const root = el('div', 'ab');
+  root.style.margin = '.35rem 0';
+  root.style.paddingTop = '.35rem';
+  root.style.borderTop = '1px solid var(--line)';
+  const head = el('div');
+  const cmd = el('div', 'note');
+  cmd.style.padding = '.1rem 0';
+  const out = el('div', 'note');
+  out.style.padding = '.1rem 0';
+  out.style.whiteSpace = 'pre-wrap';
+  const bar = el('div', 'cmdbar');
+  bar.style.border = '0';
+  bar.style.background = 'transparent';
+  const inp = el('input');
+  const sb = el('button', null, '送信');
+  const kb = el('button', null, '停止');
+  // ⚠️ 「切断」は購読解除でしかない（#17）。文言で混同しない
+  kb.title = '本当に止めます（購読をやめるだけの「切断」とは違います）';
+  const msg = el('div', 'wrmsg');
+  msg.style.padding = '0 .3rem';
+  msg.hidden = true;
+  bar.append(inp, sb, kb);
+  root.append(head, cmd, out, bar, msg);
+  const row = {
+    id: x.id, chat: isChatArgv(x.argv ?? []),
+    root, head, cmd, out, bar, inp, sb, kb, msg,
+  };
+  const say = (text, bad) => {
+    row.msg.textContent = text;
+    row.msg.classList.toggle('bad', Boolean(bad));
+    row.msg.hidden = !text;
+  };
+  const post = async (path, payload) => {
+    const r = await fetch(`/api/v0/exec/${encodeURIComponent(row.id)}/${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+      body: JSON.stringify(payload ?? {}),
+    });
+    if (r.ok) return null;
+    const b = await r.json().catch(() => ({}));
+    return b.error ?? `HTTP ${r.status}`;
+  };
+  const send = async () => {
+    const text = row.inp.value;
+    if (!text) return;
+    row.inp.value = '';
+    say('送信中…');
+    try {
+      // 🚨 会話モードなら stream-json の1行にする（argv から判定する。
+      //    送る側が形式を推測すると、素のテキストが会話に混ざって無視される）
+      const err = await post('input', { data: row.chat ? chatLine(text) : `${text}\n` });
+      if (err) { row.inp.value = text; say(`✖ ${err}`, true); return; }
+      say('');
+    } catch (e) { row.inp.value = text; say(`✖ ${e.message}`, true); }
+  };
+  // ⚠️ IME の変換確定 Enter で送らない（未確定の読みが送られる）
+  row.inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) send();
+  });
+  row.sb.addEventListener('click', send);
+  row.kb.addEventListener('click', async () => {
+    row.kb.disabled = true;
+    say('停止を要求しました（本当に止まったかは次の更新で見えます）');
+    try {
+      const err = await post('kill');
+      if (err) { say(`✖ 停止できません: ${err}`, true); row.kb.disabled = false; return; }
+      await renderMonitor();
+    } catch (e) { say(`✖ ${e.message}`, true); row.kb.disabled = false; }
+  });
+  monitorRows.set(x.id, row);
+  return row;
+}
+
+async function renderMonitor() {
+  if (!session.allowExec) return;   // 経路そのものが無い（--allow-exec 無し）
+  const pane = ensurePane($('#left'), 'monitor', 'セッション監視', []);
+  const ui = monitorMount(pane);
+  if (!session.token) {
+    // 有効に見えるのに 403 を返す状態を作らない
+    ui.status.className = 'note warn';
+    ui.status.textContent = '⚠ 監視はトークンが無いので使えません。'
+      + ' 起動時に表示された ?token=… 付きの URL を開き直してください';
+    return;
+  }
+  if (monitorBusy) return;   // 重なった更新で二重に数えない
+  monitorBusy = true;
+  try {
+    let body;
+    try {
+      const r = await fetch('/api/v0/exec/list', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      body = await r.json();
+    } catch (e) {
+      // ⚠️ 失敗しても行は消さない（打っている途中に1回失敗するのは普通）
+      ui.status.className = 'note warn';
+      ui.status.textContent = `⚠ 監視の取得に失敗: ${e.message}`;
+      return;
+    }
+    const sessions = Array.isArray(body.sessions) ? body.sessions : [];
+    const limits = body.limits ?? {};
+    const live = sessions.filter(x => x.state === 'starting' || x.state === 'running');
+    setTags(pane.tagBox, [['', `${live.length}/${limits.maxConcurrent ?? '?'} 稼働`]]);
+    ui.status.className = 'note';
+    ui.status.textContent = sessions.length
+      ? `${sessions.length} 件（稼働 ${live.length}）。打ちたい方に直接送れます`
+      : 'セッションはありません（下のコンソールから起動できます）';
+    const seen = new Set();
+    for (const x of sessions) {
+      seen.add(x.id);
+      const row = monitorRow(x);
+      const alive = x.state === 'starting' || x.state === 'running';
+      const name = (x.worktree ?? '').split(/[\\/]/).pop() || '(不明)';
+      const mark = alive ? '▶' : (x.exit && x.exit.code === 0 ? '✔' : '■');
+      // 経過と寿命を必ず出す（いつ殺されるかを黙らせない）
+      const bits = [`${Math.round(x.ageMs / 1000)}秒`];
+      if (alive && limits.timeoutMs) {
+        bits.push(`残り約${Math.max(0, Math.round((limits.timeoutMs - x.ageMs) / 1000))}秒で上限`);
+      }
+      if (alive && !x.keepAlive && x.detachedMs !== null && x.detachedMs !== undefined) {
+        const grace = limits.detachedGraceMs
+          ? `（残り約${Math.max(0, Math.round((limits.detachedGraceMs - x.detachedMs) / 1000))}秒）`
+          : '';
+        bits.push(`切断中${Math.round(x.detachedMs / 1000)}秒${grace}`);
+      }
+      if (x.inputPending > 0) bits.push(`入力滞留${x.inputPending}B`);
+      if (x.dropped > 0) bits.push(`出力${x.dropped}件省略`);
+      if (!alive && x.exit) bits.push(`exit=${x.exit.code ?? x.exit.signal ?? '?'}`);
+      row.head.replaceChildren(
+        el('b', null, `${mark} ${name}`),
+        el('span', null, `  ${bits.join(' / ')}`),
+      );
+      // argv（秘密はサーバ側でマスク済み。マスクしたことも出す）
+      row.cmd.textContent = `$ ${(x.argv ?? []).join(' ')}`
+        + (x.argvMasked ? '  ← コマンド行の秘密は落としています' : '');
+      // 🚨 **最後の出力を出す。** これが無いと「どれに入力すべきか」が分からない。
+      //    ⚠️ 会話モードの出力は**1行1レコードの JSON** なので、生で出すと読めない
+      //    （並列で回すための画面なのに目的が失われる）。`chatGlance` で1行にする。
+      //    解釈できなかったことは隠さない（生のまま出して、そう告げる）
+      row.out.textContent = monitorGlance(x, row.chat);
+      row.out.hidden = !row.out.textContent;
+      row.bar.hidden = !alive;
+      row.inp.placeholder = `${name} に送る（Enter）`;
+      if (!alive) row.msg.hidden = row.msg.textContent === '';
+      if (!row.root.parentNode) ui.list.append(row.root);   // 並びは古い順で安定
+    }
+    for (const [id, row] of monitorRows) {
+      if (seen.has(id)) continue;
+      row.root.remove();
+      monitorRows.delete(id);
+    }
+  } finally { monitorBusy = false; }
+}
+
 function renderAgents(s) {
   if (!s.agents) {
     dropPanes('agents', new Set());
@@ -1355,6 +1568,8 @@ function render(s) {
   cPane.body.replaceChildren(cBox);
 
   renderAgents(s);
+  // 監視盤は別経路（exec の関門越し）なので await しない（描画を止めない）
+  renderMonitor().catch(() => { /* 監視が取れなくても他は描く */ });
 
   // 🚨 **何の差分かを見出しに書く。** ここが並べているのは `base...HEAD` の
   //    **コミット済み**差分で、worktree カードの「変更 N・未追跡 N」は

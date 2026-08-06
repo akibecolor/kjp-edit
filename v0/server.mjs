@@ -23,7 +23,7 @@ import {
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
-import { collectAgents, transcriptRoot } from './transcript.mjs';
+import { collectAgents, transcriptRoot, maskSecrets } from './transcript.mjs';
 import { ExecRegistry, isSessionId } from './execsession.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -578,7 +578,7 @@ async function collectFresh() {
                 //    値をリテラルで打った回は記録に残る（実データで 42 件）。
                 //    そのままだと Cookie しか持たない読み取り専用の相手が実行トークンを
                 //    回収でき、**read が RCE に昇格する**（7回目のレビュー）。
-                secrets: [opts.token, cookieSecret()].filter(Boolean),
+                secrets: secretsForMasking(),
             },
         );
         agents = r.agents;
@@ -597,7 +597,18 @@ async function collectFresh() {
         // 実行セッションの一覧。**切断しても走り続ける**ようにした代わりに、
         // 「今何が走っているか」を見せる窓がどこかに必要（見えない取り残しを作らない）。
         // ⚠️ 出力の中身は含めない（argv と状態だけ）。
-        execSessions: opts.allowExec ? execRegistry.list() : null,
+        // 🚨 argv も**秘密をマスクしてから**載せる（`--token <値>` を打った回が残る）。
+        //    マスクしたことは `argvMasked` で告げる（黙って消さない）。
+        execSessions: opts.allowExec
+            ? execRegistry.list().map(x => {
+                const masked = x.argv.map(a => maskSecrets(a, secretsForMasking()));
+                return {
+                    ...x,
+                    argv: masked.map(m => m.text),
+                    argvMasked: masked.some(m => m.masked),
+                };
+            })
+            : null,
         // 取り込み順序の提案。追加の git 呼び出しは0（衝突予測の結果だけを使う純ロジック）。
         // ⚠️ 仮説であって保証ではない。詳細は v0/mergeplan.mjs のコメント。
         mergePlan: planMerge(
@@ -1012,6 +1023,15 @@ async function auditExec(entry) {
     }
 }
 
+/**
+ * 🔒 **マスクに使う「値が分かっている秘密」。**
+ *
+ * 1箇所にまとめる（記録のコマンド行と exec の argv の両方で使う）。
+ * 片方だけ渡していると、同じ秘密が別経路から出る。
+ */
+function secretsForMasking() {
+    return [opts.token, cookieSecret()].filter(Boolean);
+}
 /** 同時実行数の上限。無制限だとマシンを埋められる。 */
 const MAX_CONCURRENT_EXEC = 8;
 
@@ -1368,7 +1388,22 @@ async function handleRequest(req, res) {
         if (url.pathname === '/api/v0/state') {
             // ?fresh=1 で TTL キャッシュを無視する（手動リロード用）
             const force = url.searchParams.get('fresh') === '1';
-            const body = JSON.stringify(await collect({ force }));
+            const state = await collect({ force });
+            // 🚨 **exec の情報は Cookie だけの相手に出さない。** `argv` は
+            //    ユーザが打ったコマンド行そのもので、秘密が載りうる。
+            //    Cookie はポートで分離されないので、他ポートのページが読める状態にすると
+            //    「read は読み取りまで」という分界が崩れる（記録のコマンド行と同じクラス。
+             //   7回目のレビューで transcript 側を直したのと同型の穴がここにも残っていた）。
+            //    ⚠️ **キャッシュは共有**なので、payload を作り直すのではなく
+            //    応答の時点で落とす。
+            const body = JSON.stringify(
+                // ⚠️ 隠すのは **`--require-auth` のときだけ**。認証が要らない構成は
+                //    ループバック限定で Cookie の脅威（他ポートのページ）が無く、
+                //    ここで隠すと素の利用を壊すだけで守りにならない。
+                (state.execSessions && opts.requireAuth && !presentedToken(req, url))
+                    ? { ...state, execSessions: null, execSessionsHidden: true }
+                    : state,
+            );
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',
@@ -1605,6 +1640,48 @@ async function handleRequest(req, res) {
             return;
         }
 
+        /**
+         * 🔒 **全セッションの監視（N 個のエージェントを1画面で見るため）。**
+         *
+         * 各セッションの状態と**最後の出力**を返す。購読しなくても
+         * 「どれが動いていて、どれが止まっていて、今何が出ているか」が分かる。
+         *
+         * 🚨 **exec の関門を必ず通す**（トークン + POST + same-origin + Host）。
+         *    出力はコマンドの結果なので、Cookie だけの相手に渡すと
+         *    「read は読み取りまで」という分界が崩れる。
+         * 🚨 秘密は argv と出力の両方でマスクする（打った値が残りうる）。
+         */
+        if (url.pathname === '/api/v0/exec/list') {
+            if (!requireExec(req, res)) return;
+            const now = Date.now();
+            const secrets = secretsForMasking();
+            const sessions = execRegistry.sessionsForMonitor(now).map(x => {
+                const argv = x.argv.map(a => maskSecrets(a, secrets));
+                const last = x.lastOutput === null
+                    ? { text: null, masked: false }
+                    : maskSecrets(x.lastOutput, secrets);
+                return {
+                    ...x,
+                    argv: argv.map(m => m.text),
+                    argvMasked: argv.some(m => m.masked),
+                    lastOutput: last.text,
+                    lastOutputMasked: last.masked,
+                };
+            });
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                sessions,
+                limits: {
+                    maxConcurrent: MAX_CONCURRENT_EXEC,
+                    timeoutMs: opts.execTimeoutMs,
+                    detachedGraceMs: opts.execDetachedGraceMs,
+                },
+            }));
+            return;
+        }
         // 実行セッションの再購読。**切断しても走り続けている**ので、
         // 最後に見た通番の続きから貰えるようにする（#17）。
         {

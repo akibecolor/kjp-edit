@@ -335,9 +335,25 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'checkout-prunable-gate',
         why: '実体の消えた worktree で checkout を通す',
         file: 'v0/server.mjs',
-        from: "            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }",
-        to: '            /* 変異: prunable の門を外す */',
-        gone: "denyJson(res, 409, '作業ツリーが失われています')",
+        // 🚨 **同じ門が merge にもできたので、字面を一意にする。**
+        //    `String.replace` は最初の1件しか置換しないので、merge 側が
+        //    書き換わって checkout の門は無傷のまま「gone が残る」で STALE になっていた
+        //    （`--dry` で見つけた。守りは1件も検証されていなかった）。
+        from: "            if (wt.bare) { denyJson(res, 400, 'bare worktree では checkout できません'); return; }\n"
+            + "            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }",
+        to: "            if (wt.bare) { denyJson(res, 400, 'bare worktree では checkout できません'); return; }",
+        gone: "checkout できません'); return; }\n            if (wt.prunable)",
+        pattern: 'bare と prunable の門が実際に効く',
+    },
+    {
+        name: 'merge-prunable-gate',
+        why: '実体の消えた worktree に取り込む（cwd にできないので経路が壊れる）'
+            + '。checkout と同じ門を後から足したのに検査が1件も無かった',
+        file: 'v0/server.mjs',
+        from: "            if (wt.bare) { denyJson(res, 400, 'bare worktree では取り込めません'); return; }\n"
+            + "            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }",
+        to: "            if (wt.bare) { denyJson(res, 400, 'bare worktree では取り込めません'); return; }",
+        gone: "取り込めません'); return; }\n            if (wt.prunable)",
         pattern: 'bare と prunable の門が実際に効く',
     },
     {
@@ -912,9 +928,13 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（UI が「切断しても最後まで走ります」= 完走の約束しか言えなくなる。'
             + '実際は --exec-timeout で SIGKILL される）',
         file: 'v0/server.mjs',
-        from: '        timeoutMs: opts.execTimeoutMs,',
+        // ⚠️ **`/api/v0/exec/list` の `limits` にも同じ行ができた。**
+        //    字面（インデント込み）だけでは substring として二重に一致するので、
+        //    直前の行まで含めて一意にする（`--dry` が「2箇所」と教えてくれた）
+        from: '        //    （スマホで会話を始めて席を離れると10分で殺され、文脈は取り戻せない）。\n'
+            + '        timeoutMs: opts.execTimeoutMs,',
         to: '        /* 変異: 絶対上限を送らない */',
-        gone: 'timeoutMs: opts.execTimeoutMs',
+        gone: '文脈は取り戻せない）。\n        timeoutMs:',
         // ⚠️ assert を足したのは「明示的な kill」のテストの中（keepAlive の session を
         //    読んでいる場所）。**pattern は assert がある側のテスト名にする**
         pattern: '明示的な kill で止まり',
@@ -1036,8 +1056,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'content が配列でない行で feed が投げる'
             + '（購読ループが抜けて「停止」表示になるのにセッションは走り続ける）',
         file: 'v0/chatfilter.mjs',
-        from: '                const blocks = Array.isArray(r.message?.content) ? r.message.content : null;',
-        to: '                const blocks = r.message?.content ?? null;',
+        // ⚠️ 解釈を `chatRecordLines`（純関数）に出したのでインデントが変わった
+        from: '        const blocks = Array.isArray(r.message?.content) ? r.message.content : null;',
+        to: '        const blocks = r.message?.content ?? null;',
         gone: 'Array.isArray(r.message?.content)',
         pattern: '壊れた行でも feed が投げない',
         testFile: 'v0/chatfilter.test.mjs',
@@ -1058,8 +1079,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '知らない type を黙って捨てる（control_response = 入力の許可拒否や'
             + '将来増える type が消え、「形式が変わったら黙って消える」状態に戻る #44）',
         file: 'v0/chatfilter.mjs',
-        from: '                line(\'d\', `  （${kind} は表示していません）\\n`);',
-        to: '                /* 変異: 知らない type を捨てる */',
+        from: "    return [{ cls: 'd', text: `  （${kind} は表示していません）` }];",
+        to: '    return [];   /* 変異: 知らない type を捨てる */',
         gone: 'は表示していません',
         pattern: '知らない type を黙って捨てず',
         testFile: 'v0/chatfilter.test.mjs',
@@ -1120,9 +1141,11 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'server-passes-secrets',
         why: 'サーバが自分の資格情報を渡さない（マスクの仕組みがあっても効かない）',
         file: 'v0/server.mjs',
-        from: '                secrets: [opts.token, cookieSecret()].filter(Boolean),',
-        to: '                secrets: [],   /* 変異: 自分の秘密を渡さない */',
-        gone: 'secrets: [opts.token, cookieSecret()]',
+        // ⚠️ 集約先（`secretsForMasking()`）に移したので、そちらを空にする。
+        //    呼び出し側の字面を見ていた古い変異は `--dry` で STALE として出た
+        from: '    return [opts.token, cookieSecret()].filter(Boolean);',
+        to: '    return [];   /* 変異: 自分の秘密を渡さない */',
+        gone: 'return [opts.token, cookieSecret()]',
         pattern: 'コマンド行に載った実行トークンを read 権限で配らない',
     },
     {
@@ -1325,6 +1348,90 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/paths.test.mjs',
     },
     {
+        name: 'exec-argv-cookie-gate',
+        why: 'Cookie だけの相手に exec の argv を出す'
+            + '（コマンド行に秘密が載りうるので「read は読み取りまで」が崩れる）',
+        file: 'v0/server.mjs',
+        from: '                (state.execSessions && opts.requireAuth && !presentedToken(req, url))',
+        to: '                (false)',
+        gone: 'state.execSessions && opts.requireAuth && !presentedToken',
+        pattern: 'argv は Cookie だけでは読めず',
+    },
+    {
+        name: 'exec-argv-mask',
+        why: 'exec の argv の秘密をマスクしない（`--token <値>` を打った回がそのまま出る）',
+        file: 'v0/server.mjs',
+        from: '                const masked = x.argv.map(a => maskSecrets(a, secretsForMasking()));',
+        to: '                const masked = x.argv.map(a => ({ text: a, masked: false }));',
+        gone: 'x.argv.map(a => maskSecrets(a, secretsForMasking()))',
+        pattern: 'argv は Cookie だけでは読めず',
+    },
+    {
+        // 🚨 監視盤（N 個のエージェントを1画面で見る）の守り
+        name: 'monitor-requires-exec',
+        why: '全セッションの状態と出力を exec の関門なしで返す'
+            + '（出力はコマンドの結果なので、read だけの相手に渡ると分界が崩れる）',
+        file: 'v0/server.mjs',
+        from: "        if (url.pathname === '/api/v0/exec/list') {\n"
+            + '            if (!requireExec(req, res)) return;',
+        to: "        if (url.pathname === '/api/v0/exec/list') {",
+        gone: "'/api/v0/exec/list') {\n            if (!requireExec",
+        pattern: '全セッションの状態と最後の出力',
+    },
+    {
+        name: 'monitor-last-output',
+        why: '最後の出力を返さない'
+            + '（購読しないと状況が分からず、どのセッションに打てばよいか判断できない）',
+        file: 'v0/execsession.mjs',
+        from: '        for (let i = this.log.records.length - 1; i >= 0; i--) {',
+        to: '        for (let i = -1; i >= 0; i--) {',
+        gone: 'this.log.records.length - 1; i >= 0',
+        pattern: '全セッションの状態と最後の出力',
+    },
+    {
+        name: 'monitor-glance-raw',
+        why: '会話の最後の応答を解釈せず生の stream-json を返す'
+            + '（監視盤に JSON が並び、「どれが待っているか」が読めない）',
+        file: 'v0/chatfilter.mjs',
+        from: '        const got = chatRecordLines(r);',
+        to: '        const got = [{ cls: "", text: lines[i] }];',
+        gone: 'const got = chatRecordLines(r);',
+        pattern: 'chatGlance',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        name: 'monitor-glance-keeps-raw',
+        why: '解釈できない行を空にする（「応答が来ていない」ように見える）',
+        file: 'v0/chatfilter.mjs',
+        from: "    return { text: lines[lines.length - 1] ?? '', interpreted: false };",
+        to: "    return { text: '', interpreted: false };",
+        gone: "text: lines[lines.length - 1]",
+        pattern: 'chatGlance',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        name: 'monitor-last-output-lines',
+        why: '最後の出力の空白を潰す'
+            + '（会話モードの1行1レコード JSON が壊れ、監視盤が解釈できなくなる）',
+        file: 'v0/execsession.mjs',
+        from: "            acc = String(r.d ?? '') + acc;",
+        to: "            acc = String(r.d ?? '').replace(/\\s+/g, ' ') + acc;",
+        gone: "acc = String(r.d ?? '') + acc;",
+        pattern: '最後の出力は行の構造を保つ',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        // 🚨 これは**実ブラウザでしか測れない**（字面では入力が消えるのが見えない）
+        name: 'monitor-row-reuse',
+        why: '自動更新のたびに監視盤の行を作り直す'
+            + '（打っている途中の入力が消え、送信先の対象もずれる）',
+        file: 'v0/app.html',
+        from: '  const found = monitorRows.get(x.id);\n  if (found) return found;',
+        to: '  const found = null;\n  if (found) return found;',
+        gone: 'monitorRows.get(x.id);\n  if (found) return found;',
+        script: 'v0/render-check.mjs',
+    },
+    {
         // 🚨 取り込み（merge）は「衝突しないと分かっているもの」だけ実行する
         name: 'merge-predicted-clean',
         why: '衝突すると予測されたものも取り込む'
@@ -1382,7 +1489,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         file: 'v0/server.mjs',
         from: '            if (!isSafeRef(ref)) { denyJson(res, 400, `ref が不正です: ${ref}`); return; }\n',
         to: '',
-        gone: 'ref が不正です',
+        // ⚠️ merge 側にも `ref が不正です` ができたので、**変数名まで含めて**一意にする
+        //    （素の文字列だと外しても残っていて STALE になる。`--dry` で見つけた）
+        gone: 'isSafeRef(ref)) { denyJson',
         pattern: 'オプション名のブランチ',
     },
     {
@@ -1600,6 +1709,48 @@ if (!targets.length) {
 if (shard) {
     console.log(`シャード ${shard.index}/${shard.total}: `
         + `${targets.length} 件（全 ${MUTANTS.length} 件のうち）を走らせます`);
+}
+
+/**
+ * 🚨 **`--dry`: 字面のずれ（STALE）だけをテスト無しで洗い出す。**
+ *
+ * 全件を走らせると数十分かかるので、**リファクタの直後**にこれを回す。
+ * STALE は「守りを外せていない」= 守りが未検証のまま静かに続く状態なので、
+ * 見つけるのが早いほどよい（`--shard` の tail だけを読むと**どれがずれたのか
+ * 分からない**という形で実際に困った）。
+ */
+if (args.includes('--dry')) {
+    let bad = 0;
+    for (const m of targets) {
+        const problems = [];
+        let src;
+        try { src = readFileSync(m.file, 'utf8'); } catch { problems.push(`${m.file} が読めない`); }
+        if (src !== undefined) {
+            const hits = src.split(m.from).length - 1;
+            if (hits === 0) problems.push('from がソースに無い');
+            // ⚠️ 複数一致は「どこを書き換えたか分からない」= 測っている対象が不定
+            else if (hits > 1) problems.push(`from が ${hits} 箇所に一致する`);
+            else {
+                let mutated = src.replace(m.from, m.to);
+                for (const extra of m.also ?? []) {
+                    if (!mutated.includes(extra.from)) {
+                        problems.push(`also の from が無い: ${extra.from.slice(0, 40)}`);
+                        continue;
+                    }
+                    mutated = mutated.replace(extra.from, extra.to);
+                }
+                if (mutated.includes(m.gone)) problems.push('書き換え後も gone が残る（判定が甘い）');
+            }
+        }
+        if (problems.length) {
+            bad++;
+            console.log(`✖ ${m.name.padEnd(28)} ${problems.join(' / ')}`);
+        }
+    }
+    console.log(bad
+        ? `✖ ${bad} 件がソースとずれている（守りは1つも検証されていない）`
+        : `✔ ${targets.length} 件すべて字面は一致（実際に落ちるかはテストを走らせて確認）`);
+    process.exit(bad ? 1 : 0);
 }
 
 function runTest(m) {

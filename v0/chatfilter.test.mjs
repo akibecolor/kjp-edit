@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeChatFilter } from './chatfilter.mjs';
+import { makeChatFilter, chatGlance } from './chatfilter.mjs';
 
 /** 出力を集める。`[cls, text]` の配列で返す */
 function collect() {
@@ -142,4 +142,51 @@ test('tool_use は名前だけ出す（入力は出さない）', () => {
     assert.equal(c.out.length, 1);
     assert.match(c.out[0][1], /Edit/);
     assert.ok(!c.text().includes('S3CRET'), 'ツール入力が漏れている');
+});
+
+/* ===== 監視盤の1行要約（chatGlance） =====
+   🚨 監視盤に**生の stream-json** が並ぶと「どれが待っているか」が読めない。
+      並列で回すための画面なので、ここが読めないと目的そのものが失われる。
+      サーバ側では解釈しない約束なので、解釈はクライアント側（この関数）。 */
+
+test('chatGlance: 会話の最後の応答を1行で返す', () => {
+    const g = chatGlance(`${assistant('できました')}`);
+    assert.deepEqual(g, { text: 'できました', interpreted: true });
+});
+
+test('chatGlance: 応答の終わりが分かる（打ってよい合図）', () => {
+    const g = chatGlance(JSON.stringify({ type: 'result', is_error: false }));
+    assert.equal(g.interpreted, true);
+    assert.match(g.text, /応答おわり/);
+});
+
+test('chatGlance: 走っているツールの名前を返す（何をしているかが分かる）', () => {
+    const g = chatGlance(JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: '調べます' }, { type: 'tool_use', name: 'Bash' }] },
+    }));
+    assert.equal(g.interpreted, true);
+    assert.match(g.text, /Bash/);
+});
+
+test('🚨 chatGlance: 先頭が切れていても、後ろから見て解釈できた行を使う', () => {
+    // サーバは末尾を返すので、1行目は途中から始まる（JSON として壊れている）
+    const raw = `e":"assistant"}}\n${assistant('2行目は無傷')}`;
+    assert.deepEqual(chatGlance(raw), { text: '2行目は無傷', interpreted: true });
+});
+
+test('🚨 chatGlance: 解釈できない出力は生のまま返す（捨てない・空にしない）', () => {
+    const g = chatGlance('npm ERR! code ELIFECYCLE');
+    assert.deepEqual(g, { text: 'npm ERR! code ELIFECYCLE', interpreted: false });
+});
+
+test('🚨 chatGlance: 知らない type も「表示していません」と言う（黙って消さない）', () => {
+    const g = chatGlance(JSON.stringify({ type: 'control_response', subtype: 'deny' }));
+    assert.equal(g.interpreted, true);
+    assert.match(g.text, /control_response\/deny/);
+});
+
+test('chatGlance: 何も無いときは空文字（例外を投げない）', () => {
+    assert.deepEqual(chatGlance(''), { text: '', interpreted: false });
+    assert.deepEqual(chatGlance(null), { text: '', interpreted: false });
 });

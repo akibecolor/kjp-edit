@@ -128,7 +128,34 @@ class Session {
         return this.state === 'starting' || this.state === 'running';
     }
 
-    /** 画面と /api/v0/state に出す形。**自由文（argv）は出すが出力は出さない。** */
+    /**
+     * 🚨 **監視用の「最後の出力」。** N 個のエージェントを1画面で見るために、
+     *    全セッションを購読せずに「今どうなっているか」を取れる必要がある。
+     *    ⚠️ 出力はコマンドの結果なので、**read 権限で出してはいけない**
+     *    （呼び出し側が exec の関門を通すこと）。
+     *
+     * 🚨 **空白を潰さず、改行を残す。** 会話モード（`--output-format stream-json`）の
+     *    出力は**1行1レコードの JSON** なので、行の構造を壊すとクライアント側で
+     *    解釈できず、監視盤に生の JSON が並ぶ（`chatGlance`）。
+     * ⚠️ **`out` は行の途中で切れて届く**（`ndjson.mjs` と同じ問題）ので、
+     *    1レコードだけでなく**上限に届くまで後ろから連結する**。
+     * ⚠️ 切り詰めたら `…` を付ける（黙って削らない）。
+     *
+     * @param {number} max 文字数の上限（払い出す量を縛る。行数ではない）
+     */
+    lastOutput(max = 2000) {
+        let acc = '';
+        for (let i = this.log.records.length - 1; i >= 0; i--) {
+            const r = this.log.records[i];
+            if (r.t !== 'out' && r.t !== 'err') continue;
+            acc = String(r.d ?? '') + acc;
+            if (acc.length >= max) break;
+        }
+        const text = acc.trim();
+        if (!text) return null;
+        // 末尾を返す（進行中の出力は最後が最新）
+        return text.length > max ? `…${text.slice(-max)}` : text;
+    }
     describe(now) {
         return {
             id: this.id,
@@ -314,6 +341,19 @@ export class ExecRegistry {
         return [...this.sessions.values()]
             .sort((a, b) => b.createdAt - a.createdAt)
             .map(s => s.describe(now));
+    }
+
+    /**
+     * 監視用の一覧（`describe` + **最後の出力**）。
+     *
+     * 🚨 出力を含むので、**呼び出し側が exec の関門を通すこと**
+     *    （Cookie だけの相手に渡すと「read は読み取りまで」が崩れる）。
+     * ⚠️ 並びは**古い順**（起動した順に読める。`list()` は新しい順で用途が違う）。
+     */
+    sessionsForMonitor(now = this.now()) {
+        return [...this.sessions.values()]
+            .sort((a, b) => a.createdAt - b.createdAt)
+            .map(s => ({ ...s.describe(now), lastOutput: s.lastOutput() }));
     }
 
     get running() {

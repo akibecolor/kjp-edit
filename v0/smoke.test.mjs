@@ -773,6 +773,76 @@ test('🔒 短いトークンでは起動しない（capability を問わず）'
         assert.ok(started, '24 文字のトークンで起動しない');
     } finally { okChild.kill(); }
 });
+/**
+ * 🚨 **exec の argv を Cookie だけの相手に出さない。**
+ *
+ * `argv` はユーザが打ったコマンド行そのもので、秘密が載りうる。
+ * Cookie はポートで分離されないので、他ポートのページが読める状態にすると
+ * 「read は読み取りまで」という分界が崩れる（記録のコマンド行と同じクラス）。
+ * 7回目のレビューで transcript 側を直したが、**同型の穴が exec 側に残っていた**。
+ */
+test('🔒 exec の argv は Cookie だけでは読めず、秘密はマスクされる', async () => {
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--require-auth',
+            '--allow-exec', '--token', EXEC_TOKEN],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    try {
+        const url = await new Promise((res, rej) => {
+            const t2 = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:[/][/]127[.]0[.]0[.]1:[0-9]+/);
+                if (m) { clearTimeout(t2); res(m[0]); }
+            });
+            child.on('error', rej);
+        });
+        const port = Number(new URL(url).port);
+
+        // 秘密を argv に含むセッションを1本走らせる
+        const started = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: [process.execPath, '-e', `setTimeout(()=>{}, 3000)`, '--token', EXEC_TOKEN],
+            }),
+        });
+        assert.equal(started.status, 200);
+        started.body?.cancel?.().catch(() => {});
+        await new Promise(r => setTimeout(r, 300));
+
+        // Cookie を手に入れる（読み取りは通る）
+        const boot = await authGet(port, `/?token=${EXEC_TOKEN}`);
+        const cookie = /kjp_auth=([^;]+)/.exec(boot.setCookie)?.[1];
+        assert.ok(cookie, 'Cookie が焼かれていない');
+
+        // 🚨 Cookie だけ → 読み取りは 200 だが exec の一覧は出ない
+        const viaCookie = await authGet(port, '/api/v0/state?fresh=1',
+            { cookie: `kjp_auth=${cookie}` });
+        assert.equal(viaCookie.code, 200, 'Cookie で読み取りができない');
+        const c = JSON.parse(viaCookie.body);
+        assert.equal(c.execSessions, null, 'Cookie だけで exec の argv が読める');
+        assert.equal(c.execSessionsHidden, true, '隠したことを伝えていない');
+        assert.ok(!viaCookie.body.includes(EXEC_TOKEN),
+            'Cookie 経路の payload にトークンが出ている');
+
+        // トークンを提示すれば見える。ただし **argv の秘密はマスクされる**
+        const viaToken = await authGet(port, '/api/v0/state?fresh=1',
+            { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(viaToken.code, 200);
+        const j = JSON.parse(viaToken.body);
+        assert.ok(Array.isArray(j.execSessions), 'トークンを提示しても一覧が出ない');
+        assert.ok(j.execSessions.length >= 1);
+        assert.ok(!viaToken.body.includes(EXEC_TOKEN),
+            'argv に載ったトークンがマスクされていない');
+        assert.ok(j.execSessions.some(x => x.argvMasked === true),
+            'マスクしたことを伝えていない');
+    } finally {
+        child.kill();
+    }
+});
 test('🔒 認証失敗は記録され、連続失敗は遅くなる（本文は残さない）', async () => {
     const audit = join(repo, '..', `auth-audit-${Date.now()}.jsonl`);
     const child = spawn(process.execPath,
@@ -2130,6 +2200,56 @@ test('🚨 exec: 停止した後の出力が exit の後ろに並ばない', asy
         s.abort();
     } finally { child.kill(); }
 });
+/**
+ * 🔒 **全セッションの監視（N 個のエージェントを1画面で見るため）。**
+ *
+ * 購読しなくても「どれが動いていて、今何が出ているか」が分かる必要がある
+ * （並列で走らせた Claude のどれに入力すべきかを判断するため）。
+ * 🚨 出力はコマンドの結果なので **exec の関門を必ず通す**
+ *    （Cookie だけの相手に渡すと「read は読み取りまで」が崩れる）。
+ */
+test('🔒 exec/list: 全セッションの状態と最後の出力が関門越しに取れる', async () => {
+    const { child, url } = await startExec();
+    const list = (headers = {}) => fetch(`${url}/api/v0/exec/list`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+    });
+    try {
+        // 関門: トークン無し / GET は通さない
+        assert.equal((await list()).status, 403, 'トークン無しで監視できる');
+        // ⚠️ GET は **405**（Method Not Allowed）。403 を期待して落ちた
+        //    — 期待値を書く前に「何が返るのが正しいか」を確かめること
+        assert.equal((await fetch(`${url}/api/v0/exec/list`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } })).status, 405, 'GET で通る');
+
+        // 2本走らせる（片方は出力を出し、片方は入力待ち）
+        const a = await startSession(url, [process.execPath, '-e',
+            'console.log("AAA-marker"); setTimeout(()=>{}, 5000)']);
+        const b = await startSession(url, [process.execPath, '-e', ECHO_SCRIPT]);
+        await a.until(r => r.t === 'out' && r.d.includes('AAA-marker'));
+
+        const r = await list({ 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(r.status, 200);
+        const body = await r.json();
+        assert.ok(Array.isArray(body.sessions), `一覧が無い: ${JSON.stringify(body)}`);
+        assert.ok(body.sessions.length >= 2,
+            `2本走らせたのに ${body.sessions.length} 本しか見えない`);
+
+        // 🚨 **最後の出力が見える**（購読しなくても状況が分かる）
+        const seenA = body.sessions.find(x => x.id === a.id);
+        assert.ok(seenA, `走らせたセッションが一覧に無い: ${a.id}`);
+        assert.equal(seenA.state, 'running');
+        assert.match(seenA.lastOutput ?? '', /AAA-marker/,
+            `最後の出力が見えない: ${JSON.stringify(seenA)}`);
+
+        // 上限も返す（あと何本走らせられるか / いつ殺されるかが分かる）
+        assert.equal(typeof body.limits.maxConcurrent, 'number');
+        assert.ok(body.limits.timeoutMs > 0, '絶対上限が出ていない');
+
+        a.abort();
+        b.abort();
+    } finally { child.kill(); }
+});
 test('🚨 exec: 標準入力に書けて、往復し、EOF で閉じられる', async () => {
     const { child, url } = await startExec();
     try {
@@ -2626,6 +2746,18 @@ test('🚨 exec / checkout: bare と prunable の門が実際に効く', async (
         assert.match((await c1.json()).error, /作業ツリーが失われています/,
             '門ではなく git の失敗で 409 になっている（門を外しても緑になる）');
 
+        // 🚨 2b. **merge も同じ門を持っているのに、検査が1件も無かった。**
+        //     同じ形の門を後から足したときに測り忘れる（「規則を書いた場所から
+        //     遠いコードには適用し忘れる」と同型）。理由まで見る。
+        const m1 = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({ worktree: prunable.path, branch: 'main' }),
+        });
+        assert.equal(m1.status, 409, `merge が prunable を通した: ${m1.status}`);
+        assert.match((await m1.json()).error, /作業ツリーが失われています/,
+            'merge が門ではなく git の失敗で 409 になっている');
+
         // 3・4. bare は「既知の worktree」として出ないので、
         //       bare を cwd にしようとしても allowlist で止まる。
         //       ただし **bare が worktree 一覧に現れる構成**（bare リポジトリを
@@ -2675,6 +2807,15 @@ test('🚨 exec / checkout: bare と prunable の門が実際に効く', async (
                 body: JSON.stringify({ worktree: bare.path, ref: 'main' }),
             });
             assert.equal(c2.status, 400, 'checkout が bare を通した');
+
+            // 4b. merge も bare を拒否する（同じ門を後から足したので一緒に測る）
+            const m2 = await fetch(`${bUrl}/api/v0/merge`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+                body: JSON.stringify({ worktree: bare.path, branch: 'main' }),
+            });
+            assert.equal(m2.status, 400, 'merge が bare を通した');
+            assert.match((await m2.json()).error, /bare/);
         } finally {
             bareSrv.kill();
         }

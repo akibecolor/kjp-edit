@@ -140,6 +140,67 @@ const IME_CHECK = `(async () => {
     firedAfterComposing: afterReal.length > afterComposing.length,
   };
 })()`;
+/**
+ * 🚨 **監視盤を実ブラウザで測る（N 個の Claude を並列で回すための要）。**
+ *
+ * 測るのは2つの主張。どちらも**字面では測れない**:
+ *
+ * 1. **購読しなくても最後の出力が見える。** これが無いと「どのペインに
+ *    打てばいいか」が分からず、並列運用そのものが成立しない。
+ * 2. **自動更新で入力欄が消えない。** 行を毎回作り直すと、打っている途中の
+ *    文字が消え、さらに送信先がずれる（`docs/review-ui-conflicts.md`）。
+ *    `replaceChildren` に戻す変更は、字面の検査では**完全に見えない**。
+ *
+ * ⚠️ `IME_CHECK` が `git --version` を走らせた**後**に呼ぶこと（対象が要る）。
+ */
+const MONITOR_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const paneOf = () => document.querySelector('[data-pane-id="monitor"]');
+  const rowsOf = () => [...(paneOf()?.querySelectorAll('.body > div > .ab') ?? [])];
+  // ⚠️ **必ず出力の出るコマンドを自分で走らせる。** 既定のプリセット
+  //    （git status --short）は綺麗なリポジトリでは**何も出さない**ので、
+  //    「最後の出力が見える」を測れない（実際にこれで空振りした）。
+  const cin = [...document.querySelectorAll('.cmdbar input')].find(e =>
+    e.closest('[data-pane-id]')?.dataset.paneId !== 'monitor' && !e.placeholder);
+  if (!cin) return { error: 'コンソールの入力欄が見つからない' };
+  cin.value = 'git --version';
+  // 🚨 **input イベントを撃つ。** 値の代入だけでは argv の再解析が走らないので、
+  //    プリセットのまま実行される（この検査自身がそれで空振りした）
+  cin.dispatchEvent(new Event('input', { bubbles: true }));
+  cin.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  let row = null;
+  for (let i = 0; i < 300; i++) {
+    row = rowsOf().find(e => /git --version/.test(e.textContent ?? ''));
+    if (row && /git version/.test(row.textContent ?? '')) break;
+    await wait(100);
+  }
+  if (!row) {
+    return { error: '監視の行が出ない: ' + ((paneOf()?.textContent ?? '(ペインが無い)').slice(0, 300)) };
+  }
+  const text = row.textContent ?? '';
+  const input = row.querySelector('input');
+  if (!input) return { error: '行に入力欄が無い（打てない監視盤は用を成さない）' };
+  // 打っている途中を再現する。自動更新が来ても消えてはいけない
+  const MARK = 'KEEP-ME-42';
+  input.value = MARK;
+  document.getElementById('refresh').click();
+  await wait(3000);
+  const same = rowsOf().filter(e => /git --version/.test(e.textContent ?? ''));
+  const after = same[0];
+  return {
+    seenCommand: /git --version/.test(text),
+    seenOutput: /git version/.test(text),
+    reused: Boolean(after) && after === row,
+    // 🚨 **同じセッションの行が増えていないこと。** 作り直す変異は、古い行が
+    //    DOM に残るので「先頭は元の行のまま」になり、同一性だけでは見抜けない
+    dupes: same.length,
+    kept: after ? (after.querySelector('input')?.value ?? null) : null,
+    mark: MARK,
+    rowCount: rowsOf().length,
+    sample: text.replace(/\\s+/g, ' ').slice(0, 200),
+  };
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -290,6 +351,10 @@ try {
     //    端末の文字量で副作用を判定できない）
     const ime = await evaluate(IME_CHECK);
 
+    // 🚨 監視盤は IME の検査が走らせた実行を対象にする（**描画の計測より前**。
+    //    12,000行流した後だと自動更新が重くなって待ち時間の意味が変わる）
+    const monitor = await evaluate(MONITOR_CHECK);
+
     const probeValue = await evaluate(MEASURE);
     const probe = probeValue;
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
@@ -305,6 +370,33 @@ try {
         }
         if (!ime.firedAfterComposing) {
             problems.push('確定後の Enter で実行が発火しない（IME の守りが広すぎる）');
+        }
+    }
+    // 🚨 監視盤: 「見える」と「打てる」の両方を実挙動で確かめる
+    if (!monitor || monitor.error) {
+        problems.push(`監視盤を測れなかった: ${monitor?.error ?? '結果が取れない'}`);
+    } else {
+        if (!monitor.seenCommand) {
+            problems.push('監視盤にコマンド行が出ていない（どのセッションか分からない）'
+                + `: ${monitor.sample}`);
+        }
+        if (!monitor.seenOutput) {
+            problems.push('監視盤に最後の出力が出ていない'
+                + '（購読しないと状況が分からない = 並列運用ができない）'
+                + `: ${monitor.sample}`);
+        }
+        // 行を作り直すと入力が消える。**要素の同一性と値の両方**を見る
+        if (!monitor.reused) {
+            problems.push('自動更新で監視盤の行を作り直している'
+                + `（打っている途中の入力が消え、送信先もずれる）: 行 ${monitor.rowCount}`);
+        }
+        if (monitor.dupes !== 1) {
+            problems.push('自動更新で同じセッションの行が増えている'
+                + `（作り直した行が古い行の下に溜まる）: ${monitor.dupes} 行`);
+        }
+        if (monitor.kept !== monitor.mark) {
+            problems.push('自動更新で入力欄の中身が消えた'
+                + `: ${JSON.stringify(monitor.kept)} ≠ ${JSON.stringify(monitor.mark)}`);
         }
     }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {

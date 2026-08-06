@@ -323,3 +323,45 @@ test('describe: 切断していなければ detachedMs は null', () => {
     r.subscribe(s, 0, () => {});
     assert.equal(s.describe(r.at()).detachedMs, null);
 });
+
+// ---------------------------------------------------------------------------
+// 監視盤に出す「最後の出力」
+// ---------------------------------------------------------------------------
+
+test('🚨 監視盤の最後の出力は行の構造を保つ（会話モードの JSON を壊さない）', () => {
+    const r = reg();
+    const s = mk(r);
+    // ⚠️ `out` は行の途中で切れて届く。**連結してから**返す必要がある
+    //    （1レコードだけ見ると壊れた JSON になり、監視盤が解釈できない）
+    r.emit(s, 'out', '{"type":"assist');
+    r.emit(s, 'out', 'ant","message":{"content":[{"type":"text","text":"あ  い"}]}}\n');
+    // 🚨 **2レコード以上で測る。** 1行だけだと空白を潰しても JSON として通って
+    //    しまい、**守りを外しても緑**になる（実際にこの変異が生き残った）。
+    //    改行が消える = 2行が1行に繋がって JSON.parse が失敗する、が本当の症状。
+    r.emit(s, 'out', '{"type":"result","is_error":false}\n');
+    const got = s.lastOutput();
+    const lines = got.split('\n').filter(l => l.trim());
+    assert.equal(lines.length, 2, `行に組み直せていない: ${JSON.stringify(got)}`);
+    const rec = JSON.parse(lines[0]);
+    assert.equal(rec.message.content[0].text, 'あ  い', '中身の空白まで潰している');
+    assert.equal(JSON.parse(lines[1]).type, 'result');
+});
+
+test('監視盤の最後の出力は上限で切り詰め、切ったことを告げる', () => {
+    const r = reg();
+    const s = mk(r);
+    r.emit(s, 'out', `${'x'.repeat(50)}TAIL`);
+    const got = s.lastOutput(10);
+    assert.match(got, /^…/, '切り詰めたのに告知していない');
+    assert.match(got, /TAIL$/, '末尾（最新）ではなく先頭を返している');
+    assert.equal(got.length, 11);
+});
+
+test('監視盤の最後の出力: 入力（in）は出力として返さない', () => {
+    const r = reg();
+    const s = mk(r);
+    r.emit(s, 'out', 'これは出力\n');
+    r.emit(s, 'in', 'これは入力\n');
+    assert.match(s.lastOutput(), /これは出力/);
+    assert.ok(!s.lastOutput().includes('これは入力'), '入力を出力として見せている');
+});
