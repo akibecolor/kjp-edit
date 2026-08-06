@@ -802,8 +802,53 @@ function consoleBody(wt, paneObj) {
     if (beatTimer === null) beatTimer = setInterval(tickBeat, 1000);
   };
 
+  /**
+   * 🚨 **1ペインが購読するセッションは常に1本だけにする（8回目のレビュー。BLOCKING）。**
+   *
+   * 以前は再接続ボタンを何度でも押せて、`runExec` が同じ端末・同じ `onState` を
+   * 共有したまま**2本同時に購読**できた。結果:
+   *   - 入力欄の Enter は**最後に publish した方**に届く（画面に出ている行と無関係）。
+   *     `git commit -F -` や y/N を読む CLI に誤送信すると取り返せない
+   *   - どちらか一方が終わると `✖ exit=…` を出して心拍を消し停止も押せなくするのに、
+   *     **もう1本は同じ端末に出力を続ける**（このリポジトリ最重の「嘘」の型）
+   *   - `paneObj.abort` が上書き（実際には null に）されるので、ペインを捨てても
+   *     古い購読が abort されず、サーバは購読者が居ると見なし続ける
+   *
+   * 世代番号で「今の購読」を決め、古い購読からの通知は捨てる。
+   * 新しく始めるときは**前の購読を必ず abort し、端末を作り直す**
+   * （再接続は `from: 0` で全部再生されるので、消しても情報は失われない）。
+   */
+  let gen = 0;
+  let liveAbort = null;
+  const beginRun = (argv, opts = {}) => {
+    gen += 1;
+    const myGen = gen;
+    if (liveAbort) {
+      try { liveAbort(); } catch { /* 既に閉じている */ }
+      liveAbort = null;
+    }
+    // 端末を作り直す（前のセッションの行と混ざると、どちらの出力か判別できない）
+    term.replaceChildren();
+    runExec(term, scroll, wt, argv, st => {
+      if (myGen !== gen) return;   // 古い購読の通知は捨てる
+      // 🚨 検査用に、**門を通った遷移だけ**を記録する（`?probe=1` のときだけ）。
+      //    ⚠️ 門の**前**で記録すると守りの有無で差が出ず、変異を測れない
+      //    （最初そう書いた）。古い購読の「停止」は新しい購読の session レコードで
+      //    数ミリ秒後に上書きされて回復するので、画面のサンプリングでは掠らない
+      //    （50ms 間隔で測って変異が生き残った）。遷移列で見れば決定的。
+      if (window.__kjpProbe) {
+        (window.__kjpConsoleStates ??= []).push({
+          running: !!st.running,
+          id: st.sessionId ? String(st.sessionId).slice(0, 8) : null,
+        });
+      }
+      onState(st);
+    }, { ...opts, onActivity: ev => { if (myGen === gen) onActivity(ev); } });
+  };
+
   let cur = null;
   const onState = st => {
+    liveAbort = st.running ? st.abort : null;
     if (st.running) startBeat();
     else stopBeat();
     box.dataset.running = st.running ? '1' : '';
@@ -815,17 +860,28 @@ function consoleBody(wt, paneObj) {
     //    サーバ側は猶予（既定5分）のあいだ走り続け、その間は再接続できる
     paneObj.abort = st.running ? st.abort : null;
     paneObj.sessionId = st.running ? st.sessionId : null;
-    if (st.running) resume.hidden = true;
+    // 🚨 **購読中も一覧を出す（隠さない）。**
+    //    以前は購読を始めた瞬間に隠していたので、
+    //    (a) 走っている他のセッションが**見えなくなり**（このツールの要点は
+    //        「N 本走っていることが分かる」こと）、
+    //    (b) 隠れた古いボタンが「再接続」の字のまま DOM に残って、
+    //        次の自動更新（15秒）まで**両方見られると誤解させる**（実測で落ちた）。
+    //    購読の有無が変わったので、字（再接続 / 切替）を出し直す。
+    if (paneObj.lastSessions) paneObj.showSessions(null);
     // 標準入力の欄は走っている間だけ出す
     inbar.hidden = !st.running;
+    // 🚨 **送信先を必ず出す。** 以前は2本購読できて「最後に再接続した方」に
+    //    届いていたので、どこへ送るのか画面から分からなかった。
+    //    1本だけになった今も、id を出して「見ている行の主」と一致させる。
+    const to = st.sessionId ? ` → ${String(st.sessionId).slice(0, 8)}` : '';
     inField.placeholder = st.chat
-      ? 'claude に送るメッセージ（Enter）'
-      : '送信する行（Enter）';
+      ? `claude に送るメッセージ（Enter）${to}`
+      : `送信する行（Enter）${to}`;
     chatBtn.disabled = st.running || !session.allowExec;
   };
   const start = (opts) => {
     if (parsed.warning || !parsed.argv.length) return;
-    runExec(term, scroll, wt, parsed.argv, onState, { ...opts, onActivity });
+    beginRun(parsed.argv, opts);
   };
 
   const send = async () => {
@@ -852,8 +908,7 @@ function consoleBody(wt, paneObj) {
   chatBtn.addEventListener('click', () => {
     // 会話は専用の argv で始める（入力欄の内容は使わない）
     // ⚠️ `chat` は argv から導く（渡す値と argv がずれない形にする）
-    runExec(term, scroll, wt, CHAT_ARGV, onState,
-      { chat: isChatArgv(CHAT_ARGV), keepAlive: true, onActivity });
+    beginRun(CHAT_ARGV, { chat: isChatArgv(CHAT_ARGV), keepAlive: true });
   });
 
   /**
@@ -862,7 +917,11 @@ function consoleBody(wt, paneObj) {
    *    ここは表示だけなので作り直して良い。
    */
   paneObj.showSessions = list => {
-    const mine = (list ?? []).filter(s => samePathish(s.worktree, wt.path)
+    // 🚨 **購読が変わった瞬間に出し直せるように、最後の一覧を持つ。**
+    //    持たないと、購読を始めてもボタンの字が次の自動更新（15秒）まで
+    //    「再接続」のままで、**両方見られると誤解させる**（実測で落ちた）。
+    if (list) paneObj.lastSessions = list;
+    const mine = (list ?? paneObj.lastSessions ?? []).filter(s => samePathish(s.worktree, wt.path)
       && (s.state === 'starting' || s.state === 'running')
       && s.id !== paneObj.sessionId);
     resume.replaceChildren();
@@ -876,17 +935,21 @@ function consoleBody(wt, paneObj) {
       if (s.detachedMs !== null && !s.keepAlive) {
         row.append(el('span', 'note', ` / 切断中 ${Math.round(s.detachedMs / 1000)}秒`));
       }
-      const re = el('button', null, '再接続');
+      // ⚠️ **今すでに購読しているなら「切替」と言う。** 押すと前の購読は
+      //    abort され、端末も作り直される（2本を同じ端末に混ぜない）。
+      //    ボタンの字が「再接続」のままだと**両方見られる**と誤解させる。
+      const re = el('button', null, paneObj.sessionId ? '切替' : '再接続');
+      re.title = paneObj.sessionId
+        ? '今見ているセッションの購読をやめて、こちらに切り替えます（実行は止めません）'
+        : 'このセッションの出力を最初から再生します';
       re.addEventListener('click', () => {
         // 通番 0 から = 残っている分を全部再生してもらう
         // 🚨 **会話モードを argv から復元する。** 渡さないと次の送信で生のテキストを
         //    stdin に書き、claude が exit 1 で死んで会話が丸ごと消える（実測）
-        runExec(term, scroll, wt, s.argv, onState, {
+        beginRun(s.argv, {
           attach: { id: s.id, from: 0 },
           chat: isChatArgv(s.argv),
           keepAlive: s.keepAlive === true,
-          // 再接続でも心拍を出す（ここを忘れると「戻ったときだけ止まって見える」）
-          onActivity,
         });
       });
       const kb = el('button', null, '停止');

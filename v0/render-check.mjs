@@ -267,6 +267,109 @@ const BEAT_CHECK = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **1ペインは1本しか購読しない（8回目のレビューの BLOCKING）。**
+ *
+ * 以前は再接続を2回押すと2本を同じ端末に混ぜて購読でき、
+ * 入力は「最後に publish した方」に届き、片方の exit で
+ * `✖ exit=…` を出して停止も押せなくするのに**もう1本が同じ端末に出力を続けた**。
+ *
+ * 検査: 走っている2本（AAA / BBB）を用意し、A に再接続 → B に「切替」→
+ *   (1) 端末に A の印が**残っていない**（作り直している）
+ *   (2) 入力が B に届く（B の出力にだけ印が出る）
+ *   (3) A の出力がその後も端末に混ざらない
+ * ⚠️ 字面では測れない（世代番号の比較を消しても行は残る）。
+ */
+const DUAL_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const pane = [...document.querySelectorAll('[data-pane-id]')]
+    .find(p => p.dataset.paneId.startsWith('console-'));
+  if (!pane) return { error: 'コンソールのペインが無い' };
+  const termOf = () => pane.querySelector('.term')?.textContent ?? '';
+  const resumeBtns = () => [...pane.querySelectorAll('button')]
+    .filter(b => b.textContent === '再接続' || b.textContent === '切替');
+  // 走っている2本が resume 一覧に出るまで待つ（自動更新は15秒なので更新を押す）
+  let btns = [];
+  for (let i = 0; i < 60; i++) {
+    document.getElementById('refresh').click();
+    await wait(1000);
+    btns = resumeBtns();
+    if (btns.length >= 2) break;
+  }
+  if (btns.length < 2) return { error: '再接続の候補が2本出ない: ' + btns.length };
+  btns[0].click();
+  await wait(2500);
+  const afterFirst = termOf();
+  // 2本目に切り替える（このボタンは「切替」になっているはず）
+  const again = resumeBtns();
+  const label = again[0]?.textContent ?? '(無し)';
+  if (!again.length) return { error: '切替の候補が出ない' };
+  // 🚨 **切替の「途中」を細かく見る。** 古い購読の終了通知は、新しい購読の
+  //    session レコードで**すぐ上書きされて回復する**ので、固定時間後に見ると
+  //    健全に見える（実測。変異が生き残った）。**一瞬でも「停止」表示になったら嘘**
+  //    なので、その瞬間を捕まえる。
+  const drawnEl = e => Boolean(e) && e.getClientRects().length > 0;
+  const barOf = () => [...pane.querySelectorAll('.cmdbar input')].find(e => e.placeholder);
+  const stopOf = () => [...pane.querySelectorAll('.cmdbar button')]
+    .find(b => b.textContent === '停止');
+  window.__kjpConsoleStates = [];   // 切替の前で区切る
+  again[0].click();
+  let flickered = false;
+  for (let i = 0; i < 50; i++) {
+    await wait(50);
+    const b = barOf();
+    const st = stopOf();
+    // 入力欄が消える or 停止が押せなくなる = そのペインは「実行していない」と言っている
+    if ((b && !drawnEl(b)) || (st && st.disabled)) { flickered = true; break; }
+  }
+  await wait(1500);
+  const afterSwitch = termOf();
+  // 入力を撃つ（届いた方のプロセスが印をエコーする）
+  const inp = [...pane.querySelectorAll('.cmdbar input')].find(e => e.placeholder);
+  if (!inp) return { error: '標準入力の欄が出ていない' };
+  const placeholder = inp.placeholder;
+  inp.value = 'MARK-DUAL';
+  inp.dispatchEvent(new Event('input', { bubbles: true }));
+  inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  await wait(3000);
+  const afterInput = termOf();
+  // ⚠️ **どちらが1本目かに依存しない。** 一覧の並びは新しい順なので
+  //    「btns[0] は A」と決め打つと、正しく切り替わっているのに落ちる（実測）。
+  const sideOf = t => {
+    const a = /AAA/.test(t), b = /BBB/.test(t);
+    if (a && b) return 'both';       // 混ざっている = 二重購読が壊れている
+    if (a) return 'AAA';
+    if (b) return 'BBB';
+    return 'none';
+  };
+  const first = sideOf(afterFirst);
+  const second = sideOf(afterSwitch);
+  // 🚨 **古い購読の通知で「停止」表示に戻らないこと。**
+  //    切替で前の購読を abort すると、その finally が
+  //    onState({running:false}) を投げる。世代で捨てないと、
+  //    **走っている方を見ているのに入力欄が消え、停止も押せなくなる**
+  //    （このリポジトリ最重の食い違い）。**描かれているか**で測る。
+  const drawn = e => Boolean(e) && e.getClientRects().length > 0;
+  const barVisible = drawn(inp);
+  const stopBtn2 = [...pane.querySelectorAll('.cmdbar button')]
+    .find(b => b.textContent === '停止');
+  return {
+    label, placeholder, first, second,
+    barVisible, flickered,
+    // 門を通った遷移列。切替後に running:false が混ざっていたら
+    // 「走っているのに停止と言った」ことになる（一瞬でも嘘）
+    states: (window.__kjpConsoleStates ?? []).slice(0, 8),
+    stopEnabled: Boolean(stopBtn2) && !stopBtn2.disabled,
+    beatShown: [...pane.querySelectorAll('.note')].filter(drawn)
+      .some(e => /実行中/.test(e.textContent ?? '')),
+    // 入力は「今見ている方」に届いていなければならない
+    // ⚠️ ここはテンプレートリテラルの中。バックティックは書けないので連結で組む
+    echoedToShown: new RegExp(second + '-got:MARK-DUAL').test(afterInput),
+    mixedAfter: sideOf(afterInput) === 'both',
+    tail: afterInput.slice(-200),
+  };
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -425,6 +528,54 @@ try {
     //    15秒走るセッションが監視盤の行の数を変えて dupes の判定を乱す）
     const beat = await evaluate(BEAT_CHECK);
 
+    // 🚨 二重購読の検査。走っている2本を API で用意する（UI からは1本しか作れない）。
+    //    ⚠️ keepAlive にする（購読を切るので猶予で殺されると測る前に消える）
+    const startSide = async mark => {
+        const res = await fetch(`${base}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: [process.execPath, '-e',
+                    // ⚠️ 子のソースには**改行のエスケープ**を渡す（生の改行を入れると
+                    //    子側の文字列リテラルが閉じずに構文エラーになる）
+                    'const m=process.argv[1];const NL=String.fromCharCode(10);'
+                    + 'setInterval(()=>process.stdout.write(m+"-tick"+NL),700);'
+                    + 'process.stdin.on("data",d=>process.stdout.write(m+"-got:"+String(d).trim()+NL));',
+                    mark],
+                keepAlive: true,
+            }),
+        });
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        let id = null;
+        let timer = null;
+        const deadline = new Promise(r => { timer = setTimeout(() => r('timeout'), 5000); });
+        while (id === null) {
+            const got = await Promise.race([reader.read(), deadline]);
+            if (got === 'timeout' || got.done) break;
+            buf += dec.decode(got.value, { stream: true });
+            const nl = buf.indexOf(String.fromCharCode(10));
+            if (nl === -1) continue;
+            const rec = JSON.parse(buf.slice(0, nl));
+            if (rec.t === 'session') id = rec.id;
+        }
+        clearTimeout(timer);
+        await reader.cancel().catch(() => {});
+        return id;
+    };
+    const sideA = await startSide('AAA');
+    const sideB = await startSide('BBB');
+    const dual = (sideA && sideB) ? await evaluate(DUAL_CHECK) : { error: '2本用意できなかった' };
+    for (const id of [sideA, sideB]) {
+        if (!id) continue;
+        await fetch(`${base}/api/v0/exec/${id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
+        }).catch(() => {});
+    }
+
     const probeValue = await evaluate(MEASURE);
     const probe = probeValue;
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
@@ -481,6 +632,55 @@ try {
             problems.push('停止したのに「実行中」が残っている（走っていると誤読させる）'
                 + `: 停止を押せた=${beat.clicked} running=${JSON.stringify(beat.running)}`
                 + ` 心拍=${JSON.stringify(beat.beatNow)} 端末の末尾=${JSON.stringify(beat.tail)}`);
+        }
+    }
+    // 🚨 二重購読: 1ペイン1セッションの不変条件
+    if (!dual || dual.error) {
+        problems.push(`二重購読を測れなかった: ${dual?.error ?? '結果が取れない'}`);
+    } else {
+        if (dual.label !== '切替') {
+            problems.push('購読中なのにボタンが「切替」になっていない'
+                + `（両方見られると誤解させる）: ${dual.label}`);
+        }
+        if (dual.first === 'both' || dual.second === 'both' || dual.mixedAfter) {
+            problems.push('2本の出力が同じ端末に混ざっている（1ペイン1購読が壊れている）'
+                + `: ${JSON.stringify(dual.tail)}`);
+        }
+        if (dual.first === 'none' || dual.second === 'none') {
+            problems.push('購読したセッションの出力が出ていない'
+                + `（${dual.first} → ${dual.second}）: ${JSON.stringify(dual.tail)}`);
+        }
+        if (dual.first !== 'none' && dual.first === dual.second) {
+            problems.push('「切替」で別のセッションに移っていない'
+                + `（両方 ${dual.first}）: ${JSON.stringify(dual.tail)}`);
+        }
+        if (!dual.echoedToShown) {
+            problems.push('入力が「今見ているセッション」に届いていない'
+                + `（見えているのは ${dual.second}）: ${JSON.stringify(dual.tail)}`);
+        }
+        // 🚨 古い購読の終了通知で「停止」状態に戻っていないこと
+        if (!dual.barVisible) {
+            problems.push('切替後に標準入力の欄が消えている'
+                + '（古い購読の exit で「停止」表示に戻った = 走っているのに打てない）');
+        }
+        if (!dual.stopEnabled) {
+            problems.push('切替後に停止ボタンが押せない'
+                + '（走っているセッションをそのペインから止められない）');
+        }
+        if (!dual.beatShown) {
+            problems.push('切替後に心拍が出ていない（走っているのに止まって見える）');
+        }
+        if (dual.flickered) {
+            problems.push('切替の途中で「実行していない」表示になった'
+                + '（古い購読の終了通知を捨てていない。一瞬でも停止と見えるのは嘘）');
+        }
+        // 遷移列で決定的に見る（画面のサンプリングでは数ミリ秒の嘘を掠れない）
+        if ((dual.states ?? []).some(x => x.running === false)) {
+            problems.push('切替後に running:false の通知が通っている'
+                + `（古い購読の終了で「停止」に戻る）: ${JSON.stringify(dual.states)}`);
+        }
+        if (!/→ /.test(dual.placeholder)) {
+            problems.push(`入力欄が送信先を出していない: ${JSON.stringify(dual.placeholder)}`);
         }
     }
     if (probe.maxBlockMs > BUDGET_MAX_BLOCK_MS) {

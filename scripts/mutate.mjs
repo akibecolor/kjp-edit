@@ -1593,6 +1593,47 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/execsession.test.mjs',
     },
     {
+        // 🚨 8回目のレビューの BLOCKING: 1ペインで2本購読できた
+        //    （入力が見ていない方に届き、片方の exit で「停止」表示なのに
+        //     もう1本が同じ端末に出力を続ける）
+        name: 'console-single-subscription',
+        why: '新しく購読するときに前の購読を切らない'
+            + '（2本が同じ端末に混ざり、入力が見ていない方に届く）',
+        file: 'v0/app.html',
+        from: '    if (liveAbort) {\n      try { liveAbort(); } catch { /* 既に閉じている */ }\n      liveAbort = null;\n    }',
+        to: '    /* 変異: 前の購読を切らない */',
+        gone: 'if (liveAbort) {',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'console-stale-notifications',
+        why: '古い購読からの通知を捨てない'
+            + '（終わった方の exit で「停止」表示になり、走っている方を止められなくなる）',
+        file: 'v0/app.html',
+        from: '      if (myGen !== gen) return;   // 古い購読の通知は捨てる',
+        to: '      /* 変異: 古い通知も通す */',
+        gone: 'if (myGen !== gen) return;',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'console-switch-label',
+        why: '購読中でも「再接続」と表示する（両方見られると誤解させる）',
+        file: 'v0/app.html',
+        from: "      const re = el('button', null, paneObj.sessionId ? '切替' : '再接続');",
+        to: "      const re = el('button', null, '再接続');",
+        gone: "paneObj.sessionId ? '切替' : '再接続'",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'console-input-target',
+        why: '入力欄に送信先を出さない（どのセッションに打っているか分からない）',
+        file: 'v0/app.html',
+        from: "    const to = st.sessionId ? ` → ${String(st.sessionId).slice(0, 8)}` : '';",
+        to: "    const to = '';   /* 変異: 送信先を出さない */",
+        gone: 'st.sessionId ? ` → ${String(st.sessionId)',
+        script: 'v0/render-check.mjs',
+    },
+    {
         // 🚨 実機で「止まったように見える」と読まれた形（沈黙 = 停止ではない）
         name: 'exec-heartbeat',
         why: '出力が来ない間の心拍を出さない'
