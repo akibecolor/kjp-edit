@@ -24,6 +24,12 @@
 /**
  * `recent[]` の1件から、パスの代わりに出す文字を返す。
  *
+ * ⚠️ **渡すのは payload の `recent[]` エントリ**（`summarize` が付ける名前）。
+ *    `observedPath()` の生の返り値は `root` / `unsafe` / `unknown` という別の名前なので、
+ *    そのまま渡すと**全部に当たらず空文字**が返る（黙って「何も言わない」になる）。
+ *    実際に検証スクリプトでこれを踏んだ。
+ *
+
  * @param {{path?: string|null, outside?: boolean, pathRoot?: boolean,
  *          pathUnsafe?: boolean, pathUnknown?: boolean,
  *          pathUnresolved?: boolean}} r
