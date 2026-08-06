@@ -15,6 +15,8 @@ import {
     summarize, repoRelative, readTail, collectAgents, LIMITS, maskSecrets,
 } from './transcript.mjs';
 import { relativeInside } from './git.mjs';
+// UI が実際に出す文字。app.html の中に置いていたので検査が掛からなかった（8回目のレビュー）
+import { pathLabel } from './pathlabel.mjs';
 
 const SECRET = 'INJECT-SECRET-12345';
 const WT = process.platform === 'win32' ? 'C:/wt/agent-a' : '/wt/agent-a';
@@ -195,6 +197,72 @@ test('リポジトリ外のパスは出さず「外」と印を付ける', () =>
 });
 
 /**
+ * 🚨 **「(リポジトリ外)」を3つの別の理由で断言していた（8回目のレビュー。SERIOUS）。**
+ *
+ * `path` が無い理由は「本当に外」だけではなく
+ *   (b) `rel === ''` = **worktree ルート自身**（`Grep`/`Glob` の `path` に
+ *       worktree ルートを渡す形で普通に起きる）
+ *   (c) `isSafeRepoPath` に外れた形（先頭が `-` や `:` のファイル名）
+ * があり、どちらも**リポジトリの中**なのに `(リポジトリ外)` と表示していた。
+ * 観測ツールが「エージェントがリポジトリ外を触った」と誤って断定するのは、
+ * 安全の判断を誤らせる最悪の嘘。**payload の型でも、画面の文字でも区別する。**
+ */
+test('🚨 パスが出せない理由を区別して表示する（中にあるものを「外」と言わない）', () => {
+    const rec = (input, cwd = WT) => [JSON.stringify({
+        type: 'assistant', timestamp: ago(100), cwd, sessionId: 's',
+        message: { content: [{ type: 'tool_use', name: 'Grep', input }] },
+    })];
+    const one = input => summarize(rec(input), { worktreePath: WT, now: NOW }).recent[0];
+
+    // (a) 本当に外 — ここだけが「外」
+    const other = process.platform === 'win32' ? 'C:/other/secret.env' : '/other/secret.env';
+    const outside = one({ path: other });
+    assert.equal(outside.path, null);
+    assert.equal(outside.outside, true, '本当に外を「外」と言えていない');
+    assert.equal(outside.pathRoot, false);
+    assert.equal(outside.pathUnsafe, false);
+    assert.equal(pathLabel(outside), '(リポジトリ外)');
+
+    // (b) worktree ルート自身 — **中**
+    const root = one({ path: WT });
+    assert.equal(root.path, null);
+    assert.equal(root.outside, false, 'worktree ルート自身を「外を触った」と断言している');
+    assert.equal(root.pathRoot, true, 'ルートであることを payload に残していない');
+    assert.equal(pathLabel(root), '(worktree ルート)');
+
+    // (c) 中にあるが表示できない形 — **中**
+    for (const name of ['-notes.md', ':weird.md']) {
+        const unsafe = one({ path: `${WT}/${name}` });
+        assert.equal(unsafe.path, null, `表示できない形をそのまま出した: ${name}`);
+        assert.equal(unsafe.outside, false,
+            `中にあるファイル（${name}）を「外を触った」と断言している`);
+        assert.equal(unsafe.pathUnsafe, true, `表示できない理由を残していない: ${name}`);
+        assert.equal(pathLabel(unsafe), '(パスを表示できません)');
+    }
+
+    // (d) 相対パスの基準が不明（7回目のレビューで入れた区別。ここでも混ざらない）
+    // ⚠️ `undefined` を渡すと既定引数（WT）に落ちるので `null` を渡す
+    //    （既定引数のせいで「基準が無い」形を作れておらず、最初は空振りした）
+    const unresolved = summarize(rec({ path: 'v0/git.mjs' }, null),
+        { worktreePath: WT, now: NOW }).recent[0];
+    assert.equal(unresolved.outside, false);
+    assert.equal(pathLabel(unresolved), '(相対パスの基準が不明)');
+
+    // 🚨 **4つが本当に別の文字で出ること。** どれかが同じなら区別は消えている
+    const shown = [outside, root, one({ path: `${WT}/-notes.md` }), unresolved].map(pathLabel);
+    assert.equal(new Set(shown).size, 4, `画面の文字が区別されていない: ${shown.join(' / ')}`);
+    // 「外」と出るのは1つだけ
+    assert.equal(shown.filter(s => s === '(リポジトリ外)').length, 1,
+        `「(リポジトリ外)」が複数の理由に付いている: ${shown.join(' / ')}`);
+
+    // 判定できない場合も「外」と言わない
+    assert.equal(pathLabel({ path: null, outside: false, pathUnknown: true }),
+        '(パスを判定できません)');
+    // パスがあるときはパスを出す（判定の文字で上書きしない）
+    assert.equal(pathLabel({ path: 'v0/git.mjs', outside: false }), 'v0/git.mjs');
+});
+
+/**
  * 🚨 **パスは自由文の通り道なので、長さで縛る。**
  *
  * `isSafeRepoPath` は空白・改行・任意の Unicode を 4096 文字まで通すので、
@@ -287,15 +355,44 @@ test('🚨 symlink / junction 越しのパスでも worktree 相対に丸めら�
 
 test('大文字小文字は保つ（git はパスを区別するので小文字化してはいけない）', () => {
     const base = process.platform === 'win32' ? 'C:/wt/a' : '/wt/a';
-    assert.equal(repoRelative(base, `${base}/v0/Git.MJS`), 'v0/Git.MJS');
+    assert.deepEqual(repoRelative(base, `${base}/v0/Git.MJS`), { rel: 'v0/Git.MJS', why: null });
 });
 
-test('repoRelative: 区切り文字を / に揃え、外は null', () => {
+/**
+ * 🚨 **`rel` が無い理由を型で分ける（8回目のレビュー。SERIOUS）。**
+ *
+ * 以前は4つの別の事情で同じ `null` を返し、呼び出し側が全部
+ * `(リポジトリ外)` と表示していた。**リポジトリの中のファイルに
+ * 「エージェントが外を触った」と断言する**のは、観測ツールとして
+ * 安全の判断を誤らせる最悪の嘘（CLAUDE.md
+ * 「『調べられない』と『無い』を型で分ける」）。
+ */
+test('🚨 repoRelative: 「外」「ルート」「表示できない」「判定できない」を別の理由で返す', () => {
     const base = process.platform === 'win32' ? 'C:/wt/a' : '/wt/a';
-    assert.equal(repoRelative(base, `${base}/v0/git.mjs`), 'v0/git.mjs');
-    assert.equal(repoRelative(base, base), null, '基準そのものはパスではない');
-    assert.equal(repoRelative(base, process.platform === 'win32' ? 'C:/wt/b/x' : '/wt/b/x'), null);
-    assert.equal(repoRelative(base, null), null);
+    assert.deepEqual(repoRelative(base, `${base}/v0/git.mjs`), { rel: 'v0/git.mjs', why: null });
+    // (a) 本当に外
+    assert.deepEqual(
+        repoRelative(base, process.platform === 'win32' ? 'C:/wt/b/x' : '/wt/b/x'),
+        { rel: null, why: 'outside' }, '外を外と言えていない');
+    // (b) worktree ルート自身。**中なので「外」と言ってはいけない**
+    assert.deepEqual(repoRelative(base, base), { rel: null, why: 'root' },
+        'worktree ルート自身を「外」と断言している');
+    // (c) 中にあるが表示できない形（`isSafeRepoPath` に外れる）
+    assert.deepEqual(repoRelative(base, `${base}/-notes.md`), { rel: null, why: 'unsafe' },
+        '中にある表示できない形を「外」と断言している');
+    assert.deepEqual(repoRelative(base, `${base}/:weird.md`), { rel: null, why: 'unsafe' },
+        '中にある表示できない形を「外」と断言している');
+    // (d) 判定できない
+    assert.deepEqual(repoRelative(base, null), { rel: null, why: 'unknown' },
+        '判定できないものを「外」と断言している');
+    // ⚠️ 4つが本当に別の値であること（どれかが同じ値なら区別は消えている）
+    const whys = [
+        repoRelative(base, process.platform === 'win32' ? 'C:/wt/b/x' : '/wt/b/x').why,
+        repoRelative(base, base).why,
+        repoRelative(base, `${base}/-notes.md`).why,
+        repoRelative(base, null).why,
+    ];
+    assert.equal(new Set(whys).size, 4, `理由が区別されていない: ${whys.join(',')}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -808,4 +905,113 @@ test('🔒 秘密を渡す形は値が分からなくても落とす（--token /
         assert.equal(r.masked, false, `過剰にマスクしている: ${command} → ${r.text}`);
         assert.equal(r.text, command);
     }
+});
+
+/**
+ * 🚨 **区切りは空白1文字ではない（8回目のレビュー。SERIOUS）。**
+ *
+ * 形ベースの検出が `[ ]+` / `[ ]*` しか見ていなかったので:
+ *   - `--token\t<値>` は**何にも当たらず素通り**（告知すら出ない）
+ *   - `--token \` + 改行 + `<値>` は**継続の `\` を「値」としてマスクする**ので
+ *     `masked: true` が立ち、UI は `← 秘密を落としました` と表示しながら
+ *     その直後に秘密を並べた。`clip` が `\s+` を空白に畳むので、payload には
+ *     `--token (マスクしました) <秘密>` という**綺麗な1行**として出る
+ *   - `--token "a b"` は `"a` だけ落として ` b"` を残す（同じ部分マスク）
+ *
+ * 実データの記録では `Bash`/`PowerShell` 471 件のうち改行を含むものが 180 件、
+ * `\` + 改行の行継続が 13 件あった（レビューの実測）。
+ *
+ * **落としていないのに「落とした」と言うのがこのリポジトリで最も重い誤り**なので、
+ * (1) 素通りしないこと と (2) 落ちていないのに告知しないこと の**両方**を固定する。
+ * ⚠️ maskSecrets の返り値だけでなく、**`clip` を通った payload** も見る
+ *    （マスクは形の検出なので、切り詰めた後の文字列に形が残っていないことが背骨）。
+ */
+test('🔒 秘密の区切りはタブ・改行・行継続・クォートでも落とす（落としたと嘘をつかない）', () => {
+    const V = 'kjp-exec-token-ABCDEF0123456789';
+    const shapes = {
+        'タブ区切り': `node v0/server.mjs --allow-exec --token\t${V}`,
+        '行継続（sh の \\ + 改行）': `node v0/server.mjs --allow-exec --token \\\n  ${V}`,
+        '行継続（CRLF）': `node v0/server.mjs --allow-exec --token \\\r\n  ${V}`,
+        '行継続（PowerShell の backtick + 改行）':
+            `node v0/server.mjs --allow-exec --token \x60\n  ${V}`,
+        '素の改行': `node v0/server.mjs --allow-exec --token\n${V}`,
+        '継続が値の途中に入る': `node v0/server.mjs --token ${V.slice(0, 8)}\\\n${V.slice(8)}`,
+        'ヘッダ形 + 行継続': `curl -H "x-kjp-token: \\\n  ${V}" http://127.0.0.1:7749/`,
+        'ヘッダ形 + タブ': `curl -H "x-kjp-token:\t${V}" http://127.0.0.1:7749/`,
+        // ⚠️ **空白を含む値**にしないと意味が無い。`"<値>"` のように値が
+        //    クォートの直後から始まる形は `[^\s]+` でも丸ごと落ちるので、
+        //    「クォートを1つとして食う」を測れていなかった（変異が SURVIVED した）
+        '二重クォートで囲んだ空白入りの値': `psql --password "pass phrase ${V}"`,
+        '単一クォートで囲んだ空白入りの値': `psql --password 'pass phrase ${V}'`,
+        '= と改行': `node v0/server.mjs --token=\\\n${V}`,
+        // 🚨 `Bearer` を「値」と見なして落とし、**トークンを残す**形
+        //    （告知だけ立つので「落とした」と嘘をつく。同じ関数の別の穴）
+        'authorization: Bearer <値>': `curl -H "authorization: Bearer ${V}" http://127.0.0.1:7749/`,
+    };
+    for (const [name, command] of Object.entries(shapes)) {
+        // 値は渡さない（形ベースの検出だけで落とせること）
+        const r = maskSecrets(command, []);
+        assert.ok(!r.text.includes(V),
+            `秘密が素通りしている（${name}）: ${JSON.stringify(r.text)}`);
+        // 🚨 落としたことを言う（落ちているのに黙っていない）
+        assert.equal(r.masked, true, `落としたのに告知していない（${name}）`);
+
+        // 🚨 **clip を通った payload にも残っていないこと。** 継続の `\` を
+        //    「値」として落としていた形は、clip が空白を畳んで初めて
+        //    `--token (マスクしました) <秘密>` という綺麗な1行になって出ていた
+        const lines = [JSON.stringify({
+            type: 'assistant', timestamp: ago(100), cwd: WT, sessionId: 's',
+            message: { content: [{ type: 'tool_use', name: 'Bash', input: { command } }] },
+        })];
+        const s = summarize(lines, { worktreePath: WT, now: NOW, allowText: true });
+        const json = JSON.stringify(s);
+        assert.ok(!json.includes(V), `clip 後の payload に秘密が残っている（${name}）:\n${json}`);
+        assert.equal(s.recent[0].commandMasked, true, `payload で告知していない（${name}）`);
+    }
+
+    // 🚨 **落としていないのに「落とした」と言わない。** 行継続はあるが秘密の形は
+    //    無いコマンドで告知が立つと、告知そのものが信用できなくなる
+    const innocent = 'npm test \\\n  --silent';
+    const ok = maskSecrets(innocent, []);
+    assert.equal(ok.masked, false,
+        `落としていないのに告知している: ${JSON.stringify(ok.text)}`);
+    // 行継続は畳む（シェルが `\` + 改行を取り除くのと同じ形にする）
+    assert.equal(ok.text, 'npm test   --silent');
+});
+
+/**
+ * 🚨 **発話（text[]）にもマスクが掛かり、掛かったことを告知する。**
+ *
+ * 発話とコマンド行は**同じ `--allow-transcript-text`・同じ read 権限**で同じ
+ * payload に出るのに、マスクはコマンド行にしか掛かっていなかった（8回目のレビュー
+ * の BLOCKING）。「次を実行してください: … --token X」の形で実行トークンが
+ * 平文で出れば、**read が RCE に昇格する**。
+ */
+test('🔒 発話からも資格情報を落とし、落としたことを言う', () => {
+    const TOK = 'S3CR3T-exec-token-abcdefghijklmnop';
+    const lines = [JSON.stringify({
+        type: 'assistant', timestamp: ago(500), cwd: WT, sessionId: 's',
+        message: { content: [{ type: 'text',
+            // 値ベース（secrets）でも形ベース（--token）でも落ちる形を両方入れる
+            text: `起動は node v0/server.mjs --allow-exec --token ${TOK} です。`
+                + `\nヘッダは x-kjp-token:\t${TOK} を付けてください。` }] },
+    })];
+    const s = summarize(lines, {
+        worktreePath: WT, now: NOW, allowText: true, secrets: [TOK],
+    });
+    const json = JSON.stringify(s);
+    assert.ok(!json.includes(TOK), `発話から実行トークンが漏れている:\n${json}`);
+    assert.equal(s.text.length, 1);
+    assert.match(s.text[0].text, /マスクしました/, 'マスクの痕跡が無い');
+    assert.equal(s.text[0].masked, true, '発話で落としたことを伝えていない');
+    // 発話そのものは残る（観測の役には立つ）
+    assert.match(s.text[0].text, /起動は/);
+
+    // 秘密が無い発話には告知を付けない（告知が信用できなくなる）
+    const clean = summarize([JSON.stringify({
+        type: 'assistant', timestamp: ago(500), cwd: WT, sessionId: 's',
+        message: { content: [{ type: 'text', text: 'テストを走らせます。' }] },
+    })], { worktreePath: WT, now: NOW, allowText: true, secrets: [TOK] });
+    assert.equal(clean.text[0].masked, undefined,
+        '落としていないのに告知している（告知が信用できなくなる）');
 });
