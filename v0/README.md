@@ -30,8 +30,35 @@ URL をスマホで開くことが、実行トークンを配ることと同義*
 node v0/server.mjs                    # カレントのリポジトリを見る
 node v0/server.mjs --repo /path/to/r  # 別のリポジトリ（サブディレクトリでもルートに正規化される）
 node v0/server.mjs --repo /path/to/bare.git  # **bare も渡せる**（作業ツリーは linked worktree 側）
+node v0/server.mjs --repo /a --repo /b       # 複数（1本目が既定。ヘッダのセレクトで切り替える）
 node v0/server.mjs --port 7749 --limit 300 --base main
 ```
+
+### 🔒 複数リポジトリ（読める範囲は起動時に固定する）
+
+`--repo` は複数回渡せます（`scripts/serve.mjs` と `autostart.mjs` も同じ）。
+登録が2本以上なら**ヘッダにセレクトが出て**、切り替えると state を取り直します。
+
+```bash
+node scripts/serve.mjs --repo C:/work/app --repo C:/work/lib
+node scripts/autostart.mjs install --repo C:/work/app --repo C:/work/lib
+```
+
+🚨 **UI から任意のパスを開く経路は作っていません。** 「開きたいものを入力する」形に
+すると、トークンが1本漏れた時点で**マシン上の全 git リポジトリが読める**状態
+（`--allow-exec` があればその中でコマンドも動く）に化けます。
+だからクエリの `?repo=` は**登録済み一覧との `samePath()` 照合**しか通しません
+（`isSafeRepoPath()` ではなく登録との照合。**形式が正しくても登録外は 400**）。
+照合は入口で1回だけ行い、そこで解決した値以外を git に渡しません
+（新しい経路で照合を忘れる余地を構造として無くす）。
+
+- **指定なしは既定（1本目）** — 今まで通りの URL がそのまま動きます
+- 表示名は basename。**衝突したらフルパス**（どちらを操作しているか曖昧にしない）
+- worktree の allowlist は**選択中のリポジトリ**の一覧に対して引きます
+  （A を選んだまま B の worktree を狙っても 400）
+- **TTL キャッシュはリポジトリごと**（混ざると別リポジトリの payload が返る）
+- 1本でも開けなければ**起動しません**（黙って落とすと一覧に無いことに気付けない）
+- 同じ場所を2回渡したら1本にまとめます
 
 ```bash
 node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
@@ -186,6 +213,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 
 | | |
 |---|---|
+| `/api/v0/repos` | 登録済みリポジトリの一覧（表示名 + どれが選択中か）。**起動時に固定した範囲だけ** |
 | `/api/v0/state` | 全状態。`?fresh=1` で TTL キャッシュを無視。`stats.gitSpawns` に git の起動回数（定数5 + worktree 1本あたり3） |
 | `/api/v0/diff?base=&ref=&path=` | 1ファイルの unified diff |
 | `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`（`limitBytes` 付き。**読んでいないので `binary` は `null`**）、NUL 混入は `binary` |
@@ -196,6 +224,9 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `POST /api/v0/write` | 作業ツリーに書く。**`--allow-write` が必要**。`{worktree, path, text, baseOid}`。`baseOid` が今の中身と違えば **409** |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
 | `/layout` | `/` の別名（互換のため） |
+
+どの経路も `?repo=<登録済みパス>` で対象を選べます（指定なしは既定 = 1本目）。
+**未登録のパスは 400**（読み取り・書き込み・実行のすべてで同じ門）。
 
 ### 書き込み（既定オフ）
 

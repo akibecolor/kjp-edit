@@ -17,14 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import {
     SERVE_FLAGS, AUTOSTART_FLAGS, unknownFlag, checkPort, checkHost,
-    collectHosts, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
+    collectHosts, collectRepos, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
     runningCaps, requestedCaps, describeCaps,
     runningConfig, requestedConfig, configDiff, stopTargets, stopOutcome,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
 const base = extra => serverArgs({
-    argv: extra, server: SERVER, repo: '/r', port: 7749,
+    argv: extra, server: SERVER, repos: ['/r'], port: 7749,
     tokenFile: '/s/token-read', writeTokenFile: '/s/token-write',
     execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
 });
@@ -195,13 +195,13 @@ test('観測フラグを引き継ぐ。--agents-text は --watch-agents も付�
 });
 
 test('自動起動は capability と引き継ぎを serve.mjs の名前で登録する', () => {
-    const { args } = autostartServeArgs({ argv: ['install'], repo: 'C:/r', port: '7749' });
+    const { args } = autostartServeArgs({ argv: ['install'], repos: ['C:/r'], port: '7749' });
     assert.deepEqual(args, ['--repo', 'C:/r', '--port', '7749'],
         '既定は読み取り専用で登録する');
 
     const full = autostartServeArgs({
         argv: ['install', '--exec', '--allow-host', 'box.ts.net', '--agents-text'],
-        repo: 'C:/r', port: '7749',
+        repos: ['C:/r'], port: '7749',
     }).args;
     assert.ok(full.includes('--exec'));
     assert.deepEqual(full.slice(full.indexOf('--allow-host'), full.indexOf('--allow-host') + 2),
@@ -212,10 +212,63 @@ test('自動起動は capability と引き継ぎを serve.mjs の名前で登録
 
 test('自動起動は壊れたホスト名を登録しない', () => {
     const r = autostartServeArgs({
-        argv: ['install', '--allow-host', 'a b'], repo: 'C:/r', port: '7749',
+        argv: ['install', '--allow-host', 'a b'], repos: ['C:/r'], port: '7749',
     });
     assert.equal(r.args, undefined);
     assert.equal(r.error, 'a b');
+});
+
+/* ---- 複数リポジトリ（`--repo` を複数回） ----
+ *
+ * 🚨 引き継ぎが落ちても**手元では気付けない**（起動口では2本見えるのに、
+ *    ログオン後は1本になっている）。`--allow-host` / `--timeout` と同じ形なので
+ *    純関数で固定する。
+ */
+test('--repo の値を全部集める（1本目だけ読んで捨てない）', () => {
+    assert.deepEqual(collectRepos(['--repo', 'C:/a', '--repo', 'C:/b']).repos,
+        ['C:/a', 'C:/b'], '2本目を捨てている');
+    assert.deepEqual(collectRepos([]).repos, [], '指定が無ければ空（呼び出し側が既定を決める）');
+    // 順序は「1本目が既定」の意味を持つので保つ
+    assert.deepEqual(collectRepos(['--repo', 'C:/z', '--port', '1', '--repo', 'C:/a']).repos,
+        ['C:/z', 'C:/a']);
+});
+
+test('--repo の壊れた値を通さない（Run キーの引用が閉じなくなる）', () => {
+    for (const bad of [['--repo'], ['--repo', ''], ['--repo', '--port'],
+        ['--repo', 'C:/a"b'], ['--repo', 'C:/a\nb']]) {
+        const r = collectRepos(bad);
+        assert.equal(r.repos, undefined, `通ってしまった: ${JSON.stringify(bad)}`);
+        assert.ok('error' in r, `error を返していない: ${JSON.stringify(bad)}`);
+    }
+});
+
+test('🔒 複数の --repo をサーバに全部渡す（読める範囲は起動時に固定する）', () => {
+    const args = serverArgs({
+        argv: [], server: SERVER, repos: ['/a', '/b', '/c'], port: 7749,
+        tokenFile: '/s/token-read', writeTokenFile: '/s/token-write',
+        execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
+    });
+    const repos = args.map((a, i) => (a === '--repo' ? args[i + 1] : null)).filter(Boolean);
+    assert.deepEqual(repos, ['/a', '/b', '/c'], '本数が落ちている');
+    // 1本目が既定なので順序が意味を持つ
+    assert.equal(args[args.indexOf('--repo') + 1], '/a');
+});
+
+test('🚨 自動起動の登録に --repo を全部引き継ぐ（ログオン後だけ1本に戻らない）', () => {
+    const { args } = autostartServeArgs({
+        argv: ['install'], repos: ['C:/a', 'C:/b'], port: '7749',
+    });
+    const repos = args.map((a, i) => (a === '--repo' ? args[i + 1] : null)).filter(Boolean);
+    assert.deepEqual(repos, ['C:/a', 'C:/b'], '再起動後だけ1本になる形の回帰');
+});
+
+test('repos を配列で渡し忘れたら黙って通さない', () => {
+    // 単数の `repo` を渡すと `--repo undefined` になり「別の場所を見ている」で
+    // 気付くことになる。起動前に止める
+    assert.throws(() => serverArgs({
+        argv: [], server: SERVER, repo: '/a', port: 7749,
+    }), /repos/);
+    assert.throws(() => autostartServeArgs({ argv: [], repo: '/a', port: 1 }), /repos/);
 });
 
 // ---- 配線（純関数だけでは「呼んでいない」を検出できない）----
@@ -312,7 +365,7 @@ test('要求した capability をサーバ側の名前に直せる（差分を�
 
 test('🚨 --timeout で絶対上限をサーバに渡す', () => {
     const a = serverArgs({
-        argv: ['--exec'], server: SERVER, repo: '/r', port: 7749,
+        argv: ['--exec'], server: SERVER, repos: ['/r'], port: 7749,
         tokenFile: '/s/token-read', writeTokenFile: '/s/token-write',
         execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
         execTimeout: 3600,
@@ -343,7 +396,7 @@ test('--timeout は起動口と自動起動の両方が受け付ける（片方�
 });
 
 test('🚨 自動起動の登録に --timeout を引き継ぐ（再起動後だけ短くならない）', () => {
-    const r = autostartServeArgs({ argv: ['--exec', '--timeout', '3600'], repo: '/r', port: 7749 });
+    const r = autostartServeArgs({ argv: ['--exec', '--timeout', '3600'], repos: ['/r'], port: 7749 });
     assert.deepEqual(r.error, undefined);
     const i = r.args.indexOf('--timeout');
     assert.notEqual(i, -1, `引き継いでいない: ${r.args.join(' ')}`);
@@ -411,6 +464,48 @@ test('🚨 「既に動いています」の差分は値まで見る（上限と
     // (5) 上限は --exec と一緒でなければサーバに渡らないので要求として数えない
     assert.deepEqual(configDiff(['--timeout', '7200'], 'node v0/server.mjs --repo C:/r'), []);
     assert.equal(requestedConfig(['--timeout', '7200']).execTimeout, null);
+});
+
+/* 🚨 リポジトリの本数も「値まで見る」対象。
+ *
+ * 二重起動の判定は**1本目**（`repoOf`）でしているので、これが無いと
+ * `--repo A --repo B` を打った人に「既に動いています（A のデーモン）」と答えて
+ * exit 0 し、**B が見えないことを1文字も言わない**（`--timeout` を集合に
+ * 入れていなかったのと同型の穴）。
+ */
+test('🚨 configDiff は要求したリポジトリが全部見えているかを見る', () => {
+    const oneRepo = 'node v0/server.mjs --repo C:/one --port 7749';
+    // (1) 2本目が見えていないなら差分として出す（= 入れ直させる）
+    const d = configDiff([], oneRepo, { repos: ['C:/one', 'C:/two'] });
+    assert.deepEqual(d.map(x => x.what), ['--repo'],
+        `2本目が見えないことを黙っている: ${JSON.stringify(d)}`);
+    assert.equal(d[0].want, 'C:/two');
+    assert.match(d[0].have, /C:\/one/, '動いているリポジトリを出していない');
+
+    // (2) 全部見えているなら差分なし（毎回止めさせる形にはしない）
+    assert.deepEqual(configDiff([], oneRepo, { repos: ['C:/one'] }), []);
+    // 表記のゆらぎ（区切り・大文字小文字・末尾セパレータ）で誤報しない
+    assert.deepEqual(configDiff([], oneRepo, { repos: ['c:\\one\\'] }), [],
+        '表記が違うだけで「見えていない」と誤報している');
+
+    // (3) 渡さなければ比べない（既存の呼び出し側を壊さない）
+    assert.deepEqual(configDiff([], oneRepo), []);
+    assert.deepEqual(configDiff([], oneRepo, {}), []);
+
+    // (4) 2本見ているデーモンに1本だけ要求するのは差分ではない（多い方は問題にしない）
+    assert.deepEqual(
+        configDiff([], 'node v0/server.mjs --repo C:/one --repo C:/two', { repos: ['C:/one'] }),
+        [],
+    );
+});
+
+test('🚨 configDiff は空白入りのパスでも「見えている」と読める', () => {
+    // 🚨 `--repo "C:/Users/a b/one"` を空白で切ると `"C:/Users/a` までしか取れず、
+    //    **見えているのに毎回「入れ直してください」**になる（#31 と同じ罠）。
+    const cmd = 'C:\\node.exe v0/server.mjs --repo "C:/Users/a b/one" --port 7749';
+    assert.deepEqual(runningConfig(cmd).repos, ['C:/Users/a b/one']);
+    assert.deepEqual(configDiff([], cmd, { repos: ['C:/Users/a b/one'] }), [],
+        '空白入りのパスを取り違えている');
 });
 
 test('🚨 動いている実行デーモンの上限を必ず見せる（--status と同じ言い方で）', () => {

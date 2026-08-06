@@ -12,7 +12,7 @@
 // ⚠️ ここは**起動前**に走るので、`v0/` のモジュールに依存しない（サーバを読み込まない）。
 
 // ⚠️ `winargs.mjs` も純関数だけ（`v0/` には触らない）。`--stop` の対象を repo で絞るのに使う
-import { repoOf, samePathish } from './winargs.mjs';
+import { repoOf, reposOf, samePathish } from './winargs.mjs';
 
 /** 起動口が受け付けるフラグ。ここに無いものは黙って捨てずに止める */
 export const SERVE_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
@@ -128,17 +128,48 @@ export function collectHosts(argv) {
 }
 
 /**
+ * argv から `--repo` の値を全部集める。
+ *
+ * 🚨 **`--allow-host` と同じ扱いにする。** 1本目だけ読んで残りを捨てると、
+ *    「2本目のリポジトリが一覧に出ない」が起動するまで分からない（#30 の形）。
+ * ⚠️ 空・引用符・改行は弾く。Run キーの値は**1つの文字列**なので、
+ *    これらが混ざると別の引数に化ける（#29 と同じ根拠。`autostart.mjs` が
+ *    `--repo` 1本にだけ掛けていた検証を、全部に掛ける）。
+ * @returns {{repos: string[]} | {error: string|null}} 指定が無ければ repos: []
+ */
+export function collectRepos(argv) {
+    const repos = [];
+    const a = Array.isArray(argv) ? argv : [];
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== '--repo') continue;
+        const v = a[i + 1];
+        if (!v || v.startsWith('-') || /["\r\n\0]/.test(v)) return { error: v ?? null };
+        repos.push(v);
+    }
+    return { repos };
+}
+
+/**
  * `v0/server.mjs` に渡す argv を組む。
  *
  * 🔒 ここが capability の分界。**`--exec` は `--write` を含むが、逆は含まない。**
  *    観測（`--watch` / `--agents-text`）はどちらとも独立で、既定では付けない。
  */
 export function serverArgs({
-    argv, server, repo, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
+    argv, server, repos, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
     execTimeout = null,
 }) {
     const has = f => argv.includes(f);
-    const args = [server, '--repo', repo, '--port', String(port)];
+    // ⚠️ **配列を要求する。** 以前の `repo`（単数）を渡すと `--repo undefined` に
+    //    なって「起動したのに別の場所を見ている」で気付くことになるので、
+    //    黙って通さず throw する（呼び出し側の取り違えを起動前に止める）。
+    if (!Array.isArray(repos) || repos.length === 0) {
+        throw new TypeError('serverArgs には repos（1本以上の配列）を渡してください');
+    }
+    const args = [server];
+    // 🔒 読める範囲。**1本目が既定**なので順序を保つ
+    for (const r of repos) args.push('--repo', r);
+    args.push('--port', String(port));
     const wantExec = has('--exec');
     const wantWrite = wantExec || has('--write');
     if (wantWrite) args.push('--allow-write');
@@ -199,9 +230,17 @@ export function serverArgs({
  *    （`--allow-host` を落として**スマホから見たときだけ 403**、
  *      観測フラグを落として**ログオン後だけパネルが消える**）。
  */
-export function autostartServeArgs({ argv, repo, port }) {
+export function autostartServeArgs({ argv, repos, port }) {
     const has = f => argv.includes(f);
-    const args = ['--repo', repo, '--port', String(port)];
+    // 🚨 **リポジトリの本数も引き継ぐ。** 落とすと**再起動後だけ1本に戻る**ので、
+    //    「朝は2本見えていたのに、ログオンし直したら1本になっている」という
+    //    手元では絶対に気付けない壊れ方になる（`--allow-host` / `--timeout` と同型）。
+    if (!Array.isArray(repos) || repos.length === 0) {
+        throw new TypeError('autostartServeArgs には repos（1本以上の配列）を渡してください');
+    }
+    const args = [];
+    for (const r of repos) args.push('--repo', r);
+    args.push('--port', String(port));
     if (has('--exec')) args.push('--exec');
     else if (has('--write')) args.push('--write');
     const hosts = collectHosts(argv);
@@ -276,7 +315,10 @@ export function runningConfig(cmd) {
             execTimeout = Number(tokens[i + 1]);
         }
     }
-    return { caps: runningCaps(cmd), hosts, execTimeout };
+    // 🚨 リポジトリは**空白を含みえる**（`--repo "C:/Users/a b/repo"`）ので、
+    //    空白で切るこのループでは読めない。引用を解する `reposOf()` を使う
+    //    （`(\S+)` で取ると `"C:/Users/a` までしか取れない。#31 と同じ罠）。
+    return { caps: runningCaps(cmd), hosts, execTimeout, repos: reposOf(cmd) };
 }
 
 /**
@@ -305,10 +347,25 @@ export function requestedConfig(argv) {
  *    `--allow-host` は値を見ず、`missing=[]` で exit 0 = **黙って無効**だった。
  * @returns {{what: string, want: string, have: string}[]} 空なら差分なし
  */
-export function configDiff(argv, cmd) {
+export function configDiff(argv, cmd, { repos = null } = {}) {
     const req = requestedConfig(argv);
     const run = runningConfig(cmd);
     const diffs = [];
+    // 🚨 **要求したリポジトリが全部見えているか。** 二重起動の判定は1本目で
+    //    しているので、これが無いと `--repo A --repo B` を打った人に
+    //    「既に動いています（A のデーモン）」と答えて exit 0 してしまい、
+    //    **B が見えないことを1文字も言わない**（`--timeout` と同型の穴）。
+    // ⚠️ 呼び出し側は**解決済み**のパスを渡すこと（argv の生の値は
+    //    デーモン側の絶対パスと一致しない）。渡されなければ比べない。
+    for (const r of (Array.isArray(repos) ? repos : [])) {
+        if (!run.repos.some(x => samePathish(x, r))) {
+            diffs.push({
+                what: '--repo',
+                want: r,
+                have: run.repos.length ? run.repos.join(', ') : '(不明)',
+            });
+        }
+    }
     for (const c of req.caps) {
         if (!run.caps.includes(c)) diffs.push({ what: c, want: '有効', have: '無効' });
     }

@@ -5516,3 +5516,346 @@ test('--audit-log は .git の中なら通す（既定の置き場所を否定�
         await rm(dotGit, { force: true }).catch(() => {});
     }
 });
+// ---------------------------------------------------------------------------
+// 🔒 複数リポジトリの切り替え。
+//
+// **読める範囲は起動時に固定する。** UI から任意のパスを開けるようにすると、
+// トークンが1本漏れた時点で「マシン上の全 git リポジトリが読める」に化けるので、
+// クエリの `?repo=` は**登録済み一覧との samePath() 照合**しか通さない。
+// ここで固定するのは:
+//   1. 一覧が返る（表示名は basename、衝突したらフルパス）
+//   2. `?repo=` で切り替わる（`state.repo` も worktree も切り替わる）
+//   3. **未登録のパスは 400**（読み取り・書き込み・実行の全部で）
+//   4. 指定なしは既定（1本目）= 後方互換
+//   5. **TTL キャッシュがリポジトリごとに分かれる**（混ざると別リポジトリの payload が返る）
+//   6. worktree の allowlist が「選択中のリポジトリ」の一覧に対して引かれる
+// ---------------------------------------------------------------------------
+
+/**
+ * パスのゆるい一致（この検査の中の**表示上の**照合だけに使う）。
+ * ⚠️ 認可の照合はサーバ側の `samePath()` が持つ。ここでそれを再実装しない。
+ */
+const sameish = (x, y) => typeof x === 'string' && typeof y === 'string'
+    && x.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+    === y.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+
+/** 使い捨てのリポジトリを1本作る（コミット1本 + worktree 1本） */
+async function makeRepo(dir, branch) {
+    await mkdir(dir, { recursive: true });
+    await g(['init', '-q', '-b', 'main'], dir);
+    await g(['config', 'user.name', 't'], dir);
+    await g(['config', 'user.email', 't@example.com'], dir);
+    await writeFile(join(dir, 'only-here.txt'), `${branch}\n`, 'utf8');
+    await g(['add', '-A'], dir);
+    await g(['commit', '-q', '-m', 'chore: 初期'], dir);
+    const wt = `${dir}-wt`;
+    await g(['worktree', 'add', '-q', '-b', branch, wt], dir);
+    await writeFile(join(wt, 'x.txt'), 'x\n', 'utf8');
+    await g(['add', '-A'], wt);
+    await g(['commit', '-q', '-m', `feat: ${branch}`], wt);
+    return { dir, wt };
+}
+
+/** 複数リポジトリを登録したサーバを立てる。呼び出し側が kill する。 */
+const MULTI_TOKEN = 'smoke-multi-repo-token-0123456789ab';
+async function startMulti(repos, extra = ['--allow-exec']) {
+    const args = [SERVER, '--port', '0', '--token', MULTI_TOKEN, ...extra];
+    for (const r of repos) args.push('--repo', r);
+    const child = spawn(process.execPath, args,
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    let out = '', err = '';
+    child.stderr.on('data', d => { err += d; });
+    const url = await new Promise((resolve, reject) => {
+        // 🚨 待ちの失敗で stderr を捨てない（捨てると CI で原因が完全に消える）
+        const t = setTimeout(() => reject(new Error(
+            `起動しなかった\n  stdout: ${out.trim() || '(空)'}\n  stderr: ${err.trim() || '(空)'}`,
+        )), 15000);
+        child.stdout.on('data', d => {
+            out += d;
+            const m = out.match(/http:\/\/127\.0\.0\.1:\d+/);
+            if (m) { clearTimeout(t); resolve(m[0]); }
+        });
+        child.on('error', reject);
+    }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
+    return { child, url, banner: () => out };
+}
+
+const MH = { 'content-type': 'application/json', 'x-kjp-token': MULTI_TOKEN };
+
+/**
+ * 検査用に2本のリポジトリを用意する（テストごとに作り直さない。git の起動が重い）。
+ * ⚠️ basename はわざと衝突させない（衝突時の表示は別のテストで作る）。
+ */
+let multi = null;
+async function twoRepos() {
+    if (multi) return multi;
+    const root = await mkdtemp(join(tmpdir(), 'kjp-multi-'));
+    const a = await makeRepo(join(root, 'alpha'), 'agent-x');
+    const b = await makeRepo(join(root, 'bravo'), 'agent-y');
+    multi = { root, a, b };
+    return multi;
+}
+
+after(async () => {
+    if (multi) await rm(multi.root, { recursive: true, force: true }).catch(() => {});
+});
+
+test('🔒 登録済みリポジトリの一覧が返る（表示名 + 現在選択中）', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir, b.dir]);
+    try {
+        const d = await (await fetch(`${url}/api/v0/repos`)).json();
+        assert.equal(d.repos.length, 2, `2本返っていない: ${JSON.stringify(d)}`);
+        assert.deepEqual(d.repos.map(r => r.label), ['alpha', 'bravo'],
+            'basename が表示名になっていない');
+        // 1本目が既定 = 指定なしのときの current
+        assert.equal(d.repos[0].current, true, '1本目が current になっていない');
+        assert.equal(d.repos[1].current, false);
+        assert.ok(sameish(d.default, a.dir), `既定が1本目でない: ${d.default}`);
+
+        // ?repo= を付けたら current がそちらに移る（UI がセレクトの初期値に使う）
+        const d2 = await (await fetch(
+            `${url}/api/v0/repos?repo=${encodeURIComponent(b.dir)}`)).json();
+        assert.equal(d2.repos[1].current, true, '選択中が反映されていない');
+        assert.equal(d2.repos[0].current, false);
+    } finally { child.kill(); }
+});
+
+test('🔒 basename が衝突したらフルパスを出す（別リポジトリを取り違えない）', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kjp-dup-'));
+    const p = await makeRepo(join(root, 'p', 'same'), 'agent-p');
+    const q = await makeRepo(join(root, 'q', 'same'), 'agent-q');
+    const { child, url } = await startMulti([p.dir, q.dir], []);
+    try {
+        const d = await (await fetch(`${url}/api/v0/repos`)).json();
+        assert.equal(d.repos.length, 2);
+        // basename は両方 'same' なので、**そのまま出したら区別できない**
+        assert.notEqual(d.repos[0].label, d.repos[1].label,
+            `衝突しているのに同じ表示名になっている: ${JSON.stringify(d.repos)}`);
+        for (const r of d.repos) {
+            assert.equal(r.label, r.path, `衝突時はフルパスを出すこと: ${r.label}`);
+        }
+    } finally {
+        child.kill();
+        await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 ?repo= で対象を切り替えられる（指定なしは既定のリポジトリ）', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir, b.dir]);
+    try {
+        // 指定なし = 既定（後方互換。今まで通りの URL が今まで通り動く）
+        const def = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        assert.ok(sameish(def.repo, a.dir), `既定が1本目でない: ${def.repo}`);
+        assert.ok(def.worktrees.some(w => w.branch === 'agent-x'),
+            `既定の worktree が出ていない: ${JSON.stringify(def.worktrees.map(w => w.branch))}`);
+        assert.ok(!def.worktrees.some(w => w.branch === 'agent-y'),
+            '別リポジトリの worktree が混ざっている');
+
+        // 2本目に切り替える
+        const other = await (await fetch(
+            `${url}/api/v0/state?fresh=1&repo=${encodeURIComponent(b.dir)}`)).json();
+        assert.ok(sameish(other.repo, b.dir), `切り替わっていない: ${other.repo}`);
+        assert.ok(other.worktrees.some(w => w.branch === 'agent-y'),
+            `切り替え先の worktree が出ていない: ${JSON.stringify(other.worktrees.map(w => w.branch))}`);
+        assert.ok(!other.worktrees.some(w => w.branch === 'agent-x'),
+            '切り替えたのに元のリポジトリの worktree が出ている');
+    } finally { child.kill(); }
+});
+
+test('🔒 表記が違っても登録済みなら通る（samePath 照合。=== ではない）', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir, b.dir], []);
+    try {
+        // 区切り文字と末尾セパレータを変える（git は `/`、path.join は `\`）
+        for (const spelled of [b.dir.replace(/\\/g, '/'), `${b.dir}/`,
+            `${b.dir.replace(/\\/g, '/')}/`]) {
+            const r = await fetch(`${url}/api/v0/state?fresh=1&repo=${encodeURIComponent(spelled)}`);
+            assert.equal(r.status, 200, `登録済みなのに拒否された: ${spelled}`);
+            const d = await r.json();
+            assert.ok(sameish(d.repo, b.dir), `別のリポジトリが返った: ${d.repo}`);
+        }
+    } finally { child.kill(); }
+});
+
+test('🚨 未登録のパスは 400（形式が正しくても登録外は拒否する）', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir], []);   // b は**登録しない**
+    try {
+        // b は実在する git リポジトリで、パスとして何の問題も無い。
+        // それでも**登録されていないから**拒否する、が守りの本体。
+        for (const bad of [b.dir, tmpdir(), `${a.dir}-nope`, '/etc', 'C:/Windows',
+            `${a.dir}/..`, 'relative/path']) {
+            const r = await fetch(`${url}/api/v0/state?fresh=1&repo=${encodeURIComponent(bad)}`);
+            assert.equal(r.status, 400, `未登録のパスが通った: ${bad}`);
+            const d = await r.json();
+            assert.match(d.error, /登録されていない/, `拒否理由が違う: ${bad} → ${d.error}`);
+        }
+        // 既定のリポジトリはそのまま読める（門が広すぎて全部落ちている、を潰す）
+        const ok = await fetch(`${url}/api/v0/state?fresh=1`);
+        assert.equal(ok.status, 200, '未登録の拒否が既定の経路まで壊している');
+    } finally { child.kill(); }
+});
+
+test('🚨 未登録のパスは副作用の経路（exec / checkout / merge / diff）でも 400', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir], ['--allow-exec']);
+    try {
+        const q = `repo=${encodeURIComponent(b.dir)}`;
+        // 実行: 通れば**未登録のリポジトリでコマンドが動く**（RCE の範囲が広がる）
+        const ex = await fetch(`${url}/api/v0/exec?${q}`, {
+            method: 'POST', headers: MH,
+            body: JSON.stringify({ worktree: b.wt, argv: ['git', '--version'] }),
+        });
+        assert.equal(ex.status, 400, '未登録のリポジトリで exec が通った');
+        assert.match((await ex.json()).error, /登録されていない/);
+
+        const co = await fetch(`${url}/api/v0/checkout?${q}`, {
+            method: 'POST', headers: MH,
+            body: JSON.stringify({ worktree: b.wt, ref: 'main' }),
+        });
+        assert.equal(co.status, 400, '未登録のリポジトリで checkout が通った');
+        assert.match((await co.json()).error, /登録されていない/);
+
+        const mg = await fetch(`${url}/api/v0/merge?${q}`, {
+            method: 'POST', headers: MH,
+            body: JSON.stringify({ worktree: b.wt, branch: 'main' }),
+        });
+        assert.equal(mg.status, 400, '未登録のリポジトリで merge が通った');
+        assert.match((await mg.json()).error, /登録されていない/);
+
+        // 読み取り（diff / blob）も同じ門
+        for (const path of ['/api/v0/diff', '/api/v0/blob']) {
+            const r = await fetch(`${url}${path}?${q}&ref=main&path=only-here.txt`);
+            assert.equal(r.status, 400, `未登録のリポジトリで ${path} が通った`);
+            assert.match((await r.json()).error, /登録されていない/);
+        }
+    } finally { child.kill(); }
+});
+
+test('🔒 worktree の allowlist は「選択中のリポジトリ」の一覧に対して引く', async () => {
+    const { a, b } = await twoRepos();
+    // 両方**登録した上で**、A を選んだまま B の worktree を狙う。
+    // 登録済み照合だけでは止まらないので、allowlist が repo ごとに引かれていることが要る。
+    const { child, url } = await startMulti([a.dir, b.dir], ['--allow-exec']);
+    try {
+        const ex = await fetch(`${url}/api/v0/exec?repo=${encodeURIComponent(a.dir)}`, {
+            method: 'POST', headers: MH,
+            body: JSON.stringify({ worktree: b.wt, argv: ['git', '--version'] }),
+        });
+        assert.equal(ex.status, 400, 'A を選んでいるのに B の worktree でコマンドが動いた');
+        assert.match((await ex.json()).error, /既知の worktree ではありません/);
+
+        // 逆に B を選べば B の worktree で動く（門が広すぎて全部落ちている、を潰す）
+        const okRes = await fetch(`${url}/api/v0/exec?repo=${encodeURIComponent(b.dir)}`, {
+            method: 'POST', headers: MH,
+            body: JSON.stringify({ worktree: b.wt, argv: ['git', '--version'] }),
+        });
+        assert.equal(okRes.status, 200, 'B を選んでも B の worktree で動かない');
+        // 応答は ndjson。読み切って閉じる（読まずに捨てると購読が残る）
+        await okRes.text();
+
+        // checkout も同じ（A を選んで B の worktree は既知でない）
+        const co = await fetch(`${url}/api/v0/checkout?repo=${encodeURIComponent(a.dir)}`, {
+            method: 'POST', headers: MH,
+            body: JSON.stringify({ worktree: b.wt, ref: 'main' }),
+        });
+        assert.equal(co.status, 400, 'A を選んでいるのに B の worktree を checkout した');
+        assert.match((await co.json()).error, /既知の worktree ではありません/);
+    } finally { child.kill(); }
+});
+
+/**
+ * 🚨 **キャッシュが混ざらないこと。**
+ *
+ * TTL キャッシュが1本の変数だと、A を読んだ直後（TTL 内）に B を読むと
+ * **A の payload が B として返る**。`state.repo` も worktree も別リポジトリのものになる。
+ *
+ * ⚠️ **ここでは `?fresh=1` を付けない。** 測っているのがキャッシュそのものなので、
+ *    付けると測りたい経路を飛ばしてしまう（CLAUDE.md の `?fresh=1` の規則は
+ *    「リポジトリを変更した直後に読む」場合の話で、ここは変更していない）。
+ */
+test('🚨 TTL キャッシュがリポジトリごとに分かれる（別リポジトリの payload が返らない）', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir, b.dir], []);
+    try {
+        // A を先に読んでキャッシュに載せる
+        const first = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        assert.ok(sameish(first.repo, a.dir));
+        // 直後（TTL 1500ms 以内）に B を**キャッシュを許して**読む
+        const second = await (await fetch(
+            `${url}/api/v0/state?repo=${encodeURIComponent(b.dir)}`)).json();
+        assert.ok(sameish(second.repo, b.dir), `A のキャッシュが B として返った: ${second.repo}`);
+        assert.ok(second.worktrees.some(w => w.branch === 'agent-y'),
+            '中身が A のもの（repo だけ差し替わっている、も許さない）');
+        // A に戻しても A のまま（B のキャッシュに上書きされていない）
+        const third = await (await fetch(`${url}/api/v0/state`)).json();
+        assert.ok(sameish(third.repo, a.dir), `A が B に化けた: ${third.repo}`);
+        assert.ok(third.worktrees.some(w => w.branch === 'agent-x'));
+    } finally { child.kill(); }
+});
+
+// 🚨 **同時に来た要求の合流もリポジトリごとに分ける。**
+//    in-flight を1本の変数で持つと、A の収集中に来た B の要求が
+//    **A の Promise に合流して A の payload を受け取る**（TTL とは別の経路）。
+test('🚨 同時要求の合流もリポジトリごと（in-flight を共有しない）', async () => {
+    const { a, b } = await twoRepos();
+    const { child, url } = await startMulti([a.dir, b.dir], []);
+    try {
+        const [ra, rb] = await Promise.all([
+            fetch(`${url}/api/v0/state?fresh=1`).then(r => r.json()),
+            fetch(`${url}/api/v0/state?fresh=1&repo=${encodeURIComponent(b.dir)}`)
+                .then(r => r.json()),
+        ]);
+        assert.ok(sameish(ra.repo, a.dir), `A が別物になった: ${ra.repo}`);
+        assert.ok(sameish(rb.repo, b.dir), `B が A に合流した: ${rb.repo}`);
+    } finally { child.kill(); }
+});
+
+test('1本しか登録していなければ一覧は1件（既存の使い方は変わらない）', async () => {
+    const d = await (await fetch(`${baseUrl}/api/v0/repos`)).json();
+    assert.equal(d.repos.length, 1, `1件でない: ${JSON.stringify(d)}`);
+    assert.equal(d.repos[0].current, true);
+    assert.ok(sameish(d.repos[0].path, repo));
+});
+
+test('🚨 開けないリポジトリを1本でも渡したら起動しない（黙って落とさない）', async () => {
+    const { a } = await twoRepos();
+    const notRepo = await mkdtemp(join(tmpdir(), 'kjp-notrepo-'));
+    const child = spawn(process.execPath,
+        [SERVER, '--port', '0', '--repo', a.dir, '--repo', notRepo],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    let out = '', err = '';
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { err += d; });
+    try {
+        // 🚨 **待ち続ける形にしない。** 起動してしまった場合に永久に閉じないので、
+        //    上限を付けて「起動した」を失敗として観測する（CLAUDE.md）。
+        const code = await Promise.race([
+            new Promise(r => child.on('exit', c => r(c))),
+            new Promise(r => setTimeout(() => r('timeout'), 15000)),
+        ]);
+        assert.equal(code, 1, '開けないリポジトリを渡したのに起動した'
+            + `（code=${code}）\n  stdout: ${out}\n  stderr: ${err}`);
+        assert.match(err, /git リポジトリとして開けません/);
+        assert.ok(err.includes(notRepo), `どれが駄目なのかを言っていない: ${err}`);
+    } finally {
+        child.kill();
+        await rm(notRepo, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('同じ場所を2回渡したら1本にまとめる（キャッシュが2重にならない）', async () => {
+    const { a } = await twoRepos();
+    const { child, url } = await startMulti([a.dir, a.dir.replace(/\\/g, '/')], []);
+    try {
+        const d = await (await fetch(`${url}/api/v0/repos`)).json();
+        assert.equal(d.repos.length, 1,
+            `重複がまとめられていない: ${JSON.stringify(d.repos.map(r => r.path))}`);
+    } finally { child.kill(); }
+});

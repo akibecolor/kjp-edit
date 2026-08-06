@@ -133,9 +133,12 @@ const MUTANTS = [
         name: 'audit-log-allows-git-dir',
         why: '.git の中の監査ログも拒否する（既定の置き場所を自分で否定して起動できなくなる）',
         file: 'v0/server.mjs',
-        from: '            inWorktree = !containsPath(common, opts.auditLog);',
-        to: '            inWorktree = true;   /* 変異: .git の中も拒否する */',
-        gone: '!containsPath(common, opts.auditLog)',
+        // ⚠️ `.git` の判定は `insideRepoGate()` が返す `inGitDir` に移した
+        //    （複数リポジトリでは呼び出し側で commonDir を叩き直すと1本目だけを
+        //     見ることになるため）。字面が変わったので追随（--dry で検出）。
+        from: '    const inWorktree = gate.inside === true && gate.inGitDir !== true;',
+        to: '    const inWorktree = gate.inside === true;   /* 変異: .git の中も拒否する */',
+        gone: 'gate.inGitDir !== true',
         pattern: '.git の中なら通す',
     },
     {
@@ -432,8 +435,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'bare リポジトリを開けなくする（bare を親に worktree を並べる構成が使えない。'
             + 'かつ bare の門が到達不能になって検証できなくなる）',
         file: 'v0/server.mjs',
-        from: "    try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim(); }\n    catch { /* bare。下で判定する */ }",
-        to: "    top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();",
+        // ⚠️ `--repo` を複数受けるようにしてループの中に入ったのでインデントが増えた
+        from: "            try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim(); }\n            catch { /* bare。下で判定する */ }",
+        to: "            top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim();",
         gone: 'catch { /* bare。下で判定する */ }',
         pattern: 'bare と prunable の門が実際に効く',
     },
@@ -740,8 +744,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '全 worktree を見ずにメインの top だけで判定する'
             + '（linked worktree に置かせて、エージェントの git add -A でコミットされる #39）',
         file: 'v0/server.mjs',
-        // ⚠️ 判定を `insideRepoGate()` に集約したのでインデントが変わった（--dry で検出）
-        from: '        for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);',
+        // ⚠️ 判定を `insideRepoGate()` に集約し、さらに全リポジトリを回すループに
+        //    入れたのでインデントが変わった（--dry で検出）
+        from: '            for (const w of await listWorktrees(r0)) if (w.path) roots.push(w.path);',
         to: '            /* 変異: worktree を見ない */',
         gone: 'if (w.path) roots.push(w.path)',
         pattern: 'linked worktree と bare の中も拒否する',
@@ -757,10 +762,13 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         defensive: 'listWorktrees() が bare も .git の親も返すので現状は二重。'
             + 'worktree list が失敗したときに roots を空にしない（unknown に落とさない）ための根として残す',
         file: 'v0/server.mjs',
-        // ⚠️ 判定を `insideRepoGate()` に集約したのでインデントが変わった（--dry で検出）
-        from: `        const common = (await commonDir(opts.repo)).trim();
-        if (common) roots.push(common);`,
-        to: '        /* 変異: .git を見ない */',
+        // ⚠️ 判定を `insideRepoGate()` に集約し、さらに全リポジトリを回すループに
+        //    入れたのでインデントが変わった（--dry で検出）。
+        //    ⚠️ commonDir は gitDirs にも積むようになった（監査ログの「.git の中は許す」
+        //    判定がこれを使う）ので、外すと監査ログの門も落ちる。
+        from: `            const common = (await commonDir(r0)).trim();
+            if (common) { roots.push(common); gitDirs.push(common); }`,
+        to: '            /* 変異: .git を見ない */',
         gone: 'if (common) roots.push(common)',
         pattern: 'linked worktree と bare の中も拒否する',
     },
@@ -1090,9 +1098,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'serve-calls-config-diff',
         why: 'serve.mjs が差分の門を呼ばない（要求が黙って無効になる。純関数は緑のまま）',
         file: 'scripts/serve.mjs',
-        from: '    const diffs = configDiff(argv, already.cmd);',
+        // ⚠️ 解決済みの repos を渡すようになったので字面が変わった（--dry で検出）
+        from: '    const diffs = configDiff(argv, already.cmd, { repos });',
         to: '    const diffs = [];   /* 変異: 差分を見ない */',
-        gone: 'configDiff(argv, already.cmd)',
+        gone: 'configDiff(argv, already.cmd, { repos })',
         pattern: '既に動いているデーモンとの差分で止まり',
         testFile: 'scripts/serveargs.test.mjs',
         platforms: ['win32'],   // running() は今のところ PowerShell 経由だけ
@@ -2351,9 +2360,15 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'state の取得にトークンを付けない'
             + '（--require-auth では execSessions が常に null = 再接続口が消える）',
         file: 'v0/app.html',
-        from: "      session.token ? { headers: { [session.tokenHeader]: session.token } } : {});",
-        to: '      {});   /* 変異: トークンを付けない */',
-        gone: 'session.token ? { headers: { [session.tokenHeader]',
+        // ⚠️ **`load()` の1行に固定する。** `/api/v0/repos` の取得にも同じ形の
+        //    ヘッダ付けが増えたので、この1行だけでは2箇所に当たって SKIP に落ちた
+        //    （守りが未検証のまま静かに続く。--dry が拾った）。
+        //    直前の fetch 行ごと含めて一意にする。
+        from: "    const res = await fetch(api('/api/v0/state', force ? { fresh: '1' } : null),\n"
+            + '      session.token ? { headers: { [session.tokenHeader]: session.token } } : {});',
+        to: "    const res = await fetch(api('/api/v0/state', force ? { fresh: '1' } : null),\n"
+            + '      {});   /* 変異: トークンを付けない */',
+        gone: "api('/api/v0/state', force ? { fresh: '1' } : null),\n      session.token ?",
         script: 'v0/render-check.mjs',
     },
     {
@@ -2452,11 +2467,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '失敗経路でキャッシュを捨てない'
             + '（作業ツリーは半端なのに、画面は TTL の間 clean のまま）',
         file: 'v0/server.mjs',
-        from: '                //    画面は TTL の間 clean のままだった。\n'
-            + '                cached = null;',
-        to: '                //    画面は TTL の間 clean のままだった。\n'
-            + '                /* 変異: キャッシュを捨てない */',
-        gone: '画面は TTL の間 clean のままだった。\n                cached = null;',
+        // ⚠️ キャッシュがリポジトリごとになったので字面が変わった（--dry で検出）
+        from: '                cachedByRepo.delete(repo);\n'
+            + '                const seqAfter = await sequencerState(wt.path).catch(() => null);',
+        to: '                /* 変異: キャッシュを捨てない */\n'
+            + '                const seqAfter = await sequencerState(wt.path).catch(() => null);',
+        gone: 'cachedByRepo.delete(repo);\n                const seqAfter =',
         pattern: 'merge が途中で失敗したら',
     },
     {
@@ -2743,11 +2759,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'write-audit-no-content',
         why: '監査ログに書いた中身を残す（記録が read 権限からの秘密の持ち出し口になる）',
         file: 'v0/server.mjs',
-        from: `                    event: 'write', worktree: t.wt.path, path: t.rel,
+        // ⚠️ 記録に `repo` を載せるようになったので字面が変わった（--dry で検出）
+        from: `                    event: 'write', repo, worktree: t.wt.path, path: t.rel,
                     bytes: next.length, eol: t.info.eol, bom: t.info.bom,`,
-        to: `                    event: 'write', worktree: t.wt.path, path: t.rel, text,
+        to: `                    event: 'write', repo, worktree: t.wt.path, path: t.rel, text,
                     bytes: next.length, eol: t.info.eol, bom: t.info.bom,`,
-        gone: "event: 'write', worktree: t.wt.path, path: t.rel,\n",
+        gone: "event: 'write', repo, worktree: t.wt.path, path: t.rel,\n",
         pattern: 'write: 監査に残すが',
     },
     {
@@ -2821,6 +2838,223 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         to: '    /* 変異: 編集中でも作り直す */',
         gone: 'if (obj.editing) continue;',
         script: 'v0/render-check.mjs',
+    },
+    /* ---- 複数リポジトリ（`--repo` を複数回） ----
+     *
+     * 🔒 ここの守りの本体は「**読める範囲は起動時に固定する**」。
+     *    `?repo=` は登録済み一覧との `samePath()` 照合しか通さない。
+     *    照合を外すと、トークンが1本漏れた時点で
+     *    **マシン上の任意の git リポジトリが読める**（読み取りだけでなく
+     *    `--allow-exec` があればその中でコマンドも動く）。
+     */
+    {
+        name: 'repo-registry-gate',
+        why: '登録済み一覧との照合を外す（未登録の任意のリポジトリが読め、'
+            + '--allow-exec ならその中でコマンドも動く = 実行の範囲が広がる）',
+        file: 'v0/server.mjs',
+        from: `    const hit = opts.repos.find(r => samePath(r, want));
+    if (!hit) return { error: \`登録されていないリポジトリです: \${want}\` };
+    return { repo: hit };`,
+        to: '    return { repo: want };   /* 変異: 登録済みかを見ない */',
+        gone: '登録されていないリポジトリです',
+        pattern: '未登録のパスは 400',
+    },
+    {
+        name: 'repo-registry-samepath',
+        why: '照合を === にする（区切り文字・8.3 短縮名・symlink で外れ、'
+            + '正しく登録したリポジトリが表記の違いだけで 400 になる）',
+        file: 'v0/server.mjs',
+        from: '    const hit = opts.repos.find(r => samePath(r, want));',
+        to: '    const hit = opts.repos.find(r => r === want);',
+        gone: 'samePath(r, want)',
+        pattern: '表記が違っても登録済みなら通る',
+    },
+    {
+        name: 'repo-cache-per-repo',
+        why: 'TTL キャッシュをリポジトリ間で共有する'
+            + '（A を読んだ直後に B を読むと **A の payload が B として返る**）',
+        file: 'v0/server.mjs',
+        from: '    const hit = cachedByRepo.get(repo);',
+        to: '    const hit = [...cachedByRepo.values()][0];   /* 変異: どのリポジトリのでも返す */',
+        gone: 'cachedByRepo.get(repo)',
+        pattern: 'TTL キャッシュがリポジトリごとに分かれる',
+    },
+    {
+        name: 'repo-inflight-per-repo',
+        why: '同時要求の合流をリポジトリ間で共有する'
+            + '（A の収集中に来た B の要求が A の Promise に合流して A の payload を受け取る）',
+        file: 'v0/server.mjs',
+        from: '    const running = inFlightByRepo.get(repo);',
+        to: '    const running = [...inFlightByRepo.values()][0];   /* 変異: どれでも合流させる */',
+        gone: 'inFlightByRepo.get(repo)',
+        pattern: '同時要求の合流もリポジトリごと',
+    },
+    {
+        name: 'repo-worktree-allowlist',
+        why: 'worktree の allowlist を全リポジトリの合併に対して引く'
+            + '（A を選んでいるのに B の worktree でコマンドが動く = ?repo= の意味が消える）',
+        file: 'v0/server.mjs',
+        // ⚠️ インデントまで含めて一意にする（checkout 側に同じ式がある）
+        from: '                const worktrees = await listWorktrees(repo);',
+        to: '                const worktrees = (await Promise.all('
+            + 'opts.repos.map(r0 => listWorktrees(r0)))).flat();',
+        gone: '                const worktrees = await listWorktrees(repo);',
+        pattern: 'worktree の allowlist は',
+    },
+    {
+        name: 'repo-label-collision',
+        why: 'basename が衝突しても畳まない'
+            + '（同名のリポジトリ2本が同じ表示名になり、どちらを操作しているか分からない）',
+        file: 'v0/server.mjs',
+        from: '    return base.map((b, i) => (count.get(b) > 1 ? paths[i] : b));',
+        to: '    return base;   /* 変異: 衝突を見ない */',
+        gone: 'count.get(b) > 1 ? paths[i] : b',
+        pattern: 'basename が衝突したらフルパスを出す',
+    },
+    {
+        name: 'repo-startup-fail-closed',
+        why: '開けないリポジトリを黙って落として起動する'
+            + '（「登録したつもりの1本が一覧に無い」を起動ログを読むまで気付けない）',
+        file: 'v0/server.mjs',
+        from: "            console.error('      node v0/server.mjs --repo C:/path/to/repo"
+            + " --repo D:/other/repo\\n');\n            process.exit(1);",
+        to: '            continue;   /* 変異: 黙って落とす */',
+        gone: '--repo D:/other/repo',
+        pattern: '開けないリポジトリを1本でも渡したら起動しない',
+    },
+    {
+        name: 'repo-dedupe',
+        why: '同じ場所を2回渡したときに重複を潰さない'
+            + '（セレクトに2行出て、キャッシュも2重になる）',
+        file: 'v0/server.mjs',
+        from: '            if (normalized.some(r => samePath(r, resolved))) {',
+        to: '            if (false) {',
+        gone: 'normalized.some(r => samePath(r, resolved))',
+        pattern: '同じ場所を2回渡したら1本にまとめる',
+    },
+    {
+        name: 'serve-repos-forward',
+        why: '複数の --repo を1本目だけサーバに渡す'
+            + '（起動口で2本指定したのに1本しか見えない）',
+        file: 'scripts/serveargs.mjs',
+        from: `    const args = [server];
+    // 🔒 読める範囲。**1本目が既定**なので順序を保つ
+    for (const r of repos) args.push('--repo', r);`,
+        to: "    const args = [server];\n    args.push('--repo', repos[0]);",
+        // ⚠️ `for (const r of repos) …` は autostartServeArgs にも同じ字面であるので、
+        //    serverArgs 側だけに在るコメント行を目印にする（両方に当たると
+        //    「書き換えが効いていない」で SKIP に落ちて守りが未検証になる）
+        gone: '    // 🔒 読める範囲。**1本目が既定**なので順序を保つ',
+        pattern: '複数の --repo をサーバに全部渡す',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'autostart-repos-forward',
+        why: '自動起動の登録に --repo を1本しか引き継がない'
+            + '（**ログオン後だけ1本に戻る**。手元では絶対に気付けない #45 と同型）',
+        file: 'scripts/serveargs.mjs',
+        from: "    const args = [];\n    for (const r of repos) args.push('--repo', r);",
+        to: "    const args = [];\n    args.push('--repo', repos[0]);",
+        gone: "    const args = [];\n    for (const r of repos)",
+        pattern: '自動起動の登録に --repo を全部引き継ぐ',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'repos-of-all-values',
+        why: 'コマンドラインから --repo を1本目しか読まない'
+            + '（2本要求した人に「既に動いています」と答えて、2本目が見えないことを黙る）',
+        file: 'scripts/winargs.mjs',
+        from: '    const re = /--repo\\s+(?:"([^"]*)"|(\\S+))/g;',
+        to: '    const re = /--repo\\s+(?:"([^"]*)"|(\\S+))/;   /* 変異: g を外す = 1本目だけ */',
+        gone: '(\\S+))/g;',
+        pattern: 'reposOf: --repo を全部取る',
+        testFile: 'scripts/winargs.test.mjs',
+    },
+    {
+        name: 'config-diff-repos',
+        why: '「既に動いています」で要求したリポジトリの差分を見ない'
+            + '（--repo A --repo B を打った人に、B が見えないことを黙って exit 0 する。'
+            + '--timeout を集合に入れていなかったのと同型の穴）',
+        file: 'scripts/serveargs.mjs',
+        from: '    for (const r of (Array.isArray(repos) ? repos : [])) {',
+        to: '    for (const r of []) {   /* 変異: リポジトリの差分を見ない */',
+        gone: 'Array.isArray(repos) ? repos : []',
+        pattern: 'configDiff は要求したリポジトリ',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'running-config-repos-quoted',
+        why: 'コマンド行の --repo を空白で切って読む'
+            + '（空白入りのパスが途中で切れ、見えているのに「見えていない」と誤報して'
+            + '毎回入れ直しを要求する）',
+        file: 'scripts/serveargs.mjs',
+        from: '    return { caps: runningCaps(cmd), hosts, execTimeout, repos: reposOf(cmd) };',
+        to: '    return { caps: runningCaps(cmd), hosts, execTimeout,\n'
+            + "        repos: (String(cmd ?? '').split(/\\s+/)\n"
+            + "            .map((t, i, a) => (t === '--repo' ? a[i + 1] : null)).filter(Boolean)) };",
+        gone: 'repos: reposOf(cmd)',
+        pattern: 'configDiff は空白入りのパスでも',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 🚨 CSS の規則そのものにも変異を当てる。書き間違いでブラウザが規則を
+        //    黙って捨てても、構文チェックにも `node --check` にも掛からない
+        //    （実際にコメントの `*/` を余らせて `:has()` の規則を1つ落とした）。
+        name: 'repo-select-swaps-path',
+        why: '狭い画面でセレクトとパスの入れ替えをやめる'
+            + '（トップバーは伸びも折り返しもしないので、後ろのボタンが枠外に出る）',
+        file: 'v0/app.html',
+        from: '    .topbar:has(select:not([hidden])) #repo { display: none; }',
+        to: '    /* 変異: パスを落とさない */',
+        gone: '.topbar:has(select:not([hidden])) #repo',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        name: 'repo-select-not-rebuilt',
+        why: '自動更新でリポジトリのセレクトを作り直す'
+            + '（選択が既定に戻り、見ている画面と操作の対象がずれる。'
+            + '字面の検査では完全に見えないので実ブラウザで測る）',
+        file: 'v0/app.html',
+        // 自動更新のたびにセレクトを作り直す形にする（`load()` の中で組む変更と等価）
+        from: "$('#refresh').addEventListener('click', () => load(true));",
+        to: "$('#refresh').addEventListener('click', () => {\n"
+            + "  const s = $('#reposel');\n"
+            + "  if (!s.hidden) {\n"
+            + "    const opts2 = [...s.options].map(o => [o.value, o.textContent]);\n"
+            + "    s.replaceChildren();\n"
+            + "    for (const [v, t] of opts2) {\n"
+            + "      const o = document.createElement('option');\n"
+            + "      o.value = v; o.textContent = t; s.append(o);\n"
+            + "    }\n"
+            + "  }\n"
+            + "  load(true);\n"
+            + '});   /* 変異: 自動更新でセレクトを作り直す */',
+        gone: "$('#refresh').addEventListener('click', () => load(true));",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'repo-select-change-reloads',
+        why: 'セレクトを切り替えても state を取り直さない'
+            + '（見ている画面が別のリポジトリのまま。操作だけが切り替わる = 最悪の形）',
+        file: 'v0/app.html',
+        from: '          currentRepo = sel.value;',
+        to: '          /* 変異: 選択を反映しない */',
+        gone: 'currentRepo = sel.value;',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'repo-select-hidden-when-single',
+        why: 'リポジトリが1本でもセレクトを描く'
+            + '（選ぶものが無い操作が出る。狭い画面では他の操作を枠外へ押し出す）',
+        file: 'v0/app.html',
+        from: '      if (repos.length > 1) {',
+        to: '      if (repos.length > 0) {',
+        gone: 'repos.length > 1',
+        // 🚨 **2本で起動している検査では絶対に落ちない**（最初 smoke の
+        //    「一覧は1件」に当てて SURVIVED した。あれは API を見ているだけで
+        //    UI を1度も描いていない）。**1本構成を実ブラウザで描いて数える**
+        //    パスを layout-check に足して、そこで測る。
+        script: 'v0/layout-check.mjs',
     },
 ];
 

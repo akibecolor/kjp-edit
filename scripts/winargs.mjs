@@ -51,6 +51,23 @@ export function repoOf(cmdLine) {
 }
 
 /**
+ * 🚨 コマンドラインから `--repo` の値を**全部**取り出す（`--repo` は複数回渡せる）。
+ *
+ * `repoOf()`（1本目だけ）で二重起動を判定すると、
+ * `serve.mjs --repo A --repo B` を打った人に「既に動いています（--repo A のデーモン）」と
+ * 答えて exit 0 してしまう。**B が見えないことを1文字も言わない**という、
+ * capability を黙って捨てるのと同じ形の壊れ方になる（#30 と同型）。
+ */
+export function reposOf(cmdLine) {
+    if (typeof cmdLine !== 'string') return [];
+    const out = [];
+    const re = /--repo\s+(?:"([^"]*)"|(\S+))/g;
+    let m;
+    while ((m = re.exec(cmdLine)) !== null) out.push(m[1] ?? m[2]);
+    return out;
+}
+
+/**
  * パスのゆるい一致（区切り文字・大文字小文字・末尾セパレータを吸収する）。
  *
  * ⚠️ **認可には使わない。** 実体の解決（realpath / 8.3 短縮名）はしていない。

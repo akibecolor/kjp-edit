@@ -228,6 +228,71 @@ const MONITOR_CHECK = `(async () => {
 })()`;
 
 /**
+ * 🚨 **リポジトリの切り替えを実ブラウザで測る。**
+ *
+ * 字面では測れない主張が2つある:
+ *
+ * 1. **切り替えたら state を取り直す。** `change` を撃たずに `value` を代入しても
+ *    何も起きないので、検査は必ずイベントを撃つ（`input.value = …` で
+ *    プリセットを実行してしまった事故と同型）。
+ * 2. **自動更新でセレクトを作り直さない。** 作り直すと選択が先頭（既定の
+ *    リポジトリ）に戻り、**見ている画面と操作の対象がずれる**。
+ *    `render()` の中にセレクトの構築を移す変更は、字面の検査では**完全に見えない**。
+ *    要素の同一性・件数・選択値の3つを一緒に見る（同一性だけでは、
+ *    古い option が残る作り直しを「使い回している」と誤読する）。
+ *
+ * ⚠️ **これは他の検査より後で走らせる**（呼び出し側のコメント参照）。
+ *    切り替えるとコンソールペインが作り直され、`__kjpFeedTerm` が
+ *    DOM から外れた端末を指したままになるので、描画の計測が無意味になる。
+ *    それでも最後に既定へ戻す（この後に検査を足した人が踏まないため）。
+ */
+const REPOSEL_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const head = () => document.getElementById('repo').textContent ?? '';
+  const sel = document.getElementById('reposel');
+  if (!sel) return { error: 'リポジトリのセレクトが無い' };
+  for (let i = 0; i < 200 && sel.options.length < 2; i++) await wait(100);
+  const options = [...sel.options].map(o => o.value);
+  if (options.length < 2) {
+    return { error: '選択肢が2本出ない（2本登録して起動している）: ' + JSON.stringify(options) };
+  }
+  // hidden 属性が作者スタイルに負けていないか（押せるのに見えない/見えるのに押せない）
+  const visible = !sel.hidden && sel.offsetParent !== null;
+  const before = head();
+  // 🚨 **change を撃つ。** value の代入だけでは切り替えが走らない
+  sel.value = options[1];
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  let after = before;
+  for (let i = 0; i < 200; i++) {
+    after = head();
+    if (after !== before && after.indexOf(options[1]) !== -1) break;
+    await wait(100);
+  }
+  // 自動更新（= 再読込。同じ load() を通る）でセレクトが作り直されないこと
+  const optEl = sel.options[1];
+  document.getElementById('refresh').click();
+  await wait(3000);
+  const result = {
+    visible,
+    options,
+    switchedTo: after,
+    reused: sel.options[1] === optEl,
+    count: sel.options.length,
+    selectedAfter: sel.value,
+    headerAfter: head(),
+  };
+  // ⚠️ 既定に戻す（後続の検査のため）。戻ったことを確かめてから返す
+  sel.value = options[0];
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  for (let i = 0; i < 200; i++) {
+    if (head().indexOf(options[0]) !== -1) break;
+    await wait(100);
+  }
+  result.restored = head().indexOf(options[0]) !== -1;
+  return result;
+})()`;
+
+/**
  * 🚨 **「生きている合図」を実ブラウザで測る。**
  *
  * claude が長い応答を書いている間は**出力が1行も来ない**ので、画面が沈黙して
@@ -697,6 +762,10 @@ const BLOB_CHECK = `(async () => {
 })()`;
 
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
+// 🚨 リポジトリの切り替えを測るには**2本登録する**必要がある
+//    （1本だとセレクトは出ない = 測る対象が描かれない。
+//     「capability を切ると描かれない UI は、検査でも描かれない」と同型）
+const repo2 = await mkdtemp(join(tmpdir(), 'kjp-render2-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
 let chrome = null;
@@ -729,6 +798,13 @@ try {
     await writeFile(edFile, 'one\ntwo\nthree\n', 'utf8');
     await g(['add', '-A'], edWt);
     await g(['commit', '-q', '-m', 'edit target'], edWt);
+    // 切り替え先のリポジトリ（中身は最小限。ここでは「切り替わること」だけを測る）
+    await g(['init', '-q', '-b', 'main'], repo2);
+    await g(['config', 'user.email', 'a@b'], repo2);
+    await g(['config', 'user.name', 'a'], repo2);
+    await writeFile(join(repo2, 'g.txt'), 'y\n', 'utf8');
+    await g(['add', '-A'], repo2);
+    await g(['commit', '-q', '-m', 'seed2'], repo2);
 
     // 全文ビューアの検査用: **表示上限を超える行数のファイルを1つコミットする。**
     // これが無いと「切ったことを告知する」を測れない（切る対象が無いので緑になる）。
@@ -742,7 +818,10 @@ try {
 
     // 実行を有効にしないとコンソールペインが描かれない = 計測対象が出ない
     server = spawn(process.execPath,
-        [SERVER, '--repo', repo, '--port', '0',
+        // ⚠️ **2本登録する。** 1本だとリポジトリのセレクトが描かれないので
+        //    切り替えの検査が「何も測っていない」状態になる（下の --require-auth と
+        //    同じ「マージで消えやすい引数」なので理由をここに書く）。
+        [SERVER, '--repo', repo, '--repo', repo2, '--port', '0',
             // 🚨 **`--require-auth` を付ける（8回目のレビュー。SERIOUS）。**
             //    これは `--allow-host` = トンネル = スマホから使う既定の構成であり、
             //    サーバが `/api/v0/state` の `execSessions` を「生の鍵を提示していない
@@ -990,6 +1069,21 @@ try {
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
     if (probe.error) throw new Error(probe.error);
 
+    /* 🚨 **リポジトリの切り替えは MEASURE より後、鍵を捨てる検査より前。**
+     *
+     * 後ろに置けない理由: `window.__kjpFeedTerm` は**最初に作られたコンソール
+     * ペイン**の writer に一度だけ束縛される（`!window.__kjpFeedTerm` の番人がある）。
+     * リポジトリを切り替えるとペインは worktree の path が変わるので作り直され、
+     * `__kjpFeedTerm` は**DOM から外れた古い端末**を指したままになる。
+     * その状態で MEASURE を走らせると、**流し込む先と測る先が別の要素**になり
+     * 「12,000行を 982ms・残り12要素」という**意味の無い数字**が出る
+     * （実際にこの順序で踏んだ。告知の検査が落ちて気付けた）。
+     *
+     * 前に置けない理由: 下の READKEY_CHECK は**鍵を捨てて読み込み直す**ので、
+     * その後では `?repo=` を投げても 401 になり切り替えを測れない。
+     */
+    const reposel = await evaluate(REPOSEL_CHECK);
+
     // 🚨 **最後に「読み取り用の鍵だけ」の状態を作って測る。**
     //    鍵を捨てて読み込み直すと、Cookie（読み取り専用の派生秘密）だけが残る =
     //    スマホが案内の URL を1回開いた状態。ここで走っているセッションの一覧が
@@ -1055,6 +1149,41 @@ try {
     if (probe.error) throw new Error(probe.error);
 
     const problems = [];
+    // 🔒 リポジトリの切り替え（#複数リポジトリ）
+    if (!reposel || reposel.error) {
+        problems.push(`リポジトリの切り替えを測れなかった: ${reposel?.error ?? '結果が取れない'}`);
+    } else {
+        if (!reposel.visible) {
+            problems.push('2本登録しているのにリポジトリのセレクトが描かれていない'
+                + '（切り替える手段が無い）');
+        }
+        if (reposel.switchedTo.indexOf(reposel.options[1]) === -1) {
+            problems.push('セレクトを切り替えても state を取り直していない'
+                + `（画面が別のリポジトリのまま）: ${reposel.switchedTo.slice(0, 160)}`);
+        }
+        // 🚨 作り直しは**同一性・件数・選択値**の3つで見る
+        if (!reposel.reused) {
+            problems.push('自動更新でリポジトリのセレクトを作り直している'
+                + '（選択が既定に戻り、見ている画面と操作の対象がずれる）');
+        }
+        if (reposel.count !== reposel.options.length) {
+            problems.push('自動更新でセレクトの選択肢が増減している'
+                + `: ${reposel.count} ≠ ${reposel.options.length}`);
+        }
+        if (reposel.selectedAfter !== reposel.options[1]) {
+            problems.push('自動更新で選択が既定に戻った'
+                + `: ${reposel.selectedAfter} ≠ ${reposel.options[1]}`);
+        }
+        if (reposel.headerAfter.indexOf(reposel.options[1]) === -1) {
+            problems.push('自動更新で表示が既定のリポジトリに戻った'
+                + `（セレクトと中身が食い違う）: ${reposel.headerAfter.slice(0, 160)}`);
+        }
+        // ⚠️ 戻し損ねていたら後続の検査の前提が崩れている。黙って通さない
+        if (!reposel.restored) {
+            problems.push('既定のリポジトリに戻せなかった'
+                + '（この後の検査が別のリポジトリを相手にしている）');
+        }
+    }
     // 🔒 IME: 変換中は発火せず、確定後は発火すること（片側だけの検査にしない）
     if (!ime || ime.error) {
         problems.push(`IME の検査ができなかった: ${ime?.error ?? "結果が取れない"}`);
@@ -1402,5 +1531,6 @@ try {
     await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-ed`));
     await rmRetry(join(repo, '..', `${repo.split(/[\\/]/).pop()}-long`));
     await rmRetry(repo);
+    await rmRetry(repo2);
     await rmRetry(profile);
 }

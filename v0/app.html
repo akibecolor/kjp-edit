@@ -65,6 +65,15 @@
   .topbar button { font: inherit; font-size: 11px; background: var(--card); color: var(--fg);
     border: 1px solid var(--line); border-radius: 3px; padding: .2rem .5rem;
     min-height: 26px; cursor: pointer; }
+  /* リポジトリの切り替え。
+     🚨 **固定幅にしてはいけない。** `.topbar` は `overflow: hidden` の
+        `flex-wrap: nowrap` なので、縮まない要素を1つ足すと**後ろのボタンが
+        枠外へ押し出されて到達不能になる**（実測: 390px で #refresh と #reset が
+        clip された。横溢れとしては検出されないので気付きにくい）。
+        だから `flex: 0 1 auto` + `min-width: 0` で**縮む側**に置く。 */
+  .topbar select { font: inherit; font-size: 11px; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; padding: .2rem .3rem;
+    min-height: 26px; max-width: 40vw; flex: 0 1 auto; min-width: 0; }
 
   /* 安全に関わる警告は畳めない位置に置く */
   #alerts:empty { display: none; }
@@ -265,11 +274,28 @@
     /* ref バッジは 390px では1〜2文字に潰れて情報にならない。
        worktree HEAD バッジ（核心情報）を残して ref は落とす。 */
     .refcell { display: none; }
+    /* 🚨 セレクトを出すなら**パスの表示は落とす**。
+       トップバーは伸びも折り返しもしないので、要素を1つ足したら1つ引く。
+       落とすのは冗長な方（セレクトが今どのリポジトリかを既に示している。
+       フルパスは option の title で読める）。
+       ⚠️ そのうえでセレクトを**伸縮する側**に回す。こうすると
+          「元は .path が吸っていた余白をセレクトが吸う」形になり、
+          幅の要求は増えない = ボタンが枠外に出ない（実測で確認）。
+       ⚠️ `:has()` で「セレクトが**出ているときだけ**」に限る。無条件に落とすと、
+          1本しか登録していない構成（セレクトが hidden）でリポジトリ名が
+          どこにも出なくなる。 */
+    .topbar:has(select:not([hidden])) #repo { display: none; }
+    .topbar select { flex: 1 1 auto; max-width: none; }
   }
 </style>
 
 <div class="topbar">
   <b>kjp-edit</b>
+  <!-- 🚨 登録が1本だけなら出さない（選ぶものが無い UI を置かない）。
+       ⚠️ **自動更新で作り直さない。** 作り直すと選択が先頭に戻り、
+          「見ているつもりのリポジトリ」と実際の対象がずれる
+          （checkout の <select> と同じ理由。CLAUDE.md の UI の規則）。 -->
+  <select id="reposel" hidden></select>
   <span class="path" id="repo"></span>
   <span class="cap" id="cap" hidden></span>
   <button id="refresh">再読込</button>
@@ -329,6 +355,23 @@ const el = (t, c, x) => {
 
 let session = { allowWrite: false, allowExec: false, token: null, tokenHeader: 'x-kjp-token' };
 let state = null;
+
+/* ===== リポジトリの切り替え =====
+ *
+ * 🔒 **読める範囲はサーバの起動時に固定されている。** ここは「登録済みの中から
+ *    どれを見るか」を選ぶだけで、任意のパスを送っても 400 になる（送らない）。
+ * ⚠️ 選択中を**1箇所に持つ**。経路ごとに付け忘れると、state だけ切り替わって
+ *    checkout や exec が別のリポジトリに飛ぶ（見ている画面と対象がずれる）。
+ */
+let currentRepo = null;   // null = 既定（サーバの1本目）
+
+/** API の URL に選択中のリポジトリを付ける。**全経路がこれを通る。** */
+function api(path, params = null) {
+  const q = new URLSearchParams(params ?? {});
+  if (currentRepo) q.set('repo', currentRepo);
+  const s = q.toString();
+  return s ? `${path}?${s}` : path;
+}
 
 /* ===== スプリッタ / ペイン ===== */
 function wireSplit(sp) {
@@ -665,8 +708,7 @@ function renderDiff(text) {
 async function loadDiff(holder, base, ref, path) {
   holder.replaceChildren(el('div', 'note', `読み込み中: ${path}`));
   try {
-    const q = new URLSearchParams({ base, ref, path });
-    const res = await fetch(`/api/v0/diff?${q}`);
+    const res = await fetch(api('/api/v0/diff', { base, ref, path }));
     const d = await res.json();
     if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
     if (d.binary) { holder.replaceChildren(el('div', 'note', 'バイナリファイル')); return; }
@@ -1020,7 +1062,9 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     line('d', `$ ${shown.text}${shown.clipped ? '  ← 長いので省略' : ''}\n`);
   }
   try {
-    const res = await fetch(attach ? `/api/v0/exec/${attach.id}/stream` : '/api/v0/exec', {
+    // ⚠️ **新規実行だけ repo を付ける。** 再接続はセッション id で引くので
+    //    リポジトリに依存しない（付けても害は無いが、意味の無い引数は載せない）。
+    const res = await fetch(attach ? `/api/v0/exec/${attach.id}/stream` : api('/api/v0/exec'), {
       method: 'POST',
       headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
       body: JSON.stringify(attach
@@ -1551,7 +1595,7 @@ function checkoutForm(wt, s) {
   btn.addEventListener('click', async () => {
     btn.disabled = true; msg.className = 'wrmsg'; msg.textContent = '実行中…';
     try {
-      const res = await fetch('/api/v0/checkout', {
+      const res = await fetch(api('/api/v0/checkout'), {
         method: 'POST',
         headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
         body: JSON.stringify({ worktree: wt.path, ref: sel.value }),
@@ -2173,7 +2217,7 @@ function render(s) {
               row.append(note);
               note.textContent = `${br} を取り込んでいます…`;
               try {
-                const r = await fetch('/api/v0/merge', {
+                const r = await fetch(api('/api/v0/merge'), {
                   method: 'POST',
                   headers: {
                     'content-type': 'application/json',
@@ -2547,7 +2591,7 @@ function openDiff(wt, path) {
  */
 async function load(force = false) {
   try {
-    const res = await fetch(force ? '/api/v0/state?fresh=1' : '/api/v0/state',
+    const res = await fetch(api('/api/v0/state', force ? { fresh: '1' } : null),
       session.token ? { headers: { [session.tokenHeader]: session.token } } : {});
     const s = await res.json();
     if (s.error) throw new Error(s.error);
@@ -2619,6 +2663,49 @@ if (session.allowExec) {
 } else if (session.allowWrite) {
   cap.hidden = false; cap.className = 'cap w';
   cap.textContent = usable ? '⚠️ 書き込み有効' : '⚠️ 書き込み有効（トークン未取得）';
+}
+
+/* ===== リポジトリのセレクトを組む（**1回だけ**） =====
+ *
+ * 🚨 **自動更新では触らない。** `load()` の中で作り直すと 15 秒ごとに
+ *    選択が先頭（既定のリポジトリ）に戻り、**見ている画面と操作の対象がずれる**
+ *    （書き込み操作の入力を自動更新で作り直さない、と同じ理由）。
+ * 🚨 登録が1本のときは出さない（選ぶものが無い操作を描かない）。
+ */
+{
+  const sel = $('#reposel');
+  try {
+    // ⚠️ **鍵を持っているならヘッダで送る**（`load()` と同じ）。Cookie だけに
+    //    頼ると、Cookie が使えない構成で 401 になり**セレクトが黙って出ない**
+    //    （`--require-auth` は「トンネル = スマホから使う既定の構成」なので、
+    //     ここを落とすと一番使う経路で切り替えが消える。8回目のレビューと同型）。
+    const r = await fetch('/api/v0/repos',
+      session.token ? { headers: { [session.tokenHeader]: session.token } } : {});
+    if (r.ok) {
+      const d = await r.json();
+      const repos = Array.isArray(d.repos) ? d.repos : [];
+      if (repos.length > 1) {
+        for (const it of repos) {
+          const o = document.createElement('option');
+          o.value = it.path;
+          o.textContent = it.label;
+          o.title = it.path;      // ラベルが basename のときフルパスを見られるように
+          if (it.current) o.selected = true;
+          sel.append(o);
+        }
+        currentRepo = d.current ?? repos[0].path;
+        sel.hidden = false;
+        sel.addEventListener('change', () => {
+          currentRepo = sel.value;
+          // ⚠️ **必ず fresh で取り直す。** TTL キャッシュはリポジトリごとだが、
+          //    切り替え直後は「今の状態」を見たいので待たせない。
+          //    ペインは worktree の path で引くので、差分更新で
+          //    古いリポジトリのペインは abort されてから捨てられる（dropPanes）。
+          load(true);
+        });
+      }
+    }
+  } catch { /* 1本しか無い構成と同じ扱いにする（観測は続ける） */ }
 }
 
 $('#refresh').addEventListener('click', () => load(true));

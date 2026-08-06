@@ -32,7 +32,7 @@ import { repoOf, samePathish, parseProcPairs, descendantsOf } from './winargs.mj
 // 🚨 argv の組み立てと門は純関数に切り出してテストで固定している
 //    （scripts/serveargs.test.mjs。#45 まではここに検査が1件も無かった）
 import {
-    SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, serverArgs,
+    SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, collectRepos, serverArgs,
     configDiff, describeCaps, stopTargets, stopOutcome,
 } from './serveargs.mjs';
 
@@ -50,10 +50,11 @@ const val = (f, d) => {
 
 if (has('--help') || has('-h')) {
     console.log(`使い方:
-  node scripts/serve.mjs [--repo <path>] [--port ${DEFAULT_PORT}] [--timeout <秒>]
+  node scripts/serve.mjs [--repo <path>]... [--port ${DEFAULT_PORT}] [--timeout <秒>]
                          [--write] [--exec] [--allow-host <name>]
   node scripts/serve.mjs --status | --stop [--all]
 
+  --repo         複数指定できる（1本目が既定。読める範囲はここで固定される）
   --write        checkout を有効にする
   --exec         任意コマンドの実行も有効にする（🚨 遠隔コード実行になる）
   --timeout      実行の絶対上限（秒。既定 600。--exec と一緒に使う）
@@ -332,14 +333,28 @@ if (has('--stop')) {
     process.exit(outcome.exit);
 }
 
-// ---- リポジトリを見つける ----
-const asked = val('--repo', process.cwd());
-const repo = await topLevel(asked);
-if (!repo) {
-    console.error(`\n✖ git リポジトリが見つかりません: ${asked}`);
-    console.error('  --repo でパスを指定してください\n');
+// ---- リポジトリを見つける（--repo は複数指定できる。1本目が既定） ----
+const repoCheck = collectRepos(argv);
+if (repoCheck.error !== undefined) {
+    console.error('\n✖ --repo にパスを指定してください'
+        + `（受け取った値: ${repoCheck.error ?? '(無し)'}）\n`);
     process.exit(1);
 }
+const repos = [];
+for (const given of (repoCheck.repos.length ? repoCheck.repos : [process.cwd()])) {
+    // ⚠️ **1本ずつ解決する。** 1本でも開けなければ止める（黙って落とすと
+    //    「登録したつもりのリポジトリが一覧に無い」を後で気付くことになる）。
+    const top = await topLevel(given);
+    if (!top) {
+        console.error(`\n✖ git リポジトリが見つかりません: ${given}`);
+        console.error('  --repo でパスを指定してください（複数可）\n');
+        process.exit(1);
+    }
+    // 同じ場所を2回渡されたら1本にまとめる（サーバ側でも潰すが、案内も1本にする）
+    if (!repos.some(r => samePathish(r, top))) repos.push(top);
+}
+// 二重起動の判定と表示は1本目（既定）で行う
+const repo = repos[0];
 
 // ---- 既に動いていないか ----
 const probe = await running();
@@ -364,7 +379,13 @@ if (already) {
     //    capability の名前だけ比べていたので `--timeout 3600` は集合に入らず、
     //    `--allow-host box-b` は値を見ていなかった = **要求が黙って無効**だった
     //    （前のデーモンが 600 秒のまま／スマホからは 403 のまま。8回目のレビュー）。
-    const diffs = configDiff(argv, already.cmd);
+    // 🚨 **リポジトリの本数も「値まで比べる」対象に入れる。** 二重起動の判定は
+    //    1本目でしているので、これが無いと `--repo A --repo B` を打った人に
+    //    「既に動いています（A のデーモン）」と答えて exit 0 し、**B が見えない
+    //    ことを1文字も言わない**（`--timeout` を集合に入れていなかったのと同型）。
+    // ⚠️ 渡すのは**解決済み**の `repos`。argv の生の値（`.` や相対パス）は
+    //    デーモンのコマンド行の絶対パスと一致しないので、必ず差分に見えてしまう。
+    const diffs = configDiff(argv, already.cmd, { repos });
     if (diffs.length) {
         console.error('\n✖ 要求した設定が動いているものと違います:');
         for (const d of diffs) {
@@ -442,7 +463,7 @@ await mkdir(STATE_DIR, { recursive: true });
 // 🔒 capability の分界（--exec ⊃ --write、観測は独立）と、トークンの永続化、
 //    引き継ぎは serveargs.mjs の純関数に集約している（テストで固定）。
 const args = serverArgs({
-    argv, server: SERVER, repo, port,
+    argv, server: SERVER, repos, port,
     // 🚨 **読み取り用と実行用を同じ値にしない**（6回目のレビュー）。
     //    読み取り用の URL をスマホで開くことが、実行トークンを配ることになっていた。
     tokenFile: join(STATE_DIR, 'token-read'),
@@ -465,6 +486,6 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 }
 // 状態を書き残す（--status が PowerShell に頼らずに済む足がかり。今は参考情報）
 await writeFile(join(STATE_DIR, 'last.json'),
-    `${JSON.stringify({ repo, port, exec: wantExec, write: wantWrite, pid: child.pid }, null, 1)}\n`,
+    `${JSON.stringify({ repo, repos, port, exec: wantExec, write: wantWrite, pid: child.pid }, null, 1)}\n`,
     'utf8');
 void dirname;

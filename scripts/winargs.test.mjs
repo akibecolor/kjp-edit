@@ -7,7 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    winQuote, repoOf, samePathish, trimTrailingSep, parseProcPairs, descendantsOf,
+    winQuote, repoOf, reposOf, samePathish, trimTrailingSep,
+    parseProcPairs, descendantsOf,
 } from './winargs.mjs';
 
 // 実測で使う形。バックスラッシュを直接書く（ここはソースなのでエスケープ表記でよい）
@@ -68,6 +69,22 @@ test('repoOf: 引用が無い場合も取れる', () => {
         repoOf('node v0/server.mjs --repo C:/src/repo --port 7749 --allow-write'),
         'C:/src/repo',
     );
+});
+
+// 🚨 `--repo` は複数回渡せる。1本目だけ見ると、2本要求した人に
+//    「既に動いています」と答えて **2本目が見えないことを黙る**（#30 と同型）
+test('🚨 reposOf: --repo を全部取る（引用込み。二重起動の判定に使う）', () => {
+    const cmd = 'C:\\node.exe v0/server.mjs --repo "C:/Users/a b/one" '
+        + '--repo C:/two --port 7900 --allow-host box.example.ts.net';
+    assert.deepEqual(reposOf(cmd), ['C:/Users/a b/one', 'C:/two']);
+    // repoOf は1本目だけ（用途が違うので変えない）
+    assert.equal(repoOf(cmd), 'C:/Users/a b/one');
+});
+
+test('reposOf: --repo が無ければ空配列（null と混同しない）', () => {
+    assert.deepEqual(reposOf('node v0/server.mjs --port 7749'), []);
+    assert.deepEqual(reposOf(null), []);
+    assert.deepEqual(reposOf(''), []);
 });
 
 test('repoOf: --repo が無ければ null', () => {

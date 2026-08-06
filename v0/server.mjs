@@ -4,7 +4,13 @@
 // kjp-edit v0 — 全 worktree を1枚のグラフで見る読み取り専用デーモン。
 // 依存パッケージゼロ (Node 標準ライブラリのみ)。
 //
-//   node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300]
+//   node v0/server.mjs [--repo <path>]... [--port 7749] [--limit 300]
+//
+// 🔒 **読める範囲は起動時に固定する。** `--repo` を複数渡せるが、
+//    UI から任意のパスを開く経路は作らない。作ると「トークンが漏れた」が
+//    「マシン上の全 git リポジトリが読まれた」に直結する。
+//    クエリの `?repo=` は**登録済み一覧との samePath() 照合**だけを通す
+//    （形式が正しくても登録外は 400）。
 //
 // 🔒 127.0.0.1 のみにバインドする (docs/architecture.md の D1)。
 //    外から届かせたい場合はトンネル (tailscale serve 等) をループバックで終端させる。
@@ -35,7 +41,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
     const opts = {
-        repo: process.cwd(), port: 7749, limit: 300, base: null,
+        // 🔒 読める範囲。**起動時に固定する**（UI から増やせない）。
+        //    1本目が既定。空なら下で process.cwd() を入れる。
+        repos: [], port: 7749, limit: 300, base: null,
         layoutProbe: false, allowHosts: new Set(),
         // 🔒 書き込みは既定オフ。経路そのものを存在させない
         allowWrite: false, token: null,
@@ -84,7 +92,9 @@ function parseArgs(argv) {
             }
             return v;
         };
-        if (a === '--repo') opts.repo = resolve(argv[++i]);
+        // ⚠️ **上書きではなく追加。** 複数のリポジトリを1本のデーモンで見る。
+        //    黙って最後の1本だけ効く形にすると「打ったのに効かない」になる。
+        if (a === '--repo') opts.repos.push(resolve(argv[++i]));
         else if (a === '--port') opts.port = num('--port', 0, 65535);
         else if (a === '--limit') opts.limit = num('--limit', 1, 100000);
         else if (a === '--base') opts.base = argv[++i];
@@ -113,7 +123,8 @@ function parseArgs(argv) {
         // ⚠️ text は watch を含意させる（片方だけ指定して静かに無効、を作らない）
         else if (a === '--allow-transcript-text') { opts.allowTranscriptText = true; opts.watchAgents = true; }
         else if (a === '--help' || a === '-h') {
-            console.log('usage: node v0/server.mjs [--repo <path>] [--port 7749] [--limit 300] [--base <ref>]');
+            console.log('usage: node v0/server.mjs [--repo <path>]... [--port 7749] [--limit 300] [--base <ref>]');
+            console.log('       --repo <path>        複数指定できる（1本目が既定。読める範囲はここで固定）');
             console.log('       --allow-host <name>  トンネル経由のホスト名を許可する（既定はループバックのみ）');
             console.log('       --allow-write        checkout と追跡ファイルの編集・保存を有効にする（既定オフ）');
             console.log('       --allow-exec         任意コマンドの実行を有効にする（既定オフ。--token 必須）');
@@ -130,6 +141,7 @@ function parseArgs(argv) {
             process.exit(0);
         }
     }
+    if (opts.repos.length === 0) opts.repos.push(process.cwd());
     return opts;
 }
 
@@ -251,6 +263,27 @@ const monitorRows = [...doc.querySelectorAll('[data-pane-id="monitor"] .ab')].fi
 const bodyScroll = doc.body.scrollWidth, bodyClient = doc.body.clientWidth;
 const wtBadges = [...doc.querySelectorAll('.ref.wt')].filter(drawn).length;
 
+// 🚨 リポジトリのセレクトも同じ扱い。1本しか登録していないと描かれないので、
+//    検査は**2本登録して起動する**（描かれていないまま「測った」にしない）。
+const repoSel = doc.getElementById('reposel');
+const repoSels = repoSel && drawn(repoSel) ? repoSel.options.length : 0;
+// 🚨 **CSS が読めているかを「効果」で確かめる。** 規則の書き間違い
+//    （コメントの閉じ忘れなど）はブラウザが黙って規則を捨てるので、
+//    構文チェックにも node --check にも掛からない（実際にコメントの
+//    閉じを余らせて :has() の規則を1つ落とした）。
+//    狭い画面ではセレクトとパスは**入れ替わる**約束なので、
+//    「パスが描かれているか」を返して呼び出し側に判定させる。
+//    ⚠️ ここは server.mjs のテンプレートリテラルの中。バックティックを書かない。
+const repoPath = doc.getElementById('repo');
+const repoPathDrawn = Boolean(repoPath && drawn(repoPath));
+// 🚨 **トップバーからはみ出した操作は「押せないボタン」になる。**
+//    .topbar は overflow:hidden + flex-wrap:nowrap なので、縮まない要素を
+//    1つ足すと後ろのボタンが枠外に出る。body は溢れないので
+//    bodyScrollWidth の比較では**検出できない**（実測: リポジトリのセレクトを
+//    固定幅で足したら 390px で #refresh と #reset が到達不能になった）。
+const barClipped = [...doc.querySelectorAll('.topbar > *')]
+  .filter(e => drawn(e) && rect(e).right > vw + 1)
+  .map(e => e.tagName + (e.id ? '#' + e.id : ''));
 // ---- ペインの並び替え（ドラッグ移動）を実際に動かして測る ----
 // 🚨 **字面を assert しない。** 保存も復元も「行は残っているのに到達不能」という
 //    形で壊せるので、ヘッダを掴んで動かし、自動更新を1回通し、再読込してから
@@ -345,6 +378,10 @@ document.getElementById('out').textContent = JSON.stringify({
   drawnMonitorRows: monitorRows,
   bodyScrollWidth: bodyScroll,
   bodyClientWidth: bodyClient,
+  topbarClipped: barClipped,
+  topbarClippedCount: barClipped.length,
+  repoPathDrawn,
+  drawnRepoOptions: repoSels,
   overflowing: over.slice(0, 12),
   overflowingCount: over.length,
   hiddenButDrawn: hiddenButDrawn.slice(0, 12),
@@ -402,8 +439,50 @@ function assignLabels(worktrees) {
     }
 }
 
-async function collectFresh() {
-    const cwd = opts.repo;
+/**
+ * 登録済みリポジトリの表示名。**basename、衝突したらフルパス。**
+ *
+ * ⚠️ worktree の `assignLabels` のように「末尾2セグメント」で畳まない。
+ *    リポジトリの切り替えは**別のリポジトリに操作を撃つ**入力なので、
+ *    曖昧さを残さない方に倒す（末尾2つでも衝突しうる）。
+ * @param {string[]} paths 登録済みの絶対パス（重複排除済み）
+ * @returns {string[]} paths と同じ順序のラベル
+ */
+function repoLabels(paths) {
+    const base = paths.map(p => p.split(/[\\/]/).filter(Boolean).pop() ?? p);
+    const count = new Map();
+    for (const b of base) count.set(b, (count.get(b) ?? 0) + 1);
+    return base.map((b, i) => (count.get(b) > 1 ? paths[i] : b));
+}
+
+/**
+ * 🔒 **クエリの `?repo=` を「登録済み一覧」と突き合わせる関門。**
+ *
+ * ⚠️ **`isSafeRepoPath()` では判定しない。** あれは「リポジトリ相対のパスとして
+ *    安全か」で、絶対パスは弾くが「登録されているか」は見ない。ここで要るのは
+ *    **登録外は形式が正しくても拒否**という判定なので、`samePath()` 照合にする
+ *    （区切り文字・大文字小文字・8.3 短縮名・symlink を吸収する。`===` では
+ *     手元では通るのに CI や symlink 環境でだけ 400 になる）。
+ * ⚠️ 指定が無ければ既定（1本目）。後方互換のため必須にしない。
+ * @returns {{repo: string} | {error: string}}
+ */
+function pickRepo(url) {
+    const raw = url.searchParams.get('repo');
+    if (raw === null || raw === '') return { repo: opts.repos[0] };
+    const want = toNFC(String(raw));
+    // ⚠️ 素の一致を先に見る。`samePath()` は `realpathSync.native()` を叩くので
+    //    **要求ごとに同期の fs 呼び出し**が本数分入る。UI は
+    //    `/api/v0/repos` で渡した表記をそのまま返してくるので、ここでほぼ済む。
+    //    （素の一致で外れたときだけ samePath に落ちる。守りは緩めない）
+    if (opts.repos.includes(want)) return { repo: want };
+    // 返すのは**登録済みの表記そのもの**（クライアントの表記を git に渡さない）
+    const hit = opts.repos.find(r => samePath(r, want));
+    if (!hit) return { error: `登録されていないリポジトリです: ${want}` };
+    return { repo: hit };
+}
+
+async function collectFresh(repo) {
+    const cwd = repo;
     const errors = [];
     const spawnsBefore = stats.spawns;
 
@@ -739,11 +818,16 @@ async function collectFresh() {
         // ⚠️ 出力の中身は含めない（argv と状態だけ）。
         // 🚨 argv も**秘密をマスクしてから**載せる（`--token <値>` を打った回が残る）。
         //    マスクしたことは `argvMasked` で告げる（黙って消さない）。
+        // ⚠️ **リポジトリで絞り込まない。** 台帳は1本のデーモンに1つで、
+        //    ここは「見えない取り残しを作らない」ための窓。選択中のリポジトリで
+        //    絞ると、切り替えた瞬間に別リポジトリで走っているものが**消える**。
+        //    代わりに `repo` を載せて、どこのものかを言う。
         execSessions: opts.allowExec
             ? execRegistry.list().map(x => {
                 const masked = x.argv.map(a => maskSecrets(a, secretsForMasking()));
                 return {
                     ...x,
+                    repo: execRegistry.get(x.id)?.repo ?? null,
                     argv: masked.map(m => m.text),
                     argvMasked: masked.some(m => m.masked),
                 };
@@ -826,29 +910,41 @@ async function collectFresh() {
  * ⚠️ 状態を変えた直後に読む場合（テスト・手動再読込）は ?fresh=1 が必要。
  */
 const CACHE_TTL_MS = 1500;
-let cached = null;      // { at, value }
-let inFlight = null;
+/**
+ * 🚨 **キャッシュはリポジトリごとに分ける。** 1本の変数だと、A を読んだ直後に
+ *    B を読むと **A の payload が B として返る**（`state.repo` も worktree も
+ *    別リポジトリのものになる = 観測ツールとして最悪の嘘）。
+ * ⚠️ キーは `pickRepo()` が返した**登録済みの表記そのもの**にする。
+ *    クライアントの表記でキーを作ると、同じ場所が別表記で2エントリになり
+ *    TTL も無効化も片方にしか効かない。
+ */
+const cachedByRepo = new Map();    // repo -> { at, value }
+const inFlightByRepo = new Map();  // repo -> Promise
 
-async function collect({ force = false } = {}) {
+async function collect(repo, { force = false } = {}) {
     const now = process.hrtime.bigint();
+    const hit = cachedByRepo.get(repo);
     // ⚠️ **TTL は検査から伸ばせるようにしてある（既定は上の 1500ms）。**
     //    「書き込みが失敗したときにキャッシュを捨てているか」は、素のままだと
     //    「捨てた」と「TTL が自然に切れた」の**競争**になり、遅い環境では
     //    守りを外しても緑になる（`--exec-stream-delay` と同じ型の非決定性）。
-    if (!force && cached && Number(now - cached.at) / 1e6 < (opts.stateTtlMs ?? CACHE_TTL_MS)) {
-        return cached.value;
+    if (!force && hit && Number(now - hit.at) / 1e6 < (opts.stateTtlMs ?? CACHE_TTL_MS)) {
+        return hit.value;
     }
-    if (inFlight) return inFlight;           // 同時リクエストは1回の収集に合流させる
-    inFlight = (async () => {
+    // 同時リクエストは1回の収集に合流させる（**同じリポジトリのものだけ**）
+    const running = inFlightByRepo.get(repo);
+    if (running) return running;
+    const p = (async () => {
         try {
-            const value = await collectFresh();
-            cached = { at: process.hrtime.bigint(), value };
+            const value = await collectFresh(repo);
+            cachedByRepo.set(repo, { at: process.hrtime.bigint(), value });
             return value;
         } finally {
-            inFlight = null;
+            inFlightByRepo.delete(repo);
         }
     })();
-    return inFlight;
+    inFlightByRepo.set(repo, p);
+    return p;
 }
 
 /**
@@ -1376,7 +1472,7 @@ function requireExec(req, res) {
  * @returns {Promise<null|{wt: object, rel: string, abs: string, fh: object,
  *                         buf: Buffer, info: object}>}
  */
-async function requireEditTarget(req, res, body, { forWrite }) {
+async function requireEditTarget(req, res, body, { forWrite, repo }) {
     // ---- 1. パスの形
     const rel = toNFC(String(body.path ?? ''));
     if (!isSafeRepoPath(rel)) {
@@ -1385,7 +1481,10 @@ async function requireEditTarget(req, res, body, { forWrite }) {
     }
     // ---- 2. 対象 worktree（既知のものだけ。ここを緩めるとリポジトリ外に書ける）
     const wantPath = toNFC(String(body.worktree ?? ''));
-    const worktrees = await listWorktrees(opts.repo);
+    // 🔒 **allowlist は「選択中のリポジトリ」の worktree 一覧に対して引く**
+    //    （exec / checkout / merge と同じ。全リポジトリの合併にすると
+    //     A を選んでいるのに B のファイルを書ける = `?repo=` の意味が消える）。
+    const worktrees = await listWorktrees(repo);
     const wt = worktrees.find(w => samePath(w.path, wantPath));
     if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return null; }
     if (wt.bare) { denyJson(res, 400, 'bare worktree にはファイルを書けません'); return null; }
@@ -1503,12 +1602,21 @@ async function requireEditTarget(req, res, body, { forWrite }) {
  * ⚠️ commonDir() を毎回叩くと exec 1回につき git が余分に起動するので
  *    起動時に1回だけ解決して持つ。
  */
-let auditPath = null;
-async function auditLogPath() {
-    if (auditPath) return auditPath;
-    auditPath = opts.auditLog
-        ?? join(await commonDir(opts.repo), 'kjp-exec-audit.jsonl');
-    return auditPath;
+/**
+ * ⚠️ **リポジトリごとに解決する。** 既定の置き場所は `<GIT_DIR>` なので、
+ *    複数リポジトリを見ているときに1本目の GIT_DIR へまとめると
+ *    「B で走らせた記録が A の .git にある」になる。
+ *    `--audit-log` を明示した場合は1本にまとまるので、記録側に `repo` を載せる。
+ */
+const auditPathByRepo = new Map();
+async function auditLogPath(repo) {
+    if (opts.auditLog) return opts.auditLog;
+    const key = repo ?? opts.repos[0];
+    const hit = auditPathByRepo.get(key);
+    if (hit) return hit;
+    const p = join(await commonDir(key), 'kjp-exec-audit.jsonl');
+    auditPathByRepo.set(key, p);
+    return p;
 }
 
 /**
@@ -1519,15 +1627,22 @@ async function auditLogPath() {
  * それでも「長く動かす」だけで伸びるので**大きさ自体に上限**を置く。
  * ⚠️ 回転は記録を捨てる操作なので、**捨てたことを新しいファイルの先頭に残す**
  *    （`event: "audit-rotated"`）。前の世代（`.1`）を上書きしたかどうかも書く。
+ *
+ * 🚨 **サイズは「パスごと」に覚える。** 複数リポジトリでは既定の置き場所が
+ *    `<GIT_DIR>/kjp-exec-audit.jsonl` なので**ファイルが複数ある**。
+ *    1つの変数で数えると別のファイルの大きさで回転を判断することになり、
+ *    **まだ小さいファイルを回す**／**上限を超えたファイルを回さない**の両方が起きる
+ *    （`--audit-log` を明示した構成では1本にまとまるので、そのときは1エントリ）。
  */
-let auditBytes = null;   // 分かっている現在のサイズ（null = まだ measure していない）
+const auditBytesByPath = new Map();   // path -> 分かっている現在のサイズ
 
-async function auditExec(entry) {
+async function auditExec(entry, repo = null) {
     try {
         const { appendFile, stat, rename } = await import('node:fs/promises');
-        const path = await auditLogPath();
+        const path = await auditLogPath(repo);
         const line = `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`;
         const len = Buffer.byteLength(line, 'utf8');
+        let auditBytes = auditBytesByPath.get(path) ?? null;
         if (auditBytes === null) {
             auditBytes = await stat(path).then(s => s.size, () => 0);
         }
@@ -1547,7 +1662,7 @@ async function auditExec(entry) {
                 + ` ${kept} に回しました${had ? '（前の世代は上書きされました）' : ''}`);
         }
         await appendFile(path, line, 'utf8');
-        auditBytes += len;
+        auditBytesByPath.set(path, auditBytes + len);
     } catch (err) {
         // 監査に失敗しても実行は続ける。ただし黙らない
         console.error(`⚠ 監査ログを書けませんでした: ${err.message}`);
@@ -1708,9 +1823,9 @@ function streamSession(req, res, s, from) {
             console.error(`⚠ 追いつけていない購読者を切りました（session ${s.id}、`
                 + `${Math.round(res.writableLength / 1024)}KB 未送信）`);
             auditExec({
-                event: 'drop-subscriber', session: s.id,
+                event: 'drop-subscriber', session: s.id, repo: s.repo ?? null,
                 pendingBytes: res.writableLength,
-            }).catch(() => {});
+            }, s.repo ?? null).catch(() => {});
             try { res.destroy(); } catch { /* 既に閉じている */ }
         }
     };
@@ -1752,9 +1867,9 @@ function streamSession(req, res, s, from) {
         //    タブが停止した瞬間に会話やテストが死んでいた。
         if (s.running) {
             await auditExec({
-                event: 'detach', session: s.id,
+                event: 'detach', session: s.id, repo: s.repo ?? null,
                 graceMs: s.keepAlive ? null : opts.execDetachedGraceMs,
-            });
+            }, s.repo ?? null);
         }
     };
     req.on('aborted', detach);
@@ -1798,18 +1913,18 @@ function startExecSweeper() {
             //    先に理由を1件流せば、実際の終了コードと両方が残る。
             execRegistry.emit(session, 'err', `${note}\n`);
             await auditExec({
-                event: 'kill', reason, session: session.id,
+                event: 'kill', reason, session: session.id, repo: session.repo ?? null,
                 worktree: session.worktree, argv: session.argv,
-            });
+            }, session.repo ?? null);
             const r = session.child
                 ? await killTree(session.child) : { killed: true, why: null };
             if (!r.killed) {
                 session.killRequested = null;   // 次の tick で もう一度試せるように戻す
                 execRegistry.emit(session, 'err', `⚠ 停止できませんでした: ${r.why}\n`);
                 await auditExec({
-                    event: 'kill-failed', reason, session: session.id,
+                    event: 'kill-failed', reason, session: session.id, repo: session.repo ?? null,
                     worktree: session.worktree, argv: session.argv, why: r.why,
-                });
+                }, session.repo ?? null);
                 continue;
             }
             execRegistry.finish(session, { code: null, signal: 'SIGKILL', note });
@@ -1982,11 +2097,44 @@ async function handleRequest(req, res) {
         res.setHeader('set-cookie', `${AUTH_COOKIE}=${encodeURIComponent(cookieSecret())}`
             + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000');
     }
+    // 🔒 **`?repo=` の照合も入口で1回だけ行う。** 個別のハンドラで拾わせない。
+    //    ここで解決した `repo` 以外を git に渡さないので、
+    //    「新しい経路で照合を忘れる」余地が構造として無くなる
+    //    （副作用のある経路を足すときに必ず通る関門を同じコミットで作る、の実装）。
+    // ⚠️ 登録外は 400 で落とす（読み取りも書き込みも実行も等しく）。
+    const picked = pickRepo(url);
+    if (picked.error) {
+        res.writeHead(400, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+        });
+        res.end(JSON.stringify({ error: picked.error }));
+        return;
+    }
+    const repo = picked.repo;
     try {
+        // 登録済みリポジトリの一覧。読み取り経路なので入口の authed() の枠内。
+        // 🔒 **ここで返すのは起動時に固定した一覧だけ。** 「開けるものを探す」
+        //    経路（走査・任意パスの追加）は作らない。
+        if (url.pathname === '/api/v0/repos') {
+            const labels = repoLabels(opts.repos);
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                repos: opts.repos.map((p, i) => ({
+                    path: p, label: labels[i], current: p === repo,
+                })),
+                current: repo,
+                default: opts.repos[0],
+            }));
+            return;
+        }
         if (url.pathname === '/api/v0/state') {
             // ?fresh=1 で TTL キャッシュを無視する（手動リロード用）
             const force = url.searchParams.get('fresh') === '1';
-            const state = await collect({ force });
+            const state = await collect(repo, { force });
             // 🚨 **exec の情報は Cookie だけの相手に出さない。** `argv` は
             //    ユーザが打ったコマンド行そのもので、秘密が載りうる。
             //    Cookie はポートで分離されないので、他ポートのページが読める状態にすると
@@ -2086,6 +2234,11 @@ async function handleRequest(req, res) {
             const session = execRegistry.create({
                 worktree: '(未検証)', argv, keepAlive: body.keepAlive === true,
             });
+            // ⚠️ **セッションに repo を持たせる。** 既定の監査ログは
+            //    `<GIT_DIR>/…` なので、持たせないと `start` は B の .git に、
+            //    `exit` / `input` / `kill` は既定（1本目）の .git に書かれて
+            //    **1回の実行の記録が2つのファイルに割れる**（追えなくなる）。
+            if (session) session.repo = repo;
             if (!session) {
                 denyJson(res, 429, `同時実行が上限（${MAX_CONCURRENT_EXEC}）に達しています`);
                 return;
@@ -2110,7 +2263,10 @@ async function handleRequest(req, res) {
                 //    throw する（リポジトリの移動・削除・破損）。囲っていなかったので
                 //    外側の catch-all に吸われて 500 になるだけで **finish も remove も
                 //    走らず、枠が8本埋まったまま恒久的に 429** になっていた（#35）。
-                const worktrees = await listWorktrees(opts.repo);
+                // 🔒 **allowlist は「選択中のリポジトリ」の worktree 一覧に対して引く。**
+                //    全リポジトリを合わせた集合で照合すると、A を選んでいるのに
+                //    B の worktree でコマンドが走る（`?repo=` の意味が消える）。
+                const worktrees = await listWorktrees(repo);
                 wt = worktrees.find(w => samePath(w.path, wantPath));
                 if (!wt) { bail(400, `既知の worktree ではありません: ${wantPath}`); return; }
                 if (wt.bare) { bail(400, 'bare worktree では実行できません'); return; }
@@ -2118,18 +2274,18 @@ async function handleRequest(req, res) {
                 session.worktree = wt.path;
 
                 await auditExec({
-                    event: 'start', session: session.id, worktree: wt.path, argv,
+                    event: 'start', session: session.id, repo, worktree: wt.path, argv,
                     keepAlive: session.keepAlive,
                     ...originHint(req),
-                });
+                }, repo);
             } catch (err) {
                 // ⚠️ **spawn すらしていないことを記録に残す。** sweeper が拾うと
                 //    `signal:"SIGKILL"` / `reason:"timeout"` で終わり、
                 //    「起動していないプロセスを殺した」という嘘になる（#35）。
                 await auditExec({
-                    event: 'bail', reason: 'never-started', session: session.id,
+                    event: 'bail', reason: 'never-started', session: session.id, repo,
                     worktree: session.worktree, argv, error: err.message,
-                }).catch(() => { /* 監査に書けなくても枠は返す */ });
+                }, repo).catch(() => { /* 監査に書けなくても枠は返す */ });
                 bail(500, `実行の準備に失敗しました: ${err.message}`);
                 return;
             }
@@ -2196,9 +2352,9 @@ async function handleRequest(req, res) {
                 execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);
                 if (execRegistry.finish(session, { code: null, signal: null })) {
                     await auditExec({
-                        event: 'exit', session: session.id, worktree: wt.path, argv,
+                        event: 'exit', session: session.id, repo, worktree: wt.path, argv,
                         code: null, signal: null, note: `spawn 失敗: ${err.message}`,
-                    });
+                    }, repo);
                 }
             });
             // 🚨 **stdin の書き込み失敗も非同期の 'error' で来る。**
@@ -2237,9 +2393,9 @@ async function handleRequest(req, res) {
                 if (execRegistry.finish(session, { code: null, signal: null,
                     note: '⚠ 終了コードを取れませんでした（stdio が閉じました）' })) {
                     auditExec({
-                        event: 'exit', session: session.id, worktree: wt.path, argv,
+                        event: 'exit', session: session.id, repo, worktree: wt.path, argv,
                         code: null, signal: null, note: 'close で終端',
-                    }).catch(() => {});
+                    }, repo).catch(() => {});
                 }
             });
             // ⚠️ `close` ではなく `exit` を使う。`close` は stdio が EOF になるまで来ないので、
@@ -2250,8 +2406,8 @@ async function handleRequest(req, res) {
                 if (tailErr) execRegistry.emit(session, 'err', tailErr);
                 if (execRegistry.finish(session, { code, signal })) {
                     await auditExec({
-                        event: 'exit', session: session.id, worktree: wt.path, argv, code, signal,
-                    });
+                        event: 'exit', session: session.id, repo, worktree: wt.path, argv, code, signal,
+                    }, repo);
                 }
             });
 
@@ -2324,8 +2480,8 @@ async function handleRequest(req, res) {
                 if (m[2] === 'kill') {
                     await auditExec({
                         event: 'kill', reason: 'requested', session: s.id,
-                        worktree: s.worktree, argv: s.argv,
-                    });
+                        repo: s.repo ?? null, worktree: s.worktree, argv: s.argv,
+                    }, s.repo ?? null);
                     // 🚨 **殺してから終端する（順序を逆にした）。** 以前は
                     //    `finish()` が先だったので、(a) 実際に死ぬまでに出た出力は
                     //    `exit` の後ろに並び **live には1件も届かず告知も無い**、
@@ -2346,8 +2502,8 @@ async function handleRequest(req, res) {
                         execRegistry.emit(s, 'err', `⚠ 停止できませんでした: ${r.why}\n`);
                         await auditExec({
                             event: 'kill-failed', reason: 'requested', session: s.id,
-                            worktree: s.worktree, argv: s.argv, why: r.why,
-                        });
+                            repo: s.repo ?? null, worktree: s.worktree, argv: s.argv, why: r.why,
+                        }, s.repo ?? null);
                         denyJson(res, 500, `停止できませんでした: ${r.why}`);
                         return;
                     }
@@ -2418,9 +2574,9 @@ async function handleRequest(req, res) {
                     if (data !== null) execRegistry.emit(s, 'in', data);
                     if (eof) execRegistry.emit(s, 'note', '（標準入力を閉じました）');
                     await auditExec({
-                        event: 'input', session: s.id, bytes, eof,
+                        event: 'input', session: s.id, repo: s.repo ?? null, bytes, eof,
                         ...originHint(req),
-                    });
+                    }, s.repo ?? null);
                     res.writeHead(200, {
                         'content-type': 'application/json; charset=utf-8',
                         'cache-control': 'no-store',
@@ -2437,8 +2593,9 @@ async function handleRequest(req, res) {
                 try { body = await readJson(req); } catch { /* from 無しでも良い */ }
                 const from = Number(body.from);
                 await auditExec({
-                    event: 'reattach', session: s.id, from: Number.isFinite(from) ? from : 0,
-                });
+                    event: 'reattach', session: s.id, repo: s.repo ?? null,
+                    from: Number.isFinite(from) ? from : 0,
+                }, s.repo ?? null);
                 streamSession(req, res, s, Number.isFinite(from) ? from : 0);
                 return;
             }
@@ -2484,13 +2641,14 @@ async function handleRequest(req, res) {
             if (!isSafeRef(branch)) { denyJson(res, 400, `ref が不正です: ${branch}`); return; }
             const wantPath = toNFC(String(body.worktree ?? ''));
 
-            const worktrees = await listWorktrees(opts.repo);
+            // 🔒 allowlist は選択中のリポジトリの worktree 一覧に対して引く（exec と同じ）
+            const worktrees = await listWorktrees(repo);
             const wt = worktrees.find(w => samePath(w.path, wantPath));
             if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
             if (wt.bare) { denyJson(res, 400, 'bare worktree では取り込めません'); return; }
             if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
 
-            const refs = await refMap(opts.repo);
+            const refs = await refMap(repo);
             if (!resolveRef(refs, branch)) {
                 denyJson(res, 400, `解決できない ref です: ${branch}`);
                 return;
@@ -2579,9 +2737,9 @@ async function handleRequest(req, res) {
             const { tmpdir } = await import('node:os');
             const emptyHooks = await mkdtemp(join(tmpdir(), 'kjp-nohooks-'));
             await auditExec({
-                event: 'merge', worktree: wt.path, from, branch,
+                event: 'merge', repo, worktree: wt.path, from, branch,
                 ...originHint(req),
-            });
+            }, repo);
             try {
                 await git([
                     '-c', `core.hooksPath=${emptyHooks}`,
@@ -2607,7 +2765,11 @@ async function handleRequest(req, res) {
                 //    気付かないまま merge コミットになる。
                 // 🚨 **キャッシュも捨てる。** 失敗経路だけ `cached = null` が無かったので、
                 //    画面は TTL の間 clean のままだった。
-                cached = null;
+                //    ⚠️ キャッシュはリポジトリごとなので、**そのリポジトリの分**を捨てる
+                //       （`cached = null` のままだと ES モジュールは strict なので
+                //        ReferenceError = この経路が丸ごと 500 になる。`node --check` では
+                //        見えず、smoke の「半端な状態が残ったと言う」が拾った）。
+                cachedByRepo.delete(repo);
                 const seqAfter = await sequencerState(wt.path).catch(() => null);
                 const stAfter = await worktreeStatus(wt.path).catch(() => null);
                 // ⚠️ **「数え直せなかった」を「綺麗だ」と書かない**（分からないなら分からないと言う）
@@ -2622,9 +2784,9 @@ async function handleRequest(req, res) {
                             || stAfter.changed > 0 || stAfter.unmerged > 0,
                     };
                 await auditExec({
-                    event: 'merge-failed', worktree: wt.path, from, branch, error: err.message,
-                    leftover,
-                });
+                    event: 'merge-failed', repo, worktree: wt.path, from, branch,
+                    error: err.message, leftover,
+                }, repo);
                 const parts = [];
                 if (leftover.merging) parts.push('MERGE_HEAD あり');
                 if (leftover.changed > 0) parts.push(`変更 ${leftover.changed} 件`);
@@ -2647,11 +2809,13 @@ async function handleRequest(req, res) {
                 const { rm } = await import('node:fs/promises');
                 await rm(emptyHooks, { recursive: true, force: true }).catch(() => {});
             }
-            cached = null;   // 状態が変わったのでキャッシュを捨てる
+            // 状態が変わったので**そのリポジトリの**キャッシュを捨てる
+            // （全部消すと他のリポジトリの収集をやり直させるだけで無駄）
+            cachedByRepo.delete(repo);
             // 🚨 **取り込んだ後の状態を数え直してから返す**（「取り込みました」を
             //    確かめずに言わない）。衝突状態になっていないことも見る
             const seqAfter = await sequencerState(wt.path).catch(() => ({}));
-            const after = (await listWorktrees(opts.repo)).find(w => samePath(w.path, wantPath));
+            const after = (await listWorktrees(repo)).find(w => samePath(w.path, wantPath));
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',
@@ -2690,13 +2854,13 @@ async function handleRequest(req, res) {
 
             // ⚠️ cwd に任意のパスを受け取らない。既知の worktree のみ。
             //    ここを緩めるとリポジトリ外で git を走らせられる。
-            const worktrees = await listWorktrees(opts.repo);
+            const worktrees = await listWorktrees(repo);
             const wt = worktrees.find(w => samePath(w.path, wantPath));
             if (!wt) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
             if (wt.bare) { denyJson(res, 400, 'bare worktree では checkout できません'); return; }
             if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }
 
-            const refs = await refMap(opts.repo);
+            const refs = await refMap(repo);
             if (!resolveRef(refs, ref)) {
                 denyJson(res, 400, `解決できない ref です: ${ref}`);
                 return;
@@ -2736,8 +2900,8 @@ async function handleRequest(req, res) {
                 denyJson(res, 409, `git が checkout を拒否しました: ${err.message}`);
                 return;
             }
-            cached = null;   // 状態が変わったのでキャッシュを捨てる
-            const after = (await listWorktrees(opts.repo)).find(w => samePath(w.path, wantPath));
+            cachedByRepo.delete(repo);   // 状態が変わったのでキャッシュを捨てる
+            const after = (await listWorktrees(repo)).find(w => samePath(w.path, wantPath));
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',
@@ -2797,7 +2961,7 @@ async function handleRequest(req, res) {
                 return;
             }
             // ← 門2〜5: パスの形 / 既知の worktree / 追跡下 / 実体と中身
-            const t = await requireEditTarget(req, res, body, { forWrite });
+            const t = await requireEditTarget(req, res, body, { forWrite, repo });
             if (!t) return;                          // ← 応答は関門が書いている
             try {
                 if (!forWrite) {
@@ -2861,11 +3025,12 @@ async function handleRequest(req, res) {
                 // 🔒 監査に残す。**中身は残さない**（記録が秘密の持ち出し口になる）。
                 //    残すのは「いつ・どの worktree の・どのパスを・何バイト」だけ。
                 await auditExec({
-                    event: 'write', worktree: t.wt.path, path: t.rel,
+                    event: 'write', repo, worktree: t.wt.path, path: t.rel,
                     bytes: next.length, eol: t.info.eol, bom: t.info.bom,
                     ...originHint(req),
-                });
-                cached = null;   // 作業ツリーが変わったのでキャッシュを捨てる
+                }, repo);
+                // 作業ツリーが変わったので**そのリポジトリの**キャッシュを捨てる
+                cachedByRepo.delete(repo);
                 res.writeHead(200, {
                     'content-type': 'application/json; charset=utf-8',
                     'cache-control': 'no-store',
@@ -2896,8 +3061,8 @@ async function handleRequest(req, res) {
             const ref = url.searchParams.get('ref') ?? 'HEAD';
             try {
                 const body = url.pathname === '/api/v0/blob'
-                    ? await showBlob(opts.repo, ref, path)
-                    : await fileDiff(opts.repo, url.searchParams.get('base') ?? 'HEAD', ref, path);
+                    ? await showBlob(repo, ref, path)
+                    : await fileDiff(repo, url.searchParams.get('base') ?? 'HEAD', ref, path);
                 res.writeHead(200, {
                     'content-type': 'application/json; charset=utf-8',
                     'cache-control': 'no-store',
@@ -2976,34 +3141,53 @@ server.on('error', err => {
 //    「cwd からの相対パス」で衝突ファイルを出すので `../shared.txt` になり、
 //    `overlaps[].path`（ルート相対）と基準が食い違う。さらに
 //    `isSafeRepoPath` が `..` を弾くので UI から開けなくなる（レビュー指摘）。
-try {
-    // 🚨 **bare では `--show-toplevel` が exit 128 で落ちる**
-    //    （`fatal: this operation must be run in a work tree`）。空文字を返すのではない。
-    //    そのため以前は bare リポジトリを「git リポジトリとして開けません」と
-    //    誤って拒否していた。**bare を親にして linked worktree を並べる構成**は
-    //    エージェントを並列に走らせる普通のやり方なので、受け付ける。
-    //    （これが `wt.bare` の門が到達不能だった原因でもある。#33）
-    let top = '';
-    try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim(); }
-    catch { /* bare。下で判定する */ }
-    if (top) {
-        if (!samePath(top, opts.repo)) {
-            console.log(`repo をリポジトリのルートに解決しました: ${opts.repo} → ${top}`);
+// ⚠️ **1本でも開けなければ起動しない。** 黙って落とすと「登録したつもりの
+//    リポジトリが一覧に無い」を起動ログを読まないと気付けない（打ったフラグを
+//    黙って捨てない、と同じ根拠）。
+{
+    const normalized = [];
+    for (const given of opts.repos) {
+        try {
+            // 🚨 **bare では `--show-toplevel` が exit 128 で落ちる**
+            //    （`fatal: this operation must be run in a work tree`）。空文字を返すのではない。
+            //    そのため以前は bare リポジトリを「git リポジトリとして開けません」と
+            //    誤って拒否していた。**bare を親にして linked worktree を並べる構成**は
+            //    エージェントを並列に走らせる普通のやり方なので、受け付ける。
+            //    （これが `wt.bare` の門が到達不能だった原因でもある。#33）
+            let top = '';
+            try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim(); }
+            catch { /* bare。下で判定する */ }
+            let resolved = given;
+            if (top) {
+                if (!samePath(top, given)) {
+                    console.log(`repo をリポジトリのルートに解決しました: ${given} → ${top}`);
+                }
+                resolved = top;
+            } else {
+                const bare = (await git(['rev-parse', '--is-bare-repository'], { cwd: given })).trim();
+                if (bare !== 'true') {
+                    throw new Error('作業ツリーが無く、bare でもありません（.git の中を指していませんか）');
+                }
+                console.log(`bare リポジトリを見ています: ${given}`
+                    + '（作業ツリーは linked worktree 側にあります）');
+            }
+            // ⚠️ 重複は `===` ではなく `samePath()` で潰す。同じ場所を別表記で
+            //    2回渡されると、セレクトに2行出て**キャッシュも2重**になる
+            //    （TTL の無効化が片方にしか効かない）。
+            if (normalized.some(r => samePath(r, resolved))) {
+                console.log(`repo が重複しているので1本にまとめました: ${given}`);
+                continue;
+            }
+            normalized.push(resolved);
+        } catch (err) {
+            console.error(`\n✖ git リポジトリとして開けません: ${given}`);
+            console.error(`  ${err.message}\n`);
+            console.error('  --repo でリポジトリのパスを指定してください（複数可）:');
+            console.error('      node v0/server.mjs --repo C:/path/to/repo --repo D:/other/repo\n');
+            process.exit(1);
         }
-        opts.repo = top;
-    } else {
-        const bare = (await git(['rev-parse', '--is-bare-repository'], { cwd: opts.repo })).trim();
-        if (bare !== 'true') {
-            throw new Error('作業ツリーが無く、bare でもありません（.git の中を指していませんか）');
-        }
-        console.log('bare リポジトリを見ています（作業ツリーは linked worktree 側にあります）');
     }
-} catch (err) {
-    console.error(`\n✖ git リポジトリとして開けません: ${opts.repo}`);
-    console.error(`  ${err.message}\n`);
-    console.error('  --repo でリポジトリのパスを指定してください:');
-    console.error('      node v0/server.mjs --repo C:/path/to/repo\n');
-    process.exit(1);
+    opts.repos = normalized;
 }
 
 // 🔒 ループバックのみ。--port 0 で OS に空きポートを選ばせる（テスト用）
@@ -3037,24 +3221,39 @@ try {
  */
 async function insideRepoGate(target) {
     const roots = [];
-    try {
-        const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
-        if (top) roots.push(top);
-    } catch { /* bare。失敗を「外」と読まない */ }
-    // .git 本体（bare のリポジトリ自身もここに入る）
-    try {
-        const common = (await commonDir(opts.repo)).trim();
-        if (common) roots.push(common);
-    } catch { /* noop */ }
-    // 全 worktree の作業ツリー
-    try {
-        for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);
-    } catch { /* noop */ }
+    const gitDirs = [];
+    // 🚨 **登録した全リポジトリを見る。** 1本目だけ調べると、2本目のリポジトリの
+    //    中を指した `--token-file` / `--audit-log` が門を素通りしてコミットされる
+    //    （「メイン worktree の top だけでは足りない」#39 の再発を、
+    //      **リポジトリの本数**という別の軸で作らない）。
+    for (const r0 of opts.repos) {
+        try {
+            const top = (await git(['rev-parse', '--show-toplevel'], { cwd: r0 })).trim();
+            if (top) roots.push(top);
+        } catch { /* bare。失敗を「外」と読まない */ }
+        // .git 本体（bare のリポジトリ自身もここに入る）
+        try {
+            const common = (await commonDir(r0)).trim();
+            if (common) { roots.push(common); gitDirs.push(common); }
+        } catch { /* noop */ }
+        // 全 worktree の作業ツリー
+        try {
+            for (const w of await listWorktrees(r0)) if (w.path) roots.push(w.path);
+        } catch { /* noop */ }
+    }
     // ⚠️ 何も分からなかったときに「外」と断定しない（分からないと言う）
     if (!roots.length) return { unknown: true };
     // ⚠️ relative() では駄目。表記が違うと外れて、秘密がコミットされる
     //    （macOS の /var→/private/var、Windows の RUNNER~1 で実際に外れた）
-    return { inside: roots.some(r => containsPath(r, target)) };
+    return {
+        inside: roots.some(r => containsPath(r, target)),
+        // 🚨 **`.git` の中かどうかも一緒に返す。** 監査ログは `.git` の中（既定）を
+        //    許すので呼び出し側がこれを要る。ここで返さないと呼び出し側が
+        //    `commonDir()` を再度叩くことになり、しかも**1本目だけ**を見る
+        //    単一 repo 前提の判定に戻る（複数リポジトリでは B の .git を
+        //    「worktree の中」と誤判定して既定の置き場所を拒否する）。
+        inGitDir: gitDirs.some(d => containsPath(d, target)),
+    };
 }
 
 // 🔒 **監査ログも worktree の中に置かせない。**
@@ -3064,14 +3263,12 @@ async function insideRepoGate(target) {
 //       ここを拒否すると既定の置き場所を自分で否定することになる。
 if (opts.auditLog) {
     const gate = await insideRepoGate(opts.auditLog);
-    // worktree の中かどうかを分けて判定する（.git の中は許す）
-    let inWorktree = false;
-    if (gate.inside) {
-        try {
-            const common = (await commonDir(opts.repo)).trim();
-            inWorktree = !containsPath(common, opts.auditLog);
-        } catch { inWorktree = true; }   // 判定できないなら安全側（拒否）に倒す
-    }
+    // worktree の中かどうかを分けて判定する（.git の中は許す）。
+    // ⚠️ 判定は `insideRepoGate()` が**全リポジトリ分**まとめて返す。
+    //    ここで commonDir を叩き直すと1本目だけを見ることになり、
+    //    2本目の `.git` を「worktree の中」と誤判定して既定の場所を拒否する。
+    //    `.git` が1つも分からなければ gitDirs が空 = 安全側（拒否）に倒れる。
+    const inWorktree = gate.inside === true && gate.inGitDir !== true;
     if (inWorktree) {
         console.error(`\n✖ --audit-log を worktree の中に置かないでください: ${opts.auditLog}\n`);
         console.error('  監査ログは実行した argv をそのまま保存します（マスクしません）。');
@@ -3194,7 +3391,15 @@ if (opts.allowWrite && !opts.token) {
 server.listen(opts.port, '127.0.0.1', () => {
     const { port } = server.address();
     console.log(`kjp-edit v0  →  http://127.0.0.1:${port}`);
-    console.log(`repo: ${opts.repo}`);
+    // 🔒 **読める範囲を必ず全部出す。** 何本見ているかを起動ログで確かめられないと、
+    //    「登録したつもり」と「実際に読める範囲」がずれても気付けない。
+    if (opts.repos.length === 1) console.log(`repo: ${opts.repos[0]}`);
+    else {
+        console.log(`repo: ${opts.repos.length} 本（1本目が既定。この範囲だけが読めます）`);
+        for (const [i, r] of opts.repos.entries()) {
+            console.log(`  ${i === 0 ? '*' : ' '} ${r}`);
+        }
+    }
     if (opts.allowHosts.size) {
         console.log(`許可した Host: ${[...opts.allowHosts].join(', ')}`);
     }

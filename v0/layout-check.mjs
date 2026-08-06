@@ -16,8 +16,8 @@
 // Chrome/Edge が無い環境（CI 等）では**スキップして exit 0**。
 // ブラウザは検査にしか使わないので、プロジェクトの依存パッケージは増えない。
 
-import { spawn } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { spawn, execFile } from 'node:child_process';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,13 +54,34 @@ if (!browser) {
     process.exit(0);
 }
 
+/**
+ * 🚨 **2本目のリポジトリを用意する。**
+ *
+ * リポジトリのセレクトは**登録が1本のときは描かない**（選ぶものが無い操作を
+ * 出さないため）。つまり1本で起動した検査では**セレクトが1度も測られない**
+ * =「390px でトップバーが溢れても気付けない」。
+ * `--allow-exec` が無いとコマンドバーを測れなかったのと同じ形なので、
+ * 検査側で2本目を作る（中身は空のリポジトリで足りる。測るのは幅だけ）。
+ */
+const g2 = (args, cwd) => new Promise(res => execFile('git', args,
+    { cwd, windowsHide: true, encoding: 'utf8' }, () => res()));
+const repo2 = await mkdtemp(join(tmpdir(), 'kjp-layout-repo2-'));
+await g2(['init', '-q', '-b', 'main'], repo2);
+await g2(['config', 'user.email', 'a@b'], repo2);
+await g2(['config', 'user.name', 'a'], repo2);
+await writeFile(join(repo2, 'f.txt'), 'x\n', 'utf8');
+await g2(['add', '-A'], repo2);
+await g2(['commit', '-q', '-m', 'seed'], repo2);
+
 // サーバを起動して URL を得る
 const server = spawn(process.execPath,
     // ⚠️ 活動観測と**実行**も有効にする。--allow-exec が無いと
     //    コンソールは「実行は無効です」の一文になり、**コマンドバー
     //    （select + 入力 + ボタン3つ）が描かれないので測れない**。
     //    ボタンを1つ足したときに 390px で溢れても気付けなかった。
-    [SERVER, '--repo', repo, '--port', '0', '--layout-probe', '--watch-agents',
+    // ⚠️ `--repo` を2本渡すのはリポジトリのセレクトを描かせるため（上のコメント）。
+    //    **1本目が既定**なので、他の検査の対象は変わらない。
+    [SERVER, '--repo', repo, '--repo', repo2, '--port', '0', '--layout-probe', '--watch-agents',
         '--allow-exec', '--token', TOKEN, '--allow-write'],
     { shell: false, windowsHide: true });
 server.stdout.setEncoding('utf8');
@@ -86,7 +107,8 @@ try {
 }
 
 /** ハーネスを開いて JSON を取り出す */
-async function measure(width) {
+async function measure(width, from = null) {
+    const at = from ?? baseUrl;
     const profile = await mkdtemp(join(tmpdir(), 'kjp-layout-'));
     const child = spawn(browser, [
         // ⚠️ `--headless=old` は Chrome 132 で削除された。`=new` を使う
@@ -100,8 +122,10 @@ async function measure(width) {
         //    まったく分からない**（並び替えの計測でこれを踏んだ）。
         //    ハーネスは自動更新1回と再読込1回を通すので 8000 では足りない。
         `--user-data-dir=${profile}`, '--window-size=1200,2100',
+        // ⚠️ 予算は main 側の 30000（ドラッグ検査は reload を含むので 8000 では足りない）
         '--virtual-time-budget=30000', '--dump-dom',
-        `${baseUrl}/__probe?w=${width}&token=${TOKEN}`,
+        // ⚠️ `at` は測る対象のサーバ（1本構成の2台目も測るため）
+        `${at}/__probe?w=${width}&token=${TOKEN}`,
     ], { shell: false, windowsHide: true });
     let out = '';
     child.stdout.setEncoding('utf8');
@@ -168,6 +192,38 @@ async function startProbeSession() {
     return id;
 }
 
+/**
+ * 🚨 **1本だけ登録した構成も測る。**
+ *
+ * 「登録が1本ならセレクトを出さない」は**2本で起動している検査では絶対に落ちない**
+ * （突然変異 `repo-select-hidden-when-single` が実際に SURVIVED した）。
+ * 出さないことを主張するなら、出さない構成を1回描いて数えるしかない。
+ * ⚠️ `hidden` を付けても作者スタイルに負けると描かれるので、**件数で見る**
+ *    （`drawnRepoOptions` は描かれていなければ 0）。
+ */
+let single = null;
+async function startSingleRepoServer() {
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--layout-probe',
+            '--allow-exec', '--token', TOKEN],
+        { shell: false, windowsHide: true });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    let buf = '', err = '';
+    child.stderr.on('data', d => { err += d; });
+    const url = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(
+            `1本構成のサーバが起動しなかった: ${err.trim() || '(stderr は空)'}`)), 15000);
+        child.stdout.on('data', d => {
+            buf += d;
+            const m = buf.match(/http:\/\/127\.0\.0\.1:\d+/);
+            if (m) { clearTimeout(t); resolve(m[0]); }
+        });
+        child.on('error', reject);
+    }).catch(e => { try { child.kill(); } catch { /* noop */ } throw e; });
+    return { child, url };
+}
+
 const problems = [];
 const lines = [];
 let probeSession = null;
@@ -213,6 +269,31 @@ try {
         if (r.drawnMonitorRows === 0) {
             problems.push(`幅 ${width}: 監視盤の行が1つも描かれていない`
                 + '（セッションを走らせて測る前提が崩れている）');
+        }
+        // 🚨 トップバーからはみ出した操作は横スクロールでも到達できない
+        //    （overflow:hidden + nowrap）。body の溢れとしては出ないので別に見る。
+        if (r.topbarClippedCount > 0) {
+            problems.push(`幅 ${width}: トップバーの操作が枠外に押し出されている `
+                + `(${r.topbarClipped.join(', ')}) — 押せないボタンになっている`);
+        }
+        // 🚨 **狭い画面ではセレクトとパスが入れ替わる**という約束を効果で測る。
+        //    CSS の書き間違い（コメントの閉じ忘れ等）はブラウザが規則を黙って
+        //    捨てるので、構文チェックでは絶対に見つからない（実際に踏んだ）。
+        if (width <= 1100 && r.repoPathDrawn) {
+            problems.push(`幅 ${width}: セレクトを出しているのにパスの表示も残っている`
+                + '（トップバーは伸びも折り返しもしないので、要素を1つ足したら1つ引く。'
+                + 'CSS の規則が落ちていないか見ること）');
+        }
+        // ⚠️ 広い画面では**両方出る**のが正しい（片方だけの検査にしない）
+        if (width > 1100 && !r.repoPathDrawn) {
+            problems.push(`幅 ${width}: 広い画面なのにパスの表示が消えている`
+                + '（どのリポジトリのどこを見ているか分からない）');
+        }
+        // 🚨 2本登録して起動しているのに描かれていないなら、測っていない
+        if (r.drawnRepoOptions < 2) {
+            problems.push(`幅 ${width}: リポジトリのセレクトが描かれていない`
+                + `（選択肢 ${r.drawnRepoOptions} 個。2本登録して起動しているので`
+                + 'トップバーの幅を測れていない = 溢れても気付けない）');
         }
         // 🚨 **ペインの並び替え（ドラッグ移動）は実際に掴んで動かして測る。**
         //    保存も復元も「行は残っているのに到達不能」という形で壊せるので、
@@ -281,8 +362,29 @@ try {
             + ` / 潰れ ${r.squashedCount} / viewport 超過 ${r.overflowingCount} 件`
             + ` / コマンドバー ${r.drawnCmdbars} / 監視行 ${r.drawnMonitorRows}`
             + ` / 並び替え ${problems.length === before ? '✔' : '✖'}`
-            + `（${(r.leftAfterReload ?? []).length} 本を復元）`);
+            + `（${(r.leftAfterReload ?? []).length} 本を復元）`
+            + ` / repo選択 ${r.drawnRepoOptions} / bar枠外 ${r.topbarClippedCount}`);
     }
+    // 1本だけ登録した構成: セレクトは**描かれてはいけない**
+    single = await startSingleRepoServer();
+    const one = await measure(390, single.url);
+    if (one.drawnRepoOptions !== 0) {
+        problems.push('リポジトリが1本しか登録されていないのにセレクトが描かれている'
+            + `（選択肢 ${one.drawnRepoOptions} 個。選ぶものが無い操作を出している）`);
+    }
+    if (one.topbarClippedCount > 0) {
+        problems.push(`1本構成の 390px でトップバーの操作が枠外に押し出されている `
+            + `(${one.topbarClipped.join(', ')})`);
+    }
+    // 🚨 **セレクトを出さない構成では、パスを落としてはいけない。**
+    //    「狭いから落とす」を無条件にすると、どのリポジトリを見ているかが
+    //    どこにも出なくなる（`:has()` で条件を付けている理由そのもの）。
+    if (!one.repoPathDrawn) {
+        problems.push('1本構成の 390px でリポジトリ名がどこにも出ていない'
+            + '（セレクトも無く、パスの表示も落ちている）');
+    }
+    lines.push(`   1本構成 390px: repo選択 ${one.drawnRepoOptions}（0 が正）`
+        + ` / bar枠外 ${one.topbarClippedCount} / パス表示 ${one.repoPathDrawn}`);
 } catch (err) {
     problems.push(err.message);
 } finally {
@@ -297,6 +399,10 @@ try {
         } catch { /* サーバが既に落ちている */ }
     }
     server.kill();
+    // 🚨 起動したサーバは全部止める（1本構成の方も。取り残しはポートを塞ぐ）
+    try { single?.child.kill(); } catch { /* noop */ }
+    // 🚨 検査が作ったリポジトリは必ず消す（取り残しは意志ではなく仕組みで防ぐ）
+    await rm(repo2, { recursive: true, force: true }).catch(() => {});
 }
 
 console.log(problems.length ? '✖ layout' : '✔ layout');

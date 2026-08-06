@@ -4,7 +4,10 @@
 // ログオン時に自動起動する登録／解除。
 //
 //   node scripts/autostart.mjs status
-//   node scripts/autostart.mjs install [--repo <path>] [--port 7749] [--write] [--exec]
+//   node scripts/autostart.mjs install [--repo <path>]... [--port 7749] [--write] [--exec]
+//
+// ⚠️ `--repo` は複数指定できる（1本目が既定）。**引き継ぎを落とすと
+//    「ログオン後だけ1本に戻る」**という手元では気付けない壊れ方になる。
 //   node scripts/autostart.mjs uninstall
 //
 // ⚠️ **既定は読み取り専用で登録する。** `--write` / `--exec` を明示しない限り
@@ -29,7 +32,9 @@ import { fileURLToPath } from 'node:url';
 import { winQuote, trimTrailingSep } from './winargs.mjs';
 // 🚨 引き継ぎ（--allow-host / 観測フラグ）は落ちても**手元では気付けない**
 //    （再起動後だけ 403 / ログオン後だけパネルが消える）。純関数にして固定した（#45）
-import { AUTOSTART_FLAGS, unknownFlag, checkPort, autostartServeArgs } from './serveargs.mjs';
+import {
+    AUTOSTART_FLAGS, unknownFlag, checkPort, collectRepos, autostartServeArgs,
+} from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SERVE = join(ROOT, 'scripts', 'serve.mjs');
@@ -129,13 +134,17 @@ if (cmd !== 'install') {
 
 // ⚠️ 末尾のセパレータを落とす。残すと CRT の引用規則を踏みやすく、
 //    どのツールでも意味は変わらないので落として良い（**既定値 ROOT がこの形**）。
-const repo = trimTrailingSep(val('--repo', ROOT));
-if (!repo || /["\r\n\0]/.test(repo)) {
+// 🚨 **`--repo` は複数指定できる。1本目だけ読んで残りを捨てない**
+//    （捨てると「ログオン後だけ1本に戻る」= 手元では気付けない壊れ方）。
+const repoCheck = collectRepos(argv);
+if (repoCheck.error !== undefined) {
     // `--allow-host` は検証しているのに `--repo` が無検証、という非対称が
     // #29 の原因だった。引用を壊す文字は最初から弾く。
-    console.error(`\n✖ --repo に使えない文字が入っています（" や改行）: ${JSON.stringify(repo)}\n`);
+    console.error('\n✖ --repo に使えない文字が入っています（" や改行）: '
+        + `${JSON.stringify(repoCheck.error)}\n`);
     process.exit(1);
 }
+const repos = (repoCheck.repos.length ? repoCheck.repos : [ROOT]).map(trimTrailingSep);
 const portCheck = checkPort(val('--port', undefined), '7749');
 if (portCheck.error !== undefined) {
     console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
@@ -145,7 +154,7 @@ const port = String(portCheck.port);
 
 // ⚠️ `--allow-host` と観測フラグの引き継ぎは serveargs.mjs でテストに固定してある。
 //    落ちると**再起動後だけ 403 / ログオン後だけパネルが消える**形で壊れる。
-const built = autostartServeArgs({ argv, repo, port });
+const built = autostartServeArgs({ argv, repos, port });
 if (built.error !== undefined) {
     console.error('\n✖ --allow-host にはホスト名を指定してください'
         + `（受け取った値: ${built.error ?? '(無し)'}）\n`);
@@ -167,7 +176,9 @@ const caps = has('--exec') ? '実行+書き込み' : has('--write') ? '書き込
 const watchLabel = has('--agents-text') ? ' / 活動観測+発話'
     : has('--watch') ? ' / 活動観測' : '';
 console.log(`自動起動を登録しました（ログオン時 / ${caps}${watchLabel}）`);
-console.log(`  repo: ${repo}`);
+// 🚨 **登録した本数を全部出す。** 1本しか出さないと、2本目が引き継がれて
+//    いるかを確認する手段が「再起動して見る」だけになる
+console.log(`  repo: ${repos.join('\n        ')}`);
 console.log(`  URL : http://127.0.0.1:${port}`);
 console.log(`  中身: ${value}`);
 console.log('\n  ⚠️ ログオン時にコンソール窓が出ます（.vbs を作らない方針のため）');
