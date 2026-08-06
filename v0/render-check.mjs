@@ -163,11 +163,26 @@ const MONITOR_CHECK = `(async () => {
   const cin = [...document.querySelectorAll('.cmdbar input')].find(e =>
     e.closest('[data-pane-id]')?.dataset.paneId !== 'monitor' && !e.placeholder);
   if (!cin) return { error: 'コンソールの入力欄が見つからない' };
+  // 🚨 **コンソールが空くまで待つ。** 走っている間は入力欄が disabled で
+  //    Enter が効かないので、直前の検査（IME）の実行が終わる前に撃つと
+  //    **何も起動せず30秒空回りする**（手元は速いので緑、**CI の Windows だけ落ちた**）。
+  for (let i = 0; i < 400 && cin.disabled; i++) await wait(100);
+  if (cin.disabled) return { error: 'コンソールが空かない（前の実行が終わらない）' };
   cin.value = 'git --version';
   // 🚨 **input イベントを撃つ。** 値の代入だけでは argv の再解析が走らないので、
   //    プリセットのまま実行される（この検査自身がそれで空振りした）
   cin.dispatchEvent(new Event('input', { bubbles: true }));
   cin.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+  // 🚨 **起動したことを確かめてから待つ。** 起動していないのに行を探し続けると
+  //    「監視盤が壊れている」という**別の原因に見える**エラーになる（CI で1往復無駄にした）。
+  //    走り始めれば入力欄が disabled になる（短いコマンドは待つ前に終わりうるので
+  //    出力が出ていることでも良しとする）。
+  let started = false;
+  for (let i = 0; i < 100 && !started; i++) {
+    started = cin.disabled || /git version/.test(document.querySelector('.term')?.textContent ?? '');
+    if (!started) await wait(100);
+  }
+  if (!started) return { error: 'Enter で実行が始まらなかった（監視盤ではなくコンソール側の問題）' };
   let row = null;
   for (let i = 0; i < 300; i++) {
     row = rowsOf().find(e => /git --version/.test(e.textContent ?? ''));

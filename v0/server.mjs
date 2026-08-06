@@ -132,10 +132,10 @@ function parseArgs(argv) {
  *    測っている対象が変わる。入口は app.html が `?probe=1` のときだけ出す。
  * ⚠️ ここは server.mjs のテンプレートリテラルの中。**バックティックを書かない。**
  */
-function renderHarness(w) {
+function renderHarness(w, q) {
     return `<!doctype html><meta charset="utf-8"><title>render probe</title>
 <body style="margin:0">
-<iframe id="f" src="/?probe=1" style="width:${w}px;height:900px;border:0"></iframe>
+<iframe id="f" src="/?probe=1${q}" style="width:${w}px;height:900px;border:0"></iframe>
 <pre id="out"></pre>
 <script type="module">
 const f = document.getElementById('f');
@@ -169,14 +169,21 @@ document.getElementById('out').textContent = JSON.stringify(out);
 </script>`;
 }
 
-function probeHarness(width, mode) {
+function probeHarness(width, mode, token) {
     const w = Number.isFinite(width) && width >= 200 && width <= 4000 ? Math.floor(width) : 390;
     // 🚨 描画の予算を測るモード（#3）。**仮想時間では測れない**ので
     //    v0/render-check.mjs が実時間で開く（layout-check とは別の検査）。
-    if (mode === 'render') return renderHarness(w);
+    // 🚨 **検査用のトークンを iframe に渡す。**
+    //    これが無いと --allow-exec 付きでもコンソールは「トークンが無い」の一文になり、
+    //    **コマンドバーも監視盤の行も1つも描かれないまま「測った」ことになる**
+    //    （「capability を切ると描かれない UI は、検査でも描かれない」の再発）。
+    // 🔒 見せてよいのは **既にトークンを持っている要求だけ**（/api/v0/session と同じ規則）。
+    //    呼び出し側が presentedToken を通ったときだけ token を渡してくる。
+    const q = token ? `&token=${encodeURIComponent(token)}` : '';
+    if (mode === 'render') return renderHarness(w, q);
     return `<!doctype html><meta charset="utf-8"><title>layout probe</title>
 <body style="margin:0">
-<iframe id="f" src="/?probe=1" style="width:${w}px;height:2000px;border:0"></iframe>
+<iframe id="f" src="/?probe=1${q}" style="width:${w}px;height:2000px;border:0"></iframe>
 <pre id="out"></pre>
 <script type="module">
 const f = document.getElementById('f');
@@ -215,8 +222,15 @@ const badges = [...doc.querySelectorAll('.ref')].filter(drawn);
 // 描かれているのに幅が無い = overflow:hidden や循環参照で情報が消えている
 const squashed = badges.filter(e => rect(e).width < 24)
   .map(e => e.textContent.trim() + ' w=' + Math.round(rect(e).width));
+// 🚨 **測っている対象が存在することを一緒に返す。**
+// トークンが無いと実行系の UI は「使えません」の一文になり、
+// **溢れも hidden も測らないまま緑**になる（実際にこの状態だった）。
+const cmdbars = [...doc.querySelectorAll('.cmdbar')].filter(drawn).length;
+const monitorRows = [...doc.querySelectorAll('[data-pane-id="monitor"] .ab')].filter(drawn).length;
 document.getElementById('out').textContent = JSON.stringify({
   innerWidth: vw,
+  drawnCmdbars: cmdbars,
+  drawnMonitorRows: monitorRows,
   bodyScrollWidth: doc.body.scrollWidth,
   bodyClientWidth: doc.body.clientWidth,
   overflowing: over.slice(0, 12),
@@ -1418,7 +1432,8 @@ async function handleRequest(req, res) {
         if (opts.layoutProbe && url.pathname === '/__probe') {
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
             res.end(probeHarness(Number(url.searchParams.get('w')),
-                url.searchParams.get('mode')));
+                url.searchParams.get('mode'),
+                presentedToken(req, url) ? opts.token : null));
             return;
         }
         // クライアントが書き込み可否とトークンを知るための経路。

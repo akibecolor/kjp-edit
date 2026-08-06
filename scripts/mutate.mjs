@@ -1389,6 +1389,34 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: '全セッションの状態と最後の出力',
     },
     {
+        // 🚨 **レイアウトの検査にも変異を1件も掛けていなかった**（render だけ掛けていた）。
+        //    「実ブラウザの検査も突然変異に掛ける」と書いておきながら、
+        //    layout-check.mjs を動かす変異が0件 = 検査が壊れても誰も気付かない状態。
+        name: 'probe-token-passthrough',
+        why: 'レイアウト検査のハーネスにトークンを渡さない'
+            + '（実行系の UI が「使えません」の一文になり、'
+            + 'コマンドバーも監視盤も描かれないまま「測った」ことになる）',
+        file: 'v0/server.mjs',
+        from: '                presentedToken(req, url) ? opts.token : null));',
+        to: '                null));',
+        gone: 'presentedToken(req, url) ? opts.token : null));',
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        name: 'hidden-author-rule',
+        why: '作者スタイルの [hidden] 規則を消す（UA の [hidden]{display:none} は'
+            + '.cmdbar の display:flex に負けるので、送れないのに入力欄が描かれる）',
+        file: 'v0/app.html',
+        from: '  [hidden] { display: none !important; }',
+        to: '  /* 変異: 作者側の [hidden] 規則を消す */',
+        gone: 'display: none !important',
+        // ⚠️ **`!important` を外すだけでは落ちない（実測で SURVIVED）。**
+        //    `[hidden]` は `.cmdbar` より**後ろ**にあるので、同じ詳細度なら
+        //    順序で勝つ。守りの本体は「作者スタイルに規則があること」で、
+        //    `!important` は順序が入れ替わったときの保険（順序が守りになっている例）。
+        script: 'v0/layout-check.mjs',
+    },
+    {
         name: 'monitor-glance-raw',
         why: '会話の最後の応答を解釈せず生の stream-json を返す'
             + '（監視盤に JSON が並び、「どれが待っているか」が読めない）',

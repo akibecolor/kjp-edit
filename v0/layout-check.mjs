@@ -44,6 +44,10 @@ async function findBrowser() {
 const repoArg = process.argv.indexOf('--repo');
 const repo = repoArg !== -1 ? process.argv[repoArg + 1] : process.cwd();
 
+// 🚨 **検査用のトークン。** サーバ起動とハーネスの URL で同じ値を使う
+//    （別々に書くと片方だけ変えて「描かれないのに緑」に戻る）。
+const TOKEN = 'layout-check-token-0123456789';
+
 const browser = await findBrowser();
 if (!browser) {
     console.log('– layout: skipped (Chrome/Edge が見つからない)');
@@ -57,7 +61,7 @@ const server = spawn(process.execPath,
     //    （select + 入力 + ボタン3つ）が描かれないので測れない**。
     //    ボタンを1つ足したときに 390px で溢れても気付けなかった。
     [SERVER, '--repo', repo, '--port', '0', '--layout-probe', '--watch-agents',
-        '--allow-exec', '--token', 'layout-check-token-0123456789'],
+        '--allow-exec', '--token', TOKEN, '--allow-write'],
     { shell: false, windowsHide: true });
 server.stdout.setEncoding('utf8');
 server.stderr.setEncoding('utf8');
@@ -93,7 +97,7 @@ async function measure(width) {
         ...(process.env.CI ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
         `--user-data-dir=${profile}`, '--window-size=1200,2100',
         '--virtual-time-budget=8000', '--dump-dom',
-        `${baseUrl}/__probe?w=${width}`,
+        `${baseUrl}/__probe?w=${width}&token=${TOKEN}`,
     ], { shell: false, windowsHide: true });
     let out = '';
     child.stdout.setEncoding('utf8');
@@ -112,9 +116,62 @@ async function measure(width) {
     return JSON.parse(decode(m[1]));
 }
 
+/**
+ * 🚨 **監視盤の行を測るには、走っているセッションが1本必要。**
+ *
+ * 行が無いと監視盤は「セッションはありません」の一文で、
+ * **入力欄もボタンも描かれない = 狭い画面で溢れても気付けない**。
+ * ⚠️ keepAlive にする（購読をすぐ切るので、猶予で殺されると測る前に消える）。
+ * ⚠️ 起動したものは finally で必ず止める（取り残しを作らない）。
+ */
+async function startProbeSession() {
+    let id = null;
+    let reader = null;
+    try {
+        const res = await fetch(`${baseUrl}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: [process.execPath, '-e', 'setTimeout(() => {}, 120000)'],
+                keepAlive: true,
+            }),
+        });
+        // 1行目が {t:"session", id}。id を取ったら購読はやめる（走り続ける）
+        reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (let i = 0; i < 50 && id === null; i++) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            const nl = buf.indexOf(String.fromCharCode(10));
+            if (nl === -1) continue;
+            const rec = JSON.parse(buf.slice(0, nl));
+            if (rec.t === 'session') id = rec.id;
+        }
+    } catch (err) {
+        console.log(`   ⚠ 監視盤用のセッションを起動できませんでした: ${err.message}`);
+    } finally {
+        // 🚨 **AbortController で切らない。** Windows では、閉じかけの handle を
+        //    abort すると libuv が
+        //    `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` で**異常終了**し、
+        //    「✔ layout」を出した直後に exit が 0 でなくなる
+        //    （検査は通っているのに落ちて見える。実測）。
+        //    reader を cancel すれば本文が正しく閉じ、サーバも切断を検知する。
+        try { await reader?.cancel(); } catch { /* 既に閉じている */ }
+    }
+    return id;
+}
+
 const problems = [];
 const lines = [];
+let probeSession = null;
 try {
+    probeSession = await startProbeSession();
+    if (probeSession === null) {
+        problems.push('監視盤用のセッションが起動できなかった（行を測れない）');
+    }
     for (const width of [390, 768, 1280]) {
         const r = await measure(width);
         // iframe の幅が指定通りでないと、測っている対象が違う
@@ -141,17 +198,44 @@ try {
         if (r.visibleWorktreeBadges === 0) {
             problems.push(`幅 ${width}: worktree HEAD バッジが1つも描かれていない`);
         }
+        // 🚨 **測っている対象が本当に描かれていることを確かめる。**
+        //    トークンが無いと実行系の UI は「使えません」の一文になり、
+        //    溢れも hidden も測らないまま緑になる（この検査は実際にその状態だった。
+        //    「コマンドバーを測っている」というコメントが**嘘**になっていた）。
+        if (r.drawnCmdbars === 0) {
+            problems.push(`幅 ${width}: コマンドバーが1つも描かれていない`
+                + '（実行系の UI を測れていない = 溢れても気付けない）');
+        }
+        if (r.drawnMonitorRows === 0) {
+            problems.push(`幅 ${width}: 監視盤の行が1つも描かれていない`
+                + '（セッションを走らせて測る前提が崩れている）');
+        }
         lines.push(`  ${String(width).padStart(4)}px: 横溢れ ${overflows ? '✖' : 'なし'}`
             + ` / worktree HEAD ${r.visibleWorktreeBadges} 個・ref 込み ${r.visibleBadges} 個`
-            + ` / 潰れ ${r.squashedCount} / viewport 超過 ${r.overflowingCount} 件`);
+            + ` / 潰れ ${r.squashedCount} / viewport 超過 ${r.overflowingCount} 件`
+            + ` / コマンドバー ${r.drawnCmdbars} / 監視行 ${r.drawnMonitorRows}`);
     }
 } catch (err) {
     problems.push(err.message);
 } finally {
+    // 🚨 起動したセッションは必ず止める（Windows では server.kill() の
+    //    SIGTERM でハンドラが走らないので、子が残る）
+    if (probeSession) {
+        try {
+            await fetch(`${baseUrl}/api/v0/exec/${probeSession}/kill`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
+            });
+        } catch { /* サーバが既に落ちている */ }
+    }
     server.kill();
 }
 
 console.log(problems.length ? '✖ layout' : '✔ layout');
 for (const l of lines) console.log(l);
 for (const p of problems) console.log(`  ${p}`);
-process.exit(problems.length ? 1 : 0);
+// 🚨 **`process.exit()` で即死させない。** kill した子プロセスや閉じかけの
+//    HTTP 本文の handle が残っている状態で即死すると、Windows の libuv が
+//    `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` で**異常終了コード**を返し、
+//    「✔ layout」を出しているのに検査が落ちて見える（実測。原因を出力の中に探した）。
+process.exitCode = problems.length ? 1 : 0;

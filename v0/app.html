@@ -1797,4 +1797,11 @@ $('#refresh').addEventListener('click', () => load(true));
 await load();
 // 自動更新。差分更新なので走っているコンソールは壊れない
 setInterval(() => load(), 15000);
+// 🚨 **監視盤だけは速く更新する。** 15秒だと「今どれが待っているか」を
+//    見に来た時に古い状態が出る（並列で回すときに一番知りたいのがそこ）。
+//    行は id 単位で使い回すので、打っている途中の入力は消えない。
+//    ⚠️ 経路は exec の関門なので、トークンが無い状態では投げない（403 を量産しない）。
+if (session.allowExec && session.token) {
+  setInterval(() => { renderMonitor().catch(() => { /* 他は描き続ける */ }); }, 4000);
+}
 </script>
