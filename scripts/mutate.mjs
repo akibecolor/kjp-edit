@@ -1830,18 +1830,31 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/transcript.test.mjs',
     },
     {
-        name: 'relative-inside-depth',
-        why: '元表記の段数が足りないのに相対パスを返す'
-            + '（リポジトリ外の親ディレクトリ名を「リポジトリ相対パス」として出す）',
+        // 🚨 **この変異は以前 `defensive` で「junction が作れないので測れない」と
+        //    書いていたが、それは事実と違った**（9回目のレビューが指摘）。
+        //    `v0/paths.test.mjs` と `v0/transcript.test.mjs` は
+        //    `symlink(..., 'junction')` で実際に作れており、手元でも作れる。
+        //    つまり「未検証を defensive で誤魔化した」形だった（CLAUDE.md が禁じている）。
+        //    守り自体も作り直した（段を混ぜない）ので、字面ごと差し替える。
+        name: 'relative-inside-mix',
+        why: '元表記と解決後のパスから段を混ぜる'
+            + '（junction が段を跨ぐと、worktree の外のディレクトリ名が'
+            + '「中のパス」として payload に載り、存在しないパスを「触った」と表示する）',
         file: 'v0/git.mjs',
-        from: '    if (orig.length < depth) return null;',
-        to: '    /* 変異: 段数の対応を確かめない */',
-        gone: 'if (orig.length < depth) return null',
-        pattern: '元表記の段数が足りなければ',
-        testFile: 'v0/transcript.test.mjs',
-        defensive: '手元では junction が作れず（EPERM）、段数がずれる形を'
-            + '移植可能に作れないので落とせない。不変条件（返る段数 <= 元表記の段数）は'
-            + 'テストで固定してある。測れない理由を明示して残す',
+        from: [
+            '    if (sameSpelling) return rawChild.slice(rawParent.length + 1);',
+            '    return c.slice(p.length + 1);',
+        ].join('\n'),
+        // 変異: 元の実装（段を混ぜる形）に戻す
+        to: [
+            "    const depth = c.slice(p.length + 1).split('/').length;",
+            "    const orig = rawChild.split('/');",
+            '    if (orig.length < depth) return null;',
+            "    return orig.slice(orig.length - depth).join('/');",
+        ].join('\n'),
+        gone: 'if (sameSpelling) return rawChild.slice',
+        pattern: 'junction が段を跨いでも',
+        testFile: 'v0/paths.test.mjs',
     },
     {
         name: 'transcript-cwd-next-candidate',

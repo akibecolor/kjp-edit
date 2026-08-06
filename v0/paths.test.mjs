@@ -11,7 +11,7 @@ import { mkdtemp, rm, mkdir, symlink } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { samePath, containsPath, isSafeRepoPath, isSafeRef, git } from './git.mjs';
+import { samePath, containsPath, isSafeRepoPath, isSafeRef, git, relativeInside } from './git.mjs';
 
 test('samePath: 区切り文字の違いを吸収する', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kjp-path-'));
@@ -205,5 +205,59 @@ test('🚨 containsPath: まだ無いファイルでも別表記のリポジト�
             'リポジトリの隣は「外」でなければならない');
     } finally {
         await rm(dir, { recursive: true, force: true });
+    }
+});
+
+/**
+ * 🚨 **元表記と解決後のパスから「段を混ぜない」（9回目のレビュー。BLOCKING）。**
+ *
+ * 以前は解決後の残り段数だけ元表記の末尾を採っていたので、junction / symlink が
+ * 段を跨ぐと**2つの綴りの断片が合成され**、実測でこうなった:
+ *   - pnpm 形（`node_modules/foo` → `.pnpm/foo@1/node_modules/foo`）で
+ *     **worktree の外の親ディレクトリ名**が「中のパス」として出た
+ *   - 外から中を指すリンクで**外のディレクトリ名**が `outside:false` で payload に載った
+ *   - リポジトリに**存在しないパス**を「触ったファイル」として断定表示した
+ * `isSafeRepoPath` を通る形なので、どの守りにも掛からなかった。
+ *
+ * ⚠️ これは**攻撃者を要さない**（pnpm や dotfiles の symlink で普通に起きる）。
+ * ⚠️ リンクが作れない環境では `t.skip()`（「測れていない」と出す。緑に見せない）。
+ */
+test('🚨 junction が段を跨いでも、リポジトリ外の名前を「中のパス」にしない', async t => {
+    const base = await mkdtemp(join(tmpdir(), 'kjp-mix-'));
+    try {
+        // pnpm 形: <base>/PRIVATE-NAME/repo/node_modules/foo → 同 repo の深い実体
+        const repo = join(base, 'PRIVATE-NAME', 'repo');
+        const real = join(repo, 'node_modules', '.pnpm', 'foo@1', 'node_modules', 'foo');
+        await mkdir(real, { recursive: true });
+        const link = join(repo, 'node_modules', 'foo');
+        try {
+            await symlink(real, link, process.platform === 'win32' ? 'junction' : 'dir');
+        } catch (e) {
+            t.skip(`リンクを作れないので測れていません: ${e.code}`);
+            return;
+        }
+        const rel = relativeInside(repo, join(link, 'index.js'));
+        assert.ok(rel !== null, 'リポジトリの中なのに外と言っている');
+        assert.ok(!rel.includes('PRIVATE-NAME'),
+            `worktree の外のディレクトリ名が相対パスに入っている: ${rel}`);
+        // 記録の綴りで完結している（段を混ぜていない）
+        assert.equal(rel, 'node_modules/foo/index.js');
+
+        // 外から中の深い場所を指すリンク: 外の名前を1文字も出さない
+        const deep = join(repo, 'v0', 'deep');
+        await mkdir(deep, { recursive: true });
+        const outLink = join(base, 'OUTSIDE-SECRET', 'k');
+        await mkdir(join(base, 'OUTSIDE-SECRET'), { recursive: true });
+        await symlink(deep, outLink, process.platform === 'win32' ? 'junction' : 'dir');
+        const rel2 = relativeInside(repo, join(outLink, 'x.txt'));
+        assert.ok(rel2 === null || !rel2.includes('OUTSIDE-SECRET'),
+            `リポジトリ外のディレクトリ名が漏れている: ${rel2}`);
+        // 実体は中なので、出すなら**実体側の綴り**で出す（存在しないパスにしない）
+        if (rel2 !== null) assert.equal(rel2, 'v0/deep/x.txt');
+    } finally {
+        for (let i = 0; i < 20; i++) {
+            try { await rm(base, { recursive: true, force: true }); break; }
+            catch { await new Promise(r => setTimeout(r, 200)); }
+        }
     }
 });

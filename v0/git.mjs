@@ -452,22 +452,37 @@ export function relativeInside(parent, child) {
     if (p === '' || c === '') return null;
     if (c === p) return '';
     if (!c.startsWith(`${p}/`)) return null;
-    const depth = c.slice(p.length + 1).split('/').length;
+    // 🚨 **元表記と解決後のパスから「段を混ぜない」（9回目のレビュー。BLOCKING）。**
+    //
+    //    以前は解決後の残り段数（depth）だけ元表記の末尾を採っていた。junction /
+    //    symlink が段を跨ぐと**2つの綴りの断片が合成され**、実測でこうなった:
+    //      (A) pnpm 形（`node_modules/foo` → `.pnpm/foo@1/node_modules/foo`）で
+    //          `PRIVATE-FOLDER-NAME/repo/node_modules/foo/index.js` =
+    //          **worktree の外の親ディレクトリ名**が「中のパス」として出た
+    //      (B) 外から中を指すリンクで `OUTSIDE-SECRET-DIRNAME/k/x.txt` が
+    //          `outside:false` で payload に載った（外の名前が読み取り権限で漏れる）
+    //      (C) `j/git.mjs` のように**リポジトリに存在しないパス**を
+    //          「触ったファイル」として断定表示した
+    //    `isSafeRepoPath` は通る形なので、どの守りにも掛からなかった。
+    //
+    //    直し方: **どちらか一方の綴りで完結させる。**
+    //      1. 元表記が**文字列として**親の下にあるなら、元表記だけで相対を作る
+    //         （利用者が書いた綴りをそのまま見せられる。8.3 短縮名や大文字小文字の
+    //          違いで解決後と食い違っても、記録の綴りが正しい表示）
+    //      2. そうでなければ**解決後のパスだけ**で相対を作る（リンク越しでも
+    //         実体は中なので「中」と言ってよい。表示は実体側の綴りになる）
+    //    どちらも段を混ぜないので、外の名前が入り込む経路が無い。
     const isWin = process.platform === 'win32';
-    const orig = toNFC(child)
+    const flat = s => toNFC(s)
         .replace(isWin ? /[\\/]+/g : /\/+/g, '/')
-        .replace(/\/+$/, '')
-        .split('/');
-    // 🚨 **元表記の残り段数が depth より少ないなら諦める（null = 外として扱う）。**
-    //    junction / symlink が**リポジトリの中の深い場所**を指していて、記録が
-    //    その外側の綴りを使っていると、解決後の残り段数が元表記の段数を上回り、
-    //    `orig.slice(-depth)` が**リポジトリ外の親ディレクトリ名を巻き込む**。
-    //    それが `isSafeRepoPath` を通るので `outside:false` で payload に載り、
-    //    「リポジトリ外のパスは出さない」が破れる（外のディレクトリ名が漏れ、
-    //    存在しないパスを「触ったファイル」として表示する嘘にもなる）。
-    //    ⚠️ ここは**推測して埋めない**。対応が取れないなら外と言う（7回目のレビュー）。
-    if (orig.length < depth) return null;
-    return orig.slice(orig.length - depth).join('/');
+        .replace(/\/+$/, '');
+    const rawParent = flat(parent);
+    const rawChild = flat(child);
+    const sameSpelling = isWin
+        ? rawChild.toLowerCase().startsWith(`${rawParent.toLowerCase()}/`)
+        : rawChild.startsWith(`${rawParent}/`);
+    if (sameSpelling) return rawChild.slice(rawParent.length + 1);
+    return c.slice(p.length + 1);
 }
 
 /**
