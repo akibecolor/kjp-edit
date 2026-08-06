@@ -16,7 +16,7 @@ import { request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { mkdtemp, rm, writeFile, mkdir, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('./server.mjs', import.meta.url));
@@ -1450,6 +1450,90 @@ test('🔒 merge: カスタム merge driver があるリポジトリでは実行
         await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
         await g(['branch', '-D', 'mgd'], repo).catch(() => {});
         await rm(wt, { recursive: true, force: true }).catch(() => {});
+    }
+});
+/**
+ * 🔒 **merge も filter を断る（8回目のレビュー）。**
+ *
+ * 読み取り経路では filter を `cat` に潰して読むが、**取り込みでは潰せない** —
+ * smudge を潰したまま merge すると作業ツリーに書かれる中身が変わる
+ * （git-lfs ならポインタで実体を上書きする）。driver と同じ「断る」に倒す。
+ */
+test('🔒 merge: リポジトリ設定の filter があるときは実行しない', async () => {
+    const { child, url } = await startWritable();
+    const stem = repo.split(sep).pop();
+    const wt = join(repo, '..', `${stem}-mgf`);
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'mgf', wt, 'main'], repo);
+        await g(['config', 'filter.evil.clean', 'false'], repo);
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': WRITE_TOKEN,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: wt, branch: 'agent-a' }),
+        });
+        assert.equal(r.status, 409, 'filter があるのに取り込んだ（任意コマンドが走る）');
+        assert.match((await r.json()).error, /filter/);
+    } finally {
+        child.kill();
+        await g(['config', '--unset', 'filter.evil.clean'], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'mgf'], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+    }
+});
+/**
+ * 🔒 **merge がリポジトリ設定の署名プログラムを起動しない（8回目のレビュー）。**
+ *
+ * hooks と merge driver は潰していたのに、`commit.gpgsign=true` +
+ * `gpg.program=<任意>` は同じ `.git/config` に書けるので**書き込みの capability で
+ * 任意プログラム実行**になっていた（実測: 409 を返しながら marker が書かれた）。
+ */
+test('🔒 merge が commit.gpgsign / gpg.program を起動しない', async () => {
+    const { child, url } = await startWritable();
+    const stem = repo.split(sep).pop();
+    const wt = join(repo, '..', `${stem}-mgg`);
+    const marker = join(repo, 'gpg-ran.txt').split(sep).join('/');
+    const fake = join(repo, 'fakegpg.sh').split(sep).join('/');
+    try {
+        await writeFile(fake, `#!/bin/sh
+printf ran > "${marker}"
+exit 1
+`, 'utf8');
+        const { chmod } = await import('node:fs/promises');
+        await chmod(fake, 0o755);
+        await g(['worktree', 'add', '-q', '-b', 'mgg', wt, 'main'], repo);
+        // 衝突しない枝を用意する（成功経路で署名が走ることを見たい）
+        await writeFile(join(wt, 'mgg-only.txt'), `x${'\n'}`, 'utf8');
+        await g(['add', '-A'], wt);
+        await g(['commit', '-q', '-m', 'mgg 側'], wt);
+        await g(['config', 'commit.gpgsign', 'true'], repo);
+        await g(['config', 'gpg.program', fake], repo);
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': WRITE_TOKEN,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: wt, branch: 'agent-a' }),
+        });
+        await r.text();
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(join(repo, 'gpg-ran.txt')), false,
+            'gpg.program が起動した（書き込みの capability で任意プログラム実行）');
+    } finally {
+        child.kill();
+        await g(['config', '--unset', 'commit.gpgsign'], repo).catch(() => {});
+        await g(['config', '--unset', 'gpg.program'], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'mgg'], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+        await rm(join(repo, 'gpg-ran.txt'), { force: true }).catch(() => {});
+        await rm(join(repo, 'fakegpg.sh'), { force: true }).catch(() => {});
     }
 });
 test('🚨 checkout はシーケンサ停止中を拒否する（git は通してしまう操作）', async () => {
@@ -4137,5 +4221,46 @@ test('中継が申告しなければ null（「分からない」を「無い」
     } finally {
         child.kill();
         await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **`.gitattributes` の filter は capability ゼロで任意コマンドを実行する（8回目のレビュー）。**
+ *
+ * `core.fsmonitor` と**完全に同じクラス**の穴が filter 側に残っていた。
+ * コミット済みの `.gitattributes`（`*.txt filter=evil`）と `.git/config` の
+ * `[filter "evil"] clean = <コマンド>` の2つで、**フラグを1つも付けていない
+ * 読み取り専用デーモンが `/api/v0/state` を1回処理するだけで実行する**
+ * （`git status` は作業ツリーと index の中身を比べるときに clean filter を通す）。
+ * ⚠️ 中身のサイズが同じでないと git は比較を省くので、**同じ長さで**書き換える。
+ */
+test('🚨 status がリポジトリ設定の filter を実行しない（capability ゼロでの RCE）', async () => {
+    // ⚠️ git の設定に入れる値なので区切りを / に直す（バックスラッシュはエスケープ扱い）
+    const marker = join(repo, 'filter-ran.txt').split(sep).join('/');
+    const target = join(repo, 'filtered.txt');
+    try {
+        await writeFile(target, 'aaaa\n', 'utf8');
+        await writeFile(join(repo, '.gitattributes'), 'filtered.txt filter=evil\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: filter のテスト用'], repo);
+        await g(['config', 'filter.evil.clean', `sh -c "printf ran > '${marker}'; cat"`], repo);
+        // 同じ長さで書き換える（サイズが違うと git は中身を比べない = filter が走らない）
+        await writeFile(target, 'bbbb\n', 'utf8');
+
+        const s = await state();
+        await new Promise(r => setTimeout(r, 400));
+        const { existsSync } = await import('node:fs');
+        assert.equal(existsSync(marker), false,
+            'filter が実行された（フラグ無しの読み取り経路から任意コード実行）');
+        // 無効化したことを必ず伝える（変更ありの判定が実際と違いうるので）
+        assert.ok(s.errors.some(e => /filter/.test(e.message)),
+            `filter を無効化した旨が errors に無い: ${JSON.stringify(s.errors)}`);
+    } finally {
+        await g(['config', '--unset', 'filter.evil.clean'], repo).catch(() => {});
+        await rm(marker, { force: true });
+        await rm(target, { force: true });
+        await rm(join(repo, '.gitattributes'), { force: true });
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: filter のテスト後片付け'], repo).catch(() => {});
     }
 });

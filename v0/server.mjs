@@ -20,6 +20,7 @@ import {
     changedFiles, worktreeStatus, sequencerState,
     refMap, resolveRef, worktreeGitDirs, stats,
     showBlob, fileDiff, toNFC, samePath, containsPath, isSafeRef, mergePreview, mergeDriverNames,
+    repoFilterNames,
 } from './git.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
@@ -315,6 +316,20 @@ async function collectFresh() {
 
     const base = await guessBase(cwd, refs);
 
+    // 🔒 **`.gitattributes` の filter を潰す（capability ゼロでの任意コード実行を止める）。**
+    //    `core.fsmonitor` と同じクラスの穴で、`git status` が作業ツリーと index を
+    //    比べるときに clean filter を実行する（実測で marker が書かれた。8回目のレビュー）。
+    //    ⚠️ 1リポジトリあたり 2 spawn（--local と --worktree）。worktree の本数には比例しない。
+    const filters = await repoFilterNames(cwd);
+    if (filters.length) {
+        errors.push({
+            scope: 'repo',
+            message: `リポジトリ設定の filter（${filters.map(f => f.name).join(', ')}）を無効化して読みました`
+                + '（`.gitattributes` の filter は任意コマンドを実行できるため）。'
+                + ' 変更ありの判定が実際と違うことがあります。',
+        });
+    }
+
     // 各 worktree の状態を並行に集める。1本が壊れても他は出す。
     // 1本あたり 3 プロセス (status / rev-list / diff) に抑える。
     // ref の解決は refs 表、$GIT_DIR は gitDirs 表を引くので spawn しない。
@@ -335,7 +350,7 @@ async function collectFresh() {
         }
 
         const [status, seq] = await Promise.all([
-            worktreeStatus(wt.path).catch(e => {
+            worktreeStatus(wt.path, filters).catch(e => {
                 errors.push({ scope: wt.label, message: `status: ${e.message}` });
                 return wt.status;
             }),
@@ -1952,6 +1967,20 @@ async function handleRequest(req, res) {
                 return;
             }
 
+            // 2b. 🔒 **`.gitattributes` の filter も同じ理由で断る。**
+            //     読み取り経路では `cat` に潰して読むが、**取り込みでは潰せない** —
+            //     smudge を潰したまま merge すると**作業ツリーに書かれる中身が変わる**
+            //     （git-lfs ならポインタのまま実体を上書きする）。潰すのも走らせるのも
+            //     危ないので、driver と同じ「実行そのものを断る」に倒す（8回目のレビュー）。
+            const filterNames = await repoFilterNames(wt.path);
+            if (filterNames.length) {
+                denyJson(res, 409,
+                    `リポジトリ設定の filter があります（${filterNames.map(f => f.name).join(', ')}）。`
+                    + ' filter は任意コマンドを起動し、無効化すると作業ツリーの中身が変わるので、'
+                    + '画面からの取り込みは行いません。端末で実行してください');
+                return;
+            }
+
             // 1. 衝突すると予測されたら実行しない（作業ツリーを衝突状態にしない）
             const from = wt.shortBranch ?? wt.head ?? 'HEAD';
             let pre;
@@ -1982,6 +2011,14 @@ async function handleRequest(req, res) {
             try {
                 await git([
                     '-c', `core.hooksPath=${emptyHooks}`,
+                    // 🔒 **署名も「リポジトリ設定のプログラム」。**
+                    //    `commit.gpgsign=true` + `gpg.program=<任意>` は同じ .git/config に
+                    //    書けるので、hooks と driver だけ潰しても穴が残っていた
+                    //    （実測: 409 を返しながら gpg.program が走って marker が書かれた）。
+                    //    検証側（merge.verifySignatures）も同じプログラムを起動する。
+                    '-c', 'commit.gpgsign=false',
+                    '-c', 'merge.verifySignatures=false',
+                    '-c', 'gpg.program=false',
                     'merge', '--no-edit', '--end-of-options', branch,
                 ], { cwd: wt.path, optionalLocks: true });
             } catch (err) {

@@ -338,8 +338,20 @@ export function summarize(lines, {
             if (b.type === 'text') {
                 out.talk++;
                 if (allowText && out.text.length < limits.maxText) {
-                    const t = clip(b.text, limits.textChars);
-                    if (t) out.text.push({ at, role: r.type === 'assistant' ? 'assistant' : 'user', text: t });
+                    // 🔒 **発話にもマスクを掛ける（8回目のレビュー。BLOCKING）。**
+                    //    発話とコマンド行は**同じ `--allow-transcript-text`・同じ read 権限**で
+                    //    同じ payload に出るのに、マスクはコマンド行にしか掛かっていなかった。
+                    //    「次を実行してください: … --token X」「トークンは … です」の形で
+                    //    実行トークンが平文で出るので、**read が RCE に昇格する**
+                    //    （7回目にコマンド行側で閉じた穴と同一クラス）。
+                    const masked = maskSecrets(b.text, secrets);
+                    const t = clip(masked.text, limits.textChars);
+                    if (t) {
+                        const item = { at, role: r.type === 'assistant' ? 'assistant' : 'user', text: t };
+                        // 落としたことは必ず告知する（コマンド行と同じ扱い）
+                        if (masked.masked) item.masked = true;
+                        out.text.push(item);
+                    }
                 }
             }
         }

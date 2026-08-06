@@ -268,8 +268,12 @@ export async function changedFiles(cwd, base, head) {
  *    旧パスが `1 `/`2 `/`? `/`u ` で始まっていると二重にカウントされる。
  *    （`log()` の `%D` で踏んだのと同じ罠をここでも踏んでいた。レビューで発覚）
  */
-export async function worktreeStatus(cwd) {
-    const stdout = await git(['status', '--porcelain=v2', '-z', '--untracked-files=normal'], { cwd });
+export async function worktreeStatus(cwd, filterNames = []) {
+    const stdout = await git(
+        [...filterNeutralizeArgs(filterNames),
+            'status', '--porcelain=v2', '-z', '--untracked-files=normal'],
+        { cwd },
+    );
     const entries = splitZ(stdout);
     let changed = 0, untracked = 0, unmerged = 0;
     for (let i = 0; i < entries.length; i++) {
@@ -647,6 +651,76 @@ const MAX_MERGE_TREE_BYTES = 2 * 1024 * 1024;
  *    （`--allow-write` も不要。レビューでビーコン付きで実証された）。
  *    `core.fsmonitor` と同じクラスの穴。
  */
+/**
+ * 🔒 **`.gitattributes` の filter を無効化する引数を組む。**
+ *
+ * `core.fsmonitor` と**完全に同じクラスの穴**が filter 側に残っていた（8回目のレビュー）。
+ * コミット済みの `.gitattributes`（`*.txt filter=evil`）と `.git/config` の
+ * `[filter "evil"] clean = <コマンド>` の2つで、**capability ゼロの読み取り専用デーモンが
+ * `/api/v0/state` を1回処理するだけでコマンドを実行する**（`git status` は作業ツリーと
+ * index の中身を比べるときに clean filter を通す。実測で marker が書かれた）。
+ * `.git/config` を書けるのは並行して動いている別のエージェントなので、
+ * まさにこのツールの脅威モデルの中心。
+ *
+ * ⚠️ **潰し方は実測で選んだ（組み合わせを1つずつ切り分けた）。**
+ *   | 渡すもの | filter を止める | `required=true` でも動く |
+ *   |---|---|---|
+ *   | `clean=cat` | ✔ | ✔ |
+ *   | `clean=`（空） | ✔ | ✖ `fatal: clean filter failed` |
+ *   | `process=`（空） | ✔ | ✖ fatal |
+ *   | `smudge=cat` | **✖ 止まらない** | — |
+ *
+ * だから **`clean=cat` を常に渡し、`process` は設定されているときだけ潰す**。
+ * `process` は `clean` より優先されるので潰さないと素通りするが、
+ * 潰すと `required=true` の filter で status が fatal になる
+ * （git-lfs は既定で required。**全部潰すと lfs のリポジトリで読み取りが壊れる**）。
+ * 壊れる側に倒すのは意図的: 実行させるより「読めない」と言う方が安全。
+ * ⚠️ `smudge` は渡さない（読み取り経路では走らないので、**測れない守りは置かない**）。
+ *
+ * @param {{name: string, hasProcess: boolean}[]} filters `repoFilterNames()` の結果
+ */
+export function filterNeutralizeArgs(filters) {
+    const args = [];
+    for (const f of filters ?? []) {
+        const name = typeof f === 'string' ? f : f?.name;
+        if (!name) continue;
+        args.push('-c', `filter.${name}.clean=cat`);
+        if (f?.hasProcess) args.push('-c', `filter.${name}.process=`);
+    }
+    return args;
+}
+
+/**
+ * 🔒 **リポジトリに書かれた filter の名前を集める。**
+ *
+ * ⚠️ **`--local` と `--worktree` だけを見る。** `.git/config` は並行エージェントが
+ *    書ける（= 攻撃面）が、`~/.gitconfig` は利用者自身の設定。global まで潰すと
+ *    **git-lfs のリポジトリで status が全ファイル「変更」になり、観測が嘘になる**
+ *    （lfs は clean/smudge/process を使うので、`cat` で素通しすると
+ *     index のポインタと作業ツリーの実体を比べることになる）。
+ *    どちらを潰したかは呼び出し側が告知する。
+ */
+export async function repoFilterNames(cwd) {
+    /** name → process が設定されているか（潰し方が変わるので分ける） */
+    const found = new Map();
+    for (const scope of ['--local', '--worktree']) {
+        try {
+            // 1 = 該当なし / 128 = そのスコープが無い（extensions.worktreeConfig 未設定）
+            const out = await git(
+                ['config', scope, '--get-regexp', '^filter\\..*\\.(clean|smudge|process)$'],
+                { cwd, allowExit: [0, 1, 128] },
+            );
+            for (const l of out.split('\n')) {
+                const m = /^filter\.(.+)\.(clean|smudge|process)\s/.exec(l.trim());
+                if (!m) continue;
+                const prev = found.get(m[1]) ?? false;
+                found.set(m[1], prev || m[2] === 'process');
+            }
+        } catch { /* 判定できなければ空（呼び出し側が保守的に扱う） */ }
+    }
+    return [...found].map(([name, hasProcess]) => ({ name, hasProcess }));
+}
+
 export async function mergeDriverNames(cwd) {
     try {
         const out = await git(

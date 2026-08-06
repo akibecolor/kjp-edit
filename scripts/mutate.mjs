@@ -59,6 +59,56 @@ const MUTANTS = [
         pattern: 'DNS rebinding',
     },
     {
+        // 🚨 8回目のレビュー: fsmonitor と**同じクラス**の穴が filter 側に残っていた。
+        //    フラグ1つも付けない読み取り専用デーモンが status を1回叩くだけで実行する。
+        name: 'filter-neutralize',
+        why: '.gitattributes の filter を潰さない'
+            + '（capability ゼロの読み取り経路から任意コマンドが走る）',
+        file: 'v0/git.mjs',
+        from: "        args.push('-c', `filter.${name}.clean=cat`);",
+        to: '        /* 変異: clean を潰さない */',
+        gone: 'filter.${name}.clean=cat',
+        pattern: 'リポジトリ設定の filter を実行しない',
+    },
+    {
+        name: 'filter-status-passes-names',
+        why: 'status に filter の名前を渡さない（潰す仕組みがあっても効かない）',
+        file: 'v0/server.mjs',
+        from: '            worktreeStatus(wt.path, filters).catch(e => {',
+        to: '            worktreeStatus(wt.path).catch(e => {',
+        gone: 'worktreeStatus(wt.path, filters)',
+        pattern: 'リポジトリ設定の filter を実行しない',
+    },
+    {
+        name: 'filter-announced',
+        why: '潰したことを告知しない（変更ありの判定が実際と違うのに黙る）',
+        file: 'v0/server.mjs',
+        from: "            message: `リポジトリ設定の filter（${filters.map(f => f.name).join(', ')}）を無効化して読みました`",
+        to: '            message: `（告知を落とす変異）`',
+        gone: 'を無効化して読みました',
+        pattern: 'リポジトリ設定の filter を実行しない',
+    },
+    {
+        name: 'merge-refuses-filter',
+        why: 'filter があるリポジトリでも取り込む'
+            + '（任意コマンドが走る。潰すと作業ツリーの中身が変わるので断るしかない）',
+        file: 'v0/server.mjs',
+        from: '            const filterNames = await repoFilterNames(wt.path);\n            if (filterNames.length) {',
+        to: '            const filterNames = [];\n            if (filterNames.length) {',
+        gone: 'const filterNames = await repoFilterNames(wt.path);',
+        pattern: 'merge: リポジトリ設定の filter があるときは実行しない',
+    },
+    {
+        name: 'merge-no-gpgsign',
+        why: 'merge が commit.gpgsign / gpg.program を無効化しない'
+            + '（書き込みの capability で任意プログラム実行）',
+        file: 'v0/server.mjs',
+        from: "                    '-c', 'commit.gpgsign=false',",
+        to: '                    /* 変異: 署名を潰さない */',
+        gone: "'commit.gpgsign=false'",
+        pattern: 'merge が commit.gpgsign',
+    },
+    {
         name: 'fsmonitor',
         why: '読み取り経路がリポジトリ設定のコマンドを実行する',
         file: 'v0/git.mjs',
