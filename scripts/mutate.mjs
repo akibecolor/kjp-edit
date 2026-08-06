@@ -1369,6 +1369,28 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: 'argv は Cookie だけでは読めず',
     },
     {
+        // 🚨 トンネル越しは全部 127.0.0.1 に見えるので、中継の申告だけが手がかりになる
+        name: 'audit-origin-xff',
+        why: '中継の申告（x-forwarded-for）を記録しない'
+            + '（トンネル越しだと全部 127.0.0.1 なので「誰が動かしたか」が分からない）',
+        file: 'v0/server.mjs',
+        from: '        xffReported: first ? first.slice(0, 64) : null,',
+        to: '        xffReported: null,   /* 変異: 申告を捨てる */',
+        gone: 'first ? first.slice(0, 64) : null',
+        pattern: '中継の申告',
+    },
+    {
+        name: 'audit-origin-no-spoof',
+        why: '申告で peer を上書きする'
+            + '（自己申告は誰でも書けるので、記録が嘘をつくようになる）',
+        file: 'v0/server.mjs',
+        from: '        peer: req.socket.remoteAddress ?? null,\n        host: req.headers.host ?? null,',
+        to: '        peer: first ?? req.socket.remoteAddress ?? null,\n'
+            + '        host: req.headers.host ?? null,',
+        gone: 'peer: req.socket.remoteAddress ?? null,\n        host:',
+        pattern: '中継の申告',
+    },
+    {
         // 🚨 監視盤（N 個のエージェントを1画面で見る）の守り
         name: 'monitor-requires-exec',
         why: '全セッションの状態と出力を exec の関門なしで返す'

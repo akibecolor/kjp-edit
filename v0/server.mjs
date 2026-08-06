@@ -920,7 +920,7 @@ async function noteAuthFail(req, url) {
     }
     // 🔒 **本文は残さない。** 誰が何回外したかだけ
     await auditExec({
-        event: 'auth-failed', peer, host: req.headers.host ?? null,
+        event: 'auth-failed', ...originHint(req),
         path: url.pathname, count: rec.count,
     }).catch(() => { /* 監査に書けなくても応答は返す */ });
     const delay = authFailDelay(rec.count);
@@ -1035,6 +1035,31 @@ async function auditExec(entry) {
         // 監査に失敗しても実行は続ける。ただし黙らない
         console.error(`⚠ 監査ログを書けませんでした: ${err.message}`);
     }
+}
+
+/**
+ * 🔒 **記録に残す「どこから来たか」。**
+ *
+ * 🚨 **トンネル越しだと `peer` は必ず `127.0.0.1` になる。**
+ *    `tailscale serve` はこのマシンで TLS を終端して 127.0.0.1 に中継するので、
+ *    スマホからの実行も母艦のブラウザからの実行も**記録上は区別できない**
+ *    （実データで確認: `--exec` を開けた後の start/input が全部 127.0.0.1）。
+ *    「誰が動かしたか」を答えられないのは、観測ツールとしては黙っていてよい話ではない。
+ *
+ * ⚠️ **`x-forwarded-for` は自己申告で、認可には使えない。**
+ *    ループバックに届く相手なら誰でも好きな値を書ける。だから
+ *    **`xffReported`（申告）という名前で、値をそのまま信じない前提で残す。**
+ *    中継が付けていなければ null（「分からない」を「無い」と書かない）。
+ */
+function originHint(req) {
+    const raw = req.headers['x-forwarded-for'];
+    const first = typeof raw === 'string' ? raw.split(',')[0].trim() : null;
+    return {
+        peer: req.socket.remoteAddress ?? null,
+        host: req.headers.host ?? null,
+        // 長い値で記録を埋めない。形の検証はしない（申告をそのまま短く残す）
+        xffReported: first ? first.slice(0, 64) : null,
+    };
 }
 
 /**
@@ -1529,7 +1554,7 @@ async function handleRequest(req, res) {
                 await auditExec({
                     event: 'start', session: session.id, worktree: wt.path, argv,
                     keepAlive: session.keepAlive,
-                    peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
+                    ...originHint(req),
                 });
             } catch (err) {
                 // ⚠️ **spawn すらしていないことを記録に残す。** sweeper が拾うと
@@ -1805,7 +1830,7 @@ async function handleRequest(req, res) {
                     if (eof) execRegistry.emit(s, 'note', '（標準入力を閉じました）');
                     await auditExec({
                         event: 'input', session: s.id, bytes, eof,
-                        peer: req.socket.remoteAddress ?? null,
+                        ...originHint(req),
                     });
                     res.writeHead(200, {
                         'content-type': 'application/json; charset=utf-8',
@@ -1952,7 +1977,7 @@ async function handleRequest(req, res) {
             const emptyHooks = await mkdtemp(join(tmpdir(), 'kjp-nohooks-'));
             await auditExec({
                 event: 'merge', worktree: wt.path, from, branch,
-                peer: req.socket.remoteAddress ?? null, host: req.headers.host ?? null,
+                ...originHint(req),
             });
             try {
                 await git([

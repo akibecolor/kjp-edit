@@ -4087,3 +4087,55 @@ test('解決できない --base を渡してもエンドポイントは生きて
         child.kill();
     }
 });
+
+/**
+ * 🔒 **トンネル越しだと「誰が動かしたか」が記録から消える。**
+ *
+ * `tailscale serve` はこのマシンで TLS を終端して 127.0.0.1 に中継するので、
+ * **スマホからの実行も母艦のブラウザからの実行も記録上は同じ 127.0.0.1** になる
+ * （`--exec` をトンネルに開けた後の実データで確認した）。
+ * 中継が `x-forwarded-for` を付けているなら残す。ただし
+ * 🚨 **これは自己申告で認可には使えない**（ループバックに届く相手なら誰でも書ける）ので、
+ *    `xffReported` という名前にして、**peer を上書きしない**ことを固定する。
+ */
+test('🔒 監査は中継の申告（x-forwarded-for）を peer と別に残す', async () => {
+    const audit = join(repo, '..', `xff-audit-${Date.now()}.jsonl`);
+    const { child, url } = await startExec(['--audit-log', audit]);
+    try {
+        const r = await readExec(url, { worktree: repo, argv: ['git', '--version'] },
+            { 'x-forwarded-for': '100.88.242.31, 10.0.0.1' });
+        assert.equal(r.status ?? 200, 200, `実行できていない: ${JSON.stringify(r).slice(0, 120)}`);
+        await new Promise(res => setTimeout(res, 300));
+        const { readFile: rf } = await import('node:fs/promises');
+        const lines = (await rf(audit, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const start = lines.find(e => e.event === 'start');
+        assert.ok(start, `start が記録されていない: ${JSON.stringify(lines).slice(0, 200)}`);
+        // 申告は残る（左端 = 元の相手だけ。中継の連なりは残さない）
+        assert.equal(start.xffReported, '100.88.242.31',
+            `中継の申告が残っていない: ${JSON.stringify(start)}`);
+        // 🚨 **peer は上書きされない**（申告を実際の接続元として記録しない）
+        assert.match(start.peer, /127\.0\.0\.1|::1|::ffff:127/,
+            `申告で peer を上書きしている: ${start.peer}`);
+    } finally {
+        child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+test('中継が申告しなければ null（「分からない」を「無い」と書かない）', async () => {
+    const audit = join(repo, '..', `xff-none-${Date.now()}.jsonl`);
+    const { child, url } = await startExec(['--audit-log', audit]);
+    try {
+        await readExec(url, { worktree: repo, argv: ['git', '--version'] });
+        await new Promise(res => setTimeout(res, 300));
+        const { readFile: rf } = await import('node:fs/promises');
+        const lines = (await rf(audit, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const start = lines.find(e => e.event === 'start');
+        assert.ok(start, 'start が記録されていない');
+        assert.ok('xffReported' in start, 'キーごと落ちている（有無が読めない）');
+        assert.equal(start.xffReported, null);
+    } finally {
+        child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
