@@ -935,6 +935,95 @@ function keyPasteBox() {
 function consoleBody(wt, paneObj) {
   const box = el('div');
   box.style.cssText = 'display:flex;flex-direction:column;height:100%';
+
+  // 走っているセッションへの再接続口。**ここが無いと、切断しても走り続ける
+  // ようにした意味が半分無くなる**（戻ってきたのに追いつけない）。
+  // 🚨 **鍵が無い経路にも置く（8回目のレビュー。SERIOUS）。** 以前は
+  //    「実行の鍵が無い」で先に return していたので `showSessions` すら
+  //    定義されず、**走っているセッションと再接続口が黙って消えていた**。
+  //    しかもそれは `--allow-host`（= `--require-auth`）= スマホから使う
+  //    既定の構成なので、**一番使う経路で機能が無いのと同じ**だった。
+  const resume = el('div', 'note');
+  resume.hidden = true;
+  // 実行の鍵が無いなら押しても必ず 403 なので、ボタンは作らず理由を書く
+  const canReconnect = session.allowExec && session.canMutate;
+
+  /**
+   * この worktree で走っているセッションを出す。
+   * ⚠️ 自動更新のたびに作り直すが、**入力欄は作り直さない**（選択が飛ぶ）。
+   *    ここは表示だけなので作り直して良い。
+   * 🚨 **`hidden`（サーバが一覧を落とした）を黙って空にしない。**
+   *    読み取り用の鍵しか無い相手には `execSessions` を返さない
+   *    （argv はユーザが打ったコマンド行そのもので秘密が載りうるし、
+   *     Cookie はポートで分離されない）。**その分界は緩めない**が、
+   *    落としたことを言わないと「1本も走っていない」と区別できない。
+   */
+  paneObj.showSessions = (list, hidden) => {
+    // 🚨 **購読が変わった瞬間に出し直せるように、最後の一覧を持つ。**
+    //    持たないと、購読を始めてもボタンの字が次の自動更新（15秒）まで
+    //    「再接続」のままで、**両方見られると誤解させる**（実測で落ちた）。
+    if (list) paneObj.lastSessions = list;
+    if (hidden !== undefined) paneObj.sessionsHidden = hidden;
+    resume.replaceChildren();
+    if (paneObj.sessionsHidden) {
+      resume.hidden = false;
+      resume.append(document.createTextNode(
+        '⚠ このworktreeで走っているセッションの一覧は出せません'
+        + '（読み取り用の鍵ではコマンド行を返さないため）。'
+        + ' 実行の鍵を貼ると、走っているものと再接続口が出ます。'));
+      return;
+    }
+    const mine = (list ?? paneObj.lastSessions ?? []).filter(s => samePathish(s.worktree, wt.path)
+      && (s.state === 'starting' || s.state === 'running')
+      && s.id !== paneObj.sessionId);
+    resume.hidden = mine.length === 0;
+    if (!mine.length) return;
+    resume.append(document.createTextNode(
+      `⚠ このworktreeで ${mine.length} 件のセッションが走っています（別の画面から実行したもの）:`));
+    for (const s of mine) {
+      const row = el('div', 'ab');
+      row.append(document.createTextNode(`${s.argv.join(' ')} — ${Math.round(s.ageMs / 1000)}秒経過`));
+      if (s.detachedMs !== null && !s.keepAlive) {
+        row.append(el('span', 'note', ` / 切断中 ${Math.round(s.detachedMs / 1000)}秒`));
+      }
+      if (!canReconnect) {
+        // 押せば必ず 403 になるボタンは出さない。**できない理由を書く**
+        row.append(el('span', 'note', ' / 実行の鍵が無いので再接続も停止もできません'));
+        resume.append(row);
+        continue;
+      }
+      // ⚠️ **今すでに購読しているなら「切替」と言う。** 押すと前の購読は
+      //    abort され、端末も作り直される（2本を同じ端末に混ぜない）。
+      //    ボタンの字が「再接続」のままだと**両方見られる**と誤解させる。
+      const re = el('button', null, paneObj.sessionId ? '切替' : '再接続');
+      re.title = paneObj.sessionId
+        ? '今見ているセッションの購読をやめて、こちらに切り替えます（実行は止めません）'
+        : 'このセッションの出力を最初から再生します';
+      re.addEventListener('click', () => {
+        // 通番 0 から = 残っている分を全部再生してもらう
+        // 🚨 **会話モードを argv から復元する。** 渡さないと次の送信で生のテキストを
+        //    stdin に書き、claude が exit 1 で死んで会話が丸ごと消える（実測）
+        beginRun(s.argv, {
+          attach: { id: s.id, from: 0 },
+          chat: isChatArgv(s.argv),
+          keepAlive: s.keepAlive === true,
+        });
+      });
+      const kb = el('button', null, '停止');
+      kb.addEventListener('click', async () => {
+        kb.disabled = true;
+        try {
+          await fetch(`/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
+          });
+        } catch { /* 既に終わっている */ }
+      });
+      row.append(re, kb);
+      resume.append(row);
+    }
+  };
+
   // 🚨 同じ理由で、実行の鍵が無いなら実行のバーも出さない（必ず 403 になる）
   if (session.allowExec && !session.canMutate) {
     box.append(el('div', 'note warn',
@@ -942,6 +1031,7 @@ function consoleBody(wt, paneObj) {
       + ' 🔒 実行の鍵は URL に載せていません（履歴・ブックマーク・中継のログに残るため）。'
       + ' 起動時に表示された鍵を下に貼ってください（このタブだけが持ちます）。'));
     box.append(keyPasteBox());
+    box.append(resume);
     return box;
   }
   if (!session.allowExec) {
@@ -984,11 +1074,6 @@ function consoleBody(wt, paneObj) {
   input.addEventListener('input', refresh);
   sel.addEventListener('change', () => { input.value = sel.value; refresh(); });
   refresh();
-
-  // 走っているセッションへの再接続口。**ここが無いと、切断しても走り続ける
-  // ようにした意味が半分無くなる**（戻ってきたのに追いつけない）。
-  const resume = el('div', 'note');
-  resume.hidden = true;
 
   // 標準入力の欄（#18）。走っているセッションにだけ出す。
   // ⚠️ **自動更新で作り直さない。** 入力途中の文字が消える
@@ -1161,61 +1246,6 @@ function consoleBody(wt, paneObj) {
     beginRun(CHAT_ARGV, { chat: isChatArgv(CHAT_ARGV), keepAlive: true });
   });
 
-  /**
-   * この worktree で走っているセッションを出す。
-   * ⚠️ 自動更新のたびに作り直すが、**入力欄は作り直さない**（選択が飛ぶ）。
-   *    ここは表示だけなので作り直して良い。
-   */
-  paneObj.showSessions = list => {
-    // 🚨 **購読が変わった瞬間に出し直せるように、最後の一覧を持つ。**
-    //    持たないと、購読を始めてもボタンの字が次の自動更新（15秒）まで
-    //    「再接続」のままで、**両方見られると誤解させる**（実測で落ちた）。
-    if (list) paneObj.lastSessions = list;
-    const mine = (list ?? paneObj.lastSessions ?? []).filter(s => samePathish(s.worktree, wt.path)
-      && (s.state === 'starting' || s.state === 'running')
-      && s.id !== paneObj.sessionId);
-    resume.replaceChildren();
-    resume.hidden = mine.length === 0;
-    if (!mine.length) return;
-    resume.append(document.createTextNode(
-      `⚠ このworktreeで ${mine.length} 件のセッションが走っています（別の画面から実行したもの）:`));
-    for (const s of mine) {
-      const row = el('div', 'ab');
-      row.append(document.createTextNode(`${s.argv.join(' ')} — ${Math.round(s.ageMs / 1000)}秒経過`));
-      if (s.detachedMs !== null && !s.keepAlive) {
-        row.append(el('span', 'note', ` / 切断中 ${Math.round(s.detachedMs / 1000)}秒`));
-      }
-      // ⚠️ **今すでに購読しているなら「切替」と言う。** 押すと前の購読は
-      //    abort され、端末も作り直される（2本を同じ端末に混ぜない）。
-      //    ボタンの字が「再接続」のままだと**両方見られる**と誤解させる。
-      const re = el('button', null, paneObj.sessionId ? '切替' : '再接続');
-      re.title = paneObj.sessionId
-        ? '今見ているセッションの購読をやめて、こちらに切り替えます（実行は止めません）'
-        : 'このセッションの出力を最初から再生します';
-      re.addEventListener('click', () => {
-        // 通番 0 から = 残っている分を全部再生してもらう
-        // 🚨 **会話モードを argv から復元する。** 渡さないと次の送信で生のテキストを
-        //    stdin に書き、claude が exit 1 で死んで会話が丸ごと消える（実測）
-        beginRun(s.argv, {
-          attach: { id: s.id, from: 0 },
-          chat: isChatArgv(s.argv),
-          keepAlive: s.keepAlive === true,
-        });
-      });
-      const kb = el('button', null, '停止');
-      kb.addEventListener('click', async () => {
-        kb.disabled = true;
-        try {
-          await fetch(`/api/v0/exec/${s.id}/kill`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token ?? '' },
-          });
-        } catch { /* 既に終わっている */ }
-      });
-      row.append(re, kb);
-      resume.append(row);
-    }
-  };
   run.addEventListener('click', start);
   // 🚨 実行側も同じ（IME の確定 Enter で半端な argv を実行しない）
   input.addEventListener('keydown', e => {
@@ -2071,7 +2101,10 @@ function render(s) {
     }
     // 走っているセッションの一覧を毎回渡す。
     // ⚠️ 別の端末や再読込の前に始めたセッションはここからしか見つけられない
-    obj.showSessions?.(s.execSessions);
+    // 🚨 **「出せなかった」も一緒に渡す。** サーバは読み取り用の鍵しか無い相手には
+    //    一覧を落とす（argv に秘密が載りうる）。フラグを渡さないと
+    //    「1本も走っていない」と区別できず、**黙って空になる**（8回目のレビュー）。
+    obj.showSessions?.(s.execSessions, s.execSessionsHidden === true);
   }
   clearNotices($('#consoles'));
   if (!live.length) {
@@ -2130,9 +2163,25 @@ function openDiff(wt, path) {
 }
 
 /* ===== 読み込み ===== */
+/**
+ * 🚨 **トークンを持っているなら state にも送る（8回目のレビュー。SERIOUS）。**
+ *
+ * `/api/v0/state` の `execSessions` は「Cookie だけの相手には出さない」
+ * （argv にユーザが打った秘密が載りうるし、Cookie はポートで分離されない）。
+ * ここがヘッダを付けていなかったので、**`--require-auth`（= `--allow-host` の
+ * トンネル = スマホから使う既定の構成）では常に `execSessions: null` を受け取り、
+ * 走っているセッションと再接続口が黙って消えていた** — 切断をまたいで
+ * 再購読できるようにした（#17）目的そのものが、その構成でだけ到達不能だった。
+ *
+ * ⚠️ **分界は緩めない。** 読み取り用の派生秘密を送っても、サーバの
+ *    `presentedToken`（生の鍵のみ）は真にならないので一覧は出ない。
+ *    そのときは `execSessionsHidden` で告げられるので、UI は黙らずに案内する
+ *    （`showSessions`）。
+ */
 async function load(force = false) {
   try {
-    const res = await fetch(force ? '/api/v0/state?fresh=1' : '/api/v0/state');
+    const res = await fetch(force ? '/api/v0/state?fresh=1' : '/api/v0/state',
+      session.token ? { headers: { [session.tokenHeader]: session.token } } : {});
     const s = await res.json();
     if (s.error) throw new Error(s.error);
     render(s);

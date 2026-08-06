@@ -182,6 +182,38 @@ test('🚨 chatGlance: 解釈できない出力は生のまま返す（捨てな
     assert.deepEqual(g, { text: 'npm ERR! code ELIFECYCLE', interpreted: false });
 });
 
+/* 🚨 8回目のレビューの SERIOUS。**JSON 行 + 末尾の生テキスト**という混在形が
+      テストに1件も無く、`chatGlance` は末尾の非 JSON 行を無条件に飛ばして
+      **数分前の応答を「最後の出力」として返していた**（しかも interpreted:true
+      なので「← 解釈できない行」も付かない = 黙って捨てている）。
+      会話が死ぬ / 殺されるときに最後に来るのは必ず生テキストなので、
+      **止まったのに動いているように見える**（この盤で一番効く嘘）。 */
+
+test('🚨 chatGlance: 末尾の非 JSON 行を飛ばして古い応答を出さない（停止が消える）', () => {
+    const raw = `${assistant('これは3分前の応答')}⚠ 停止を要求されました\n`;
+    const g = chatGlance(raw);
+    assert.equal(g.text, '⚠ 停止を要求されました',
+        `末尾の行を捨てて前の応答を「最後の出力」にしている: ${JSON.stringify(g)}`);
+    assert.equal(g.interpreted, false,
+        '解釈できなかったのに interpreted:true（「← 解釈できない行」が付かない）');
+});
+
+test('🚨 chatGlance: 末尾が claude の stderr のときもそれを出す', () => {
+    // 実測の形（会話モードの子が死ぬときに最後に来る行）
+    const raw = `${assistant('ああああ')}Error parsing streaming input line: boom\n`;
+    const g = chatGlance(raw);
+    assert.match(g.text, /Error parsing streaming input line/,
+        '終わった理由が画面から消える');
+    assert.equal(g.interpreted, false);
+});
+
+test('🚨 chatGlance: 先頭が切れていて末尾も生テキストなら、末尾を出す', () => {
+    // 「先頭切れの救済」と「末尾を捨てない」は両立する（救済は先頭の1行だけ）
+    const raw = `e":"assistant"}}\n${assistant('途中の応答')}npm ERR! code ELIFECYCLE\n`;
+    assert.deepEqual(chatGlance(raw),
+        { text: 'npm ERR! code ELIFECYCLE', interpreted: false });
+});
+
 test('🚨 chatGlance: 知らない type も「表示していません」と言う（黙って消さない）', () => {
     const g = chatGlance(JSON.stringify({ type: 'control_response', subtype: 'deny' }));
     assert.equal(g.interpreted, true);

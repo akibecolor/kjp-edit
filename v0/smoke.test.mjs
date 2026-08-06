@@ -843,6 +843,64 @@ test('🔒 exec の argv は Cookie だけでは読めず、秘密はマスク�
         child.kill();
     }
 });
+/**
+ * 🚨 **`--require-auth` で走っているセッションが「無い」ことにならない
+ *    （8回目のレビュー。SERIOUS）。**
+ *
+ * `--allow-host`（= トンネル = スマホから使う既定の構成）は `--require-auth` を
+ * 自動でオンにする。案内の URL に載るのは**読み取り専用の派生秘密**なので、
+ * スマホのタブはまずそれを `x-kjp-token` で送って読む。
+ * ⚠️ **その相手に exec の argv を渡す分界は緩めない**（コマンド行に秘密が載りうるし、
+ *    Cookie はポートで分離されない）。しかし**落としたことを言わなければ**、
+ *    UI は `execSessions: null` を「1本も走っていない」と描き、
+ *    走っているセッションと再接続口が**黙って消える**（#17 の目的が到達不能）。
+ *
+ * ここで固定するのは server 側の契約:
+ *   (A) 読み取り用の鍵 → 200 / `execSessions: null` / **`execSessionsHidden: true`**
+ *   (B) 実行の鍵       → 200 / 一覧が出る（`load()` はこの鍵をヘッダで送る）
+ * UI が実際に案内するかは実ブラウザで測る（`v0/render-check.mjs` の読み取り鍵の検査）。
+ */
+test('🚨 --require-auth: 読み取り用の鍵では走っているセッションを出さないが、隠したと告げる', async () => {
+    const s = await startAuthServer(['--require-auth', '--allow-exec', '--token', EXEC_TOKEN]);
+    try {
+        const readKey = /\?token=([A-Za-z0-9_-]+)/.exec(s.banner())?.[1];
+        assert.ok(readKey, `案内の URL に読み取り用の鍵が出ていない: ${s.banner()}`);
+        assert.notEqual(readKey, EXEC_TOKEN, '案内の URL に生の鍵が載っている');
+
+        // 走っているセッションを1本用意する（実行の鍵で起こす）
+        const started = await fetch(`http://127.0.0.1:${s.port}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: [process.execPath, '-e', 'setTimeout(()=>{}, 5000)'],
+            }),
+        });
+        assert.equal(started.status, 200, '実行の鍵でセッションを作れない');
+        started.body?.cancel?.().catch(() => { /* 購読はしない */ });
+        await new Promise(r => setTimeout(r, 300));
+
+        // (A) 読み取り用の鍵をヘッダで送る = スマホのタブがやること
+        const viaRead = await authGet(s.port, '/api/v0/state?fresh=1',
+            { 'x-kjp-token': readKey });
+        assert.equal(viaRead.code, 200, '読み取り用の鍵で読めない');
+        const r = JSON.parse(viaRead.body);
+        assert.equal(r.execSessions, null, '読み取り用の鍵で exec の argv が読める');
+        assert.equal(r.execSessionsHidden, true,
+            '一覧を落としたのに黙っている（UI が「1本も走っていない」と描く）');
+
+        // (B) 実行の鍵をヘッダで送る = 画面で鍵を貼ったタブ
+        const viaToken = await authGet(s.port, '/api/v0/state?fresh=1',
+            { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(viaToken.code, 200);
+        const t = JSON.parse(viaToken.body);
+        assert.ok(Array.isArray(t.execSessions),
+            '実行の鍵でも一覧が出ない（走っているものへの再接続口が消える）');
+        assert.ok(t.execSessions.some(x => x.state === 'starting' || x.state === 'running'),
+            `走っているセッションが一覧に出ていない: ${viaToken.body.slice(0, 300)}`);
+        assert.ok(!t.execSessionsHidden, '出しているのに「隠した」と言っている');
+    } finally { s.child.kill(); }
+});
 test('🔒 認証失敗は記録され、連続失敗は遅くなる（本文は残さない）', async () => {
     const audit = join(repo, '..', `auth-audit-${Date.now()}.jsonl`);
     const child = spawn(process.execPath,
