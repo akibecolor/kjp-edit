@@ -1085,7 +1085,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'UI が import する共有モジュールを配信しない（import が1本 404 になると'
             + 'モジュール全体が実行されず**ページが真っ白**になる）',
         file: 'v0/server.mjs',
-        from: "            || url.pathname === '/chatfilter.mjs') {",
+        from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/pathlabel.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
@@ -1190,6 +1190,111 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         to: '                    /* 変異: 落としたことを言わない */',
         gone: 'entry.commandMasked = true',
         pattern: 'コマンド行から自分の資格情報を落とし',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        // 🚨 8回目のレビュー: 形ベースの検出が空白1文字しか見ていなかった。
+        //    タブは素通り、行継続は**継続の `\` をマスクして masked:true を立てる** =
+        //    「秘密を落としました」と表示しながら秘密を並べる（最も重い「嘘」）
+        name: 'transcript-mask-whitespace',
+        why: '秘密の区切りを空白1文字だけに戻す（タブで素通りし、行継続では'
+            + '継続文字だけをマスクして「落とした」と嘘をつく）',
+        file: 'v0/transcript.mjs',
+        from: 'const SECRET_WS = "\\\\s";',
+        to: 'const SECRET_WS = "[ ]";   /* 変異: 空白1文字しか見ない */',
+        gone: 'const SECRET_WS = "\\\\s"',
+        pattern: '秘密の区切りはタブ・改行・行継続',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-mask-continuation',
+        why: '行継続（`\\` + 改行）を畳まない（継続文字を「値」としてマスクし、'
+            + '秘密は次の行に残る。clip が畳むので綺麗な1行として payload に出る）',
+        file: 'v0/transcript.mjs',
+        from: '    let out = text.replace(CONTINUATION_RE, "");',
+        to: '    let out = text;   /* 変異: 行継続を畳まない */',
+        gone: 'text.replace(CONTINUATION_RE',
+        pattern: '秘密の区切りはタブ・改行・行継続',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-mask-quoted-value',
+        why: 'クォートで囲んだ値を1つとして食わない（`--password "pass phrase X"` の'
+            + ' `"pass` だけ落として残りを残す = 部分マスク。落としたと言いながら秘密が残る）',
+        file: 'v0/transcript.mjs',
+        from: 'const SECRET_VALUE = "(?:\\"[^\\"]*\\"?|\'[^\']*\'?|[^" + SECRET_WS + "\'\\"]+)";',
+        to: 'const SECRET_VALUE = "[^" + SECRET_WS + "]+";   /* 変異: クォートを見ない */',
+        gone: 'SECRET_VALUE = "(?:',
+        pattern: '秘密の区切りはタブ・改行・行継続',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-mask-auth-scheme',
+        why: '`authorization: Bearer <値>` の「Bearer」を値と見なして落とし、'
+            + 'トークンを残す（告知だけ立つので「落とした」と嘘をつく）',
+        file: 'v0/transcript.mjs',
+        from: 'const AUTH_SCHEME = "(?:(?:bearer|basic|token)" + SECRET_WS + "+)?";',
+        to: 'const AUTH_SCHEME = "";   /* 変異: スキーム語を値と見なす */',
+        gone: 'AUTH_SCHEME = "(?:',
+        pattern: '秘密の区切りはタブ・改行・行継続',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        // 🚨 8回目のレビュー: 発話（text[]）は同じ read 権限で同じ payload に出るのに
+        //    マスクがコマンド行にしか掛かっていなかった。守りは入ったが検査が無かった
+        name: 'transcript-text-mask-secrets',
+        why: '発話の秘密をマスクしない（「起動は … --token X です」の形で'
+            + '実行トークンが read 権限で読める = read → RCE に昇格する）',
+        file: 'v0/transcript.mjs',
+        from: '                    const masked = maskSecrets(b.text, secrets);',
+        to: '                    const masked = { text: b.text, masked: false };',
+        gone: 'maskSecrets(b.text, secrets)',
+        pattern: '発話からも資格情報を落とし',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-text-mask-announce',
+        why: '発話でマスクしたことを告知しない（コマンド行だけ告知して発話は'
+            + '黙って消す = 同じ約束を片方で破る）',
+        file: 'v0/transcript.mjs',
+        from: '                        if (masked.masked) item.masked = true;',
+        to: '                        /* 変異: 落としたことを言わない */',
+        gone: 'item.masked = true',
+        pattern: '発話からも資格情報を落とし',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        // 🚨 8回目のレビュー: 「(リポジトリ外)」を3つの別の理由で断言していた
+        name: 'transcript-path-root-is-inside',
+        why: 'worktree ルート自身を「外」と言う（`Grep`/`Glob` の `path` に'
+            + 'ルートを渡す形で普通に起き、実データに 5 件あった）',
+        file: 'v0/transcript.mjs',
+        from: "    if (rel === '') return { rel: null, why: 'root' };",
+        to: "    if (rel === '') return { rel: null, why: 'outside' };",
+        gone: "why: 'root' }",
+        pattern: 'パスが出せない理由を区別して表示する',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'transcript-path-unsafe-is-inside',
+        why: '中にあるが表示できない形（先頭が `-` や `:`）を「外」と言う'
+            + '（リポジトリ内のファイルに「外を触った」と断言する）',
+        file: 'v0/transcript.mjs',
+        from: "    if (!isSafeRepoPath(rel)) return { rel: null, why: 'unsafe' };",
+        to: "    if (!isSafeRepoPath(rel)) return { rel: null, why: 'outside' };",
+        gone: "why: 'unsafe' }",
+        pattern: 'パスが出せない理由を区別して表示する',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'pathlabel-outside-only',
+        why: 'パスが無い理由を全部「(リポジトリ外)」にする'
+            + '（app.html に書いていた元の形。安全に関わる誤った断定）',
+        file: 'v0/pathlabel.mjs',
+        from: "    if (r.outside === true) return '(リポジトリ外)';",
+        to: "    return '(リポジトリ外)';   /* 変異: 理由を区別しない */",
+        gone: 'if (r.outside === true)',
+        pattern: 'パスが出せない理由を区別して表示する',
         testFile: 'v0/transcript.test.mjs',
     },
     {

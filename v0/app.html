@@ -259,6 +259,9 @@ import { splitArgv, isChatArgv, argvSummary } from './argv.mjs';
 // 会話モードの出力の解釈も同じ理由で外に出した。
 // **中に書いていたので「捨てない」という約束が破れていたのに気付けなかった**（#44）
 import { makeChatFilter, chatGlance, chatInputText } from './chatfilter.mjs';
+// 「(リポジトリ外)」と言ってよいかの判定も外に出した。ここに書いていたので
+// **中にあるファイルを「外を触った」と断言していた**のに検査が掛からなかった（8回目のレビュー）
+import { pathLabel } from './pathlabel.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -1476,8 +1479,10 @@ function renderAgents(s) {
     const runs = [];
     for (const r of a.recent ?? []) {
       const last = runs[runs.length - 1];
+      // ⚠️ 畳む鍵に「パスが無い理由」も入れる。入れないと `(リポジトリ外)` と
+      //    `(worktree ルート)` が同じ1行に畳まれて、また区別が消える
       if (last && last.tool === r.tool && last.path === r.path
-          && last.outside === r.outside && last.command === r.command) {
+          && pathLabel(last) === pathLabel(r) && last.command === r.command) {
         last.n++;
         continue;
       }
@@ -1486,7 +1491,9 @@ function renderAgents(s) {
     for (const r of runs.slice(0, 6)) {
       const line = el('div', 'ab');
       line.style.margin = '0';
-      const what = r.path ?? (r.outside ? '(リポジトリ外)' : '');
+      // 🚨 **「外」と言ってよいのは outside だけ。** worktree ルート自身と
+      //    表示できない形は**中**なので、別の文字を出す（pathlabel.mjs）
+      const what = pathLabel(r);
       line.append(el('span', 'tag', r.n > 1 ? `${r.tool} ×${r.n}` : r.tool));
       if (what) {
         if (r.path && wt && openable.has(r.path)) {
@@ -1501,9 +1508,8 @@ function renderAgents(s) {
       //    開けない（`openable` に無いのでリンクにもならない）。黙って出すと
       //    「そのファイルを触った」という誤読になる（#38）
       if (r.pathClipped) line.append(el('span', 'note', ' (パスが長いので省略)'));
-      // 🚨 相対パスの基準が分からなかった場合。**「外」と断言しない**
-      //    （デーモンの cwd で解決すると別のファイルの名前を出す）
-      if (r.pathUnresolved) line.append(el('span', 'note', ' (相対パスの基準が不明)'));
+      // ⚠️ 相対パスの基準が不明・worktree ルート・表示できない形は `pathLabel` が
+      //    それぞれの文字を返す（ここで二重に出さない）
       if (r.sidechain) line.append(el('span', 'note', ' (サブ)'));
       // 🚨 マスクしたことを言う（黙って消すと「そう打っていない」と誤読される）
       if (r.command) {
@@ -1514,7 +1520,10 @@ function renderAgents(s) {
     }
     for (const t of a.text ?? []) {
       const q = el('div', 'note');
-      q.textContent = `${t.role === 'assistant' ? '◂' : '▸'} ${t.text}`;
+      // 🚨 発話にもマスクが掛かる（サーバ側）。**落としたことを言う。**
+      //    コマンド行だけ告知していて発話は黙って消していた（同じ約束を片方で破っていた）
+      q.textContent = `${t.role === 'assistant' ? '◂' : '▸'} ${t.text}`
+        + (t.masked ? '   ← 秘密を落としました' : '');
       d.append(q);
     }
     if (a.tailOnly) d.append(el('div', 'note', `⚠ 記録の末尾 ${Math.round((a.bytesRead ?? 0) / 1024)}KB だけを読んでいます`));

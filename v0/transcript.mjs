@@ -114,27 +114,57 @@ function clip(v, max) {
  *
  * ⚠️ リポジトリの外を触っていた場合は**パスを出さない**。
  *    記録には他プロジェクトのパスも入る。
+ *
+ * 🚨 **`null` の理由を型で分ける（8回目のレビュー。SERIOUS）。**
+ *    以前は4つの別の事情で同じ `null` を返し、呼び出し側がそれを全部
+ *    `(リポジトリ外)` と表示していた:
+ *      (a) 本当に worktree の外            … 「外」と言ってよい
+ *      (b) `rel === ''` = worktree ルート自身 … **中**。`Grep`/`Glob` の `path` に
+ *          ルートを渡す形で普通に起きる
+ *      (c) `isSafeRepoPath` に外れた形（先頭が `-` や `:` のファイル名）… **中**
+ *      (d) 引数が判定できない（文字列でない / 空）    … 「調べられない」
+ *    (b)(c) はリポジトリの中なのに「エージェントがリポジトリ外を触った」という
+ *    **安全に関わる誤った断定**になっていた。同じファイルの `observedPath` は
+ *    相対パスの基準が不明なときに「外と断言せず不明にする」と丁寧に分けていたのに、
+ *    その原則がここに適用されていなかった（CLAUDE.md
+ *    「『調べられない』と『無い』を型で分ける」）。
+ *
+ * @returns {{rel: string|null, why: null|'outside'|'root'|'unsafe'|'unknown'}}
  */
 export function repoRelative(base, abs) {
-    if (typeof abs !== 'string' || !abs || typeof base !== 'string') return null;
+    if (typeof abs !== 'string' || !abs || typeof base !== 'string') {
+        return { rel: null, why: 'unknown' };
+    }
     // ⚠️ path.relative() を使わない。記録の中のパスは worktree のパスと
     //    表記が違いうる（8.3 短縮名 / symlink / 大文字小文字）。
     //    素の relative() だと `../../..` になって、中にあるファイルなのに
     //    「外」と判定される（漏れではなく**見失う**方向の壊れ方）
     const rel = relativeInside(base, abs);
-    if (rel === null || rel === '') return null;
+    // ⚠️ `relativeInside` の null は「本当に外」と「symlink で段数が合わない」の
+    //    両方だが、どちらも**中だと言えない**ので外に倒す（漏らさない側に倒す）
+    if (rel === null) return { rel: null, why: 'outside' };
+    // worktree ルート自身。**中なので「外」と言ってはいけない**（パスは無い）
+    if (rel === '') return { rel: null, why: 'root' };
     // isSafeRepoPath は HTTP から来た値と同じ検証。ここも通す（UI が
     // このパスで差分を開くので、開ける形であることを保証する）
-    return isSafeRepoPath(rel) ? rel : null;
+    // ⚠️ ここに外れたものは**中にあるが表示できない**。外ではない
+    if (!isSafeRepoPath(rel)) return { rel: null, why: 'unsafe' };
+    return { rel, why: null };
 }
 
 /**
  * 記録の中のパスを、出してよい形にする。
  *
- * 返す形: `{ path, outside, clipped }`
+ * 返す形: `{ path, outside, clipped, unresolved, root, unsafe, unknown }`
  *   - `outside: true`  … 触ってはいるが worktree の外（パスは出さない）
  *   - `clipped: true`  … 長すぎたので切った。**切ったパスは開けない**ので
  *                        UI はリンクにしてはいけない（`app.html` が見る）
+ *   - `root: true`     … worktree ルート自身（**中**。パスとしては出せない）
+ *   - `unsafe: true`   … 中にあるが表示できない形（先頭が `-` / `:` など）
+ *   - `unknown: true`  … 判定できなかった（「外」ではない）
+ *
+ * 🚨 **`path === null` を全部「外」と読ませてはいけない。** 5つの事情があり、
+ *    「外」と断言してよいのは `outside` だけ（8回目のレビュー。詳細は `repoRelative`）。
  *
  * 🚨 **切ったパスをそのまま「開ける」ものとして扱わない。** 途中で切れた文字列は
  *    別のファイルを指すか、どのファイルも指さない。省略したことを告げる。
@@ -157,8 +187,18 @@ export function observedPath(base, raw, max, recordCwd = null) {
         if (typeof recordCwd === 'string' && recordCwd) abs = join(recordCwd, raw);
         else return { path: null, outside: false, clipped: false, unresolved: true };
     }
-    const rel = repoRelative(base, abs);
-    if (rel === null) return { path: null, outside: true, clipped: false };
+    const { rel, why } = repoRelative(base, abs);
+    // 🚨 **理由ごとに別のフィールドで返す。** ここで全部 `outside: true` にしていたので、
+    //    worktree ルートと中にある表示できないファイルが「外を触った」になっていた
+    if (rel === null) {
+        return {
+            path: null, clipped: false,
+            outside: why === 'outside',
+            root: why === 'root',
+            unsafe: why === 'unsafe',
+            unknown: why === 'unknown',
+        };
+    }
     if (rel.length <= max) return { path: rel, outside: false, clipped: false };
     return { path: `${rel.slice(0, max)}…`, outside: false, clipped: true };
 }
@@ -185,14 +225,48 @@ function isAbsolutePath(p) {
  *    (a) **このデーモン自身の資格情報**（値が分かっているので確実に落とせる）と
  *    (b) `--token` / `--password` 等の**直後の語**。
  *    **落としたことは必ず告知する**（黙って消すと「そう打っていない」と誤読される）。
- * @param {string} text コマンド行
+ *
+ * 🚨 **形ベース（b）の区切りは「空白1文字」ではない（8回目のレビュー。SERIOUS）。**
+ *    `[ ]+` / `[ ]*` しか見ていなかったので:
+ *      - `--token\t<値>` は**何にも当たらず素通り**（告知も出ない）
+ *      - `--token \` + 改行 + `<値>` は**継続の `\` を「値」としてマスクする**ので
+ *        `masked: true` が立ち、UI は `← 秘密を落としました` と表示しながら
+ *        その直後に秘密を並べた。`clip` が後で `\s+` を空白に畳むので、payload には
+ *        `--token (マスクしました) <秘密>` という**綺麗な1行**として出る
+ *      - `--token "a b"` は `"a` だけ落として ` b"` を残す（同じ部分マスク）
+ *    **落としていないのに「落とした」と言うのがこのリポジトリで最も重い誤り**なので
+ *    3つ全部を直す:
+ *      1. **行継続を先に畳む**（sh の `\` + 改行 / PowerShell の backtick + 改行）。
+ *         シェルはこの2文字を取り除くので、畳んだ形が「実際に実行された形」
+ *      2. 区切りを `\s` にする（タブ・改行・全角空白も見る）
+ *      3. クォートで囲まれた値を**1つとして食う**
+ *    ⚠️ 副作用として**過剰にマスクする**ことがある（`--password` が行末にあると
+ *       次の行の先頭語を落とす）。過剰マスクは告知付きで情報が減るだけだが、
+ *       未マスクは秘密が漏れて**しかも嘘をつく**ので、こちら側に倒す。
+ *    ⚠️ `clip` の後にもう一度掛ける必要は無い。`clip` は `\s+` を空白1つに畳んで
+ *       末尾を切るだけで、`\s` を見ている以上**畳んだ後に初めて成立する形は無い**
+ *       （テスト側では clip 後の payload も見て固定してある）。
+ * @param {string} text コマンド行 / 発話
  * @param {string[]} secrets 値が分かっている秘密（token / cookie の導出値）
  * @returns {{text: string, masked: boolean}}
  */
 const SECRET_KEYS = "token|password|passwd|secret|api[-_]?key|authorization|bearer";
+// 🚨 区切りの文字クラス。**`[ ]` に戻すとタブ・改行・行継続で秘密が素通りする**
+const SECRET_WS = "\\s";
+// 行継続。sh は `\` + 改行、PowerShell は backtick（\x60）+ 改行を**取り除く**ので
+// 同じように取り除く（畳んだ形が実際に実行された形。`^` は cmd 用だが、
+// 文中の行末 `^` を巻き込むので入れない）
+const CONTINUATION_RE = /[\\\x60]\r?\n/g;
+// 値。クォートで囲まれた値を1つとして食う（`[^ ]+` だと
+// `--password "pass phrase X"` の `"pass` だけ落として ` phrase X"` を残す）
+const SECRET_VALUE = "(?:\"[^\"]*\"?|'[^']*'?|[^" + SECRET_WS + "'\"]+)";
+// 🚨 `authorization: Bearer <値>` は「Bearer」を値と見なして落とし、**トークンを残す**
+//    （告知だけ立つので「落とした」と嘘をつく）。スキーム語ごと食う
+const AUTH_SCHEME = "(?:(?:bearer|basic|token)" + SECRET_WS + "+)?";
 export function maskSecrets(text, secrets = []) {
     if (typeof text !== "string" || !text) return { text, masked: false };
-    let out = text;
+    // 1. 行継続を畳む（これが無いと継続文字だけをマスクして秘密を残す）
+    let out = text.replace(CONTINUATION_RE, "");
     let masked = false;
     // (a) 値が分かっているものは確実に落とす（短すぎる値は誤爆するので見ない）
     for (const v of secrets) {
@@ -205,9 +279,10 @@ export function maskSecrets(text, secrets = []) {
     // (b) 秘密を渡す形の**直後の語**を落とす（`--token=X` と `--token X` の両方、
     //     `x-kjp-token: X` のようなヘッダ形も）
     const forms = [
-        new RegExp("(--?(?:" + SECRET_KEYS + ")=)([^ ]+)", "gi"),
-        new RegExp("(--?(?:" + SECRET_KEYS + ")[ ]+)([^ ]+)", "gi"),
-        new RegExp("((?:" + SECRET_KEYS + ")['\"]?[:=][ ]*)([^ '\"]+)", "gi"),
+        new RegExp("(--?(?:" + SECRET_KEYS + ")=" + SECRET_WS + "*)" + SECRET_VALUE, "gi"),
+        new RegExp("(--?(?:" + SECRET_KEYS + ")" + SECRET_WS + "+)" + SECRET_VALUE, "gi"),
+        new RegExp("((?:" + SECRET_KEYS + ")['\"]?[:=]" + SECRET_WS + "*)"
+            + AUTH_SCHEME + "([^" + SECRET_WS + "'\"]+)", "gi"),
     ];
     for (const re of forms) {
         out = out.replace(re, (m, head) => { masked = true; return head + "(マスクしました)"; });
@@ -320,6 +395,12 @@ export function summarize(lines, {
                     // 🚨 相対パスの基準が分からなかった = 「外」ではなく「不明」。
                     //    デーモンの cwd で解決すると別のファイルの名前を出す（7回目のレビュー）
                     pathUnresolved: seen.unresolved === true,
+                    // 🚨 **「外」と別の理由を別のフィールドで出す（8回目のレビュー）。**
+                    //    worktree ルート自身と、中にあるが表示できない形を
+                    //    `outside` に混ぜていたので「外を触った」と嘘をついていた
+                    pathRoot: seen.root === true,
+                    pathUnsafe: seen.unsafe === true,
+                    pathUnknown: seen.unknown === true,
                     sidechain: r.isSidechain === true,
                 };
                 // T2: コマンド行は自由文。既定では出さない

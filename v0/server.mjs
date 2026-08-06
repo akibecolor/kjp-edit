@@ -2197,7 +2197,7 @@ async function handleRequest(req, res) {
         // ブラウザと unit テストで共有しているモジュール。
         // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
         if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs'
-            || url.pathname === '/chatfilter.mjs') {
+            || url.pathname === '/chatfilter.mjs' || url.pathname === '/pathlabel.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',
