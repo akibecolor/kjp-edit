@@ -1549,6 +1549,20 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'v0/chatfilter.test.mjs',
     },
     {
+        // 🚨 8回目のレビューの SERIOUS: 末尾の非 JSON 行（stderr / 「⚠ 停止しました」）を
+        //    飛ばして**数分前の応答を「最後の出力」として出していた**。
+        //    しかも interpreted:true なので「← 解釈できない行」も付かない =
+        //    止まったのに動いているように見える（この盤で一番効く嘘）。
+        name: 'monitor-glance-tail-skipped',
+        why: '末尾の解釈できない行を飛ばす（終わった理由が消え、古い応答が最後の出力になる）',
+        file: 'v0/chatfilter.mjs',
+        from: '            if (i > 0) return { text: lines[i], interpreted: false };\n            break;',
+        to: '            continue;   /* 変異: 末尾の生テキストも飛ばす */',
+        gone: 'if (i > 0) return { text: lines[i], interpreted: false };',
+        pattern: 'chatGlance',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
         name: 'monitor-glance-keeps-raw',
         why: '解釈できない行を空にする（「応答が来ていない」ように見える）',
         file: 'v0/chatfilter.mjs',
@@ -1674,6 +1688,47 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         to: '    if (st.running) startBeat();',
         gone: 'else stopBeat();',
         script: 'v0/render-check.mjs',
+    },
+    {
+        // 🚨 8回目のレビューの SERIOUS: `--require-auth`（= `--allow-host` の
+        //    トンネル = スマホから使う既定の構成）では、`load()` がトークンを
+        //    付けないので `execSessions` が常に null で返り、**走っているセッションと
+        //    再接続口が黙って消えていた**（#17 の目的が一番使う経路で到達不能）。
+        //    ⚠️ 字面では測れない（行は残る）。render-check を `--require-auth` で
+        //    走らせて、再接続の候補が実際に出ることで測る。
+        name: 'state-fetch-token-header',
+        why: 'state の取得にトークンを付けない'
+            + '（--require-auth では execSessions が常に null = 再接続口が消える）',
+        file: 'v0/app.html',
+        from: "      session.token ? { headers: { [session.tokenHeader]: session.token } } : {});",
+        to: '      {});   /* 変異: トークンを付けない */',
+        gone: 'session.token ? { headers: { [session.tokenHeader]',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // 🚨 分界（Cookie / 読み取り用の鍵には exec の argv を渡さない）は緩めない。
+        //    緩めない代わりに**落としたことを言う**のが守りの本体。
+        name: 'sessions-hidden-notice',
+        why: 'サーバが一覧を落としたことを画面に出さない'
+            + '（読み取り用の鍵のタブで「1本も走っていない」と同じ見た目になる）',
+        file: 'v0/app.html',
+        from: `      resume.append(document.createTextNode(
+        '⚠ このworktreeで走っているセッションの一覧は出せません'
+        + '（読み取り用の鍵ではコマンド行を返さないため）。'
+        + ' 実行の鍵を貼ると、走っているものと再接続口が出ます。'));`,
+        to: '      /* 変異: 出せないことを言わない（黙って空にする） */',
+        gone: 'このworktreeで走っているセッションの一覧は出せません',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'state-exec-sessions-hidden-flag',
+        why: '一覧を落としたことをサーバが伝えない'
+            + '（UI からは「1本も走っていない」と区別できない）',
+        file: 'v0/server.mjs',
+        from: '                    ? { ...state, execSessions: null, execSessionsHidden: true }',
+        to: '                    ? { ...state, execSessions: null }',
+        gone: 'execSessionsHidden: true',
+        pattern: '読み取り用の鍵では走っているセッションを出さない',
     },
     {
         // 🚨 これは**実ブラウザでしか測れない**（字面では入力が消えるのが見えない）

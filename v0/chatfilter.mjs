@@ -85,6 +85,17 @@ export function chatRecordLines(r) {
  *    渡される文字列は**先頭が切れている**ことがある（サーバが末尾を返す）ので、
  *    **後ろから見て最初に解釈できた行**を使う。
  *
+ * 🚨 **ただし飛ばしてよいのは「先頭の1行」だけ**（8回目のレビュー。SERIOUS）。
+ *    以前は解釈できない行を無条件に飛ばしていたので、**末尾の生テキストが
+ *    黙って捨てられ、数分前の応答が「最後の出力」として出ていた。**
+ *    会話セッションが死ぬ / 殺されるときに最後に来るのは必ず生テキストで
+ *    （claude の stderr `Error parsing streaming input line: …`、
+ *     サーバの `⚠ 停止を要求されました` / `⚠ 停止しました` は err レコード）、
+ *    **止まったのに正常に応答したように見えた**（`interpreted: true` を返すので
+ *    「← 解釈できない行」も付かない）。しかも端末（`makeChatFilter`）は同じ行を
+ *    生のまま出すので、**同じ出力が場所によって違う意味**になっていた。
+ *    「どれが待っているか」を見る盤で、終わった理由が消えるのが一番効く。
+ *
  * @param {string} raw 改行を含みうる出力の断片
  * @returns {{text: string, interpreted: boolean}}
  */
@@ -92,7 +103,12 @@ export function chatGlance(raw) {
     const lines = String(raw ?? '').split('\n').map(l => l.trim()).filter(Boolean);
     for (let i = lines.length - 1; i >= 0; i--) {
         let r;
-        try { r = JSON.parse(lines[i]); } catch { continue; }   // 切れた行は飛ばす
+        try { r = JSON.parse(lines[i]); } catch {
+            // 飛ばす理由は「サーバが末尾を返すので**先頭の行**が途中から始まる」
+            // ことだけ。末尾側の解釈できない行は**そのまま出す**（捨てない）。
+            if (i > 0) return { text: lines[i], interpreted: false };
+            break;
+        }
         const got = chatRecordLines(r);
         // 🚨 **本文とツール名の両方を出す。** 最後の1行だけにすると、
         //    text と tool_use が同じレコードに入っている形で**本文が消え**、

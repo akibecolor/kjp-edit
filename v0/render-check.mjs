@@ -370,6 +370,42 @@ const DUAL_CHECK = `(async () => {
   };
 })()`;
 
+/**
+ * 🚨 **読み取り用の鍵しか無いタブ（= スマホ）で機能が黙って消えないこと
+ *    （8回目のレビュー。SERIOUS）。**
+ *
+ * `--allow-host` のトンネルは `--require-auth` を自動でオンにする。その構成では
+ * サーバが `execSessions` を落とす（argv に秘密が載りうる。**この分界は緩めない**）。
+ * 落としたことを UI が言わないと、**走っているセッションと再接続口が
+ * 「1本も走っていない」と同じ見た目**になる（#17 の目的そのものが到達不能）。
+ *
+ * ⚠️ **字面では測れない。** 告知の行を作らなくても、hidden のままでも、
+ *    文字列は app.html に残る。**描かれている文字**を見る。
+ * ⚠️ 最後に走らせる（鍵を捨てて読み込み直すので、他の検査の前提を壊す）。
+ */
+const READKEY_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const pane = [...document.querySelectorAll('[data-pane-id]')]
+    .find(p => p.dataset.paneId.startsWith('console-'));
+  if (!pane) return { error: 'コンソールのペインが無い（読み込み直しに失敗した？）' };
+  const drawn = e => e.getClientRects().length > 0;
+  // ⚠️ hidden でも textContent は残るので、**描かれているものだけ**を読む
+  const notes = () => [...pane.querySelectorAll('.note')].filter(drawn)
+    .map(e => e.textContent ?? '').join(' | ');
+  let text = '';
+  for (let i = 0; i < 100; i++) {
+    text = notes();
+    if (/出せません/.test(text)) break;
+    await wait(200);
+  }
+  return {
+    heldToken: (() => { try { return sessionStorage.getItem('kjp_token'); } catch { return null; } })(),
+    canRun: [...pane.querySelectorAll('button')].some(b => b.textContent === '実行'),
+    said: /出せません/.test(text),
+    sample: text.replace(/\\s+/g, ' ').slice(0, 300),
+  };
+})()`;
+
 const repo = await mkdtemp(join(tmpdir(), 'kjp-render-'));
 const profile = await mkdtemp(join(tmpdir(), 'kjp-render-prof-'));
 let server = null;
@@ -394,8 +430,14 @@ try {
         'changed but not committed\n', 'utf8');
 
     // 実行を有効にしないとコンソールペインが描かれない = 計測対象が出ない
+    // 🚨 **`--require-auth` を付ける（8回目のレビュー。SERIOUS）。**
+    //    これは `--allow-host` = トンネル = スマホから使う既定の構成であり、
+    //    サーバが `/api/v0/state` の `execSessions` を「生の鍵を提示していない
+    //    要求」には返さない構成でもある。ブラウザ検査はこの構成を**1度も
+    //    踏んでいなかった**ので、`load()` がヘッダを付けずに一覧を取り落とし、
+    //    **一番使う経路で再接続口が黙って消えている**ことに誰も気付けなかった。
     server = spawn(process.execPath,
-        [SERVER, '--repo', repo, '--port', '0',
+        [SERVER, '--repo', repo, '--port', '0', '--require-auth',
             '--allow-exec', '--token', TOKEN],
         { shell: false, windowsHide: true });
     server.stdout.setEncoding('utf8');
@@ -581,6 +623,26 @@ try {
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
     if (probe.error) throw new Error(probe.error);
 
+    // 🚨 **最後に「読み取り用の鍵だけ」の状態を作って測る。**
+    //    鍵を捨てて読み込み直すと、Cookie（読み取り専用の派生秘密）だけが残る =
+    //    スマホが案内の URL を1回開いた状態。ここで走っているセッションの一覧が
+    //    「出せません」と言われることを確かめる（黙って空にしない）。
+    //    ⚠️ 他の検査の前提（鍵を持っている）を壊すので、必ずこの位置。
+    await evaluate(`(() => {
+      try { sessionStorage.removeItem('kjp_token'); } catch (e) { /* 使えない環境 */ }
+      location.reload();
+      return true;
+    })()`).catch(() => { /* reload で実行コンテキストが消えるのは正常 */ });
+    await sleep(1500);
+    await evaluate(`(async () => {
+      for (let i = 0; i < 300; i++) {
+        if (document.readyState === 'complete') return true;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return false;
+    })()`);
+    const readkey = await evaluate(READKEY_CHECK);
+
     const problems = [];
     // 🔒 IME: 変換中は発火せず、確定後は発火すること（片側だけの検査にしない）
     if (!ime || ime.error) {
@@ -724,6 +786,23 @@ try {
     if (!/捨てて/.test(probe.firstText)) {
         problems.push('古い行を捨てたのに告知が見えない（「全部見えている」と誤認させる）'
             + `: 先頭は ${JSON.stringify(probe.firstText)}`);
+    }
+    // 🚨 読み取り用の鍵だけのタブ（スマホの既定の構成）で、機能が黙って消えないこと
+    if (!readkey || readkey.error) {
+        problems.push(`読み取り用の鍵の画面を測れなかった: ${readkey?.error ?? '結果が取れない'}`);
+    } else {
+        if (readkey.heldToken !== null) {
+            problems.push('検査が鍵を捨てられていない = 読み取り専用の状態を作れていない'
+                + `（この検査は何も測っていない）: ${JSON.stringify(readkey.heldToken)}`);
+        }
+        if (readkey.canRun) {
+            problems.push('実行の鍵が無いのに実行ボタンが出ている（押せば必ず 403）');
+        }
+        if (!readkey.said) {
+            problems.push('読み取り用の鍵のとき、走っているセッションの一覧を'
+                + '「出せない」と言っていない（1本も走っていないと同じ見た目になる）'
+                + `: ${JSON.stringify(readkey.sample)}`);
+        }
     }
     console.log(problems.length ? '✖ render' : '✔ render');
     console.log(`   ${probe.lines} 行 = ${probe.totalMs}ms / `
