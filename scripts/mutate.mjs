@@ -93,9 +93,9 @@ const MUTANTS = [
         why: 'filter があるリポジトリでも取り込む'
             + '（任意コマンドが走る。潰すと作業ツリーの中身が変わるので断るしかない）',
         file: 'v0/server.mjs',
-        from: '            const filterNames = await repoFilterNames(wt.path);\n            if (filterNames.length) {',
-        to: '            const filterNames = [];\n            if (filterNames.length) {',
-        gone: 'const filterNames = await repoFilterNames(wt.path);',
+        from: '            const filterNames = await repoFilterNames(wt.path, await commonDir(wt.path));',
+        to: '            const filterNames = [];   /* 変異: filter を見ない */',
+        gone: 'const filterNames = await repoFilterNames(wt.path',
         pattern: 'merge: リポジトリ設定の filter があるときは実行しない',
     },
     {

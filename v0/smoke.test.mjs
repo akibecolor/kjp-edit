@@ -1521,7 +1521,13 @@ exit 1
             },
             body: JSON.stringify({ worktree: wt, branch: 'agent-a' }),
         });
-        await r.text();
+        // 🚨 **前提条件そのものを検証する。** 取り込みが門で断られていると
+        //    署名の段まで到達せず、**守りを外しても marker が書かれない**ので
+        //    テストが緑になる（実際に変異が SURVIVED した）。
+        //    200 = 実際にマージコミットを作った = 署名が走りうる状態だったこと。
+        const body = await r.json();
+        assert.equal(r.status, 200,
+            `取り込みが成立していないので署名の経路を測れていない: ${JSON.stringify(body)}`);
         const { existsSync } = await import('node:fs');
         assert.equal(existsSync(join(repo, 'gpg-ran.txt')), false,
             'gpg.program が起動した（書き込みの capability で任意プログラム実行）');
@@ -4253,8 +4259,13 @@ test('🚨 status がリポジトリ設定の filter を実行しない（capabi
         assert.equal(existsSync(marker), false,
             'filter が実行された（フラグ無しの読み取り経路から任意コード実行）');
         // 無効化したことを必ず伝える（変更ありの判定が実際と違いうるので）
-        assert.ok(s.errors.some(e => /filter/.test(e.message)),
-            `filter を無効化した旨が errors に無い: ${JSON.stringify(s.errors)}`);
+        // 🚨 **`/filter/` のような緩い照合にしない。** 最初そう書いたら、
+        //    告知を丸ごと空にする変異が **SURVIVED した**（別の errors 要素に
+        //    "filter" の字が入っていて当たっていた）。**告知の文そのもの**を見る。
+        const notices = s.errors.filter(e => /を無効化して読みました/.test(e.message));
+        assert.equal(notices.length, 1,
+            `filter を無効化した旨の告知が1件でない: ${JSON.stringify(s.errors)}`);
+        assert.match(notices[0].message, /evil/, '何を無効化したのか言っていない');
     } finally {
         await g(['config', '--unset', 'filter.evil.clean'], repo).catch(() => {});
         await rm(marker, { force: true });

@@ -320,7 +320,7 @@ async function collectFresh() {
     //    `core.fsmonitor` と同じクラスの穴で、`git status` が作業ツリーと index を
     //    比べるときに clean filter を実行する（実測で marker が書かれた。8回目のレビュー）。
     //    ⚠️ 1リポジトリあたり 2 spawn（--local と --worktree）。worktree の本数には比例しない。
-    const filters = await repoFilterNames(cwd);
+    const filters = await repoFilterNames(cwd, common);
     if (filters.length) {
         errors.push({
             scope: 'repo',
@@ -1972,7 +1972,7 @@ async function handleRequest(req, res) {
             //     smudge を潰したまま merge すると**作業ツリーに書かれる中身が変わる**
             //     （git-lfs ならポインタのまま実体を上書きする）。潰すのも走らせるのも
             //     危ないので、driver と同じ「実行そのものを断る」に倒す（8回目のレビュー）。
-            const filterNames = await repoFilterNames(wt.path);
+            const filterNames = await repoFilterNames(wt.path, await commonDir(wt.path));
             if (filterNames.length) {
                 denyJson(res, 409,
                     `リポジトリ設定の filter があります（${filterNames.map(f => f.name).join(', ')}）。`

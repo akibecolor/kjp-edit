@@ -8,7 +8,7 @@
 
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { join, sep } from 'node:path';
+import { join, sep, resolve } from 'node:path';
 
 const BASE_ARGS = [
     '-c', 'core.quotepath=false',
@@ -700,24 +700,40 @@ export function filterNeutralizeArgs(filters) {
  *     index のポインタと作業ツリーの実体を比べることになる）。
  *    どちらを潰したかは呼び出し側が告知する。
  */
-export async function repoFilterNames(cwd) {
+export async function repoFilterNames(cwd, commonDirPath = null) {
     /** name → process が設定されているか（潰し方が変わるので分ける） */
     const found = new Map();
-    for (const scope of ['--local', '--worktree']) {
-        try {
-            // 1 = 該当なし / 128 = そのスコープが無い（extensions.worktreeConfig 未設定）
-            const out = await git(
-                ['config', scope, '--get-regexp', '^filter\\..*\\.(clean|smudge|process)$'],
-                { cwd, allowExit: [0, 1, 128] },
-            );
-            for (const l of out.split('\n')) {
-                const m = /^filter\.(.+)\.(clean|smudge|process)\s/.exec(l.trim());
-                if (!m) continue;
-                const prev = found.get(m[1]) ?? false;
-                found.set(m[1], prev || m[2] === 'process');
-            }
-        } catch { /* 判定できなければ空（呼び出し側が保守的に扱う） */ }
-    }
+    try {
+        // ⚠️ **1回の spawn で済ませる。** `--local` と `--worktree` を別々に呼ぶと
+        //    1回の収集で 2 プロセス増え、`stats.gitSpawns` の予算テストが落ちる
+        //    （worktree 本数に比例しない固定費でも、増やす前に測る規則）。
+        //    `--show-origin` で出所を見て、**リポジトリの中の設定ファイルだけ**採る。
+        const out = await git(
+            ['config', '--show-origin', '--get-regexp',
+                '^filter\\..*\\.(clean|smudge|process)$'],
+            { cwd, allowExit: [0, 1] },   // 1 = 該当なし
+        );
+        for (const raw of out.split('\n')) {
+            const l = raw.trim();
+            if (!l) continue;
+            // 形: `file:<path>\tfilter.<name>.<key> <value>`
+            const m = /^file:(.+?)\t+filter\.(.+?)\.(clean|smudge|process)(?:\s|$)/.exec(l);
+            if (!m) continue;
+            const [, rawOrigin, name, key] = m;
+            // ⚠️ **`--show-origin` は相対パスを返す**（リポジトリの中で走らせると
+            //    `file:.git/config`）。解決せずに比べると照合が必ず外れ、
+            //    **潰す対象が空になって守りが消える**（実測で踏んだ）。
+            const origin = resolve(cwd, rawOrigin);
+            // 🔒 global / system の filter は潰さない（利用者自身の設定。
+            //    潰すと git-lfs のリポジトリで status が全ファイル「変更」になる）。
+            //    リポジトリの中（`.git/config` と `config.worktree`）だけを対象にする。
+            const inRepo = (commonDirPath && containsPath(resolve(cwd, commonDirPath), origin))
+                || containsPath(join(cwd, '.git'), origin);
+            if (!inRepo) continue;
+            const prev = found.get(name) ?? false;
+            found.set(name, prev || key === 'process');
+        }
+    } catch { /* 判定できなければ空（呼び出し側が保守的に扱う） */ }
     return [...found].map(([name, hasProcess]) => ({ name, hasProcess }));
 }
 
