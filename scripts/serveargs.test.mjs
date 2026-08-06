@@ -94,7 +94,10 @@ test('--allow-host は複数指定を全部集める', () => {
 
 test('既定は読み取り専用（capability は1つも付かない）', () => {
     const a = base([]);
-    assert.deepEqual(a, [SERVER, '--repo', '/r', '--port', '7749']);
+    // ⚠️ `--audit-log` は capability ではない（記録の置き場所）。
+    //    どの構成でも渡す（401 の記録は --require-auth から出るため）。
+    assert.deepEqual(a, [SERVER, '--repo', '/r', '--port', '7749',
+        '--audit-log', '/s/audit.jsonl']);
 });
 
 test('--exec は --write を含むが、--write は --exec を含まない', () => {
@@ -106,6 +109,25 @@ test('--exec は --write を含むが、--write は --exec を含まない', () 
     assert.ok(e.includes('--allow-write'));
     assert.ok(e.includes('--allow-exec'));
     assert.ok(e.includes('--audit-log'), '実行を許すなら監査ログを必ず付ける');
+});
+
+/**
+ * 🚨 **8回目のレビュー: 記録の置き場所は capability に関係なく渡す。**
+ *
+ * 401（認証失敗）は `--require-auth` を付けた瞬間から記録されるので、
+ * 「実行を許したときだけ記録が出る」という前提は既に成り立っていない。
+ * `--exec` のときだけ `--audit-log` を渡していたので、**常用構成
+ * （読み取り専用 + `--allow-host`）では記録を `.git` の外に出す手段が無かった**
+ * — つまりトンネルに出している間、tailnet の全端末が自分の `.git` の中の
+ * ファイルを無認証で伸ばせる状態だった。
+ */
+test('監査ログの置き場所はどの capability でも渡す', () => {
+    for (const argv of [[], ['--write'], ['--allow-host', 'box.ts.net'], ['--exec']]) {
+        const a = base(argv);
+        assert.ok(a.includes('--audit-log'),
+            `${argv.join(' ') || '(既定)'} で監査ログの置き場所を渡していない`);
+        assert.equal(a[a.indexOf('--audit-log') + 1], '/s/audit.jsonl');
+    }
 });
 
 test('実行とトンネルはトークンを永続化する（起動ごとに変えない）', () => {

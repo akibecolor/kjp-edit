@@ -163,9 +163,15 @@ export function serverArgs({
     //     書いてこの組み合わせを承認していた）。
     const file = wantExec ? execTokenFile : (wantWrite ? writeTokenFile : tokenFile);
     if ((hosts.length > 0 || wantExec) && file) args.push('--token-file', file);
+    // 🚨 **監査ログの置き場所は capability に関係なく渡す**（8回目のレビュー）。
+    //    以前は `--exec` のときだけ渡していたので、常用構成（読み取り専用 +
+    //    `--allow-host`）では**認証失敗の記録を移す手段が無く**、自分の `.git` の中に
+    //    無認証で書かれ続けた（トンネルに出している間、tailnet の全端末から撃てる）。
+    //    401 を記録するのは `--require-auth` を付けた瞬間からなので、
+    //    「実行を許したときだけ記録が出る」という前提が既に成り立っていない。
+    if (auditLog) args.push('--audit-log', auditLog);
     if (wantExec) {
         args.push('--allow-exec');
-        if (auditLog) args.push('--audit-log', auditLog);
         // 🚨 **絶対上限を起動口から延ばせるようにする。**
         //    既定 600 秒はエージェントの仕事に足りない（実測: Bash/Read を20回する
         //    「issue を洗って優先度を付ける」が 551 秒の時点でまだ走っていた）。

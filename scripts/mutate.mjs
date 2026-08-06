@@ -240,9 +240,9 @@ const MUTANTS = [
         name: 'read-auth-gate',
         why: '読み取り経路の認証を外す（トンネルに届く相手が誰でも差分を読める）',
         file: 'v0/server.mjs',
-        from: '    if (!authed(req, url)) {',
-        to: '    if (false) {',
-        gone: '!authed(req, url)',
+        from: '            pass = authed(req, url);',
+        to: '            pass = true;   /* 変異: 認証しない */',
+        gone: 'pass = authed(req, url)',
         pattern: 'トークンが無い / 違うと 401',
     },
     {
@@ -627,6 +627,59 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: '相手が終わった直後に標準入力へ送っても',
     },
     {
+        // 🚨 8回目のレビュー: stdin と同じ型の兄弟経路が取りこぼされていた。
+        name: 'exec-child-error-listener',
+        why: "spawn した子の 'error' を拾わない"
+            + '（ENOENT が uncaughtException になりデーモンが exit 1 で落ちる）',
+        file: 'v0/server.mjs',
+        from: "            child.on('error', async err => {",
+        to: '            if (false) (async err => {',
+        gone: "child.on('error', async err => {",
+        pattern: '起動できないコマンドでもセッションが終端し',
+    },
+    {
+        /**
+         * 🚨 **順序そのものを測る。** listener が「存在する」ことと
+         *    「早期 return より前に張られている」ことは別で、後者が守りの本体。
+         *    `attachChild` が false の経路（starting のうちに kill された回）では、
+         *    後ろに張っていると listener 無しの ChildProcess が残り ENOENT で即死する。
+         * ⚠️ 移した先の登録は**わざと二重引用符**にしてある。同じ字面のままだと
+         *    `gone` が書き換え後も残り「置換が効いていない」と誤判定される（SKIP/STALE）。
+         */
+        name: 'exec-child-error-after-attach',
+        why: "spawn した子の 'error' を早期 return の後ろで張る"
+            + '（starting のうちに kill された回だけ listener が無くなり、'
+            + 'ENOENT でデーモンが落ちる。実測で exec 1本 + kill 1本で消えた）',
+        file: 'v0/server.mjs',
+        from: "            child.on('error', async err => {\n"
+            + "                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);\n",
+        to: "            if (false) (async err => {\n"
+            + "                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);\n",
+        also: [{
+            from: '            if (!execRegistry.attachChild(session, child)) {\n'
+                + '                await killTree(child);\n'
+                + '                streamSession(req, res, session, 0);\n'
+                + '                return;\n'
+                + '            }\n',
+            to: '            if (!execRegistry.attachChild(session, child)) {\n'
+                + '                await killTree(child);\n'
+                + '                streamSession(req, res, session, 0);\n'
+                + '                return;\n'
+                + '            }\n'
+                + '            child.on("error", async err => {\n'
+                + "                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);\n"
+                + '                if (execRegistry.finish(session, { code: null, signal: null })) {\n'
+                + '                    await auditExec({\n'
+                + '                        event: \'exit\', session: session.id, worktree: wt.path, argv,\n'
+                + '                        code: null, signal: null, note: `spawn 失敗: ${err.message}`,\n'
+                + '                    });\n'
+                + '                }\n'
+                + '            });\n',
+        }],
+        gone: "child.on('error', async err => {",
+        pattern: 'starting のうちに kill された後に spawn',
+    },
+    {
         name: 'transcript-string-content',
         why: 'user の文字列 content から本文を出す'
             + '（ツールの結果と形で区別できないので T5 が漏れる）',
@@ -843,8 +896,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'serve-audit-log',
         why: '実行を許すのに監査ログを付けない（何が走ったか後から分からない）',
         file: 'scripts/serveargs.mjs',
-        from: "        if (auditLog) args.push('--audit-log', auditLog);",
-        to: '        /* 変異: 監査ログを付けない */',
+        from: "    if (auditLog) args.push('--audit-log', auditLog);\n",
+        to: '',
         gone: "args.push('--audit-log', auditLog)",
         pattern: '--exec は --write を含むが',
         testFile: 'scripts/serveargs.test.mjs',
@@ -1280,10 +1333,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'UI が import する共有モジュールを配信しない（import が1本 404 になると'
             + 'モジュール全体が実行されず**ページが真っ白**になる）',
         file: 'v0/server.mjs',
-        // ⚠️ 並列で足した2つのモジュール（panelayout / pathlabel）が同じ行に来たので、
-        //    行をまたぐ形になった。**改行込みで一意に指定する**
+        // ⚠️ 並列で足した3つのモジュール（panelayout / pathlabel / mergeresult）が
+        //    同じ条件に来たので、行をまたぐ形になった。**改行込みで一意に指定する**
         from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'\n"
-            + "            || url.pathname === '/pathlabel.mjs') {",
+            + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
@@ -1353,8 +1406,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'auth-fail-audit',
         why: '認証失敗を記録しない（当て放題かつ痕跡ゼロで総当たりできる）',
         file: 'v0/server.mjs',
-        from: '        await noteAuthFail(req, url);',
-        to: '        /* 変異: 失敗を記録も遅延もしない */',
+        from: '            else await noteAuthFail(req, url);',
+        to: '            /* 変異: 失敗を記録も遅延もしない */',
         gone: 'await noteAuthFail(req, url)',
         pattern: '認証失敗は記録され',
     },
@@ -1367,6 +1420,80 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         to: '    return 0;   /* 変異: 遅延を掛けない */',
         gone: '2 ** (count - 3) * 50',
         pattern: '認証失敗は記録され',
+    },
+    {
+        // 🚨 8回目のレビュー: 遅延は「1本ずつを遅くする」だけで並列を縛らない。
+        //    実測で並列 1200 本なら 485 回/秒（遅延が有る状態で）。
+        name: 'preauth-inflight-gate',
+        why: '認証前の同時本数を縛らない（並列度がそのまま当てる速さになる。実測 485 回/秒）',
+        file: 'v0/server.mjs',
+        from: '        if (!trusted && !preAuthAcquire(peer)) {',
+        to: '        if (false) {   /* 変異: 並列を縛らない */',
+        gone: '!preAuthAcquire(peer)',
+        pattern: '401 は並列でも縛られる',
+    },
+    {
+        // ⚠️ 縛る側だけでなく「締め出さない側」も測る。
+        name: 'preauth-known-good-bypass',
+        why: '一度通った資格情報も混雑の門に掛ける'
+            + '（トンネル越しでは peer が全部 127.0.0.1 なので、'
+            + '総当たりの間 正規の利用者が 429 で締め出される。実測 15 本中 0 本）',
+        file: 'v0/server.mjs',
+        from: '        const trusted = knownGoodSecret(vals, now);',
+        to: '        const trusted = false;   /* 変異: 一度通った値も門に掛ける */',
+        gone: 'const trusted = knownGoodSecret(vals, now)',
+        pattern: '総当たりが続いている間も正しい鍵は通り',
+    },
+    {
+        name: 'auth-fail-aggregate',
+        why: '401 を1本1行で追記する'
+            + '（認証前の要求で .git の中のファイルを無制限に伸ばせる。実測 400 本で 61 KB）',
+        file: 'v0/server.mjs',
+        from: '    if (rec.logged < AUTH_FAIL_LOG_FIRST) {',
+        to: '    if (true) {   /* 変異: 常に個別行を書く */',
+        gone: 'rec.logged < AUTH_FAIL_LOG_FIRST',
+        pattern: '認証失敗は記録され',
+    },
+    {
+        name: 'auth-fail-summary-rate',
+        why: '集約行を件数ごとに出す（429 は毎秒1万本以上撃てるので、'
+            + '「50件ごとに1行」でも 7 秒で 503 KB 伸びた。実測）',
+        file: 'v0/server.mjs',
+        from: '    return rec.reported === 0 || now - rec.reportedAt >= AUTH_FAIL_SUMMARY_MS;',
+        to: '    return true;   /* 変異: 毎回集約行を出す */',
+        gone: 'now - rec.reportedAt >= AUTH_FAIL_SUMMARY_MS',
+        pattern: '総当たりが続いている間も正しい鍵は通り',
+    },
+    {
+        name: 'audit-rotate',
+        why: '監査ログに大きさの上限が無い（長く動かすだけで伸び、'
+            + '認証前の要求からも伸ばせる）',
+        file: 'v0/server.mjs',
+        from: '        if (auditBytes + len > opts.auditMaxBytes) {',
+        to: '        if (false) {   /* 変異: 回転しない */',
+        gone: 'auditBytes + len > opts.auditMaxBytes',
+        pattern: '監査ログは上限で回転',
+    },
+    {
+        name: 'audit-rotate-announced',
+        why: '回転したことを記録に残さない（記録を捨てたのに黙っている）',
+        file: 'v0/server.mjs',
+        from: "            await appendFile(path, notice, 'utf8');",
+        to: '            /* 変異: 回転を記録に残さない */',
+        gone: "appendFile(path, notice, 'utf8')",
+        pattern: '監査ログは上限で回転',
+    },
+    {
+        name: 'serveargs-audit-any-cap',
+        why: '監査ログの置き場所を --exec のときだけ渡す'
+            + '（読み取り専用 + --allow-host の常用構成では 401 の記録を .git の外に'
+            + '出せず、トンネルの向こうから容量を食える）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (auditLog) args.push('--audit-log', auditLog);\n    if (wantExec) {",
+        to: '    if (wantExec) {',
+        gone: "if (auditLog) args.push('--audit-log', auditLog)",
+        pattern: '監査ログの置き場所はどの capability でも渡す',
+        testFile: 'scripts/serveargs.test.mjs',
     },
     {
         // 🚨 7回目のレビュー: read 権限のコマンド行に実行トークンが載っていた
@@ -2169,6 +2296,64 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         to: '            if (false) {',
         gone: 'st.changed > 0 || st.unmerged > 0',
         pattern: '衝突しないものは取り込め、衝突するものは拒否する',
+    },
+    {
+        // 🚨 8回目のレビュー: 成功経路だけが数え直していた（失敗経路は嘘を返す）
+        name: 'merge-failed-recount',
+        why: 'merge が途中で失敗したときに数え直さない'
+            + '（MERGE_HEAD と staged 変更を残したまま「拒否しました」と返す）',
+        file: 'v0/server.mjs',
+        from: '                const seqAfter = await sequencerState(wt.path).catch(() => null);\n'
+            + '                const stAfter = await worktreeStatus(wt.path).catch(() => null);',
+        to: '                const seqAfter = null, stAfter = null;   /* 変異: 数え直さない */',
+        gone: 'const seqAfter = await sequencerState(wt.path).catch(() => null)',
+        pattern: 'merge が途中で失敗したら',
+    },
+    {
+        name: 'merge-failed-message',
+        why: '半端な状態が残っても「git が取り込みを拒否しました」と言う（嘘）',
+        file: 'v0/server.mjs',
+        from: "                const message = leftover.counted === false",
+        to: '                const message = `git が取り込みを拒否しました: ${err.message}`;\n'
+            + '                if (false) void (leftover.counted === false',
+        gone: '                const message = leftover.counted === false',
+        pattern: 'merge が途中で失敗したら',
+    },
+    {
+        name: 'merge-failed-cache',
+        why: '失敗経路でキャッシュを捨てない'
+            + '（作業ツリーは半端なのに、画面は TTL の間 clean のまま）',
+        file: 'v0/server.mjs',
+        from: '                //    画面は TTL の間 clean のままだった。\n'
+            + '                cached = null;',
+        to: '                //    画面は TTL の間 clean のままだった。\n'
+            + '                /* 変異: キャッシュを捨てない */',
+        gone: '画面は TTL の間 clean のままだった。\n                cached = null;',
+        pattern: 'merge が途中で失敗したら',
+    },
+    {
+        name: 'merge-outcome-reload',
+        why: '取り込みが失敗したときに画面を数え直さない'
+            + '（半端な状態が残っているのに clean のまま見える）',
+        file: 'v0/mergeresult.mjs',
+        from: '        // 🚨 失敗でも数え直す。断られた理由が「画面が古い」ことである場合も多い\n'
+            + '        reload: true,',
+        to: '        // 🚨 失敗でも数え直す。断られた理由が「画面が古い」ことである場合も多い\n'
+            + '        reload: false,',
+        gone: 'ことである場合も多い\n        reload: true,',
+        pattern: '半端な状態が残ったら',
+        testFile: 'v0/mergeresult.test.mjs',
+    },
+    {
+        name: 'merge-outcome-sticky',
+        why: '半端な状態の告知を再描画で消える場所にしか出さない'
+            + '（load(true) でペインが作り直されて文字が消え、「clean」に見える）',
+        file: 'v0/mergeresult.mjs',
+        from: '        sticky: (dirty || unknown) ? message : null,',
+        to: '        sticky: null,   /* 変異: 消えない告知に回さない */',
+        gone: 'sticky: (dirty || unknown)',
+        pattern: '半端な状態が残ったら',
+        testFile: 'v0/mergeresult.test.mjs',
     },
     {
         name: 'merge-no-hooks',

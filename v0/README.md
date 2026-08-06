@@ -457,7 +457,8 @@ Web ページのインジェクションが `Read("<repo>/<秘密>")` を1回呼
 [../docs/agent-observation.md](../docs/agent-observation.md)。
 | cwd | 既知の worktree のみ |
 | shell | 使いません（`argv` 配列で受けます） |
-| 監査 | `<GIT_DIR>/kjp-exec-audit.jsonl` に start / exit を追記 |
+| 監査 | `<GIT_DIR>/kjp-exec-audit.jsonl` に start / exit を追記（`--audit-log` で移せます。**認証失敗（401）も同じファイル**に集約して残ります） |
+| 監査ログの上限 | 既定 4 MB（`--audit-max-bytes`）。超えたら `.1` に1世代だけ回し、新しいファイルの先頭に `audit-rotated` を書きます（黙って消しません） |
 | 上限 | 既定 600 秒（`--exec-timeout`）／同時 8 本 |
 | 切断 | **殺しません**（下の「切断に耐えるセッション」） |
 | セッション | 台帳に載り、`/api/v0/state` の `execSessions` に出ます。再接続・明示的な停止ができます |

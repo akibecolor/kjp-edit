@@ -38,6 +38,9 @@ function parseArgs(argv) {
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
+        // 🔒 監査ログの上限（超えたら1世代だけ残して回転する）。認証前の 401 も
+        //    同じファイルに追記されるので、上限が無いと外から容量を食える。
+        auditMaxBytes: 4 * 1024 * 1024,
         // 「トークンを明示的に決めたか」。長さでは判定できない（自動生成も43文字）
         tokenExplicit: false,
         // 🚨 切断で子プロセスを殺すのをやめた代わりの制約（#17）。
@@ -48,6 +51,11 @@ function parseArgs(argv) {
         // ⚠️ 検査専用。応答を流し始めるのを遅らせて「届く前に切られた」を
         //    決定的に作る（既定 0 = 何もしない）。`--layout-probe` と同じ扱い。
         execStreamDelayMs: 0,
+        // ⚠️ 検査専用。create() と spawn() の間を遅らせて「starting のうちに
+        //    kill された」を決定的に作る（既定 0 = 何もしない）。
+        execSpawnDelayMs: 0,
+        // 検査専用。状態キャッシュの TTL を伸ばす（既定 = CACHE_TTL_MS）
+        stateTtlMs: null,
         // 🔒 エージェントの活動観測。**リポジトリ外（~/.claude/projects/）を読む**ので
         //    読み取り側の不変条件（git cat-file 経由のみ）を破る。だから別 capability。
         //    さらに自由文（発話・コマンド行）は**もう一段別のフラグ**にする。
@@ -84,11 +92,14 @@ function parseArgs(argv) {
         else if (a === '--exec-detached-grace') opts.execDetachedGraceMs = num('--exec-detached-grace', 1, 86400) * 1000;
         // 検査専用（`--layout-probe` と同じ扱い。ヘルプには出さない）
         else if (a === '--exec-stream-delay') opts.execStreamDelayMs = num('--exec-stream-delay', 0, 60000);
+        else if (a === '--exec-spawn-delay') opts.execSpawnDelayMs = num('--exec-spawn-delay', 0, 60000);
+        else if (a === '--state-ttl') opts.stateTtlMs = num('--state-ttl', 0, 600000);
         else if (a === '--exec-retain') opts.execRetainMs = num('--exec-retain', 1, 86400) * 1000;
         // 🚨 「明示的に決めた」ことを記録する。長さだけを見ると、
         //    自動生成（32バイト = 43文字）が条件を満たしてしまう（6回目のレビュー）
         else if (a === '--token') { opts.token = argv[++i]; opts.tokenExplicit = true; }
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
+        else if (a === '--audit-max-bytes') opts.auditMaxBytes = num('--audit-max-bytes', 512, 2 ** 40);
         else if (a === '--token-file') { opts.tokenFile = resolve(argv[++i]); opts.tokenExplicit = true; }
         else if (a === '--require-auth') opts.requireAuth = true;
         // ⚠️ 明示的に切る道を残す。ただし --allow-host と併用したら起動を止める
@@ -105,6 +116,7 @@ function parseArgs(argv) {
             console.log('       --exec-timeout <秒>  実行の上限時間（既定 600）');
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
+            console.log('       --audit-max-bytes <n> 監査ログの上限（既定 4194304。超えたら .1 に回す）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
             console.log('       --require-auth       読み取りにもトークンを要求する（--allow-host のとき既定オン）');
             console.log('       --no-auth            上を明示的に切る（--allow-host との併用は拒否）');
@@ -783,6 +795,12 @@ async function collectFresh() {
         // スモークテストで固定する（コメントだけでは回帰を防げない）。
         stats: {
             gitSpawns: stats.spawns - spawnsBefore,
+            // 🚨 プロセス開始からの合計。**認証前の要求が git を起動していないか**を
+            //    測るために要る（8回目のレビュー: 冷えたデーモンでは 401 の1本ごとに
+            //    `git rev-parse --git-common-dir` が起動していた。実測で並列 200 本の
+            //    最中に git.exe が 7 本同時）。この収集ぶん（gitSpawns）を引けば
+            //    「それ以前に何回起動したか」が分かる。
+            gitSpawnsTotal: stats.spawns,
             worktrees: worktrees.length,
             // 衝突予測は候補ペアの数だけ git を起動する（worktree 本数とは別軸）
             conflictPairs: conflicts.length,
@@ -809,7 +827,11 @@ let inFlight = null;
 
 async function collect({ force = false } = {}) {
     const now = process.hrtime.bigint();
-    if (!force && cached && Number(now - cached.at) / 1e6 < CACHE_TTL_MS) {
+    // ⚠️ **TTL は検査から伸ばせるようにしてある（既定は上の 1500ms）。**
+    //    「書き込みが失敗したときにキャッシュを捨てているか」は、素のままだと
+    //    「捨てた」と「TTL が自然に切れた」の**競争**になり、遅い環境では
+    //    守りを外しても緑になる（`--exec-stream-delay` と同じ型の非決定性）。
+    if (!force && cached && Number(now - cached.at) / 1e6 < (opts.stateTtlMs ?? CACHE_TTL_MS)) {
         return cached.value;
     }
     if (inFlight) return inFlight;           // 同時リクエストは1回の収集に合流させる
@@ -1004,9 +1026,46 @@ function tokenMatches(given) {
  * ⚠️ 遅延は**指数**にするが上限を付ける（無限に伸ばすとイベントループに
  *    タイマーが溜まり、正規の利用者も締め出す）。
  */
-const authFails = new Map();   // peer -> { count, firstAt }
+const authFails = new Map();   // peer -> { count, firstAt, logged, shed, reported, reportedAt }
 const AUTH_FAIL_WINDOW_MS = 5 * 60 * 1000;
 const AUTH_FAIL_MAX_DELAY_MS = 2000;
+
+/**
+ * 🚨 **遅延だけではレートを縛れない（8回目のレビュー。SERIOUS）。**
+ *
+ * 遅延は「1本ずつを遅くする」だけで、**同じ相手が同時に何本投げられるか**を
+ * 制限しない。だから総当たりの速さは遅延ではなく**攻撃側の並列度**で決まる。
+ * 実測（このリポジトリ、`--require-auth --token <40字>`、node:http で同一 peer）:
+ *   直列 8 本   : 1,556 ms（= 遅延は効いている。7回目のテストが見ていたのはこれだけ）
+ *   並列 300 本 : 2,142 ms / 全部 401 / **140 回/秒** / 監査 +46,092 B
+ *   並列 1200 本: 2,474 ms / 全部 401 / **485 回/秒** / 監査 +184,893 B
+ * 7回目の「痕跡ゼロの総当たりを塞いだ」という主張は、**測っていない軸で崩れていた。**
+ *
+ * だから縛るのは**比較そのものの同時本数**にする。
+ *
+ * ⚠️ **門は比較の手前に置く。** 401 を返した後で絞っても、外した相手には
+ *    「外れた」が即座に伝わるので当てる速さは並列度で決まったままになる
+ *    （429 を返すのが比較の後だと、429 は「その値は違った」の同義語になる）。
+ * ⚠️ **枠を握るのは失敗した要求だけ**になる。`authed()` は同期なので、
+ *    通る要求は await を1つも挟まずに枠を返す（正規の利用者は 429 を踏まない）。
+ *    枠を長く握るのは指数遅延の中に居る失敗だけ = 上限は
+ *    PREAUTH_MAX_INFLIGHT / AUTH_FAIL_MAX_DELAY_MS ≒ **1 回/秒**。
+ * ⚠️ **トレードオフを隠さない:** トンネル越しでは peer が全部 127.0.0.1 なので
+ *    攻撃と正規の利用者を区別できない。総当たりが続いている間は正規の要求も
+ *    429（Retry-After）になりうる。**唯一の壁がトークンである**以上、
+ *    「当てる速さを縛る」を「無中断で応答する」より優先する。
+ */
+const PREAUTH_MAX_INFLIGHT = 2;
+/** 窓の中で 401 を個別に記録する本数。これを超えたら集約行にまとめる */
+const AUTH_FAIL_LOG_FIRST = 3;
+/**
+ * 集約行を挟む最短間隔（活動中は少なくともこの間隔で件数を残す）。
+ *
+ * ⚠️ **「N 件ごとに1行」にしてはいけない。** 429 は 1 秒間に1万本以上撃てるので
+ *    （実測: 並列50で 18,000 req/s）、50件ごとに1行でも **7秒で 503 KB** 伸びた。
+ *    追記の本数は要求数から切り離し、**時間**で縛る（1 peer あたり 10 秒に1行）。
+ */
+const AUTH_FAIL_SUMMARY_MS = 10 * 1000;
 
 /** 連続失敗から遅延（ms）を決める。純関数なのでテストで固定できる */
 export function authFailDelay(count) {
@@ -1014,25 +1073,165 @@ export function authFailDelay(count) {
     return Math.min(AUTH_FAIL_MAX_DELAY_MS, 2 ** (count - 3) * 50);
 }
 
-async function noteAuthFail(req, url) {
-    const peer = req.socket.remoteAddress ?? '(不明)';
-    const now = Date.now();
+function peerKey(req) {
+    return req.socket.remoteAddress ?? '(不明)';
+}
+
+/**
+ * 🔒 認証前の要求を同時に何本処理しているか（peer ごと）。
+ *
+ * 取れなければ **比較せずに** 429 で切る。
+ */
+const preAuthInFlight = new Map();   // peer -> 本数
+function preAuthAcquire(peer) {
+    const n = preAuthInFlight.get(peer) ?? 0;
+    if (n >= PREAUTH_MAX_INFLIGHT) return false;
+    preAuthInFlight.set(peer, n + 1);
+    return true;
+}
+function preAuthRelease(peer) {
+    const n = (preAuthInFlight.get(peer) ?? 1) - 1;
+    if (n > 0) preAuthInFlight.set(peer, n);
+    else preAuthInFlight.delete(peer);
+}
+
+/**
+ * 🚨 **一度通った資格情報は門の外に置く（正規の利用者を締め出さないため）。**
+ *
+ * 実測（持続攻撃: 並列50を6秒）: 門だけだと当てる速さは 485 → 1.8 回/秒に落ちるが、
+ * **正規のトークンも 15 本中 0 本しか通らなくなった**（トンネル越しでは peer が
+ * 全部 127.0.0.1 なので、peer では攻撃と正規を区別できない）。
+ * 区別できるのは**トークンを知っているかどうか**だけなので、
+ * 「過去に通った値そのもの」を覚えておいて、それを提示した要求は門を通さない。
+ *
+ * ⚠️ **これは認可の代わりではない。** 素通りするのは**混雑の門だけ**で、
+ *    `authed()` は必ず通る（つまり値が本当に合っていなければ 401 になる）。
+ * ⚠️ 総当たり側がここに入る道は無い（**成功した後にしか登録されない**）。
+ *    覚えるのはハッシュだけ・件数と TTL で上限を付ける。
+ * ⚠️ 残る穴を隠さない: **攻撃が始まった後の「初回」の認証**は 429 になりうる
+ *    （まだ1度も通っていない端末は覚えられていない）。再試行が要る。
+ */
+const goodSecrets = new Map();   // sha256(hex) -> 最後に通った時刻
+const GOOD_SECRET_TTL_MS = 60 * 60 * 1000;
+const GOOD_SECRET_MAX = 64;
+
+function presentedSecrets(req, url) {
+    const vals = [];
+    const h = req.headers[TOKEN_HEADER];
+    if (typeof h === 'string') vals.push(h);
+    const q = url.searchParams.get('token');
+    if (typeof q === 'string') vals.push(q);
+    for (const c of readCookies(req, AUTH_COOKIE)) vals.push(c);
+    return vals;
+}
+
+const secretHash = v => createHash('sha256').update(v, 'utf8').digest('hex');
+
+function knownGoodSecret(vals, now) {
+    for (const v of vals) {
+        const at = goodSecrets.get(secretHash(v));
+        if (at !== undefined && now - at < GOOD_SECRET_TTL_MS) {
+            goodSecrets.set(secretHash(v), now);
+            return true;
+        }
+    }
+    return false;
+}
+
+function rememberGoodSecret(vals, now) {
+    // ⚠️ **通った要求が提示した値を全部覚えてはいけない。** 偽の Cookie を
+    //    正しいトークンと一緒に送るだけで、その偽の値が門を素通りする鍵になる
+    //    （#43 と同じ「合っていない本数は理由にならない」型）。**合った値だけ**覚える。
+    for (const v of vals) {
+        if (!tokenMatches(v) && !secretMatches(v, cookieSecret())) continue;
+        goodSecrets.set(secretHash(v), now);
+    }
+    if (goodSecrets.size > GOOD_SECRET_MAX) {
+        for (const [k, at] of goodSecrets) {
+            if (goodSecrets.size <= GOOD_SECRET_MAX) break;
+            if (now - at >= GOOD_SECRET_TTL_MS) goodSecrets.delete(k);
+        }
+        // それでも溢れるなら古い順に落とす（Map は挿入順）
+        for (const k of goodSecrets.keys()) {
+            if (goodSecrets.size <= GOOD_SECRET_MAX) break;
+            goodSecrets.delete(k);
+        }
+    }
+}
+
+/** 窓の中の記録を取り出す（窓が変わっていたら前の窓を締めてから作り直す） */
+function authFailRecord(peer, now) {
     const cur = authFails.get(peer);
-    const rec = (cur && now - cur.firstAt < AUTH_FAIL_WINDOW_MS)
-        ? { count: cur.count + 1, firstAt: cur.firstAt }
-        : { count: 1, firstAt: now };
+    if (cur && now - cur.firstAt < AUTH_FAIL_WINDOW_MS) return cur;
+    if (cur) flushAuthFailSummary(peer, cur, 'window-rolled').catch(() => {});
+    const rec = { count: 0, firstAt: now, logged: 0, shed: 0, reported: 0, reportedAt: 0 };
     authFails.set(peer, rec);
     // 台帳が無限に増えないよう古いものを落とす
     if (authFails.size > 256) {
         for (const [k, v] of authFails) {
-            if (now - v.firstAt >= AUTH_FAIL_WINDOW_MS) authFails.delete(k);
+            if (k !== peer && now - v.firstAt >= AUTH_FAIL_WINDOW_MS) authFails.delete(k);
         }
     }
-    // 🔒 **本文は残さない。** 誰が何回外したかだけ
+    return rec;
+}
+
+/**
+ * 🚨 **記録を捨てるなら「捨てた」と分かる形にする。**
+ *
+ * 認証前の要求は誰でも撃てるので、1本1行で追記していると
+ * **外から `.git` の中のファイルを無制限に伸ばせる**（実測: 400本で 61 KB。
+ * 既定の置き場所は `<GIT_DIR>/kjp-exec-audit.jsonl` で、実行の監査記録と
+ * 同じファイルなので埋められると本来の記録が読めなくなる）。
+ * だから個別行は窓の先頭 AUTH_FAIL_LOG_FIRST 本だけにして、
+ * **残りは件数だけの集約行**にする。黙って落とさない。
+ */
+async function flushAuthFailSummary(peer, rec, why) {
+    const dropped = (rec.count - rec.logged) + rec.shed;
+    if (dropped <= rec.reported) return;
+    rec.reported = dropped;
+    rec.reportedAt = Date.now();
     await auditExec({
-        event: 'auth-failed', ...originHint(req),
-        path: url.pathname, count: rec.count,
+        event: 'auth-failed-summary', peer, why,
+        // 比較して外れた本数（401）と、比較せずに切った本数（429）を分けて残す
+        attempts: rec.count, logged: rec.logged,
+        suppressed: rec.count - rec.logged, shed: rec.shed,
+        windowStartedAt: new Date(rec.firstAt).toISOString(),
     }).catch(() => { /* 監査に書けなくても応答は返す */ });
+}
+
+/** 集約行を出す条件（最初の1件と、そこから一定時間ごと） */
+function authFailSummaryDue(rec, now) {
+    const dropped = (rec.count - rec.logged) + rec.shed;
+    if (dropped <= rec.reported) return false;
+    return rec.reported === 0 || now - rec.reportedAt >= AUTH_FAIL_SUMMARY_MS;
+}
+
+/** 比較せずに切った（429）ことを数える。**ここでは追記しない**（増幅を断つため） */
+function noteAuthShed(peer) {
+    const now = Date.now();
+    const rec = authFailRecord(peer, now);
+    rec.shed++;
+    if (authFailSummaryDue(rec, now)) {
+        flushAuthFailSummary(peer, rec, 'shed').catch(() => {});
+    }
+    return rec;
+}
+
+async function noteAuthFail(req, url) {
+    const peer = peerKey(req);
+    const now = Date.now();
+    const rec = authFailRecord(peer, now);
+    rec.count++;
+    // 🔒 **本文は残さない。** 誰が何回外したかだけ
+    if (rec.logged < AUTH_FAIL_LOG_FIRST) {
+        rec.logged++;
+        await auditExec({
+            event: 'auth-failed', ...originHint(req),
+            path: url.pathname, count: rec.count,
+        }).catch(() => { /* 監査に書けなくても応答は返す */ });
+    } else if (authFailSummaryDue(rec, now)) {
+        await flushAuthFailSummary(peer, rec, 'threshold');
+    }
     const delay = authFailDelay(rec.count);
     if (delay > 0) await new Promise(r => setTimeout(r, delay));
     return rec.count;
@@ -1156,14 +1355,43 @@ async function auditLogPath() {
     return auditPath;
 }
 
+/**
+ * 🚨 **上限と回転を付ける（8回目のレビュー）。**
+ *
+ * 既定の置き場所は `.git` の中で、しかも**認証前の 401 も同じファイルに追記する**ので、
+ * 上限が無いと外から容量を食える。並列度の門で追記の本数は縛ったが、
+ * それでも「長く動かす」だけで伸びるので**大きさ自体に上限**を置く。
+ * ⚠️ 回転は記録を捨てる操作なので、**捨てたことを新しいファイルの先頭に残す**
+ *    （`event: "audit-rotated"`）。前の世代（`.1`）を上書きしたかどうかも書く。
+ */
+let auditBytes = null;   // 分かっている現在のサイズ（null = まだ measure していない）
+
 async function auditExec(entry) {
     try {
-        const { appendFile } = await import('node:fs/promises');
-        await appendFile(
-            await auditLogPath(),
-            `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-            'utf8',
-        );
+        const { appendFile, stat, rename } = await import('node:fs/promises');
+        const path = await auditLogPath();
+        const line = `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`;
+        const len = Buffer.byteLength(line, 'utf8');
+        if (auditBytes === null) {
+            auditBytes = await stat(path).then(s => s.size, () => 0);
+        }
+        if (auditBytes + len > opts.auditMaxBytes) {
+            const kept = `${path}.1`;
+            const had = await stat(kept).then(() => true, () => false);
+            await rename(path, kept);
+            const notice = `${JSON.stringify({
+                at: new Date().toISOString(), event: 'audit-rotated',
+                keptAs: kept, bytes: auditBytes, limit: opts.auditMaxBytes,
+                // ⚠️ 前の世代は上書きされる = **そこにあった記録は失われた**
+                discardedPrevious: had,
+            })}\n`;
+            await appendFile(path, notice, 'utf8');
+            auditBytes = Buffer.byteLength(notice, 'utf8');
+            console.error(`⚠ 監査ログが上限（${opts.auditMaxBytes} B）に達したので`
+                + ` ${kept} に回しました${had ? '（前の世代は上書きされました）' : ''}`);
+        }
+        await appendFile(path, line, 'utf8');
+        auditBytes += len;
     } catch (err) {
         // 監査に失敗しても実行は続ける。ただし黙らない
         console.error(`⚠ 監査ログを書けませんでした: ${err.message}`);
@@ -1524,19 +1752,51 @@ async function handleRequest(req, res) {
     }
     // 🔒 読み取りの認証も**入口で**判定する。個別のハンドラに任せない。
     //    ここを通らない経路を作らないことが、後から穴を1つ忘れないための唯一の方法。
-    if (!authed(req, url)) {
-        // 🚨 **失敗を記録して、連続失敗には遅延を掛ける。** ここが無いと
-        //    痕跡ゼロで総当たりできる（実測で29回目に通った）。
-        await noteAuthFail(req, url);
-        // ⚠️ 「トークンが違う」と「トークンが無い」を区別して返さない
-        //    （総当たりに手掛かりを与えない）。
-        res.writeHead(401, {
-            'content-type': 'text/plain; charset=utf-8',
-            'cache-control': 'no-store',
-        });
-        res.end('unauthorized: トークンが必要です。'
-            + '起動時に表示された ?token=... 付きの URL を開いてください\n');
-        return;
+    // 🚨 **認証前の並列度を、比較の手前で縛る**（8回目のレビュー。SERIOUS）。
+    //    遅延は1本ずつを遅くするだけで同時本数を制限しないので、並列度を上げれば
+    //    実測 485 回/秒で当て続けられた。**枠が取れなければ比較せずに 429 で切る。**
+    //    ⚠️ 順序が守りの本体。比較の後ろに置くと 429 が「その値は違った」の
+    //       同義語になり、当てる速さは並列度で決まったままになる。
+    if (opts.requireAuth) {
+        const peer = peerKey(req);
+        const now = Date.now();
+        // 🔒 一度通った値そのものを提示している要求は、混雑の門を通さない
+        //    （素通りするのは門だけ。authed() は必ず通る）。
+        const vals = presentedSecrets(req, url);
+        const trusted = knownGoodSecret(vals, now);
+        if (!trusted && !preAuthAcquire(peer)) {
+            noteAuthShed(peer);
+            res.writeHead(429, {
+                'content-type': 'text/plain; charset=utf-8',
+                'cache-control': 'no-store',
+                'retry-after': '1',
+            });
+            res.end('too many auth attempts: 認証前の要求が同時に多すぎます。'
+                + '少し待って開き直してください\n');
+            return;
+        }
+        let pass;
+        try {
+            pass = authed(req, url);
+            if (pass) rememberGoodSecret(vals, now);
+            // 🚨 **失敗を記録して、連続失敗には遅延を掛ける。** ここが無いと
+            //    痕跡ゼロで総当たりできる（実測で29回目に通った）。
+            //    ⚠️ 遅延の間も枠を握る。これが「並列でも縛れる」の本体。
+            else await noteAuthFail(req, url);
+        } finally {
+            if (!trusted) preAuthRelease(peer);
+        }
+        if (!pass) {
+            // ⚠️ 「トークンが違う」と「トークンが無い」を区別して返さない
+            //    （総当たりに手掛かりを与えない）。
+            res.writeHead(401, {
+                'content-type': 'text/plain; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end('unauthorized: トークンが必要です。'
+                + '起動時に表示された ?token=... 付きの URL を開いてください\n');
+            return;
+        }
     }
     // ?token=... で来たら**読み取り用の Cookie を焼く**（応答は普通に返す）。
     //
@@ -1711,6 +1971,16 @@ async function handleRequest(req, res) {
             const { spawn } = await import('node:child_process');
             const { StringDecoder } = await import('node:string_decoder');
 
+            // ⚠️ **検査専用の遅延（既定 0）。** `create()` と `spawn()` の間の窓
+            //    （実測 100ms 前後）に `/kill` を確実に割り込ませるために要る。
+            //    素のままでは「starting のうちに殺されてから spawn が失敗する」経路が
+            //    プラットフォーム依存の競争になり、**決定的に再現できない**
+            //    （`--exec-stream-delay` / `--layout-probe` と同じ扱い。
+            //      渡さない限りこの経路は存在しない）。
+            if (opts.execSpawnDelayMs > 0) {
+                await new Promise(r => setTimeout(r, opts.execSpawnDelayMs));
+            }
+
             let child;
             try {
                 child = spawn(argv[0], argv.slice(1), {
@@ -1733,36 +2003,20 @@ async function handleRequest(req, res) {
                 streamSession(req, res, session, 0);
                 return;
             }
-            // 🚨 create() から spawn() までに await が入るので、その隙に
-            //    セッションが殺されている（猶予切れ / kill）ことがある。
-            //    そのまま走らせると「停止した」と告げた後に動き続ける。
-            if (!execRegistry.attachChild(session, child)) {
-                await killTree(child);
-                streamSession(req, res, session, 0);
-                return;
-            }
-
-            // 🚨 **stdin の書き込み失敗は非同期の 'error' で来る。**
-            //    listener が無いと uncaughtException になり**デーモンが落ちる**
-            //    （走っている全セッションが消え、監査に exit が1件も残らない。
-            //     レビューで実測）。相手が入力待ちを終えた直後に送るだけで起きる。
-            child.stdin?.on('error', err => {
-                // EPIPE は「相手が読むのをやめた」だけなので、セッションは殺さない
-                execRegistry.emit(session, 'err',
-                    `⚠ 標準入力に書けませんでした: ${err.code ?? err.message}`);
-            });
-
-            // ⚠️ chunk ごとに toString() すると3バイト文字が割れる。
-            //    StringDecoder が境界を持ち越す（CLAUDE.md の git 呼び出し規則と同じ理由）。
-            const decOut = new StringDecoder('utf8'), decErr = new StringDecoder('utf8');
-            child.stdout.on('data', c => {
-                const s = decOut.write(c);
-                if (s) execRegistry.emit(session, 'out', s);
-            });
-            child.stderr.on('data', c => {
-                const s = decErr.write(c);
-                if (s) execRegistry.emit(session, 'err', s);
-            });
+            // 🚨 **子の 'error' は spawn の直後・どの早期 return よりも前に張る**
+            //    （8回目のレビュー。SERIOUS）。以前は `attachChild` が false のときの
+            //    早期 return より**後ろ**で張っていたので、`create()` と `spawn()` の間に
+            //    `/kill`（または猶予切れ）が入った回だけ **ChildProcess に error の
+            //    listener が1つも無い**状態になっていた。spawn の失敗（ENOENT / EACCES）は
+            //    非同期の 'error' で来るので、そこで **uncaughtException になり
+            //    デーモンが exit 1 で即死**する（実測: exec 1本 + kill 1本で消えた）。
+            //    落ちると SIGINT/SIGTERM のハンドラも走らないので、
+            //    **走っていた全セッションの子が寿命管理の外に落ち**（POSIX は
+            //    detached でプロセスグループを切っているので確実に残る）、
+            //    監査に `exit` が1件も残らない。**タイポ1個 + 停止ボタンで盲目になる。**
+            //    `child.stdin` については同じ型を既に直していたのに（#17 の兄弟経路）、
+            //    こちらだけ取りこぼしていた。
+            // ⚠️ 既に done のセッションへの emit / finish は無害（finish は1回しか効かない）。
             // 🚨 **spawn の失敗は同期例外ではなく 'error' イベントで来る。**
             //    存在しないコマンド（Windows なら拡張子なしの `npm` も）は
             //    ENOENT で 'error' + 'close' だけを出し、**'exit' は来ない**。
@@ -1780,6 +2034,35 @@ async function handleRequest(req, res) {
                         code: null, signal: null, note: `spawn 失敗: ${err.message}`,
                     });
                 }
+            });
+            // 🚨 **stdin の書き込み失敗も非同期の 'error' で来る。**
+            //    listener が無いと uncaughtException になり**デーモンが落ちる**
+            //    （走っている全セッションが消え、監査に exit が1件も残らない。
+            //     レビューで実測）。相手が入力待ちを終えた直後に送るだけで起きる。
+            child.stdin?.on('error', err => {
+                // EPIPE は「相手が読むのをやめた」だけなので、セッションは殺さない
+                execRegistry.emit(session, 'err',
+                    `⚠ 標準入力に書けませんでした: ${err.code ?? err.message}`);
+            });
+            // 🚨 create() から spawn() までに await が入るので、その隙に
+            //    セッションが殺されている（猶予切れ / kill）ことがある。
+            //    そのまま走らせると「停止した」と告げた後に動き続ける。
+            if (!execRegistry.attachChild(session, child)) {
+                await killTree(child);
+                streamSession(req, res, session, 0);
+                return;
+            }
+
+            // ⚠️ chunk ごとに toString() すると3バイト文字が割れる。
+            //    StringDecoder が境界を持ち越す（CLAUDE.md の git 呼び出し規則と同じ理由）。
+            const decOut = new StringDecoder('utf8'), decErr = new StringDecoder('utf8');
+            child.stdout.on('data', c => {
+                const s = decOut.write(c);
+                if (s) execRegistry.emit(session, 'out', s);
+            });
+            child.stderr.on('data', c => {
+                const s = decErr.write(c);
+                if (s) execRegistry.emit(session, 'err', s);
             });
             // ⚠️ `close` は保険。`exit` を主にする理由（孫がパイプを握ると
             //    `close` が来ない）は変わらないが、**逆に `exit` が来ない経路がある**
@@ -2147,10 +2430,52 @@ async function handleRequest(req, res) {
                     'merge', '--no-edit', '--end-of-options', branch,
                 ], { cwd: wt.path, optionalLocks: true });
             } catch (err) {
+                // 🚨 **失敗経路でも数え直す（8回目のレビュー。SERIOUS）。**
+                //    `git merge` は**作業ツリーと index を書いた後に失敗しうる**
+                //    （commit 生成の失敗・署名の失敗・同時実行・checkout の失敗）。
+                //    成功経路だけが `sequencerState` を数え直していたので、
+                //    **MERGE_HEAD と staged 変更を残したまま「git が取り込みを
+                //    拒否しました」= 嘘**を返していた（実測: 409 の直後に
+                //    `MERGE_HEAD: true` / `1 A. … b.txt`）。残るのは他のエージェントの
+                //    worktree なので、そのエージェントが次に commit すると
+                //    気付かないまま merge コミットになる。
+                // 🚨 **キャッシュも捨てる。** 失敗経路だけ `cached = null` が無かったので、
+                //    画面は TTL の間 clean のままだった。
+                cached = null;
+                const seqAfter = await sequencerState(wt.path).catch(() => null);
+                const stAfter = await worktreeStatus(wt.path).catch(() => null);
+                // ⚠️ **「数え直せなかった」を「綺麗だ」と書かない**（分からないなら分からないと言う）
+                const leftover = (seqAfter === null || stAfter === null)
+                    ? { counted: false, dirty: null, merging: null, changed: null, unmerged: null }
+                    : {
+                        counted: true,
+                        merging: seqAfter.merging === true,
+                        changed: stAfter.changed,
+                        unmerged: stAfter.unmerged,
+                        dirty: seqAfter.merging === true
+                            || stAfter.changed > 0 || stAfter.unmerged > 0,
+                    };
                 await auditExec({
                     event: 'merge-failed', worktree: wt.path, from, branch, error: err.message,
+                    leftover,
                 });
-                denyJson(res, 409, `git が取り込みを拒否しました: ${err.message}`);
+                const parts = [];
+                if (leftover.merging) parts.push('MERGE_HEAD あり');
+                if (leftover.changed > 0) parts.push(`変更 ${leftover.changed} 件`);
+                if (leftover.unmerged > 0) parts.push(`未解決 ${leftover.unmerged} 件`);
+                const message = leftover.counted === false
+                    ? '取り込みが失敗し、そのあとの作業ツリーの状態を数え直せませんでした。'
+                        + '半端な状態が残っているかもしれません。端末で確認してください: '
+                        + err.message
+                    : (leftover.dirty
+                        ? `取り込みは完了しませんでした。作業ツリーに半端な状態が残っています（${parts.join(' / ')}）。`
+                            + ' 端末で git merge --abort か解決をしてください: ' + err.message
+                        : `git が取り込みを拒否しました（作業ツリーは元のままです）: ${err.message}`);
+                res.writeHead(409, {
+                    'content-type': 'application/json; charset=utf-8',
+                    'cache-control': 'no-store',
+                });
+                res.end(JSON.stringify({ error: message, leftover }));
                 return;
             } finally {
                 const { rm } = await import('node:fs/promises');
@@ -2293,7 +2618,7 @@ async function handleRequest(req, res) {
         // ここに置く理由は ndjson.mjs の冒頭コメント参照（ブラウザ内だとテストできない）。
         if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs'
             || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'
-            || url.pathname === '/pathlabel.mjs') {
+            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',
@@ -2653,6 +2978,10 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
         //    サーバが死んでも孫は回収されない（放置すると溜まる）。
         for (const s of execRegistry.running) {
             if (s.child) killTree(s.child).catch(() => {});
+        }
+        // ⚠️ 集約待ちの認証失敗を落とさない（「何本外されたか」を残して終わる）
+        for (const [peer, rec] of authFails) {
+            flushAuthFailSummary(peer, rec, 'shutdown').catch(() => {});
         }
         server.close(() => process.exit(0));
         // ソケットが残っていても確実に終わらせる

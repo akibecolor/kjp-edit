@@ -280,6 +280,9 @@ import {
 // 「(リポジトリ外)」と言ってよいかの判定も外に出した。ここに書いていたので
 // **中にあるファイルを「外を触った」と断言していた**のに検査が掛からなかった（8回目のレビュー）
 import { pathLabel } from './pathlabel.mjs';
+// 取り込みの応答の解釈も外に出した（「失敗しても数え直す」「半端な状態の告知は
+// 再描画で消さない」は、壊れても静かなので字面ではなく挙動で固定する。8回目のレビュー）
+import { mergeOutcome } from './mergeresult.mjs';
 
 // 🚨 描画の予算を測る検査だけが立てる印（`--layout-probe` の iframe が `?probe=1` で開く）。
 //    ⚠️ これで**機能を変えない**。測定用の入口を1つ出すだけ。
@@ -1772,6 +1775,17 @@ function renderAgents(s) {
   p.body.replaceChildren(box);
 }
 
+/* 🚨 **書き込みが半端に終わったことを、再描画で消さない（8回目のレビュー）。**
+   取り込みのペインは毎回 `replaceChildren` で作り直されるので、押した場所に出した
+   文字は `load(true)` で消える。「MERGE_HEAD が残った」は消してよい話ではないので、
+   **告知の側を掴んで持つ**（端末の上限で告知が消えたのと同じ型の間違い）。 */
+const stickyAlerts = [];
+const STICKY_MAX = 5;
+function stickyAlert(text) {
+  stickyAlerts.push(text);
+  while (stickyAlerts.length > STICKY_MAX) stickyAlerts.shift();
+}
+
 function render(s) {
   state = s;
   $('#repo').textContent = `${s.repo}   base: ${s.base}`;
@@ -1780,6 +1794,11 @@ function render(s) {
   // 警告（安全に関わるので畳めない位置）
   const alerts = $('#alerts');
   alerts.replaceChildren();
+  for (const t of stickyAlerts) {
+    const d = el('div', 'alert danger');
+    d.append(el('b', null, '⚠ 操作の結果: '), document.createTextNode(t));
+    alerts.append(d);
+  }
   for (const e of s.errors ?? []) {
     const d = el('div', 'alert');
     d.append(el('b', null, `${e.scope}: `), document.createTextNode(e.message));
@@ -1932,18 +1951,23 @@ function render(s) {
                   },
                   body: JSON.stringify({ worktree: target.path, branch: br }),
                 });
-                const body = await r.json().catch(() => ({}));
-                if (!r.ok) {
-                  // 🚨 **断られた理由をそのまま出す。** 「できません」だけだと
-                  //    何を直せばよいか分からない（衝突 / dirty / driver / 進行中）
-                  note.className = 'note warn';
-                  note.textContent = `✖ ${br}: ${body.error ?? `HTTP ${r.status}`}`;
-                  b.disabled = false;
-                  return;
-                }
-                note.textContent = `✔ ${br} を取り込みました`
-                  + (body.warning ? `  ${body.warning}` : '');
-                await load(true);
+                const body = await r.json().catch(() => null);
+                // 判定は共有モジュール（`mergeresult.mjs`。unit テストと同じコード）
+                const out = mergeOutcome(r.status, body);
+                // 🚨 **半端な状態が残ったなら、再描画で消えない場所に出す。**
+                //    直後に load(true) を呼ぶので、ここ（作り直されるペイン）だけに
+                //    書くと**文字が消えて「clean」に見える**。
+                if (out.sticky) stickyAlert(`${target.name} ← ${br}: ${out.sticky}`);
+                // 🚨 **断られた理由をそのまま出す。** 「できません」だけだと
+                //    何を直せばよいか分からない（衝突 / dirty / driver / 進行中）
+                note.className = out.ok ? 'note' : 'note warn';
+                note.textContent = out.ok
+                  ? `✔ ${br}: ${out.message}`
+                  : `✖ ${br}: ${out.message}`;
+                if (!out.ok) b.disabled = false;
+                // 🚨 **失敗でも数え直す。** 以前は成功時だけ load していたので、
+                //    merge が途中で失敗して MERGE_HEAD が残っても画面は clean のままだった
+                if (out.reload) await load(true);
               } catch (e) {
                 note.className = 'note warn';
                 note.textContent = `✖ ${br}: ${e.message}`;

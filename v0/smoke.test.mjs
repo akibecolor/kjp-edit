@@ -12,7 +12,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { request as httpRequest } from 'node:http';
+import { request as httpRequest, Agent as HttpAgent } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { mkdtemp, rm, writeFile, mkdir, rename } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -943,9 +943,21 @@ test('🔒 認証失敗は記録され、連続失敗は遅くなる（本文は
         const { readFile: rf } = await import('node:fs/promises');
         const lines = (await rf(audit, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
         const fails = lines.filter(e => e.event === 'auth-failed');
-        assert.ok(fails.length >= 8, `失敗が記録されていない: ${fails.length} 件`);
+        assert.ok(fails.length >= 1, `失敗が記録されていない: ${fails.length} 件`);
         assert.equal(typeof fails[0].peer, 'string');
         assert.equal(fails[0].path, '/api/v0/state');
+        // 🚨 **1本1行では記録しない（8回目のレビュー）。** 認証前の要求は誰でも
+        //    撃てるので、個別行だと外から `.git` の中のファイルを無制限に伸ばせる。
+        //    先頭だけ個別に残し、**残りは集約行**にする。
+        assert.ok(fails.length <= 3,
+            `401 を1本1行で追記している（${fails.length} 行）。外から容量を食える`);
+        const sum = lines.filter(e => e.event === 'auth-failed-summary');
+        // 🚨 **捨てたことが分かる形で残す**（黙って落とさない）
+        assert.ok(sum.length >= 1, '集約行が無い。個別行を省いたことが記録から分からない');
+        const last = sum[sum.length - 1];
+        assert.ok(last.suppressed >= 1,
+            `集約行が「何本省いたか」を持っていない: ${JSON.stringify(last)}`);
+        assert.equal(typeof last.attempts, 'number');
         // 🔒 **試された値は記録しない**（トークンの候補を記録に書かない）
         assert.ok(!JSON.stringify(lines).includes('wrong-value-'),
             '試されたトークンの値が監査に入っている');
@@ -954,6 +966,207 @@ test('🔒 認証失敗は記録され、連続失敗は遅くなる（本文は
         await rm(audit, { force: true }).catch(() => {});
     }
 });
+/**
+ * 並列に叩くための小道具。
+ *
+ * 🚨 **`fetch`（undici）で並列の総当たりを再現してはいけない。** 同一オリジンへの
+ *    接続をプールして本数を絞るので、**攻撃を送れていないのに「縛れている」と
+ *    読める**（Host 検証を fetch で測って偽陽性を出したのと同じ型）。
+ *    `node:http` の Agent を明示して並列度を自分で決める。
+ * ⚠️ keepAlive を使うのは移植性のため。持続攻撃で毎回新しいソケットを開くと
+ *    Windows の ephemeral port を食い潰す。
+ */
+function makeHitter(port, parallel) {
+    const agent = new HttpAgent({ keepAlive: true, maxSockets: parallel });
+    const hit = (token, path = '/api/v0/state') => new Promise(res => {
+        const r = httpRequest({
+            host: '127.0.0.1', port, path, method: 'GET', agent,
+            headers: token === null ? {} : { 'x-kjp-token': token },
+        }, x => {
+            let b = '';
+            x.on('data', d => { b += d; });
+            x.on('end', () => res({ code: x.statusCode, body: b }));
+        });
+        r.on('error', e => res({ code: 0, body: e.message }));
+        r.end();
+    });
+    return { hit, close: () => agent.destroy() };
+}
+
+const sizeOrZero = async p => {
+    const { stat } = await import('node:fs/promises');
+    return stat(p).then(s => s.size, () => 0);
+};
+
+/**
+ * 🚨 **8回目のレビュー（SERIOUS）: 401 の指数遅延はレートを縛っていなかった。**
+ *
+ * 遅延は「1本ずつを遅くする」だけで同時本数を制限しないので、
+ * **攻撃側が並列度を上げるだけで元の速さに戻る。** 実測（このリポジトリ）:
+ *   直列 8 本   : 1,556 ms（7回目のテストが見ていたのはこれだけ）
+ *   並列 300 本 : 2,142 ms / 401 が 300 本 / **140 回/秒** / 監査 +46,092 B
+ *   並列 1200 本: 2,474 ms / 401 が 1200 本 / **485 回/秒** / 監査 +184,893 B
+ * 直列のテストは**この性質を1度も測っていなかった。**
+ */
+test('🔒 401 は並列でも縛られる（比較の本数と記録の増分に上限がある）', async () => {
+    const audit = join(repo, '..', `auth-par-${Date.now()}.jsonl`);
+    const s = await startAuthServer(['--require-auth', '--token', EXEC_TOKEN,
+        '--audit-log', audit]);
+    const { hit, close } = makeHitter(s.port, 320);
+    try {
+        // 正規のトークンで1回通す（= この値は「一度通った」ものになる）
+        const seed = await hit(EXEC_TOKEN, '/api/v0/state?fresh=1');
+        assert.equal(seed.code, 200, `正しいトークンが通らない: ${seed.body.slice(0, 200)}`);
+        const before = JSON.parse(seed.body).stats;
+
+        const N = 300;
+        const t0 = Date.now();
+        const rs = await Promise.all(
+            Array.from({ length: N }, (_, i) => hit(`wrong-parallel-${i}`)));
+        const ms = Date.now() - t0;
+        const by = {};
+        for (const r of rs) by[r.code] = (by[r.code] ?? 0) + 1;
+        const compared = by[401] ?? 0;
+        const shed = by[429] ?? 0;
+        assert.equal(compared + shed, N, `401/429 以外が返った: ${JSON.stringify(by)}`);
+        // 🔒 **比較された本数に上限がある**こと。門が無いと 300 本全部が 401 になる
+        //    （= 並列度がそのまま当てる速さになる）。実測は 5 本 / 315 ms。
+        assert.ok(compared <= 40,
+            `並列 ${N} 本のうち ${compared} 本が比較された（${ms}ms, ${(compared / (ms / 1000)).toFixed(1)} 回/秒）。`
+            + '遅延は並列を縛れない');
+        assert.ok(shed >= 100, `429 で切られた本数が少なすぎる: ${shed}`);
+
+        // 🔒 **記録の増幅を断つ**（認証前の要求で `.git` の中を伸ばせない）
+        await new Promise(r => setTimeout(r, 300));
+        const grew = await sizeOrZero(audit);
+        assert.ok(grew <= 8 * 1024,
+            `認証前の ${N} 本で監査ログが ${grew} B になった（基準: 修正前は 46,092 B）`);
+
+        // 正規のトークンは攻撃の直後も通る（締め出していない）
+        const after = await hit(EXEC_TOKEN, '/api/v0/state?fresh=1');
+        assert.equal(after.code, 200, '攻撃の直後に正しいトークンが通らない');
+        const st = JSON.parse(after.body).stats;
+        // 🔒 **認証前の要求が git を起動しない**こと。冷えたデーモンでは
+        //    401 の1本ごとに `git rev-parse --git-common-dir` が起動していた
+        //    （実測で並列 200 本の最中に git.exe が 7 本同時）。
+        //    この収集ぶんを引けば「その間に何回起動したか」が出る。
+        const during = st.gitSpawnsTotal - st.gitSpawns - before.gitSpawnsTotal;
+        assert.ok(during <= 2,
+            `認証前の ${N} 本の間に git が ${during} 回起動した（1本ごとに起動している）`);
+    } finally {
+        close();
+        s.child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **縛った代わりに正規の利用者を締め出していないこと。**
+ *
+ * トンネル越しでは peer が全部 127.0.0.1 なので、peer だけでは攻撃と
+ * 正規の利用者を区別できない。実測で門だけを入れたときは
+ * **持続攻撃（並列50）の間、正規のトークンが 15 本中 0 本しか通らなかった。**
+ * 区別できるのは「トークンを知っているか」だけなので、
+ * 一度通った値そのものを提示した要求は混雑の門を通さない。
+ */
+test('🔒 総当たりが続いている間も正しい鍵は通り、記録も増幅しない', async () => {
+    const audit = join(repo, '..', `auth-sus-${Date.now()}.jsonl`);
+    const s = await startAuthServer(['--require-auth', '--token', EXEC_TOKEN,
+        '--audit-log', audit]);
+    const PAR = 12;
+    const { hit, close } = makeHitter(s.port, PAR + 2);
+    try {
+        // 先に1回通しておく（実運用で言えば「母艦のブラウザで既に開いている」状態）
+        assert.equal((await hit(EXEC_TOKEN)).code, 200, '最初の1回が通らない');
+
+        const before = await sizeOrZero(audit);
+        const deadline = Date.now() + 2500;
+        let sent = 0;
+        const attack = {};
+        const worker = async () => {
+            while (Date.now() < deadline) {
+                const r = await hit(`wrong-sustained-${sent++}`);
+                attack[r.code] = (attack[r.code] ?? 0) + 1;
+            }
+        };
+        const legit = [];
+        const legitLoop = async () => {
+            while (Date.now() < deadline) {
+                legit.push((await hit(EXEC_TOKEN)).code);
+                await new Promise(r => setTimeout(r, 300));
+            }
+        };
+        const t0 = Date.now();
+        await Promise.all([...Array.from({ length: PAR }, worker), legitLoop()]);
+        const ms = Date.now() - t0;
+
+        // 🔒 正しい鍵は**全部**通る（1本でも 429 なら締め出している）
+        assert.ok(legit.length >= 5, `正規の要求が少なすぎる: ${legit.length} 本`);
+        assert.ok(legit.every(c => c === 200),
+            `総当たりの最中に正しい鍵が弾かれた: ${JSON.stringify(legit)}`);
+        // 当てる速さは縛られたまま（実測 1.8 回/秒。修正前は 485 回/秒）
+        const compared = attack[401] ?? 0;
+        const rate = compared / (ms / 1000);
+        assert.ok(rate <= 20,
+            `持続攻撃で ${rate.toFixed(1)} 回/秒 比較された（${compared} 本 / ${sent} 要求）`);
+        // 🚨 **429 で記録を増幅させない。** 「N 件ごとに1行」にしていたときは
+        //    7秒で 503 KB 伸びた（429 は毎秒1万本以上撃てる）。時間で縛る。
+        await new Promise(r => setTimeout(r, 300));
+        const grew = await sizeOrZero(audit) - before;
+        assert.ok(grew <= 20 * 1024,
+            `${sent} 本の 429 で監査ログが ${grew} B 伸びた（件数ごとに追記している）`);
+    } finally {
+        close();
+        s.child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **監査ログは上限で回転し、「捨てた」ことを残す。**
+ *
+ * 既定の置き場所は `.git` の中で、認証前の 401 も同じファイルに追記されるので、
+ * 上限が無いと長く動かすだけで伸びる。回転は記録を捨てる操作なので、
+ * 新しいファイルの先頭に何をどこへ回したかを残す（黙って消さない）。
+ */
+test('🔒 監査ログは上限で回転し、捨てたことを記録に残す', async () => {
+    const audit = join(repo, '..', `auth-rot-${Date.now()}.jsonl`);
+    const { writeFile: wf, readFile: rf } = await import('node:fs/promises');
+    // 上限を超えた状態から始める（既に長く動いていたデーモンと同じ）
+    const old = `${JSON.stringify({ at: 'old', event: 'start', filler: 'x'.repeat(400) })}\n`;
+    await wf(audit, old.repeat(4), 'utf8');
+    const s = await startAuthServer(['--require-auth', '--token', EXEC_TOKEN,
+        '--audit-log', audit, '--audit-max-bytes', '1024']);
+    try {
+        assert.equal((await authGet(s.port, '/api/v0/state',
+            { 'x-kjp-token': 'wrong-rotate' })).code, 401);
+        // 追記は非同期なので、回転が現れるまで待つ（固定時間で待たない）
+        let lines = [];
+        for (let i = 0; i < 60; i++) {
+            lines = (await rf(audit, 'utf8').catch(() => '')).split('\n')
+                .filter(Boolean).map(l => JSON.parse(l));
+            if (lines.some(e => e.event === 'audit-rotated')) break;
+            await new Promise(r => setTimeout(r, 100));
+        }
+        const rot = lines.find(e => e.event === 'audit-rotated');
+        assert.ok(rot, `回転していない: ${JSON.stringify(lines).slice(0, 300)}`);
+        assert.equal(rot.keptAs, `${audit}.1`);
+        assert.equal(rot.discardedPrevious, false, '初回なのに前の世代を捨てたと言っている');
+        assert.ok(rot.bytes >= 1024, `回転前のサイズを残していない: ${rot.bytes}`);
+        // 回した先に元の記録がある（消したのではなく回した）
+        assert.ok((await rf(`${audit}.1`, 'utf8')).includes('"at":"old"'),
+            '前の記録が .1 に残っていない');
+        // 新しいファイルは小さく、上限を守っている
+        assert.ok(await sizeOrZero(audit) <= 1024 + 400,
+            '回転後のファイルが上限を超えている');
+        assert.ok(lines.some(e => e.event === 'auth-failed'), '回転後に追記できていない');
+    } finally {
+        s.child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+        await rm(`${audit}.1`, { force: true }).catch(() => {});
+    }
+});
+
 test('🔒 コマンド行に載った実行トークンを read 権限で配らない', async () => {
     const home = await mkdtemp(join(tmpdir(), 'kjp-mask-home-'));
     // 記録を仕込む（サーバは ~/.claude/projects を読むので HOME を差し替える）
@@ -1194,11 +1407,11 @@ test('🔒 --allow-write なしでは session がトークンを返さない', a
  *    （Cookie を持つ相手が実行トークンを取り戻せる穴だった。4回目のレビュー）。
  */
 const WRITE_TOKEN = 'smoke-write-token-0123456789abcdef';
-async function startWritable(extra = []) {
+async function startWritable(extra = [], env = {}) {
     const child = spawn(
         process.execPath,
         [SERVER, '--repo', repo, '--port', '0', '--allow-write', '--token', WRITE_TOKEN, ...extra],
-        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } },
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig(), ...env } },
     );
     child.stdout.setEncoding('utf8');
     const url = await new Promise((resolve, reject) => {
@@ -1418,6 +1631,108 @@ test('🔒 merge: 衝突しないものは取り込め、衝突するものは�
             await g(['branch', '-D', br], repo).catch(() => {});
             await rm(wt, { recursive: true, force: true }).catch(() => {});
         }
+    }
+});
+
+/**
+ * 🚨 **8回目のレビュー（SERIOUS）: merge が途中で失敗すると MERGE_HEAD と
+ *    staged 変更を残したまま「git が取り込みを拒否しました」と返していた。**
+ *
+ * 約束は「衝突すると予測されたものは実行しない = 作業ツリーを衝突状態にしない」で、
+ * 成功経路は `conflicted` を数え直しているのに、**失敗経路は1度も数え直さなかった。**
+ * `git merge` は作業ツリーと index を書いた**後**に失敗しうるので「拒否しました」は嘘。
+ * 残るのは他のエージェントの worktree の MERGE_HEAD なので、そのエージェントが
+ * 次に commit すると気付かないまま merge コミットになる。
+ *
+ * ⚠️ 決定的に失敗させる方法: `GIT_AUTHOR_DATE` を不正な値にする。
+ *    git は**マージして作業ツリーと index を書いた後**、commit を作る段で
+ *    `fatal: invalid date format` で落ちる（実測: MERGE_HEAD あり /
+ *    `1 A. … b.txt` が staged）。identity を消す方法は commit の**手前**で
+ *    落ちるので（実測で MERGE_HEAD 無し）この形を測れない。
+ */
+test('🚨 merge が途中で失敗したら「半端な状態が残った」と言う', async () => {
+    const stem = repo.split(/[\\/]/).pop();
+    const base = join(repo, '..', `${stem}-mf-base`);
+    const src = join(repo, '..', `${stem}-mf-src`);
+    // ⚠️ サーバ側の git にだけ効かせる（テスト自身の g() は自前で identity を渡す）
+    // ⚠️ `--state-ttl` で「キャッシュを捨てたか」を決定的に測る。既定の 1500ms だと
+    //    merge に掛かる時間と競争になり、遅い環境では守りを外しても緑になる。
+    const { child, url } = await startWritable(['--state-ttl', '60000'],
+        { GIT_AUTHOR_DATE: 'kjp-not-a-date' });
+    const { existsSync } = await import('node:fs');
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'mf-base', base, 'main'], repo);
+        await g(['worktree', 'add', '-q', '-b', 'mf-src', src, 'main'], repo);
+        // src 側に「衝突しない追加」（= 予測は clean になる）
+        await writeFile(join(src, 'mf-src-only.txt'), 'src\n', 'utf8');
+        await g(['add', '-A'], src);
+        await g(['commit', '-q', '-m', 'feat: src 側の追加'], src);
+        // base 側も1つ進めて fast-forward にしない（merge コミットを作らせる）
+        await writeFile(join(base, 'mf-base-only.txt'), 'base\n', 'utf8');
+        await g(['add', '-A'], base);
+        await g(['commit', '-q', '-m', 'feat: base 側の追加'], base);
+
+        // 🚨 **キャッシュが有る状態から始める。** 何も読んでいないと、
+        //    失敗後の読み取りは（キャッシュを捨てていなくても）collect し直すので、
+        //    「捨てている」を測れない（変異が SURVIVED した）。
+        const plain = async () => (await (await fetch(`${url}/api/v0/state`)).json());
+        const before = await plain();
+        const t0 = Date.now();
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': WRITE_TOKEN,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: base, branch: 'mf-src' }),
+        });
+        const b = await r.json();
+        assert.equal(r.status, 409, `失敗しなかった: ${JSON.stringify(b)}`);
+        // 実体はどうなっているか（テスト側で数え直す）
+        const mergeHead = existsSync(join(base, '.git'))
+            ? (await g(['rev-parse', '--verify', '-q', 'MERGE_HEAD'], base)
+                .then(() => true, () => false))
+            : false;
+        const st = await g(['status', '--porcelain=v2'], base);
+        assert.equal(mergeHead, true,
+            `この検査の前提が崩れた（MERGE_HEAD が残らない失敗になっている）: ${st}`);
+
+        // 🚨 **応答が実体と一致していること。** 「拒否しました」と言ってはいけない
+        assert.ok(b.leftover, `半端な状態を数え直していない: ${JSON.stringify(b)}`);
+        assert.equal(b.leftover.counted, true, '数え直せなかったのか、と読めてしまう');
+        assert.equal(b.leftover.merging, true,
+            `MERGE_HEAD が残っているのにそう言っていない: ${JSON.stringify(b.leftover)}`);
+        assert.equal(b.leftover.dirty, true);
+        assert.ok(b.leftover.changed > 0,
+            `staged 変更が残っているのに 0 と言っている: ${JSON.stringify(b.leftover)}`);
+        assert.match(b.error, /半端な状態/,
+            `「拒否しました」で済ませている（作業ツリーは半端なのに）: ${b.error}`);
+        assert.ok(!/拒否しました/.test(b.error), `嘘の文言が残っている: ${b.error}`);
+
+        // 🚨 **キャッシュを捨てていること。** 素の /api/v0/state（?fresh=1 なし）が
+        //    merging を返す = 失敗経路で cached を捨てている
+        const s = await plain();
+        const elapsed = Date.now() - t0;
+        // ⚠️ TTL を超えていたら、キャッシュは自然に切れているので
+        //    「捨てたから新しい」を測れない。**測れなかったことを緑にしない。**
+        assert.ok(elapsed < 60000,
+            `キャッシュの判定を測れなかった（merge に ${elapsed}ms かかり TTL を超えた）`);
+        assert.notEqual(s.generatedAt, before.generatedAt,
+            'キャッシュをそのまま返している（画面は clean のままになる）');
+        const w = s.worktrees.find(x => x.branch === 'mf-base');
+        assert.ok(w, `worktree が見えない: ${s.worktrees.map(x => x.branch).join(',')}`);
+        assert.equal(w.sequencer.merging, true,
+            'キャッシュが古いままなので、画面は clean のままになる');
+    } finally {
+        child.kill();
+        await g(['merge', '--abort'], base).catch(() => {});
+        for (const [wt, br] of [[base, 'mf-base'], [src, 'mf-src']]) {
+            await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+            await g(['branch', '-D', br], repo).catch(() => {});
+            await rm(wt, { recursive: true, force: true }).catch(() => {});
+        }
+        await g(['worktree', 'prune'], repo).catch(() => {});
     }
 });
 
@@ -2106,6 +2421,70 @@ test('🚨 exec: 応答が届く前に切っても切断として扱い、猶予
             if (!s || s.state === 'done') done = s ?? { state: 'evicted' };
         }
         assert.ok(done, `猶予を過ぎても止まらない: ${JSON.stringify(await sessions())}`);
+    } finally { child.kill(); }
+});
+
+/**
+ * 🚨 **8回目のレビュー（SERIOUS）: `attachChild` 失敗経路に 'error' listener が無く、
+ *    ENOENT でデーモンが exit 1 で落ちていた。**
+ *
+ * `create()` → `spawn()` の間に `/kill` が入るとセッションは done になり、
+ * `if (!execRegistry.attachChild(...))` で早期 return する。ところが
+ * `child.on('error')` を張るのは**その return の後ろ**だったので、この経路の
+ * ChildProcess には error listener が1つも無かった。spawn の失敗は非同期の
+ * 'error' で来る（ENOENT / EACCES）ため、**listener 無しの 'error' が
+ * uncaughtException になりデーモンが即死**する（要求2本で消える）。
+ * SIGINT/SIGTERM のハンドラは uncaughtException では走らないので、
+ * 走っている全セッションの子は寿命管理の外に落ちる。
+ * `child.stdin` の 'error' で同じ型を直していたのに、兄弟経路を取りこぼしていた。
+ */
+test('🚨 exec: starting のうちに kill された後に spawn が失敗してもデーモンは生きている', async () => {
+    // `--exec-spawn-delay` で「kill が spawn より先」を決定的にする
+    //（素のままだと窓は実測 100ms 前後のプラットフォーム依存の競争）
+    const { child, url } = await startExec(['--exec-spawn-delay', '900']);
+    const port = Number(new URL(url).port);
+    try {
+        // 存在しないコマンド。spawn は ENOENT で非同期の 'error' を出す
+        const q = httpRequest({
+            host: '127.0.0.1', port, path: '/api/v0/exec', method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        }, x => x.resume());
+        q.on('error', () => { /* 応答は待たない */ });
+        q.write(JSON.stringify({ worktree: repo, argv: ['kjp-no-such-command-xyz'] }));
+        q.end();
+
+        const list = async () => {
+            const r = await fetch(`${url}/api/v0/exec/list`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            });
+            return r.ok ? (await r.json()).sessions ?? [] : null;
+        };
+        // starting のうちに掴む（spawn の手前で待たせているので必ず居る）
+        let target = null;
+        for (let i = 0; i < 40 && !target; i++) {
+            await new Promise(r => setTimeout(r, 50));
+            target = (await list() ?? []).find(s => s.state === 'starting');
+        }
+        assert.ok(target, 'starting のセッションが見えない（窓を作れていない）');
+        const killed = await fetch(`${url}/api/v0/exec/${target.id}/kill`, {
+            method: 'POST', headers: { 'x-kjp-token': EXEC_TOKEN },
+        });
+        assert.equal(killed.status, 200, '停止できない');
+        await killed.text();
+
+        // spawn（900ms 後）の ENOENT を過ぎてもデーモンが応答すること
+        await new Promise(r => setTimeout(r, 1500));
+        const after = await list();
+        assert.ok(after !== null,
+            'ENOENT の '
+            + `'error' でデーモンが落ちた（exitCode=${child.exitCode}）。`
+            + '要求2本で全セッションの観測が消える');
+        assert.equal(child.exitCode, null, `デーモンが終了している: ${child.exitCode}`);
+        // 起動できなかったことがセッションに残る（黙って消えない）
+        const s = (after ?? []).find(x => x.id === target.id);
+        assert.ok(s, `セッションが台帳から消えた: ${JSON.stringify(after)}`);
+        assert.equal(s.state, 'done', `終端していない: ${JSON.stringify(s)}`);
     } finally { child.kill(); }
 });
 
