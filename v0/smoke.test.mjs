@@ -4393,3 +4393,62 @@ test('🔒 案内の URL の鍵では実行できない（読み取りだけ通�
         child.kill();
     }
 });
+
+/**
+ * 🔒 **監査ログを worktree の中に置かせない（8回目のレビュー。MINOR）。**
+ *
+ * 監査ログは exec の argv を**マスクせずに**保存する（画面に出す側は maskSecrets を
+ * 通すので、**ファイルの方が UI より秘密が多い**）。worktree の中に落ちると、
+ * このツールが前提にしている「常時 `git add -A` する N 個のエージェント」が
+ * そのままコミットし、push で外に出る。
+ * `--token-file` には同じ理由の門が4行の説明付きであったのに、**こちらは素通り**だった。
+ * ⚠️ `.git` の中（既定の置き場所）は許す — `git add -A` では追跡されないので。
+ */
+test('🔒 --audit-log を worktree の中に置くと起動を拒否する', async () => {
+    const inside = join(repo, 'kjp-audit-in-repo.jsonl');
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec',
+            '--token', EXEC_TOKEN, '--audit-log', inside],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stderr.setEncoding('utf8');
+    let err = '';
+    child.stderr.on('data', d => { err += d; });
+    // 🚨 **待ち続ける形にしない。** 門を外すとサーバは正常に起動して
+    //    `close` が永久に来ないので、`node --test` ごとハングして SIGKILL され、
+    //    要約が出ず**原因が完全に消える**（変異が HUNG で報告された）。
+    //    上限を付けて「拒否されなかった」を失敗として観測できる形にする。
+    const code = await Promise.race([
+        new Promise(r => child.on('close', r)),
+        new Promise(r => setTimeout(() => r('タイムアウト（起動してしまった）'), 8000)),
+    ]);
+    child.kill();
+    assert.equal(code, 1, `worktree の中を指したのに起動した: ${code} ${err}`);
+    assert.match(err, /worktree の中に置かないでください/);
+    // 理由を言う（黙って拒否しない）
+    assert.match(err, /git add -A/);
+    await rm(inside, { force: true }).catch(() => {});
+});
+
+test('--audit-log は .git の中なら通す（既定の置き場所を否定しない）', async () => {
+    const dotGit = join(repo, '.git', 'kjp-audit-ok.jsonl');
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-exec',
+            '--token', EXEC_TOKEN, '--audit-log', dotGit],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    child.stdout.setEncoding('utf8');
+    try {
+        const started = await new Promise((res, rej) => {
+            const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                if (/http:\/\/127\.0\.0\.1:\d+/.test(buf)) { clearTimeout(t); res(true); }
+            });
+            child.on('close', () => { clearTimeout(t); rej(new Error('起動せず終了した')); });
+        });
+        assert.equal(started, true);
+    } finally {
+        child.kill();
+        await rm(dotGit, { force: true }).catch(() => {});
+    }
+});

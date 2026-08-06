@@ -118,6 +118,27 @@ const MUTANTS = [
         pattern: 'core.fsmonitor',
     },
     {
+        // 🚨 8回目のレビュー: --token-file には門があったのに --audit-log は素通り
+        //    （監査ログは argv を**マスクせずに**保存するので、コミットされると外に出る）
+        name: 'audit-log-inside-worktree',
+        why: '監査ログを worktree の中に置かせる'
+            + '（マスクしていない argv が git add -A でコミットされ、push で外に出る）',
+        file: 'v0/server.mjs',
+        from: '    if (inWorktree) {',
+        to: '    if (false) {   /* 変異: 門を外す */',
+        gone: 'if (inWorktree) {',
+        pattern: 'worktree の中に置くと起動を拒否する',
+    },
+    {
+        name: 'audit-log-allows-git-dir',
+        why: '.git の中の監査ログも拒否する（既定の置き場所を自分で否定して起動できなくなる）',
+        file: 'v0/server.mjs',
+        from: '            inWorktree = !containsPath(common, opts.auditLog);',
+        to: '            inWorktree = true;   /* 変異: .git の中も拒否する */',
+        gone: '!containsPath(common, opts.auditLog)',
+        pattern: '.git の中なら通す',
+    },
+    {
         name: 'token-file-inside-repo',
         why: '表記の違い（8.3 短縮名 / symlink / /private/var）でリポジトリ内判定が外れ、'
             + '実行トークンがコミットされる',
@@ -666,7 +687,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '全 worktree を見ずにメインの top だけで判定する'
             + '（linked worktree に置かせて、エージェントの git add -A でコミットされる #39）',
         file: 'v0/server.mjs',
-        from: '            for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);',
+        // ⚠️ 判定を `insideRepoGate()` に集約したのでインデントが変わった（--dry で検出）
+        from: '        for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);',
         to: '            /* 変異: worktree を見ない */',
         gone: 'if (w.path) roots.push(w.path)',
         pattern: 'linked worktree と bare の中も拒否する',
@@ -682,9 +704,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         defensive: 'listWorktrees() が bare も .git の親も返すので現状は二重。'
             + 'worktree list が失敗したときに roots を空にしない（unknown に落とさない）ための根として残す',
         file: 'v0/server.mjs',
-        from: `            const common = (await commonDir(opts.repo)).trim();
-            if (common) roots.push(common);`,
-        to: '            /* 変異: .git を見ない */',
+        // ⚠️ 判定を `insideRepoGate()` に集約したのでインデントが変わった（--dry で検出）
+        from: `        const common = (await commonDir(opts.repo)).trim();
+        if (common) roots.push(common);`,
+        to: '        /* 変異: .git を見ない */',
         gone: 'if (common) roots.push(common)',
         pattern: 'linked worktree と bare の中も拒否する',
     },

@@ -2397,6 +2397,73 @@ try {
 //   必須にしているのと同じ理屈）。ファイルに置けば運用できる。
 // ⚠️ 代わりに「再起動で無効化される」性質を失う。だから**明示的なオプション**にし、
 //   既定では使わない。作るときは所有者のみ読める権限（0600）にする。
+/**
+ * 🚨 **「リポジトリの中か」の判定を1箇所にする。**
+ *
+ * `--token-file` にはこの門があったのに、**同じ危険を持つ `--audit-log` には
+ * 1つも無かった**（8回目のレビュー）。監査ログは exec の argv を**マスクせずに**
+ * 保存するので、worktree の中に落ちると常時 `git add -A` するエージェントが
+ * そのままコミットし、push で外に出る（実データで 24 文字以上のトークン様文字列を
+ * 含む argv が 2 件あった）。`--help` が「既定は `<GIT_DIR>` 内。実行した相手が
+ * 消せる」と書いて外に出すことを促すので、リポジトリ直下を指す動機まであった。
+ *
+ * 経路ごとに書くと1つ忘れる（認可の関門と同じ理屈）。**関数にして両方が通る。**
+ *
+ * @returns {{inside: boolean} | {unknown: true}} 判定できないときは unknown
+ *   （⚠️ 分からないことを「外」と断定しない）
+ */
+async function insideRepoGate(target) {
+    const roots = [];
+    try {
+        const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
+        if (top) roots.push(top);
+    } catch { /* bare。失敗を「外」と読まない */ }
+    // .git 本体（bare のリポジトリ自身もここに入る）
+    try {
+        const common = (await commonDir(opts.repo)).trim();
+        if (common) roots.push(common);
+    } catch { /* noop */ }
+    // 全 worktree の作業ツリー
+    try {
+        for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);
+    } catch { /* noop */ }
+    // ⚠️ 何も分からなかったときに「外」と断定しない（分からないと言う）
+    if (!roots.length) return { unknown: true };
+    // ⚠️ relative() では駄目。表記が違うと外れて、秘密がコミットされる
+    //    （macOS の /var→/private/var、Windows の RUNNER~1 で実際に外れた）
+    return { inside: roots.some(r => containsPath(r, target)) };
+}
+
+// 🔒 **監査ログも worktree の中に置かせない。**
+//    argv をマスクせずに保存するので、置いた場所がそのままコミットされる
+//    （8回目のレビュー。`--token-file` には門があったのにこちらは素通りだった）。
+//    ⚠️ `.git` の中（既定）は許す — `git add -A` では追跡されないので、
+//       ここを拒否すると既定の置き場所を自分で否定することになる。
+if (opts.auditLog) {
+    const gate = await insideRepoGate(opts.auditLog);
+    // worktree の中かどうかを分けて判定する（.git の中は許す）
+    let inWorktree = false;
+    if (gate.inside) {
+        try {
+            const common = (await commonDir(opts.repo)).trim();
+            inWorktree = !containsPath(common, opts.auditLog);
+        } catch { inWorktree = true; }   // 判定できないなら安全側（拒否）に倒す
+    }
+    if (inWorktree) {
+        console.error(`\n✖ --audit-log を worktree の中に置かないでください: ${opts.auditLog}\n`);
+        console.error('  監査ログは実行した argv をそのまま保存します（マスクしません）。');
+        console.error('  worktree の中に置くと、エージェントの `git add -A` でコミットされ、');
+        console.error('  push で外に出ます（実データにトークン様の文字列を含む argv がありました）。');
+        console.error('  ホームディレクトリの下など、リポジトリの外を指定してください\n');
+        process.exit(1);
+    }
+    if (gate.unknown) {
+        console.error('⚠ --audit-log がリポジトリの中かどうか判定できませんでした'
+            + `（worktree 一覧が取れません）: ${opts.auditLog}`);
+        console.error('  コミットされていないか自分で確認してください。');
+    }
+}
+
 // ⚠️ リポジトリの中に置かせない（コミットされる）。
 if (opts.tokenFile) {
     const { readFile: rf, writeFile: wf, chmod } = await import('node:fs/promises');
@@ -2406,27 +2473,7 @@ if (opts.tokenFile) {
     //    commit に入る（実測で `git show HEAD:token` にトークン本体が出た）。
     //    さらに bare では `--show-toplevel` が exit 128 で落ち、catch → false で
     //    **門が丸ごと無効**だった（cc7e9b0 で直したのと同じクラスの再発。#39）。
-    const gate = await (async () => {
-        const roots = [];
-        try {
-            const top = (await git(['rev-parse', '--show-toplevel'], { cwd: opts.repo })).trim();
-            if (top) roots.push(top);
-        } catch { /* bare。失敗を「外」と読まない */ }
-        // .git 本体（bare のリポジトリ自身もここに入る）
-        try {
-            const common = (await commonDir(opts.repo)).trim();
-            if (common) roots.push(common);
-        } catch { /* noop */ }
-        // 全 worktree の作業ツリー
-        try {
-            for (const w of await listWorktrees(opts.repo)) if (w.path) roots.push(w.path);
-        } catch { /* noop */ }
-        // ⚠️ 何も分からなかったときに「外」と断定しない（分からないと言う）
-        if (!roots.length) return { unknown: true };
-        // ⚠️ relative() では駄目。表記が違うと外れて、トークンがコミットされる
-        //    （macOS の /var→/private/var、Windows の RUNNER~1 で実際に外れた）
-        return { inside: roots.some(r => containsPath(r, opts.tokenFile)) };
-    })();
+    const gate = await insideRepoGate(opts.tokenFile);
     if (gate.inside) {
         // ⚠️ 理由を場所ごとに正しく言う。`.git` の中は `git add -A` では追跡されないので、
         //    「コミットされます」だけを理由にすると嘘になる（それでも置き場所としては誤り）。
