@@ -742,10 +742,23 @@ function makeTermWriter(termEl, scrollEl) {
 }
 
 async function runExec(termEl, scrollEl, wt, argv, onState,
-  { attach = null, keepAlive = false, chat = false, onActivity = null } = {}) {
+  { attach = null, keepAlive = false, chat = false, onActivity = null, isCurrent = null } = {}) {
   // 端末への追記は共通の書き手を使う（描画の計測も同じものを通る。#3）
   const writer = makeTermWriter(termEl, scrollEl);
-  const line = writer.line;
+  /**
+   * 🚨 **古い購読は端末に1文字も書かない（macOS の CI が捕まえた）。**
+   *
+   * 切替のとき `beginRun` は前の購読を abort して端末を消すが、
+   * **書き手は `requestAnimationFrame` でまとめて流す**ので、消した**後**に
+   * 古い行が同じ要素へ入る（`finally` の `flush()` も同じ）。結果、
+   * 2本の出力が混ざり「どちらの出力か判別できない」状態に戻っていた。
+   * 手元（Windows）では rAF の順序が違って再現せず、**CI の macOS だけで落ちた**。
+   * 世代が変わったら書き込みを捨てる（購読の abort とは別に、**出口も閉じる**）。
+   */
+  const line = (cls, text) => {
+    if (isCurrent && !isCurrent()) return;
+    writer.line(cls, text);
+  };
 
   const ac = new AbortController();
   // ⚠️ **abort はもう「停止」ではない。** #17 でサーバが切断で子を殺すのを
@@ -883,7 +896,9 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     // 🚨 **順序が重要。** chatFilter に残っている行を先に line() に流し、
     //    そのあと writer を flush する。逆にすると最後の応答が DOM に出ない（#44）
     chatFilter?.flush();
-    writer.flush();                // 溜まっている分を出し切る
+    // ⚠️ 切替で世代が変わっていたら**流さない**（消した端末に古い行が入る）。
+    //    dispose は必ずやる（タイマーと参照を落とすため）
+    if (!isCurrent || isCurrent()) writer.flush();
     writer.dispose();
     onState({ running: false });
   }
@@ -1181,7 +1196,12 @@ function consoleBody(wt, paneObj) {
         });
       }
       onState(st);
-    }, { ...opts, onActivity: ev => { if (myGen === gen) onActivity(ev); } });
+    }, {
+      ...opts,
+      onActivity: ev => { if (myGen === gen) onActivity(ev); },
+      // 🚨 出口も閉じる（購読を abort しても、書き手は rAF で後から流し込む）
+      isCurrent: () => myGen === gen,
+    });
   };
 
   let cur = null;

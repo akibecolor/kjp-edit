@@ -689,6 +689,31 @@ try {
     const sideA = await startSide('AAA');
     const sideB = await startSide('BBB');
     const dual = (sideA && sideB) ? await evaluate(DUAL_CHECK) : { error: '2本用意できなかった' };
+    /**
+     * 🚨 **切替で前の購読が本当に切れたかは、サーバ側の購読者数で測る。**
+     *
+     * 画面の「混ざらない」だけでは足りない: 書き込みの出口を閉じた（`isCurrent`）ので、
+     * **abort を外しても画面は混ざらなくなった**（変異が SURVIVED した）。
+     * 切らないと fetch が開いたままでサーバは購読者が居ると見なし、
+     * `lastDetachedAt` が立たないので**切断後の猶予が始まらない**（取り残しになる）。
+     * ここが abort の本体なので、ここを測る。
+     */
+    let subs = null;
+    if (sideA && sideB && dual && !dual.error) {
+        try {
+            const body = await (await fetch(`${base}/api/v0/exec/list`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': TOKEN },
+            })).json();
+            const byId = new Map((body.sessions ?? []).map(s => [s.id, s.subscribers]));
+            // dual.second は今見ている側（'AAA' か 'BBB'）
+            const shown = dual.second === 'AAA' ? sideA : sideB;
+            const other = dual.second === 'AAA' ? sideB : sideA;
+            subs = { shown: byId.get(shown) ?? null, other: byId.get(other) ?? null };
+        } catch (e) {
+            subs = { error: e.message };
+        }
+    }
     for (const id of [sideA, sideB]) {
         if (!id) continue;
         await fetch(`${base}/api/v0/exec/${id}/kill`, {
@@ -818,6 +843,18 @@ try {
         }
         if (!dual.beatShown) {
             problems.push('切替後に心拍が出ていない（走っているのに止まって見える）');
+        }
+        // 🚨 前の購読が本当に切れたか（切れないと猶予が始まらず取り残しになる）
+        if (subs && subs.error) {
+            problems.push(`購読者数を測れなかった: ${subs.error}`);
+        } else if (subs) {
+            if (subs.other !== 0) {
+                problems.push('切替で前の購読が切れていない'
+                    + `（サーバは購読者 ${subs.other} と見なしている = 切断後の猶予が始まらない）`);
+            }
+            if (!(subs.shown >= 1)) {
+                problems.push(`切り替え先を購読していない（購読者 ${subs.shown}）`);
+            }
         }
         if (dual.flickered) {
             problems.push('切替の途中で「実行していない」表示になった'

@@ -2165,6 +2165,21 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         script: 'v0/render-check.mjs',
     },
     {
+        // 🚨 **CI の macOS が捕まえた本物のバグ。** 購読を abort しても、書き手は
+        //    `requestAnimationFrame` でまとめて流すので、消した端末に古い行が入る。
+        //    ⚠️ 手元（Windows）では rAF の順序が違って**再現しない**ので、
+        //       この変異は darwin / linux でしか殺せない（SKIP を緑と読まない）。
+        name: 'console-stale-writer',
+        why: '古い購読の書き込みを捨てない'
+            + '（切替で端末を消しても rAF の flush で古い行が入り、2本が混ざる）',
+        file: 'v0/app.html',
+        from: '    if (isCurrent && !isCurrent()) return;',
+        to: '    /* 変異: 古い購読の書き込みも通す */',
+        gone: 'if (isCurrent && !isCurrent()) return;',
+        platforms: ['darwin', 'linux'],
+        script: 'v0/render-check.mjs',
+    },
+    {
         name: 'console-stale-notifications',
         why: '古い購読からの通知を捨てない'
             + '（終わった方の exit で「停止」表示になり、走っている方を止められなくなる）',
