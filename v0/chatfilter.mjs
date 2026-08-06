@@ -37,7 +37,7 @@ export function chatRecordLines(r) {
         //    `transcript.mjs` は同じ形を `Array.isArray` で守っている。
         const blocks = Array.isArray(r.message?.content) ? r.message.content : null;
         if (blocks === null) {
-            return [{ cls: 'd', text: '  （assistant の content が配列ではないので表示していません）' }];
+            return [{ cls: 'd', kind: 'skip', text: '  （assistant の content が配列ではないので表示していません）' }];
         }
         const t = blocks.filter(b => b?.type === 'text')
             .map(b => (typeof b.text === 'string' ? b.text : '')).join('');
@@ -53,7 +53,7 @@ export function chatRecordLines(r) {
         if (!out.length) {
             const kinds = blocks.map(b => (typeof b?.type === 'string' ? b.type : '?'))
                 .join(',').slice(0, 60);
-            out.push({ cls: 'd', text: `  （assistant の中身を解釈できませんでした: ${kinds || '空'}）` });
+            out.push({ cls: 'd', kind: 'skip', text: `  （assistant の中身を解釈できませんでした: ${kinds || '空'}）` });
         }
         return out;
     }
@@ -70,7 +70,7 @@ export function chatRecordLines(r) {
     //    1行で出す（長い本文で画面を埋めない。省略したことは言う）
     const kind = [r?.type, r?.subtype].filter(v => typeof v === 'string' && v)
         .join('/').slice(0, 60) || '(type なし)';
-    return [{ cls: 'd', text: `  （${kind} は表示していません）` }];
+    return [{ cls: 'd', kind: 'skip', text: `  （${kind} は表示していません）` }];
 }
 
 /**
@@ -109,6 +109,36 @@ export function chatGlance(raw) {
  */
 export function makeChatFilter(line) {
     let buf = '';
+    /**
+     * 🚨 **同じ告知の連続をまとめる（実機で踏んだ）。**
+     *
+     * `thinking` や `stream_event` は**トークンごとに1レコード来る**ので、
+     * 「表示していません」を1件1行で出すと**画面が告知で埋まり、
+     * 肝心の応答が押し出される**（スマホの実画面の8割がこれになった）。
+     *
+     * ⚠️ **黙って捨てない約束は守る。** 最初の1件は即座に出し、
+     *    続く同じ告知は数えて「同上 ×N」として出す（件数は必ず見せる）。
+     * ⚠️ 応答本文とツール名（`· Bash`）は**待たせない**。読む対象なので、
+     *    まとめ待ちで遅らせると「止まっている」ように見える。
+     */
+    let run = null;   // {cls, text, extra}
+    const endRun = () => {
+        if (run !== null && run.extra > 0) {
+            line(run.cls, `  （同上 ×${run.extra} を省略）\n`);
+        }
+        run = null;
+    };
+    const emit = o => {
+        if (o.kind === 'skip') {
+            if (run !== null && run.text === o.text) { run.extra++; return; }
+            endRun();
+            line(o.cls, `${o.text}\n`);
+            run = { cls: o.cls, text: o.text, extra: 0 };
+            return;
+        }
+        endRun();
+        line(o.cls, `${o.text}\n`);
+    };
     const feed = raw => {
         buf += raw;
         const parts = buf.split('\n');
@@ -116,19 +146,21 @@ export function makeChatFilter(line) {
         for (const l of parts) {
             if (!l.trim()) continue;
             let r;
-            try { r = JSON.parse(l); } catch { line('', `${l}\n`); continue; }
-            for (const o of chatRecordLines(r)) line(o.cls, `${o.text}\n`);
+            try { r = JSON.parse(l); } catch { emit({ cls: '', text: l }); continue; }
+            for (const o of chatRecordLines(r)) emit(o);
         }
     };
     /**
      * 🚨 **残りを必ず出す。** 改行で終わらない最後の行は `buf` に残る。
      *    出力が途中で切れた場合の最後の応答が消えないようにする（#44）。
      *    解釈できないので生のまま出す。
+     *    ⚠️ まとめ待ちの件数も必ず出す（数えたまま黙って終わらない）。
      */
     const flush = () => {
         const rest = buf;
         buf = '';
-        if (rest.trim()) line('', `${rest}\n`);
+        if (rest.trim()) emit({ cls: '', text: rest });
+        endRun();
     };
     return { feed, flush };
 }

@@ -365,3 +365,37 @@ test('監視盤の最後の出力: 入力（in）は出力として返さない'
     assert.match(s.lastOutput(), /これは出力/);
     assert.ok(!s.lastOutput().includes('これは入力'), '入力を出力として見せている');
 });
+
+/**
+ * 🚨 **実機で踏んだ形の回帰テスト。**
+ *
+ * claude の `result` 行は**最終回答の本文を含むので 7813 文字**あった（実測）。
+ * 上限 2000 文字で末尾を切ると、監視盤には
+ * `…"cache_read_input_tokens":42857` のような断片が出て、
+ * 「終わったのか / 何と言われたのか」が**まったく読めない**。
+ * 最後の1行が JSON として解釈できる形で返ることを固定する。
+ */
+test('🚨 監視盤の最後の出力は、長い result 行でも解釈できる形で返る', () => {
+    const r = reg();
+    const s = mk(r);
+    r.emit(s, 'out', `${JSON.stringify({
+        type: 'assistant', message: { content: [{ type: 'text', text: '調べました' }] },
+    })}\n`);
+    // 実測に合わせた大きさ（本文 + usage/cost で 7000 文字超）
+    const big = JSON.stringify({
+        type: 'result', subtype: 'success', is_error: false,
+        result: 'あ'.repeat(1200), usage: { pad: 'x'.repeat(3000) },
+    });
+    assert.ok(big.length > 4000, `テストの前提が崩れている: ${big.length}`);
+    r.emit(s, 'out', `${big}\n`);
+    const got = s.lastOutput();
+    const lines = got.replace(/^…/, '').split('\n').filter(l => l.trim());
+    const last = lines[lines.length - 1];
+    assert.doesNotThrow(() => JSON.parse(last),
+        `最後の行が解釈できない（断片が返っている）: ${JSON.stringify(last.slice(0, 80))}`);
+    assert.equal(JSON.parse(last).type, 'result');
+});
+
+// ⚠️ 「先頭を行の境界に揃える」テストは**置かない。**
+//    解釈する側は後ろから走査するので観測可能な差が無く、変異が SURVIVED した
+//    （守りごと削除した。測れない守りを残さない）。

@@ -141,9 +141,20 @@ class Session {
      *    1レコードだけでなく**上限に届くまで後ろから連結する**。
      * ⚠️ 切り詰めたら `…` を付ける（黙って削らない）。
      *
+     * 🚨 **上限は実測で決めた。** claude の stream-json は行長の中央値 420 文字だが、
+     *    `result` 行は**最終回答の本文を含むので 7813 文字**あった（実測）。
+     *    2000 文字で末尾を切ると「応答おわり」の行が必ず壊れ、監視盤には
+     *    `…"cache_read_input_tokens":42857` のような断片が出る
+     *    （何が起きたのか読めない。実機で踏んだ）。
+     *
+     * ⚠️ **行の境界で切る処理は置かない。** 先頭が半端になっても、解釈する側
+     *    （`chatGlance`）は**後ろから走査する**ので結果が変わらない
+     *    = 観測可能な差が無い（変異が SURVIVED して分かった）。
+     *    測れない守りをコードに残さない。
+     *
      * @param {number} max 文字数の上限（払い出す量を縛る。行数ではない）
      */
-    lastOutput(max = 2000) {
+    lastOutput(max = 8000) {
         let acc = '';
         for (let i = this.log.records.length - 1; i >= 0; i--) {
             const r = this.log.records[i];
@@ -153,7 +164,7 @@ class Session {
         }
         const text = acc.trim();
         if (!text) return null;
-        // 末尾を返す（進行中の出力は最後が最新）
+        // 末尾を返す（進行中の出力は最後が最新）。切ったことは告げる
         return text.length > max ? `…${text.slice(-max)}` : text;
     }
     describe(now) {

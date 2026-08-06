@@ -192,3 +192,60 @@ test('chatGlance: 何も無いときは空文字（例外を投げない）', ()
     assert.deepEqual(chatGlance(''), { text: '', interpreted: false });
     assert.deepEqual(chatGlance(null), { text: '', interpreted: false });
 });
+
+/* ===== 告知の連続をまとめる（実機で画面が埋まった） =====
+   thinking / stream_event はトークンごとに1レコード来るので、
+   1件1行の告知だと応答が押し出される。**件数は必ず見せる**。 */
+
+const skip = (type, subtype) => `${JSON.stringify({ type, subtype })}\n`;
+
+test('🚨 同じ告知が連続したら「同上 ×N」でまとめる（件数を隠さない）', () => {
+    const c = collect();
+    for (let i = 0; i < 40; i++) c.feed(skip('system', 'thinking_tokens'));
+    c.feed(assistant('できました'));
+    const texts = c.out.map(([, t]) => t);
+    // 最初の1件 + まとめ1行 + 応答本文 = 3行（40行にならない）
+    assert.equal(texts.length, 3, `行が減っていない: ${JSON.stringify(texts)}`);
+    assert.match(texts[0], /system\/thinking_tokens は表示していません/);
+    assert.match(texts[1], /×39/, `件数が出ていない: ${texts[1]}`);
+    assert.match(texts[2], /できました/);
+});
+
+test('🚨 応答本文とツール名はまとめ待ちで遅らせない', () => {
+    const c = collect();
+    c.feed(skip('stream_event'));
+    c.feed(`${JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'いま調べます' }, { type: 'tool_use', name: 'Bash' }] },
+    })}\n`);
+    const texts = c.out.map(([, t]) => t);
+    // 告知1件（まとめ無し = extra 0）→ 本文 → ツール名
+    assert.match(texts[0], /stream_event/);
+    assert.match(texts[1], /いま調べます/);
+    assert.match(texts[2], /Bash/);
+    assert.equal(texts.length, 3, JSON.stringify(texts));
+});
+
+test('🚨 数えたまま黙って終わらない（flush でまとめを出す）', () => {
+    const c = collect();
+    for (let i = 0; i < 5; i++) c.feed(skip('system', 'thinking_tokens'));
+    c.flush();
+    const texts = c.out.map(([, t]) => t);
+    assert.equal(texts.length, 2, JSON.stringify(texts));
+    assert.match(texts[1], /×4/);
+});
+
+test('違う告知が挟まったら別の run として数える', () => {
+    const c = collect();
+    c.feed(skip('system', 'thinking_tokens'));
+    c.feed(skip('system', 'thinking_tokens'));
+    c.feed(skip('rate_limit_event'));
+    c.feed(skip('rate_limit_event'));
+    c.flush();
+    const texts = c.out.map(([, t]) => t);
+    assert.match(texts[0], /thinking_tokens/);
+    assert.match(texts[1], /×1/);
+    assert.match(texts[2], /rate_limit_event/);
+    assert.match(texts[3], /×1/);
+    assert.equal(texts.length, 4, JSON.stringify(texts));
+});
