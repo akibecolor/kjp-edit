@@ -93,6 +93,17 @@
   #diffs { flex: 1 1 58%; }
   #consoles { flex: 1 1 42%; }
 
+  /* 🚨 グリッド配置（#57）。`?grid=1` のときだけ効く。
+     入れ物を display:contents にして、ペインを #shell のグリッドの直下扱いにする
+     （**親を変えないので scrollTop が飛ばない**。#46 の再発を防ぐ要件）。 */
+  .shell.gridmode { display: grid; gap: 4px; padding: 2px; }
+  .shell.gridmode > #left, .shell.gridmode > #right,
+  .shell.gridmode > #center, .shell.gridmode #diffs, .shell.gridmode #consoles {
+    display: contents; }
+  .shell.gridmode > .split, .shell.gridmode .split { display: none; }
+  .shell.gridmode .pane { margin: 0; min-width: 0; min-height: 0; }
+  /* 入り切らないペイン（溢れ）。**消さずに畳んで、告知で件数を出す** */
+  .shell.gridmode .pane.overflowed { display: none; }
   .split { flex: 0 0 var(--split); position: relative; }
   .split::after { content: ''; position: absolute; inset: 0; background: var(--line); }
   .split:hover::after, .split.dragging::after { background: var(--accent); }
@@ -267,6 +278,11 @@
     #left { order: 1; } #right { order: 2; } #center { order: 3; }
     .split { display: none; }
     #left, #right, #center, #diffs, #consoles { flex: none; }
+    /* 🚨 グリッドでも狭い画面は1列（縦に伸ばす）。**結合は無視する**
+       — 390px で2セル分に広げても読めないので（#57 の見本どおり）。 */
+    .shell.gridmode { grid-template-columns: 1fr !important;
+      grid-template-rows: none !important; grid-auto-rows: minmax(240px, auto); }
+    .shell.gridmode .pane { grid-column: auto !important; grid-row: auto !important; }
     .pane { margin: .4rem; }
     .pane > .body { max-height: 60vh; }
     .pane.max { position: static; inset: auto; }
@@ -306,6 +322,8 @@
 <section id="alerts"></section>
 <!-- 閉じたペインを開き直す口（#57）。閉じたものが1つも無ければ hidden -->
 <div class="bar" id="closed" hidden></div>
+<!-- グリッド（#57）: パターンの切り替えと、入り切らないペインの告知 -->
+<div class="bar" id="gridbar" hidden></div>
 
 <div class="shell" id="shell">
   <div class="col" id="left"></div>
@@ -332,6 +350,11 @@ import {
   PANE_HOSTS, parseLayout, serializeLayout, hostOf, orderedIds, setHostOrder, pruneLayout,
   isHidden, hidePane, showPane,
 } from './panelayout.mjs';
+// グリッド配置（#57）。セル座標・パターン・結合は純関数側に置いてある
+import {
+  GRID_PRESETS, parseGrid, serializeGrid, autoPlace, applyPreset,
+  mergeCell, splitCell, migrateV1, pruneGrid, presetOf, cellOf,
+} from './panegrid.mjs';
 // 「(リポジトリ外)」と言ってよいかの判定も外に出した。ここに書いていたので
 // **中にあるファイルを「外を触った」と断言していた**のに検査が掛からなかった（8回目のレビュー）
 import { pathLabel } from './pathlabel.mjs';
@@ -421,6 +444,30 @@ function readStoredLayout() {
 }
 let paneLayout = parseLayout(readStoredLayout());
 
+/**
+ * 🚨 **グリッド配置（#57）は `?grid=1` のときだけ。**
+ *
+ *    既定を切り替えるのは、実ブラウザ検査（入れ物 id で並びを測っている）の
+ *    書き換えと**同じコミット**で行う。先に切り替えると「測る対象が消えた」を
+ *    別の失敗として報告するか、最悪「測っていないのに緑」になる。
+ */
+const gridMode = new URLSearchParams(location.search).get('grid') === '1';
+const GRID_KEY = 'kjp-edit:pane-grid:v2';
+function readStoredGrid() {
+  try { return localStorage.getItem(GRID_KEY); } catch { return null; }
+}
+// ⚠️ 保存が無ければ v1 の並びから移す（利用者が移した位置を1回で捨てない）
+let paneGrid = (() => {
+  const raw = readStoredGrid();
+  if (raw) return parseGrid(raw);
+  return migrateV1(paneLayout);
+})();
+function saveGrid() {
+  paneGrid = pruneGrid(paneGrid, new Set(panes.keys()));
+  try { localStorage.setItem(GRID_KEY, serializeGrid(paneGrid)); }
+  catch { /* 保存できなくても今の画面には効いている */ }
+}
+
 function saveLayout() {
   paneLayout = pruneLayout(paneLayout, new Set(panes.keys()));
   try { localStorage.setItem(ORDER_KEY, serializeLayout(paneLayout)); } catch { /* 保存できなくても今の画面には効いている */ }
@@ -490,7 +537,43 @@ function clearNotices(host) {
 }
 
 /** 全ペインを「保存された配置 → 無ければ既定の入れ物」に従って置き直す */
+/**
+ * 🚨 **グリッドの配置を CSS だけで当てる（#57）。**
+ *
+ *    ペインの親は変えない（`display: contents` の入れ物のまま）。
+ *    `append` で動かすと子孫の `scrollTop` が 0 に戻り、長い出力が読めず
+ *    追従も切れる（#46 で実測 21258 → 0）。**位置は座標だけで変える。**
+ * ⚠️ 入り切らないペインは**消さずに畳んで件数を告知する**
+ *    （黙って消すと「1本も走っていない」と読める）。
+ */
+function applyGridLayout() {
+  const shell = $('#shell');
+  if (!shell) return;
+  shell.classList.add('gridmode');
+  // 出ているペインを読み順で渡す（新しく現れたものは既定の順で後ろに付く）
+  const ids = [...panes.keys()]
+    .sort((a, b) => panes.get(a).defaultRank - panes.get(b).defaultRank);
+  const placedNow = autoPlace(paneGrid, ids);
+  paneGrid = placedNow.grid;
+  shell.style.gridTemplateColumns = `repeat(${paneGrid.cols}, minmax(0, 1fr))`;
+  shell.style.gridTemplateRows = `repeat(${paneGrid.rows}, minmax(0, 1fr))`;
+  for (const [id, obj] of panes) {
+    const c = cellOf(paneGrid, id);
+    if (!c) {
+      // 溢れ: 畳む（DOM からは外さない = 走っている購読を壊さない）
+      obj.p.classList.add('overflowed');
+      continue;
+    }
+    obj.p.classList.remove('overflowed');
+    obj.p.style.gridColumn = `${c.col} / span ${c.cw}`;
+    obj.p.style.gridRow = `${c.row} / span ${c.ch}`;
+  }
+  renderGridBar(placedNow.overflow);
+  saveGrid();
+}
+
 function applyLayout() {
+  if (gridMode) { applyGridLayout(); return; }
   const byHost = new Map(PANE_HOSTS.map(h => [h, []]));
   for (const [id, obj] of panes) {
     byHost.get(hostOf(paneLayout, id, obj.defaultHost))?.push(id);
@@ -625,9 +708,18 @@ function pane(id, title, tags = []) {
   // 🚨 **閉じる（#57）。** 今まで「畳む」しか無く、要らないペインが場所を取り続けた。
   //    ⚠️ 文言を混同しない: これは**見るのをやめる**だけで、走っている実行は止まらない
   //    （#17。止めるのは監視盤の「停止」）。title でそう言う。
+  // 🚨 結合（#57）。**グリッドのときだけ出す**（入れ物モデルでは意味が無いので、
+  //    押せるのに何も起きないボタンを作らない）。
+  const bwide = el('button', null, '▭→'); bwide.title = '右のセルと結合';
+  const btall = el('button', null, '▭↓'); btall.title = '下のセルと結合';
+  const bunit = el('button', null, '▭×'); bunit.title = '結合を解く（1セルに戻す）';
+  for (const b of [bwide, btall, bunit]) b.hidden = !gridMode;
+  bwide.addEventListener('click', ev => { ev.stopPropagation(); mergePane(id, 'right'); });
+  btall.addEventListener('click', ev => { ev.stopPropagation(); mergePane(id, 'down'); });
+  bunit.addEventListener('click', ev => { ev.stopPropagation(); mergePane(id, 'split'); });
   const bclose = el('button', null, '×');
   bclose.title = '閉じる（実行は止まりません。監視盤から戻せます）';
-  h.append(ttl, el('span', 'grow'), tagBox, bmin, bmax, bclose);
+  h.append(ttl, el('span', 'grow'), tagBox, bwide, btall, bunit, bmin, bmax, bclose);
   const body = el('div', 'body');
   p.append(h, body);
 
@@ -639,7 +731,8 @@ function pane(id, title, tags = []) {
     closePane(id);
   });
   h.addEventListener('click', ev => {
-    if (ev.target === bmin || ev.target === bmax || ev.target === bclose) return;
+    if (ev.target === bmin || ev.target === bmax || ev.target === bclose
+      || ev.target === bwide || ev.target === btall || ev.target === bunit) return;
     if (drag.moved) { drag.moved = false; return; }
     p.classList.toggle('min');
   });
@@ -682,6 +775,79 @@ function reopenPane(id) {
   renderClosedList();
   // 次の描画を待たずに出す（押した手応えが無いと壊れて見える）
   load(true).catch(() => { /* 失敗は render 側が出す */ });
+}
+
+/**
+ * 🚨 **パターンの切り替えと、入り切らないペインの告知（#57）。**
+ *
+ * ⚠️ **溢れを黙って消さない。** 「他 N 本は表示していません」を必ず出し、
+ *    どうすれば見られるか（形を広げる / 閉じる）も書く。
+ *    件数だけ出して直し方を書かないと、消えた理由が分からない。
+ */
+/**
+ * 配置の操作の結果を帯に出す（押しても何も起きないのが一番分からない）。
+ *
+ * ⚠️ `#alerts`（安全に関わる警告）には混ぜない。混ぜると本当の警告が埋もれる。
+ */
+function gridNote(text) {
+  const box = $('#gridbar');
+  if (!box) return;
+  box.hidden = false;
+  const old = box.querySelector('.gridnote');
+  if (old) old.remove();
+  const n = el('span', 'note warn gridnote', `  ${text}`);
+  box.append(n);
+}
+
+function renderGridBar(overflow) {
+  const box = $('#gridbar');
+  if (!box || !gridMode) return;
+  box.hidden = false;
+  box.replaceChildren();
+  box.append(el('b', null, '配置'));
+  const cur = presetOf(paneGrid);
+  for (const pre of GRID_PRESETS) {
+    const b = el('button', pre.name === cur ? 'on' : null, pre.label);
+    b.title = `${pre.rows} 行 × ${pre.cols} 列にする`;
+    b.addEventListener('click', () => setPreset(pre.name));
+    box.append(b);
+  }
+  if (overflow?.length) {
+    box.append(el('span', 'note warn',
+      `⚠ 他 ${overflow.length} 本は表示していません（配置を広げるか、要らないものを × で閉じてください）`));
+  }
+}
+
+/**
+ * パターンを当てる。
+ *
+ * ⚠️ **結合を解いたことは黙らない**（広げたはずのペインが1セルに戻るので）。
+ */
+function setPreset(name) {
+  const ids = [...panes.keys()]
+    .sort((a, b) => panes.get(a).defaultRank - panes.get(b).defaultRank);
+  const r = applyPreset(paneGrid, name, ids);
+  paneGrid = r.grid;
+  saveGrid();
+  applyGridLayout();
+  if (r.unmerged) {
+    // ⚠️ **黙って解かない。** 帯に出す（stickyAlerts は「操作の結果」用で、
+    //    配置の話をそこに混ぜると本当の警告が埋もれる）
+    gridNote(`広げていた ${r.unmerged} 枚を1セルに戻しました（配置を ${name} にしたため）`);
+  }
+}
+
+/**
+ * 結合（隣を占める）／解く。
+ *
+ * ⚠️ 断られた理由をそのまま出す（押しても何も起きないのが一番分からない）。
+ */
+function mergePane(id, dir) {
+  const r = dir === 'split' ? splitCell(paneGrid, id) : mergeCell(paneGrid, id, dir);
+  if (!r.ok) { gridNote(`広げられません: ${r.why}`); return; }
+  paneGrid = r.grid;
+  saveGrid();
+  applyGridLayout();
 }
 
 /**

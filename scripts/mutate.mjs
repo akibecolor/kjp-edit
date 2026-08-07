@@ -133,9 +133,11 @@ const MUTANTS = [
         name: 'closed-list-shown',
         why: '閉じたペインの一覧を出さない（開き直す手段が無くなる）',
         file: 'v0/app.html',
-        from: '  box.hidden = false;',
-        to: '  return;   /* 変異: 一覧を出さない */',
-        gone: '  box.hidden = false;',
+        // ⚠️ `box.hidden = false;` はグリッドの帯にも出てきたので、
+        //    **閉じた一覧のものだけ**を指す形にする（3箇所に一致して STALE になった）
+        from: '  if (!ids.length) { box.hidden = true; return; }',
+        to: '  if (true) { box.hidden = true; return; }   /* 変異: 一覧を出さない */',
+        gone: '  if (!ids.length) { box.hidden = true; return; }',
         script: 'v0/render-check.mjs',
     },
     {
@@ -1749,7 +1751,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'\n"
             + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'\n"
             + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'\n"
-            + "            || url.pathname === '/dirlabel.mjs') {",
+            + "            || url.pathname === '/dirlabel.mjs'\n"
+            + "            || url.pathname === '/panegrid.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
