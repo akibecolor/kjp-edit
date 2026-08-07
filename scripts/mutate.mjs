@@ -32,6 +32,61 @@ process.chdir(ROOT);
  *      そうしないと「置換が効いていない」と誤判定する（実際に踏んだ）。
  */
 const MUTANTS = [
+    // -----------------------------------------------------------------
+    // 🚨 #57: 閉じる／開く。守りは「覚える」「一覧に出す」「作り直さない」。
+    // -----------------------------------------------------------------
+    {
+        name: 'close-is-remembered',
+        why: '閉じたことを覚えない（15秒ごとの更新で戻ってきて閉じられない）',
+        file: 'v0/panelayout.mjs',
+        from: '    return { ...layout, closed: [...(layout.closed ?? []), paneId] };',
+        to: '    return layout;   /* 変異: 閉じたことを覚えない */',
+        gone: 'closed: [...(layout.closed ?? []), paneId]',
+        pattern: '閉じたことを覚え、開けば戻る',
+        testFile: 'v0/panelayout.test.mjs',
+    },
+    {
+        // ⚠️ 並べ替えで閉じた記憶が落ちると、ドラッグしただけで閉じたものが戻る
+        name: 'close-survives-reorder',
+        why: '並べ替えのときに閉じた記憶を落とす（ドラッグで閉じたものが戻ってくる）',
+        file: 'v0/panelayout.mjs',
+        from: '    out.closed = [...(layout.closed ?? [])];\n    return out;\n}',
+        to: '    return out;\n}',
+        gone: '    out.closed = [...(layout.closed ?? [])];\n    return out;',
+        pattern: '閉じた記憶が保存と読み込みで往復する',
+        testFile: 'v0/panelayout.test.mjs',
+    },
+    {
+        // 🚨 前方互換: closed が無い古い保存値で並びが消えてはいけない
+        name: 'close-parse-tolerant',
+        why: '古い保存値（closed 無し）を読めなくする（利用者の並びが1回消える）',
+        file: 'v0/panelayout.mjs',
+        from: '    for (const id of Array.isArray(raw.closed) ? raw.closed : []) {',
+        to: '    for (const id of raw.closed) {   /* 変異: closed を必須にする */',
+        gone: 'Array.isArray(raw.closed) ? raw.closed : []',
+        pattern: '古い値も読める',
+        testFile: 'v0/panelayout.test.mjs',
+    },
+    {
+        // 🚨 描画が閉じたペインを作り直すと、記憶があっても戻ってくる（配線）
+        name: 'close-not-recreated',
+        why: '閉じているペインを描画が作り直す（更新で戻ってきて閉じられない）',
+        file: 'v0/app.html',
+        from: '  if (isHidden(paneLayout, id)) return null;',
+        to: '  /* 変異: 閉じていても作る */',
+        gone: 'if (isHidden(paneLayout, id)) return null;',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // 🚨 一覧が無いと「閉じたら二度と開けない」= 閉じるのが危険な操作になる
+        name: 'closed-list-shown',
+        why: '閉じたペインの一覧を出さない（開き直す手段が無くなる）',
+        file: 'v0/app.html',
+        from: '  box.hidden = false;',
+        to: '  return;   /* 変異: 一覧を出さない */',
+        gone: '  box.hidden = false;',
+        script: 'v0/render-check.mjs',
+    },
     {
         name: 'url-crash',
         why: '不正な request-target で認証前にプロセスが落ちる',

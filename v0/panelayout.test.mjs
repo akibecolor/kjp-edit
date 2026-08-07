@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import {
     PANE_HOSTS, MAX_REMEMBERED,
     parseLayout, serializeLayout, hostOf, orderedIds, setHostOrder, pruneLayout,
+    isHidden, hidePane, showPane,
 } from './panelayout.mjs';
 
 test('parseLayout は壊れた入力でも例外を投げず「配置なし」にする', () => {
@@ -89,4 +90,47 @@ test('pruneLayout は上限を超えたときだけ、今無い id から捨て�
     // 上限内なら何も捨てない（差分が無い worktree のペインが一時的に消えても位置を覚えている）
     const small = setHostOrder(parseLayout(''), 'left', ['filer', 'worktrees']);
     assert.deepEqual(pruneLayout(small, new Set()), small);
+});
+
+/* ===== 閉じる／開く（#57） ===== */
+
+// 🚨 覚えないと 15 秒ごとの更新で戻ってくる（閉じる操作の意味が消える）
+test('閉じたことを覚え、開けば戻る', () => {
+    let g = parseLayout(null);
+    assert.equal(isHidden(g, 'graph'), false);
+    g = hidePane(g, 'graph');
+    assert.equal(isHidden(g, 'graph'), true);
+    g = hidePane(g, 'graph');
+    assert.deepEqual(g.closed, ['graph'], '同じ id を溜めている');
+    g = showPane(g, 'graph');
+    assert.equal(isHidden(g, 'graph'), false);
+    // 無いものを開いても壊れない
+    assert.deepEqual(showPane(g, 'nope').closed, []);
+    // 壊れた入力で投げない
+    assert.equal(hidePane(g, ''), g);
+    assert.equal(hidePane(g, null), g);
+});
+
+// 🚨 保存の形は前方互換（closed が無い古い値も読める）
+test('閉じた記憶が保存と読み込みで往復する（古い値も読める）', () => {
+    let g = hidePane(parseLayout(null), 'monitor');
+    g = setHostOrder(g, 'left', ['worktrees']);
+    const back = parseLayout(serializeLayout(g));
+    assert.deepEqual(back.closed, ['monitor'], '並べ替えで閉じた記憶が落ちた');
+    assert.deepEqual(back.left, ['worktrees']);
+    // closed が無い古い保存値
+    const old = parseLayout('{"left":["worktrees"],"diffs":[],"consoles":[],"right":[]}');
+    assert.deepEqual(old.closed, [], '古い値で壊れている');
+    assert.deepEqual(old.left, ['worktrees'], '古い値の並びを捨てている');
+    // 壊れた closed
+    assert.deepEqual(parseLayout('{"closed":"x"}').closed, []);
+    assert.deepEqual(parseLayout('{"closed":[1,"",null,"a","a"]}').closed, ['a']);
+});
+
+test('閉じた記憶も上限で削る（今あるものは残す）', () => {
+    let g = parseLayout(null);
+    for (let i = 0; i < 10; i++) g = hidePane(g, `x${i}`);
+    const pruned = pruneLayout(g, new Set(['x0']), 3);
+    assert.ok(pruned.closed.length <= 3, `上限を超えている: ${pruned.closed.length}`);
+    assert.ok(pruned.closed.includes('x0'), '今あるものを捨てた');
 });

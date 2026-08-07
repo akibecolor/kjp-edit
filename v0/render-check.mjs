@@ -554,6 +554,49 @@ const SCROLL_CHECK = `(async () => {
     sameEl: sc === (paneOf()?.querySelector('.term')?.parentElement),
   };
 })()`;
+/**
+ * 🚨 **閉じたら閉じたままで、開き直せること（#57）。**
+ *
+ * 記憶が無いと 15 秒ごとの更新で戻ってくる（閉じる操作の意味が消える）。
+ * 開き直す口が無いと「閉じたら二度と出せない」= 閉じるのが危険な操作になる。
+ * ⚠️ **実行は止まらない**（#17）ことは監視盤側で見る。ここは表示だけ。
+ */
+const CLOSE_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const paneOf = id => document.querySelector('[data-pane-id=' + JSON.stringify(id) + ']');
+  // 閉じる対象はグラフ（走っている実行に影響しない = 検査の副作用が小さい）
+  const target = 'graph';
+  if (!paneOf(target)) return { error: 'グラフのペインが無い' };
+  const btn = [...paneOf(target).querySelectorAll('header > button')]
+    .find(b => b.textContent === '×');
+  if (!btn) return { error: '閉じるボタンが無い' };
+  btn.click();
+  await wait(300);
+  const goneNow = !paneOf(target);
+  // 更新しても戻ってこないこと（記憶が効いている）
+  document.getElementById('refresh').click();
+  await wait(2500);
+  const goneAfterRefresh = !paneOf(target);
+  // 開き直す口が出ていること
+  const box = document.getElementById('closed');
+  const listed = Boolean(box) && !box.hidden && /グラフ/.test(box.textContent || '');
+  const openBtn = box ? [...box.querySelectorAll('button')][0] : null;
+  let backAfterOpen = false;
+  if (openBtn) {
+    openBtn.click();
+    for (let i = 0; i < 60 && !backAfterOpen; i++) {
+      await wait(200);
+      backAfterOpen = Boolean(paneOf(target));
+    }
+  }
+  return {
+    goneNow, goneAfterRefresh, listed, backAfterOpen,
+    hasBox: Boolean(box), boxHidden: box ? box.hidden : null,
+    closedIds: typeof window.__kjpClosed === 'function' ? window.__kjpClosed() : 'hook なし',
+    btnCount: box ? box.querySelectorAll('button').length : -1,
+    boxText: (box?.textContent || '').slice(0, 80),
+  };
+})()`;
 const DRAG_LIVE_CHECK = `(async () => {
   const wait = ms => new Promise(r => setTimeout(r, ms));
   const cin = [...document.querySelectorAll('.cmdbar input')].find(e =>
@@ -1162,6 +1205,8 @@ try {
     //    心拍の検査の後に置く（あれが走らせたセッションが終わるのを待つ形になる）。
     const dragLive = await evaluate(DRAG_LIVE_CHECK);
 
+    // 🚨 閉じる検査は**他の検査より後**（ペインを消すので前に置くと他が測れない）
+    const closing = await evaluate(CLOSE_CHECK);
     const probeValue = await evaluate(MEASURE);
     const probe = probeValue;
     // 🚨 #46: 更新でスクロール位置が飛ばないこと（MEASURE の後 = 端末に十分な高さがある）
@@ -1364,6 +1409,22 @@ try {
         if (!scroll.sameEl) {
             problems.push('端末のスクロール要素が作り直された（追従も購読も切れる）');
         }
+    }
+    // 🚨 #57: 閉じたら閉じたまま / 開き直せる
+    if (!closing || closing.error) {
+        problems.push(`閉じる／開くを測れなかった: ${closing?.error ?? '結果が取れない'}`);
+    } else {
+        if (!closing.goneNow) problems.push('× を押してもペインが消えない（#57）');
+        if (!closing.goneAfterRefresh) {
+            problems.push('更新で閉じたペインが戻ってきた（#57。閉じる操作の意味が消える）');
+        }
+        if (!closing.listed) {
+            problems.push('閉じたペインの一覧が出ていない（開き直せない）: '
+                + `box=${closing.hasBox} hidden=${closing.boxHidden} `
+                + `btn=${closing.btnCount} text=${JSON.stringify(closing.boxText)} `
+                + `closed=${JSON.stringify(closing.closedIds)}`);
+        }
+        if (!closing.backAfterOpen) problems.push('一覧から開き直せない（#57）');
     }
     if (!dual || dual.error) {
         problems.push(`二重購読を測れなかった: ${dual?.error ?? '結果が取れない'}`);

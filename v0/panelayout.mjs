@@ -31,6 +31,8 @@ export const MAX_REMEMBERED = 300;
 function emptyLayout() {
     const out = {};
     for (const h of PANE_HOSTS) out[h] = [];
+    // 閉じたペインの記憶（#57）。**古い保存値には無い**ので既定は空
+    out.closed = [];
     return out;
 }
 
@@ -59,12 +61,18 @@ export function parseLayout(text) {
             out[h].push(id);
         }
     }
+    // ⚠️ **古い保存値（closed 無し）でも読める**こと。ここを必須にすると
+    //    利用者の並びが1回消える（前方互換）。
+    for (const id of Array.isArray(raw.closed) ? raw.closed : []) {
+        if (typeof id === 'string' && id !== '' && !out.closed.includes(id)) out.closed.push(id);
+    }
     return out;
 }
 
 export function serializeLayout(layout) {
     const out = {};
     for (const h of PANE_HOSTS) out[h] = [...(layout[h] ?? [])];
+    out.closed = [...(layout.closed ?? [])];
     return JSON.stringify(out);
 }
 
@@ -113,6 +121,8 @@ export function setHostOrder(layout, hostId, ids) {
     for (const h of PANE_HOSTS) {
         out[h] = h === hostId ? [...ids] : (layout[h] ?? []).filter(id => !moved.has(id));
     }
+    // ⚠️ 閉じた記憶を落とさない（並べ替えたら閉じたものが戻ってくる、を作らない）
+    out.closed = [...(layout.closed ?? [])];
     return out;
 }
 
@@ -122,7 +132,8 @@ export function setHostOrder(layout, hostId, ids) {
  * @param present 今ペインとして存在する id の集合
  */
 export function pruneLayout(layout, present, cap = MAX_REMEMBERED) {
-    const total = PANE_HOSTS.reduce((n, h) => n + (layout[h] ?? []).length, 0);
+    const total = PANE_HOSTS.reduce((n, h) => n + (layout[h] ?? []).length, 0)
+        + (layout.closed ?? []).length;
     if (total <= cap) return layout;
     let drop = total - cap;
     const out = {};
@@ -133,5 +144,40 @@ export function pruneLayout(layout, present, cap = MAX_REMEMBERED) {
             return false;
         });
     }
+    // 閉じた記憶も同じ上限で削る（消えた worktree の「閉じた」を永久に覚えない）
+    out.closed = (layout.closed ?? []).filter(id => {
+        if (drop === 0 || present.has(id)) return true;
+        drop--;
+        return false;
+    });
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// 閉じる／開く（#57 の一部を先に入れる）
+//
+// 🚨 **閉じたことを覚えないと、15秒ごとの更新で戻ってくる。**
+//    描画は毎回「あるべきペイン」を作り直そうとするので、記憶が無いと
+//    閉じる操作が1周期で巻き戻る（このリポジトリで何度も踏んだ型）。
+// ⚠️ グリッド（`panegrid.mjs`）にも同じ概念があるが、あちらは段階2以降。
+//    今の入れ物モデルでも閉じられるようにするため、ここにも持たせる。
+//    **保存の形は前方互換**（`closed` が無い古い値も読める）。
+// ---------------------------------------------------------------------------
+
+/** 閉じているか */
+export function isHidden(layout, paneId) {
+    return (layout?.closed ?? []).includes(paneId);
+}
+
+/** 閉じる（同じ id を溜めない） */
+export function hidePane(layout, paneId) {
+    if (typeof paneId !== 'string' || paneId === '') return layout;
+    if (isHidden(layout, paneId)) return layout;
+    return { ...layout, closed: [...(layout.closed ?? []), paneId] };
+}
+
+/** 開く */
+export function showPane(layout, paneId) {
+    if (!isHidden(layout, paneId)) return layout;
+    return { ...layout, closed: (layout.closed ?? []).filter(id => id !== paneId) };
 }

@@ -304,6 +304,8 @@
 </div>
 
 <section id="alerts"></section>
+<!-- 閉じたペインを開き直す口（#57）。閉じたものが1つも無ければ hidden -->
+<div class="bar" id="closed" hidden></div>
 
 <div class="shell" id="shell">
   <div class="col" id="left"></div>
@@ -328,6 +330,7 @@ import { makeChatFilter, chatGlance, chatInputText } from './chatfilter.mjs';
 // ペインの配置（ドラッグで決めた並び）の表現と永続化の形も同じ理由で外に出した
 import {
   PANE_HOSTS, parseLayout, serializeLayout, hostOf, orderedIds, setHostOrder, pruneLayout,
+  isHidden, hidePane, showPane,
 } from './panelayout.mjs';
 // 「(リポジトリ外)」と言ってよいかの判定も外に出した。ここに書いていたので
 // **中にあるファイルを「外を触った」と断言していた**のに検査が掛からなかった（8回目のレビュー）
@@ -619,15 +622,24 @@ function pane(id, title, tags = []) {
   for (const [cls, text] of tags) tagBox.append(el('span', `tag ${cls}`, text));
   const bmin = el('button', null, '–'); bmin.title = '最小化';
   const bmax = el('button', null, '⛶'); bmax.title = '最大化';
-  h.append(ttl, el('span', 'grow'), tagBox, bmin, bmax);
+  // 🚨 **閉じる（#57）。** 今まで「畳む」しか無く、要らないペインが場所を取り続けた。
+  //    ⚠️ 文言を混同しない: これは**見るのをやめる**だけで、走っている実行は止まらない
+  //    （#17。止めるのは監視盤の「停止」）。title でそう言う。
+  const bclose = el('button', null, '×');
+  bclose.title = '閉じる（実行は止まりません。監視盤から戻せます）';
+  h.append(ttl, el('span', 'grow'), tagBox, bmin, bmax, bclose);
   const body = el('div', 'body');
   p.append(h, body);
 
   // ⚠️ ドラッグで動かした直後の click で開閉すると、並べ替えるたびに畳まれる。
   //    掴んだ時点で false に戻すので、click が来ないまま終わっても次は効く。
   const drag = { moved: false };
+  bclose.addEventListener('click', ev => {
+    ev.stopPropagation();
+    closePane(id);
+  });
   h.addEventListener('click', ev => {
-    if (ev.target === bmin || ev.target === bmax) return;
+    if (ev.target === bmin || ev.target === bmax || ev.target === bclose) return;
     if (drag.moved) { drag.moved = false; return; }
     p.classList.toggle('min');
   });
@@ -642,6 +654,99 @@ function pane(id, title, tags = []) {
   return { p, body, ttl, tagBox };
 }
 
+/**
+ * 🚨 **ペインを閉じる（#57）。**
+ *
+ * ⚠️ **閉じたことを覚える。** 覚えないと 15 秒ごとの更新で戻ってくる
+ *    （利用者の操作を巻き戻すのは、このリポジトリで何度も踏んだ型）。
+ * ⚠️ **購読は切るが、実行は止まらない**（#17）。切断と停止を混同しないこと。
+ *    走っているセッションは監視盤に残り、そこから停止できる。
+ */
+function closePane(id) {
+  const obj = panes.get(id);
+  if (obj) {
+    try { obj.abort?.(); } catch { /* 既に終わっている */ }
+    obj.p.remove();
+    panes.delete(id);
+  }
+  paneLayout = hidePane(paneLayout, id);
+  saveLayout();
+  renderClosedList();
+  scheduleLayout();
+}
+
+/** 閉じたペインを開き直す（次の描画で作られる） */
+function reopenPane(id) {
+  paneLayout = showPane(paneLayout, id);
+  saveLayout();
+  renderClosedList();
+  // 次の描画を待たずに出す（押した手応えが無いと壊れて見える）
+  load(true).catch(() => { /* 失敗は render 側が出す */ });
+}
+
+/**
+ * 🚨 **閉じたものを一覧に出す（#57）。**
+ *
+ *    出さないと「閉じたら二度と開けない」= 閉じるのが危険な操作になる。
+ *    CLAUDE.md「表示上限で省略したら必ず告知する」と同じ根拠
+ *    （見えないものの存在を黙らせない）。
+ */
+function renderClosedList() {
+  if (window.__kjpProbe) {
+    window.__kjpClosed = () => [...(paneLayout.closed ?? [])];
+  }
+  const box = $('#closed');
+  if (!box) return;
+  const ids = [...(paneLayout.closed ?? [])];
+  box.replaceChildren();
+  if (!ids.length) { box.hidden = true; return; }
+  box.hidden = false;
+  box.append(el('span', 'note', `閉じたペイン ${ids.length}:`));
+  for (const id of ids.slice(0, 8)) {
+    const b = el('button', null, paneTitleOf(id));
+    b.title = `${id} を開く`;
+    b.addEventListener('click', () => reopenPane(id));
+    box.append(b);
+  }
+  if (ids.length > 8) {
+    box.append(el('span', 'note', `…他 ${ids.length - 8} 件`));
+  }
+}
+
+/**
+ * 閉じたペインのボタンに出す名前。
+ *
+ * ⚠️ id は `console-<絶対パス>` のような長い文字列なので、そのまま出すと
+ *    ボタンが画面幅を超える（スマホで押せない）。**種別 + basename** にする。
+ */
+function paneTitleOf(id) {
+  const kind = id.startsWith('console-') ? 'コンソール'
+    : id.startsWith('diff-') ? '差分'
+    : id === 'monitor' ? 'セッション監視'
+    : id === 'agents' ? 'エージェント'
+    : id === 'worktrees' ? 'worktree'
+    : id === 'graph' ? 'グラフ' : id;
+  const rest = id.replace(/^(console|diff)-/, '');
+  if (rest === id) return kind;
+  const name = rest.split(/[\\/]/).filter(Boolean).pop() ?? rest;
+  return `${kind}: ${name}`;
+}
+
+/**
+ * 閉じているペインの代わりに渡す「捨てる先」（#57）。
+ *
+ * ⚠️ `render(s)` の中では early return できない（後続の描画を全部落とす）。
+ *    ここに書いた DOM はどこにも append されないので画面に出ない。
+ *    購読や取得は呼び出し側が別に守る（監視盤は early return している）。
+ */
+/** 閉じているなら「捨てる先」を返す */
+function ghostOr(obj) { return obj ?? ghostPane(); }
+
+function ghostPane() {
+  return { p: el('div'), body: el('div'), ttl: el('span'), tagBox: el('span'),
+    defaultHost: '', defaultRank: 0 };
+}
+
 function setTags(tagBox, tags) {
   tagBox.replaceChildren();
   for (const [cls, text] of tags) tagBox.append(el('span', `tag ${cls}`, text));
@@ -653,7 +758,9 @@ $('#reset').addEventListener('click', () => {
   }
   // 並びも既定に戻す。⚠️ 忘れた記憶を残すと「レイアウトを戻したのに
   //    ペインが元の列に戻らない」という直し方の無い状態になる。
+  // 閉じた記憶も戻す（「レイアウト」を押したのに開かないと直し方が無い）
   paneLayout = parseLayout(null);
+  renderClosedList();
   try { localStorage.removeItem(ORDER_KEY); } catch { /* 元から書けていない */ }
   applyLayout();
 });
@@ -1685,6 +1792,9 @@ const panes = new Map();     // id -> {p, body, ttl, tagBox, abort?, holder?}
 let paneSeq = 0;
 
 function ensurePane(host, id, title, tags) {
+  // 🚨 **閉じているものは作らない（#57）。** ここで作ると 15 秒ごとの更新で
+  //    閉じたペインが戻ってきて、閉じる操作の意味が消える。
+  if (isHidden(paneLayout, id)) return null;
   let obj = panes.get(id);
   if (!obj) {
     obj = pane(id, title, tags);
@@ -1889,6 +1999,7 @@ function monitorRow(x) {
 async function renderMonitor() {
   if (!session.allowExec) return;   // 経路そのものが無い（--allow-exec 無し）
   const pane = ensurePane($('#left'), 'monitor', 'セッション監視', []);
+  if (!pane) return;   // 閉じている（#57）。取得もしない
   const ui = monitorMount(pane);
   if (!session.canMutate) {
     // 有効に見えるのに 403 を返す状態を作らない
@@ -1993,6 +2104,7 @@ function renderAgents(s) {
   // ⚠️ 見出しは短くする。左カラムは狭く、`text-overflow: ellipsis` で
   //    「エージェントの活…」になって読めなかった（実測）
   const p = ensurePane($('#left'), 'agents', 'エージェント', tags);
+  if (!p) return;   // 閉じている（#57）
   const box = el('div');
   box.style.padding = '.4rem';
   const wtByPath = new Map(s.worktrees.map(w => [w.path, w]));
@@ -2160,8 +2272,8 @@ function render(s) {
 
   // 左: worktree カード + ファイラ
   const dirty = s.worktrees.filter(w => w.status?.dirty).length;
-  const wtPane = ensurePane($('#left'), 'worktrees',
-    `Worktrees ${s.worktrees.length}`, dirty ? [['dirty', `dirty ${dirty}`]] : []);
+  const wtPane = ghostOr(ensurePane($('#left'), 'worktrees',
+    `Worktrees ${s.worktrees.length}`, dirty ? [['dirty', `dirty ${dirty}`]] : []));
   const cards = el('div', 'cards');
   for (const wt of s.worktrees) {
     const c = el('div', 'card');
@@ -2195,8 +2307,8 @@ function render(s) {
   // 衝突予測。「同じファイルを触っている」は代理指標なので、実際にマージしてみた結果を出す
   const conf = s.conflicts ?? [];
   const bad = conf.filter(c => !c.clean);
-  const cPane = ensurePane($('#left'), 'conflicts', '衝突予測',
-    bad.length ? [['danger', `${bad.length} ペア`]] : [['', conf.length ? 'なし' : '候補なし']]);
+  const cPane = ghostOr(ensurePane($('#left'), 'conflicts', '衝突予測',
+    bad.length ? [['danger', `${bad.length} ペア`]] : [['', conf.length ? 'なし' : '候補なし']]));
   const cBox = el('div');
   cBox.style.padding = '.4rem';
   if (!conf.length) {
@@ -2374,8 +2486,8 @@ function render(s) {
   //    **未コミット**の数。別のものを同じ見た目で並べていたので、
   //    「変更 10」と出ているのにファイラが「(差分なし)」になり、
   //    **どちらの数字も信じられなくなっていた**（#4）。
-  const filer = ensurePane($('#left'), 'filer',
-    `ファイラ（${s.base ?? 'base'}...HEAD の差分）`, []);
+  const filer = ghostOr(ensurePane($('#left'), 'filer',
+    `ファイラ（${s.base ?? 'base'}...HEAD の差分）`, []));
   const tree = el('div', 'tree');
   // ⚠️ ここは textContent なので Markdown 記法は書かない（そのまま文字として出る）
   tree.append(el('div', 'note',
@@ -2422,6 +2534,7 @@ function render(s) {
     // ⚠️ 見出しを「差分」固定にしない。全文も同じペインに出るので、
     //    片方の名前だけを出すとヘッダが中身と食い違う
     const obj = ensurePane($('#diffs'), id, '差分 / 全文', [['br', wt.branch ?? wt.name]]);
+    if (!obj) continue;   // 閉じている（#57）
     obj.p.dataset.wt = wt.path;
     obj.wt = wt;
     // 🚨 **編集中は作り直さない**（textarea を捨てると打っている途中の内容が消える）。
@@ -2577,6 +2690,7 @@ function render(s) {
     const id = `console-${wt.path}`;
     const existed = panes.has(id);
     const obj = ensurePane($('#consoles'), id, wt.branch ?? wt.name, wtTags(wt).slice(1));
+    if (!obj) continue;   // 閉じている（#57）
     // 既にあるペインは中身を作り直さない（走っている実行を壊さないため）
     if (!existed) {
       obj.body.style.display = 'flex';
@@ -2598,8 +2712,8 @@ function render(s) {
   }
 
   // 右: グラフ
-  const g = ensurePane($('#right'), 'graph',
-    '統合グラフ（全 worktree の HEAD）', [['', `${s.graph.length} commits`]]);
+  const g = ghostOr(ensurePane($('#right'), 'graph',
+    '統合グラフ（全 worktree の HEAD）', [['', `${s.graph.length} commits`]]));
   const box = el('div');
   if (!s.graph.length) box.append(el('div', 'empty', 'コミットがありません'));
   for (const row of s.graph) {
