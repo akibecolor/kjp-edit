@@ -215,6 +215,15 @@ const MONITOR_CHECK = `(async () => {
   const after = same[0];
   return {
     seenCommand: /git --version/.test(text),
+    // 🚨 **行を見分ける印（#50）。** 見出しは basename だと
+    //    a/wt-main と b/wt-main で同じになる（ここはテンプレートリテラルの中なので
+    //    バックティックは書けない）。ラベルの一意化は unit で測るので、ここでは
+    //    **最後の手段の id** が
+    //    実際に描かれていることを測る（各行に stdin の欄があるので、
+    //    見分けられないと別のエージェントに文字が入る）。
+    idTagShown: /#[0-9a-f]{6}/.test(text),
+    // 送信先が入力欄の placeholder にも出ていること（打つ直前に確認できる）
+    placeholderHasId: /#[0-9a-f]{6}/.test(input.placeholder ?? ''),
     seenOutput: /git version/.test(text),
     reused: Boolean(after) && after === row,
     // 🚨 **同じセッションの行が増えていないこと。** 作り直す変異は、古い行が
@@ -1231,6 +1240,13 @@ try {
         if (monitor.dupes !== 1) {
             problems.push('自動更新で同じセッションの行が増えている'
                 + `（作り直した行が古い行の下に溜まる）: ${monitor.dupes} 行`);
+        }
+        if (!monitor.idTagShown) {
+            problems.push('監視盤の行にセッションを見分ける印（#id）が出ていない'
+                + `（同名 worktree で入力先を間違える。#50）: ${monitor.sample}`);
+        }
+        if (!monitor.placeholderHasId) {
+            problems.push('入力欄が送信先の id を出していない（打つ直前に確認できない）');
         }
         if (monitor.kept !== monitor.mark) {
             problems.push('自動更新で入力欄の中身が消えた'

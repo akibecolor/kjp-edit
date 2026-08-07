@@ -100,13 +100,33 @@ export function chatRecordLines(r) {
  * @returns {{text: string, interpreted: boolean}}
  */
 export function chatGlance(raw) {
-    const lines = String(raw ?? '').split('\n').map(l => l.trim()).filter(Boolean);
+    const s = String(raw ?? '');
+    // 🚨 **応答を書いている最中の断片で本文を隠さない（9回目のレビュー / #51）。**
+    //
+    //    サーバの `lastOutput()` は**その瞬間までの生の出力**を返すので、
+    //    エージェントが応答を書いている間、最後の行は
+    //    `{"type":"assistant","message":{"content":[{"type":"te` のように
+    //    **改行で終わらない JSON の断片**になる。以前はそれを
+    //    「末尾の解釈できない行」として**そのまま出していた**ので、
+    //    **並列で回して見ている最中（= この盤を一番見たいとき）に限って
+    //    直前の応答が読めなくなっていた。**
+    //    ⚠️ 断片は**黙って捨てない**（`writing` で告げて、UI が出す）。
+    const partialTail = s.length > 0 && !s.endsWith('\n');
+    const lines = s.split('\n').map(l => l.trim()).filter(Boolean);
+    let writing = false;
     for (let i = lines.length - 1; i >= 0; i--) {
         let r;
         try { r = JSON.parse(lines[i]); } catch {
+            // 末尾が改行で終わっていない = まだ書き込み中の行。飛ばして1つ前を見る
+            // （改行で終わっているなら**完全な1行**なので、そのまま出す。
+            //  claude の stderr や停止の告知がここに来るので捨ててはいけない）。
+            if (i === lines.length - 1 && partialTail && lines.length > 1) {
+                writing = true;
+                continue;
+            }
             // 飛ばす理由は「サーバが末尾を返すので**先頭の行**が途中から始まる」
             // ことだけ。末尾側の解釈できない行は**そのまま出す**（捨てない）。
-            if (i > 0) return { text: lines[i], interpreted: false };
+            if (i > 0) return { text: lines[i], interpreted: false, writing };
             break;
         }
         const got = chatRecordLines(r);
@@ -114,9 +134,9 @@ export function chatGlance(raw) {
         //    text と tool_use が同じレコードに入っている形で**本文が消え**、
         //    `· Bash` だけになる（「〜しますか？」が読めず、打つべきか判断できない）。
         const text = got.map(o => o.text.trim()).filter(Boolean).join(' ');
-        if (text) return { text, interpreted: true };
+        if (text) return { text, interpreted: true, writing };
     }
-    return { text: lines[lines.length - 1] ?? '', interpreted: false };
+    return { text: lines[lines.length - 1] ?? '', interpreted: false, writing };
 }
 
 /**

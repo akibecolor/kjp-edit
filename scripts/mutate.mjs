@@ -1342,6 +1342,44 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         platforms: ['linux', 'darwin'],
         pattern: '「停止しました」が実態と一致する',
     },
+    // -----------------------------------------------------------------
+    // 🚨 9回目のレビュー / #49: 監視盤は購読せずに入力できるのに、
+    //    切断後の猶予は購読/解除の時刻でしか進まなかった。
+    //    判断（execsession）と配線（server）を**別々に**測る。
+    // -----------------------------------------------------------------
+    {
+        name: 'input-extends-grace',
+        why: '入力しても切断後の猶予を延ばさない'
+            + '（スマホから返事を書いている最中のセッションが SIGKILL される）',
+        file: 'v0/execsession.mjs',
+        from: '        s.lastDetachedAt = this.now();\n        return true;',
+        to: '        return true;   /* 変異: 猶予を延ばさない */',
+        gone: 's.lastDetachedAt = this.now();\n        return true;',
+        pattern: '入力が通ったら切断後の猶予はやり直しになる',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        // ⚠️ 判断が正しくても**呼んでいなければ**同じ事故が起きる。配線を測る。
+        name: 'input-grace-wiring',
+        why: '/input が noteInput を呼ばない（判断は正しいのに配線が無い）',
+        file: 'v0/server.mjs',
+        from: '                    execRegistry.noteInput(s);',
+        to: '                    /* 変異: 猶予を延ばさない */',
+        gone: 'execRegistry.noteInput(s);',
+        pattern: '入力している間は猶予',
+    },
+    {
+        // 🚨 **延ばす対象を広げすぎない。** 購読中は猶予の外なので、
+        //    そこで起点を作ると解除後の猶予が狂う（実質2倍待つ）。
+        name: 'input-grace-only-detached',
+        why: '購読中のセッションでも猶予の起点を作る（解除後の猶予が狂う）',
+        file: 'v0/execsession.mjs',
+        from: '        if (s.subscribers.size) return false;',
+        to: '        /* 変異: 購読中でも起点を作る */',
+        gone: 'if (s.subscribers.size) return false;',
+        pattern: '購読中の入力は猶予に触らない',
+        testFile: 'v0/execsession.test.mjs',
+    },
     {
         name: 'sweep-skip-killing',
         why: '殺しに行っているセッションを sweep がもう一度候補にする（二重に殺しに行く）',
@@ -1582,7 +1620,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         //    **改行込みで一意に指定する**
         from: "            || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'\n"
             + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'\n"
-            + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs') {",
+            + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'\n"
+            + "            || url.pathname === '/dirlabel.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
         pattern: 'import しているモジュールが全部配信される',
@@ -2250,6 +2289,67 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         gone: "'/api/v0/exec/list') {\n            if (!await gateExec",
         pattern: '全セッションの状態と最後の出力',
     },
+    // -----------------------------------------------------------------
+    // 🚨 9回目のレビュー / #50・#51: 監視盤は「どれに打つか」を決める盤なので、
+    //    見分けと最後の出力が壊れると**誤操作**と**判断不能**に直結する。
+    // -----------------------------------------------------------------
+    {
+        name: 'monitor-row-id-tag',
+        why: '行にセッションを見分ける印（#id）を出さない'
+            + '（同名 worktree が並ぶと入力先を間違える = 別のエージェントに文字が入る）',
+        file: 'v0/app.html',
+        from: "        el('span', 'note', `  #${idTag}`),",
+        to: '        /* 変異: 見分ける印を出さない */',
+        gone: "el('span', 'note', `  #${idTag}`)",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        name: 'monitor-input-placeholder-id',
+        why: '入力欄が送信先の id を出さない（打つ直前に確認できない）',
+        file: 'v0/app.html',
+        from: "      row.inp.placeholder = `${name} #${idTag} に送る（Enter）`;",
+        to: "      row.inp.placeholder = `送る（Enter）`;   /* 変異: 送信先を出さない */",
+        gone: "`${name} #${idTag} に送る",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // ⚠️ ラベルの一意化は純関数なので unit で測る（衝突する worktree を
+        //    実ブラウザの仕込みに作るより、こちらの方が確実で速い）。
+        name: 'monitor-label-unique',
+        why: '見出しを basename だけにする（同名 worktree が区別できない）',
+        file: 'v0/dirlabel.mjs',
+        from: '            if (depth[i] < segs[i].length) { depth[i]++; grew = true; }',
+        to: '            /* 変異: 親を足さない = basename のまま */',
+        gone: 'if (depth[i] < segs[i].length) { depth[i]++; grew = true; }',
+        pattern: 'basename が衝突したら',
+        testFile: 'v0/dirlabel.test.mjs',
+    },
+    {
+        // 🚨 #51: 応答を書いている最中の断片で本文が隠れていた
+        name: 'glance-writing-fragment',
+        why: '書き込み中の断片をそのまま「最後の出力」として出す'
+            + '（並列で見ている最中に限って直前の応答が読めない = 盤の目的が消える）',
+        file: 'v0/chatfilter.mjs',
+        from: '            if (i === lines.length - 1 && partialTail && lines.length > 1) {',
+        to: '            if (false) {   /* 変異: 断片をそのまま出す */',
+        gone: 'i === lines.length - 1 && partialTail',
+        pattern: '書き込み中の断片で本文を隠さない',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        // ⚠️ 「飛ばしたことを告げる」側も測る（黙って捨てるのが一番悪い）
+        name: 'glance-writing-announce',
+        why: '断片を飛ばしたことを告げない（黙って捨てる）',
+        file: 'v0/app.html',
+        from: "    + (g.writing ? '  ← 応答を書いています' : '')",
+        to: '    + \'\'   /* 変異: 飛ばしたことを告げない */',
+        gone: "g.writing ? '  ← 応答を書いています'",
+        script: 'v0/render-check.mjs',
+        // ⚠️ 実ブラウザで断片の状態を作るのは難しい（サーバの払い出しに依存）。
+        //    SURVIVED なら、告知を測る検査を chatfilter 側（unit）に寄せること。
+        defensive: '断片が出ている瞬間を実ブラウザで固定するのが難しい。'
+            + '告知の有無は chatfilter の unit（writing フラグ）で測っている',
+    },
     {
         name: 'monitor-last-output',
         why: '最後の出力を返さない'
@@ -2400,9 +2500,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'monitor-glance-tail-skipped',
         why: '末尾の解釈できない行を飛ばす（終わった理由が消え、古い応答が最後の出力になる）',
         file: 'v0/chatfilter.mjs',
-        from: '            if (i > 0) return { text: lines[i], interpreted: false };\n            break;',
+        from: '            if (i > 0) return { text: lines[i], interpreted: false, writing };\n            break;',
         to: '            continue;   /* 変異: 末尾の生テキストも飛ばす */',
-        gone: 'if (i > 0) return { text: lines[i], interpreted: false };',
+        gone: 'if (i > 0) return { text: lines[i], interpreted: false, writing };',
         pattern: 'chatGlance',
         testFile: 'v0/chatfilter.test.mjs',
     },
@@ -2410,8 +2510,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'monitor-glance-keeps-raw',
         why: '解釈できない行を空にする（「応答が来ていない」ように見える）',
         file: 'v0/chatfilter.mjs',
-        from: "    return { text: lines[lines.length - 1] ?? '', interpreted: false };",
-        to: "    return { text: '', interpreted: false };",
+        from: "    return { text: lines[lines.length - 1] ?? '', interpreted: false, writing };",
+        to: "    return { text: '', interpreted: false, writing };",
         gone: "text: lines[lines.length - 1]",
         pattern: 'chatGlance',
         testFile: 'v0/chatfilter.test.mjs',
@@ -3108,10 +3208,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'repo-label-collision',
         why: 'basename が衝突しても畳まない'
             + '（同名のリポジトリ2本が同じ表示名になり、どちらを操作しているか分からない）',
-        file: 'v0/server.mjs',
-        from: '    return base.map((b, i) => (count.get(b) > 1 ? paths[i] : b));',
+        file: 'v0/dirlabel.mjs',
+        from: '    return base.map((b, i) => ((count.get(b) ?? 0) > 1 ? list[i] : b));',
         to: '    return base;   /* 変異: 衝突を見ない */',
-        gone: 'count.get(b) > 1 ? paths[i] : b',
+        gone: '(count.get(b) ?? 0) > 1 ? list[i] : b',
         pattern: 'basename が衝突したらフルパスを出す',
     },
     {

@@ -38,6 +38,7 @@ import { collectAgents, transcriptRoot, maskSecrets } from './transcript.mjs';
 import { ExecRegistry, isSessionId } from './execsession.mjs';
 import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
 import { makeFailTracker, makeInflightGate, makeGoodSet, failDelay } from './failtracker.mjs';
+import { collisionFullLabels } from './dirlabel.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -450,11 +451,11 @@ function assignLabels(worktrees) {
  * @param {string[]} paths 登録済みの絶対パス（重複排除済み）
  * @returns {string[]} paths と同じ順序のラベル
  */
+// ⚠️ 実装は `v0/dirlabel.mjs`（ブラウザ側の監視盤と同じ道具を使う）。
+//    選択リストは**衝突したらフルパス**に落とす（どのリポジトリかを
+//    取り違えると読む対象そのものが変わるので、曖昧さを完全に消す方に倒す）。
 function repoLabels(paths) {
-    const base = paths.map(p => p.split(/[\\/]/).filter(Boolean).pop() ?? p);
-    const count = new Map();
-    for (const b of base) count.set(b, (count.get(b) ?? 0) + 1);
-    return base.map((b, i) => (count.get(b) > 1 ? paths[i] : b));
+    return collisionFullLabels(paths);
 }
 
 /**
@@ -2632,6 +2633,10 @@ async function handleRequest(req, res) {
                         denyJson(res, 409, `標準入力に書けません: ${err.message}`);
                         return;
                     }
+                    // 🚨 **入力が通ったら切断後の猶予を延ばす（#49）。**
+                    //    監視盤は購読せずに入力できるので、これが無いと
+                    //    **返事を書いている最中のセッションが猶予切れで殺される。**
+                    execRegistry.noteInput(s);
                     // 入力も**記録に残して購読者全員に流す**。
                     // そうしないと別の端末から見ている側に「何を送ったか」が見えず、
                     // 再接続したときにも自分の入力が消える。
@@ -3168,7 +3173,8 @@ async function handleRequest(req, res) {
         if (url.pathname === '/ndjson.mjs' || url.pathname === '/argv.mjs'
             || url.pathname === '/chatfilter.mjs' || url.pathname === '/panelayout.mjs'
             || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'
-            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs') {
+            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'
+            || url.pathname === '/dirlabel.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
                 'content-type': 'text/javascript; charset=utf-8',

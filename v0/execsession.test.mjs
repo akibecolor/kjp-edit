@@ -209,6 +209,46 @@ test('再購読すると猶予はやり直しになる', () => {
     assert.equal(r.sweep().kill.length, 1);
 });
 
+/**
+ * 🚨 **#49: 入力している最中のセッションを猶予で殺してはいけない。**
+ *
+ * 監視盤は**購読せずに**入力できる（`/api/v0/exec/list` + `/input`）。
+ * 猶予が購読/解除の時刻でしか進まないと、スマホから返事を書いている最中に
+ * 「切断されたまま N 秒経った」で SIGKILL される。並列でエージェントを
+ * 回すという**本来の使い方でだけ**起きる壊れ方。
+ */
+test('🚨 入力が通ったら切断後の猶予はやり直しになる（#49）', () => {
+    const r = reg({ detachedGraceMs: 5 * MIN });
+    const s = mk(r);
+    r.attachChild(s, { pid: 1 });
+    r.subscribe(s, 0, () => {}).unsubscribe();
+
+    r.advance(4 * MIN);
+    assert.equal(r.noteInput(s), true, '猶予を延ばせていない');
+    r.advance(4 * MIN);
+    assert.deepEqual(r.sweep().kill, [],
+        '入力したのに猶予が延びていない（返事を書いている最中に殺される）');
+    r.advance(1 * MIN + 1);
+    assert.equal(r.sweep().kill.length, 1, '入力が止まっても猶予が効かなくなっている');
+});
+
+test('購読中の入力は猶予に触らない（購読中は既に猶予の外）', () => {
+    const r = reg({ detachedGraceMs: 5 * MIN });
+    const s = mk(r);
+    r.attachChild(s, { pid: 1 });
+    r.subscribe(s, 0, () => {});
+    assert.equal(r.noteInput(s), false, '購読中に猶予の起点を作っている');
+    assert.equal(s.lastDetachedAt, null, '購読中なのに切断時刻が入っている');
+});
+
+test('終わったセッションへの入力では猶予を延ばさない（死体を延命しない）', () => {
+    const r = reg({ detachedGraceMs: 5 * MIN });
+    const s = mk(r);
+    r.attachChild(s, { pid: 1 });
+    r.finish(s, { code: 0 });
+    assert.equal(r.noteInput(s), false, '終了済みのセッションで猶予を延ばした');
+});
+
 test('keepAlive なら切断しても猶予では殺さない（絶対上限だけで縛る）', () => {
     const r = reg({ detachedGraceMs: 1 * MIN });
     const s = mk(r, { keepAlive: true });

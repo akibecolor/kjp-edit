@@ -151,7 +151,7 @@ test('tool_use は名前だけ出す（入力は出さない）', () => {
 
 test('chatGlance: 会話の最後の応答を1行で返す', () => {
     const g = chatGlance(`${assistant('できました')}`);
-    assert.deepEqual(g, { text: 'できました', interpreted: true });
+    assert.deepEqual(g, { text: 'できました', interpreted: true, writing: false });
 });
 
 test('chatGlance: 応答の終わりが分かる（打ってよい合図）', () => {
@@ -174,12 +174,12 @@ test('🚨 chatGlance: 本文とツール名の両方を返す（本文だけ落
 test('🚨 chatGlance: 先頭が切れていても、後ろから見て解釈できた行を使う', () => {
     // サーバは末尾を返すので、1行目は途中から始まる（JSON として壊れている）
     const raw = `e":"assistant"}}\n${assistant('2行目は無傷')}`;
-    assert.deepEqual(chatGlance(raw), { text: '2行目は無傷', interpreted: true });
+    assert.deepEqual(chatGlance(raw), { text: '2行目は無傷', interpreted: true, writing: false });
 });
 
 test('🚨 chatGlance: 解釈できない出力は生のまま返す（捨てない・空にしない）', () => {
     const g = chatGlance('npm ERR! code ELIFECYCLE');
-    assert.deepEqual(g, { text: 'npm ERR! code ELIFECYCLE', interpreted: false });
+    assert.deepEqual(g, { text: 'npm ERR! code ELIFECYCLE', interpreted: false, writing: false });
 });
 
 /* 🚨 8回目のレビューの SERIOUS。**JSON 行 + 末尾の生テキスト**という混在形が
@@ -211,9 +211,37 @@ test('🚨 chatGlance: 先頭が切れていて末尾も生テキストなら、
     // 「先頭切れの救済」と「末尾を捨てない」は両立する（救済は先頭の1行だけ）
     const raw = `e":"assistant"}}\n${assistant('途中の応答')}npm ERR! code ELIFECYCLE\n`;
     assert.deepEqual(chatGlance(raw),
-        { text: 'npm ERR! code ELIFECYCLE', interpreted: false });
+        { text: 'npm ERR! code ELIFECYCLE', interpreted: false, writing: false });
 });
 
+/* 🚨 9回目のレビュー / #51: **応答を書いている最中**の断片で本文が隠れていた。
+   サーバの `lastOutput()` はその瞬間までの生の出力を返すので、
+   ストリーム中の最後の行は改行で終わらない JSON の断片になる。
+   以前はそれを「末尾の解釈できない行」としてそのまま出していたので、
+   **並列で回して見ている最中（この盤を一番見たいとき）に限って
+   直前の応答が読めなかった。** 断片は飛ばすが、飛ばしたことは告げる。 */
+
+test('🚨 chatGlance: 書き込み中の断片で本文を隠さない（飛ばしたことは告げる）', () => {
+    const partial = '{"type":"assistant","message":{"content":[{"type":"te';
+    const g = chatGlance(`${assistant('直前の応答です')}${partial}`);
+    assert.equal(g.text, '直前の応答です',
+        `書き込み中の断片が本文を隠している: ${JSON.stringify(g)}`);
+    assert.equal(g.interpreted, true);
+    assert.equal(g.writing, true, '断片を飛ばしたことを告げていない（黙って捨てている）');
+});
+
+test('🚨 chatGlance: 改行で終わる非 JSON 行は「書き込み中」にしない（停止の告知を消さない）', () => {
+    const g = chatGlance(`${assistant('前の応答')}⚠ 停止を要求されました
+`);
+    assert.equal(g.text, '⚠ 停止を要求されました', '完全な1行を書き込み中と誤判定している');
+    assert.equal(g.writing, false);
+});
+
+test('chatGlance: 断片しか無いなら断片を出す（空にしない）', () => {
+    const g = chatGlance('{"type":"assi');
+    assert.equal(g.text, '{"type":"assi', '断片しか無いのに空にしている');
+    assert.equal(g.interpreted, false);
+});
 test('🚨 chatGlance: 知らない type も「表示していません」と言う（黙って消さない）', () => {
     const g = chatGlance(JSON.stringify({ type: 'control_response', subtype: 'deny' }));
     assert.equal(g.interpreted, true);
@@ -221,8 +249,8 @@ test('🚨 chatGlance: 知らない type も「表示していません」と言
 });
 
 test('chatGlance: 何も無いときは空文字（例外を投げない）', () => {
-    assert.deepEqual(chatGlance(''), { text: '', interpreted: false });
-    assert.deepEqual(chatGlance(null), { text: '', interpreted: false });
+    assert.deepEqual(chatGlance(''), { text: '', interpreted: false, writing: false });
+    assert.deepEqual(chatGlance(null), { text: '', interpreted: false, writing: false });
 });
 
 /* ===== 告知の連続をまとめる（実機で画面が埋まった） =====

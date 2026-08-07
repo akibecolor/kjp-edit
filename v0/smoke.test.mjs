@@ -3400,6 +3400,63 @@ const sendInput = (url, id, body) => fetch(`${url}/api/v0/exec/${id}/input`, {
 });
 
 /**
+ * 🚨 **#49: 監視盤から入力している最中のセッションを、猶予切れで殺さない。**
+ *
+ * 監視盤は**購読せずに**入力できる（`/api/v0/exec/list` + `/input`）ので、
+ * 猶予が購読/解除の時刻でしか進まないと**返事を書いている最中に SIGKILL**される。
+ * ここは寿命の配線（`/input` → `noteInput`）を測る。判断そのものは
+ * `execsession.test.mjs` の純関数 `sweep(now)` で測ってある。
+ */
+test('🚨 exec: 購読していなくても、入力している間は猶予で殺されない（#49）', async () => {
+    // 猶予 2 秒。入力を 700ms ごとに送り続けて、猶予の2倍以上生き延びること
+    const { child, url } = await startExec(['--exec-detached-grace', '2']);
+    try {
+        // 標準入力を読んで応答する仕込み（入力が届いていることも確かめられる）
+        const script = 'process.stdin.on("data", d => '
+            + 'process.stdout.write("got:" + String(d).trim() + String.fromCharCode(10)));'
+            + 'setInterval(() => {}, 1000);';
+        const s = await startSession(url, [process.execPath, '-e', script]);
+        // 🚨 **購読をやめる**（= 監視盤だけで触っている状態を作る）。
+        //    ここで abort しないと lastDetachedAt が入らず、猶予が始まらない
+        s.abort();
+        await new Promise(r => setTimeout(r, 300));
+
+        const alive = async () => {
+            const r = await fetch(`${url}/api/v0/exec/list`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            });
+            const body = await r.json();
+            return (body.sessions ?? []).find(x => x.id === s.id) ?? null;
+        };
+        // 猶予（2秒）の 2.5 倍のあいだ、700ms ごとに入力を送る
+        const sent = [];
+        for (let i = 0; i < 7; i++) {
+            const res = await sendInput(url, s.id, { data: `poke-${i}\n` });
+            sent.push(res.status);
+            await new Promise(r => setTimeout(r, 700));
+        }
+        const st = await alive();
+        assert.ok(st, `セッションが台帳から消えた（入力中に殺された）: 入力の応答 ${JSON.stringify(sent)}`);
+        assert.equal(st.state, 'running',
+            `入力し続けたのに殺された（state=${st.state} / 入力の応答 ${JSON.stringify(sent)}）`);
+        assert.ok(sent.every(c => c === 200), `入力が通っていない: ${JSON.stringify(sent)}`);
+
+        // 入力をやめたら、猶予を過ぎて**ちゃんと殺される**（延命しっぱなしにしない）
+        for (let i = 0; i < 40; i++) {
+            const cur = await alive();
+            if (!cur || cur.state !== 'running') break;
+            await new Promise(r => setTimeout(r, 250));
+        }
+        const after = await alive();
+        assert.ok(!after || after.state !== 'running',
+            '入力をやめても猶予で殺されない（取り残しの経路になっている）');
+    } finally {
+        child.kill();
+    }
+});
+
+/**
  * 🚨 **停止したら、そこで終端すること（exit の後ろに出力を並べない）。**
  *
  * 以前は `/kill` と sweeper がどちらも **finish() を先に、killTree() を後に**

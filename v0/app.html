@@ -332,6 +332,7 @@ import {
 // 「(リポジトリ外)」と言ってよいかの判定も外に出した。ここに書いていたので
 // **中にあるファイルを「外を触った」と断言していた**のに検査が掛からなかった（8回目のレビュー）
 import { pathLabel } from './pathlabel.mjs';
+import { uniqueLabels } from './dirlabel.mjs';
 // 取り込みの応答の解釈も外に出した（「失敗しても数え直す」「半端な状態の告知は
 // 再描画で消さない」は、壊れても静かなので字面ではなく挙動で固定する。8回目のレビュー）
 import { mergeOutcome } from './mergeresult.mjs';
@@ -1779,6 +1780,9 @@ function monitorGlance(x, chat) {
   const cut = flat.length > 200 ? `…${flat.slice(-200)}` : flat;
   return `› ${cut}`
     + (chat && !g.interpreted ? '  ← 解釈できない行' : '')
+    // 🚨 断片を飛ばしたことは**必ず告げる**（#51。黙って捨てない）。
+    //    「今まさに書いている」ことが分かるのは、どれに打つかの判断に直接効く
+    + (g.writing ? '  ← 応答を書いています' : '')
     + (x.lastOutputMasked ? '  ← 出力の秘密は落としています' : '');
 }
 
@@ -1894,12 +1898,20 @@ async function renderMonitor() {
     ui.status.textContent = sessions.length
       ? `${sessions.length} 件（稼働 ${live.length}）。打ちたい方に直接送れます`
       : 'セッションはありません（下のコンソールから起動できます）';
+    // 🚨 **見出しは basename では足りない（#50）。** 並列でエージェントを
+    //    回すと `.../a/wt-main` と `.../b/wt-main` のように basename が同じ
+    //    worktree が並ぶ。各行に標準入力の欄があるので、見分けられないと
+    //    **別のエージェントに文字が入る**（誤操作を誘発する最悪の形）。
+    const labels = uniqueLabels(sessions.map(x => x.worktree ?? ''));
     const seen = new Set();
-    for (const x of sessions) {
+    for (const [ix, x] of sessions.entries()) {
       seen.add(x.id);
       const row = monitorRow(x);
       const alive = x.state === 'starting' || x.state === 'running';
-      const name = (x.worktree ?? '').split(/[\\/]/).pop() || '(不明)';
+      const name = labels[ix] || '(不明)';
+      // ⚠️ ラベルでも区別できない場合（同じパスの worktree が2本）が残るので、
+      //    **セッション id の先頭**も必ず出す。ラベルだけに頼らせない。
+      const idTag = String(x.id ?? '').slice(0, 6);
       const mark = alive ? '▶' : (x.exit && x.exit.code === 0 ? '✔' : '■');
       // 経過と寿命を必ず出す（いつ殺されるかを黙らせない）
       const bits = [`${Math.round(x.ageMs / 1000)}秒`];
@@ -1917,6 +1929,7 @@ async function renderMonitor() {
       if (!alive && x.exit) bits.push(`exit=${x.exit.code ?? x.exit.signal ?? '?'}`);
       row.head.replaceChildren(
         el('b', null, `${mark} ${name}`),
+        el('span', 'note', `  #${idTag}`),
         el('span', null, `  ${bits.join(' / ')}`),
       );
       // argv（秘密はサーバ側でマスク済み。マスクしたことも出す）
@@ -1934,7 +1947,7 @@ async function renderMonitor() {
       row.out.textContent = monitorGlance(x, row.chat);
       row.out.hidden = !row.out.textContent;
       row.bar.hidden = !alive;
-      row.inp.placeholder = `${name} に送る（Enter）`;
+      row.inp.placeholder = `${name} #${idTag} に送る（Enter）`;
       if (!alive) row.msg.hidden = row.msg.textContent === '';
       if (!row.root.parentNode) ui.list.append(row.root);   // 並びは古い順で安定
     }
