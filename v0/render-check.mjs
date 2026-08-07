@@ -209,12 +209,33 @@ const MONITOR_CHECK = `(async () => {
   // 打っている途中を再現する。自動更新が来ても消えてはいけない
   const MARK = 'KEEP-ME-42';
   input.value = MARK;
+  // 🚨 **周期更新（4秒）が click 無しで発火することを測る。**
+  //    レイアウト検査は timers=0 で止められるようにしたので、
+  //    「実運用では止まっていない」をここで押さえる（止まると盤が
+  //    古い状態を出し続け、どれが待っているか分からなくなる）。
+  const ageOf = () => {
+    const r = rowsOf().find(e => /git --version/.test(e.textContent ?? ''));
+    // ⚠️ ここはテンプレートリテラルの中。バックスラッシュのエスケープは
+    //    1段失われる（\d が d に潰れて一致しない。実測で ageBefore=null になった）。
+    //    バックスラッシュを持ち込まない書き方（文字クラス）にする。
+    const m = /([0-9]+)秒/.exec(r?.textContent ?? '');
+    return m ? Number(m[1]) : null;
+  };
+  const ageBefore = ageOf();
+  let tickedWithoutClick = false;
+  for (let i = 0; i < 100 && !tickedWithoutClick; i++) {
+    await wait(200);
+    const now = ageOf();
+    tickedWithoutClick = ageBefore !== null && now !== null && now > ageBefore;
+  }
   document.getElementById('refresh').click();
   await wait(3000);
   const same = rowsOf().filter(e => /git --version/.test(e.textContent ?? ''));
   const after = same[0];
   return {
     seenCommand: /git --version/.test(text),
+    tickedWithoutClick,
+    ageBefore,
     // 🚨 **行を見分ける印（#50）。** 見出しは basename だと
     //    a/wt-main と b/wt-main で同じになる（ここはテンプレートリテラルの中なので
     //    バックティックは書けない）。ラベルの一意化は unit で測るので、ここでは
@@ -1240,6 +1261,11 @@ try {
         if (monitor.dupes !== 1) {
             problems.push('自動更新で同じセッションの行が増えている'
                 + `（作り直した行が古い行の下に溜まる）: ${monitor.dupes} 行`);
+        }
+        if (!monitor.tickedWithoutClick) {
+            problems.push('監視盤が周期更新で動いていない'
+                + `（click 無しで経過が進まない。ageBefore=${monitor.ageBefore}）。`
+                + 'timers=0 の分岐が実運用にも効いていないか確認すること');
         }
         if (!monitor.idTagShown) {
             problems.push('監視盤の行にセッションを見分ける印（#id）が出ていない'

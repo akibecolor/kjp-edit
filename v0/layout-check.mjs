@@ -55,7 +55,7 @@ const TOKEN = 'layout-check-token-0123456789';
  * **何を待っていたか消えていた**（macOS の CI で実際にこれを踏んだ）。
  * 「打ち切られた結果を緑と読まない」の裏返しで、**打ち切るなら理由を残す**。
  */
-const DEADLINE_MS = 200_000;
+const DEADLINE_MS = 260_000;
 const startedAt = Date.now();
 const leftMs = () => DEADLINE_MS - (Date.now() - startedAt);
 /** 経過を必ず出す（verify は失敗時に末尾を見せるので、ここが手掛かりになる） */

@@ -215,7 +215,7 @@ function probeHarness(width, mode, token) {
     if (mode === 'render') return renderHarness(w, q);
     return `<!doctype html><meta charset="utf-8"><title>layout probe</title>
 <body style="margin:0">
-<iframe id="f" src="/?probe=1${q}" style="width:${w}px;height:2000px;border:0"></iframe>
+<iframe id="f" src="/?probe=1&timers=0${q}" style="width:${w}px;height:2000px;border:0"></iframe>
 <pre id="out"></pre>
 <script type="module">
 const f = document.getElementById('f');

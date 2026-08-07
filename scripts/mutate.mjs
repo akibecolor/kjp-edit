@@ -1308,6 +1308,19 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         testFile: 'scripts/serveargs.test.mjs',
     },
     {
+        // 🚨 レイアウト検査のために周期タイマーを止められるようにしたので、
+        //    **実運用では止まっていない**ことを測る（止まると盤が古い状態を
+        //    出し続け、「どれが待っているか」が分からなくなる）。
+        name: 'probe-timers-scope',
+        why: '検査用の timers=0 が実運用のページでも効く'
+            + '（周期更新が止まり、監視盤が古い状態を出し続ける）',
+        file: 'v0/app.html',
+        from: 'const noTimers = window.__kjpProbe',
+        to: 'const noTimers = true ||   /* 変異: 本番でも止める */ window.__kjpProbe',
+        gone: 'const noTimers = window.__kjpProbe',
+        script: 'v0/render-check.mjs',
+    },
+    {
         // #3 の予算。**`node --test` ではなく実ブラウザの検査に掛ける**
         name: 'render-raf-batch',
         why: 'rAF でまとめるのをやめる（1件ごとに scrollHeight を読んで総文字数に対して二次。'

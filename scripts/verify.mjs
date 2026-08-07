@@ -235,7 +235,10 @@ if (!quick && !failed) {
 // 4. レイアウト検査（ブラウザが有る環境だけ。CI では自動でスキップされる）
 //    CSS の「見た目で気付けない」バグ用。詳細は v0/layout-check.mjs のコメント。
 if (!quick && !failed) {
-    const r = await run(['v0/layout-check.mjs'], { timeout: 240_000 });
+    // ⚠️ 上限は「遅さを隠すため」ではなく**ハングを失敗として観測するため**。
+    //    macOS の runner は同じ検査に Windows の 20 倍かかる（実測 122.9s vs 6s）。
+    //    layout-check 自身が 260s の締切で理由を出して落ちるので、ここは少し広い。
+    const r = await run(['v0/layout-check.mjs'], { timeout: 300_000 });
     const skipped = /skipped/.test(r.output);
     const ok = r.code === 0;
     steps.push({
