@@ -389,7 +389,18 @@ const DUAL_CHECK = `(async () => {
   const stopOf = () => [...pane.querySelectorAll('.cmdbar button')]
     .find(b => b.textContent === '停止');
   window.__kjpConsoleStates = [];   // 切替の前で区切る
+  // 🚨 **「切替の瞬間に溜まっている行」を決定的に作る。**
+  //    flush を保留してから 1.2 秒待つ（仕込みは 700ms ごとに tick を出す）。
+  //    こうすると、切替の時点で**必ず**古い購読の行が溜まっている。
+  //    以前はここを rAF の順序任せにしていたので、macOS だけで再現し
+  //    **linux では門を外しても緑**だった（SURVIVED）。
+  window.__kjpHoldFlush = true;
+  await wait(1200);
+  const heldBefore = (window.__kjpHeldFlushes ?? []).length;
   again[0].click();
+  await wait(300);
+  const released = typeof window.__kjpReleaseFlush === 'function'
+    ? window.__kjpReleaseFlush() : -1;
   let flickered = false;
   for (let i = 0; i < 50; i++) {
     await wait(50);
@@ -432,6 +443,10 @@ const DUAL_CHECK = `(async () => {
   return {
     label, placeholder, first, second,
     barVisible, flickered,
+    // 保留していた flush が実際にあったか（無ければ何も測れていない）。
+    // ⚠️ ここはテンプレートリテラルの中。バックティックは書けない。
+    //    second は解放**後**の端末なので、古い行が漏れれば both になる
+    heldBefore, released,
     // 門を通った遷移列。切替後に running:false が混ざっていたら
     // 「走っているのに停止と言った」ことになる（一瞬でも嘘）
     states: (window.__kjpConsoleStates ?? []).slice(0, 8),
@@ -1247,6 +1262,18 @@ try {
         if (dual.first === 'both' || dual.second === 'both' || dual.mixedAfter) {
             problems.push('2本の出力が同じ端末に混ざっている（1ペイン1購読が壊れている）'
                 + `: ${JSON.stringify(dual.tail)}`);
+        }
+        // 🚨 **「溜まっていた行を落とす」門を測れたことを確かめる。**
+        //    保留が1件も無ければ、切替の瞬間に古い行が無かった = 何も測っていない。
+        //    ここを見ないと、rAF の順序次第で**門を外しても緑**になる
+        //    （linux の CI で SURVIVED した形。`--exec-stream-delay` と同じ理由で
+        //     検査専用の保留を入れた）。
+        if (!(dual.heldBefore > 0)) {
+            problems.push('切替の瞬間に溜まっている行を作れていない'
+                + `（保留 ${dual.heldBefore} 件）= 古い書き込みの門を測れていない`);
+        }
+        if (!(dual.released > 0)) {
+            problems.push(`保留した flush を解放できていない（released=${dual.released}）`);
         }
         if (dual.first === 'none' || dual.second === 'none') {
             problems.push('購読したセッションの出力が出ていない'

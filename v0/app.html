@@ -954,7 +954,7 @@ const TERM_MAX_SPANS = 4000;
  * ⚠️ **計測がこの関数を通ることが重要。** 別経路を測ると
  *    「速い」という主張の根拠にならない（v0/render-check.mjs）。
  */
-function makeTermWriter(termEl, scrollEl) {
+function makeTermWriter(termEl, scrollEl, isCurrent = null) {
   let follow = true;
   const onScroll = () => {
     follow = scrollEl.scrollTop + scrollEl.clientHeight >= scrollEl.scrollHeight - 24;
@@ -966,6 +966,14 @@ function makeTermWriter(termEl, scrollEl) {
   let notice = null;
   const flush = () => {
     flushing = false;
+    // 🚨 **出口は「流す瞬間」に閉じる（enqueue の時ではない）。**
+    //    以前の門は `line()` 側にあったので、**切替の前に溜まっていた行**は
+    //    そのまま流れていた（端末の要素は切替後も同じものを使うので、
+    //    `replaceChildren()` で消した後に古い行が入る）。1フレーム分の
+    //    古い出力が新しい方に混ざる = 「どちらの出力か判別できない」に戻る。
+    //    linux の CI で `console-stale-writer` が SURVIVED したのはこれで、
+    //    門が実際には効いていなかった（門の位置が間違っていた）。
+    if (isCurrent && !isCurrent()) { queue = []; return; }
     if (!queue.length) return;
     const frag = document.createDocumentFragment();
     for (const [cls, s] of queue) frag.append(el('span', cls, s));
@@ -986,9 +994,24 @@ function makeTermWriter(termEl, scrollEl) {
     }
     if (follow) scrollEl.scrollTop = scrollEl.scrollHeight;
   };
+  /**
+   * ⚠️ **検査専用: flush を保留できるようにする（既定では存在しない経路）。**
+   *
+   * 「切替の瞬間に溜まっている行がある」状態は rAF の順序次第で、
+   * **macOS だけで再現し linux では再現しなかった**（守りを外しても緑になる）。
+   * `--exec-stream-delay` / `--layout-probe` と同じ扱いで、
+   * `?probe=1` のときだけ保留できるようにして**決定的に**作る。
+   */
+  const schedule = () => {
+    if (window.__kjpProbe && window.__kjpHoldFlush) {
+      (window.__kjpHeldFlushes ??= []).push(flush);
+      return;
+    }
+    requestAnimationFrame(flush);
+  };
   const line = (cls, s) => {
     queue.push([cls, s]);
-    if (!flushing) { flushing = true; requestAnimationFrame(flush); }
+    if (!flushing) { flushing = true; schedule(); }
   };
   return { line, flush, dispose: () => scrollEl.removeEventListener('scroll', onScroll) };
 }
@@ -996,7 +1019,8 @@ function makeTermWriter(termEl, scrollEl) {
 async function runExec(termEl, scrollEl, wt, argv, onState,
   { attach = null, keepAlive = false, chat = false, onActivity = null, isCurrent = null } = {}) {
   // 端末への追記は共通の書き手を使う（描画の計測も同じものを通る。#3）
-  const writer = makeTermWriter(termEl, scrollEl);
+  // ⚠️ 世代の判定は**書き手に渡す**（流す瞬間に見る必要があるため）
+  const writer = makeTermWriter(termEl, scrollEl, isCurrent);
   /**
    * 🚨 **古い購読は端末に1文字も書かない（macOS の CI が捕まえた）。**
    *
@@ -1007,10 +1031,9 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
    * 手元（Windows）では rAF の順序が違って再現せず、**CI の macOS だけで落ちた**。
    * 世代が変わったら書き込みを捨てる（購読の abort とは別に、**出口も閉じる**）。
    */
-  const line = (cls, text) => {
-    if (isCurrent && !isCurrent()) return;
-    writer.line(cls, text);
-  };
+  //    ⚠️ 門は**書き手の flush の中**にある（溜まっている分も落とすため）。
+  //       ここで捨てると「溜めない」だけで、既に溜まった分は流れてしまう。
+  const line = (cls, text) => writer.line(cls, text);
 
   const ac = new AbortController();
   // ⚠️ **abort はもう「停止」ではない。** #17 でサーバが切断で子を殺すのを
@@ -1150,9 +1173,11 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
     // 🚨 **順序が重要。** chatFilter に残っている行を先に line() に流し、
     //    そのあと writer を flush する。逆にすると最後の応答が DOM に出ない（#44）
     chatFilter?.flush();
-    // ⚠️ 切替で世代が変わっていたら**流さない**（消した端末に古い行が入る）。
+    // ⚠️ 世代が変わっていたら流さない — の判定は `writer.flush()` の中にある。
+    //    ここで条件を書くと門が2箇所になり、**どちらも単独では効いていない**
+    //    （= どちらの変異も生き残る）状態になる。
     //    dispose は必ずやる（タイマーと参照を落とすため）
-    if (!isCurrent || isCurrent()) writer.flush();
+    writer.flush();
     writer.dispose();
     onState({ running: false });
   }
@@ -1543,6 +1568,16 @@ function consoleBody(wt, paneObj) {
   if (window.__kjpProbe && !window.__kjpFeedTerm) {
     const probeWriter = makeTermWriter(term, scroll);
     window.__kjpFeedTerm = s => probeWriter.line('', s);
+    // 🚨 保留した flush を解放する入口（`__kjpHoldFlush` と対）。
+    //    これで「切替の瞬間に溜まっていた行」を決定的に作れる
+    //    （rAF の順序に依存しないので Windows でも測れる）。
+    window.__kjpReleaseFlush = () => {
+      const held = window.__kjpHeldFlushes ?? [];
+      window.__kjpHeldFlushes = [];
+      window.__kjpHoldFlush = false;
+      for (const f of held) f();
+      return held.length;
+    };
   }
 
   box.append(bar, peek, beat, resume, scroll, inbar);

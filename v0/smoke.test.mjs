@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process';
 import { request as httpRequest, Agent as HttpAgent } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { mkdtemp, rm, writeFile, readFile, mkdir, rename } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -5885,9 +5886,18 @@ test('--audit-log は .git の中なら通す（既定の置き場所を否定�
  * パスのゆるい一致（この検査の中の**表示上の**照合だけに使う）。
  * ⚠️ 認可の照合はサーバ側の `samePath()` が持つ。ここでそれを再実装しない。
  */
+// 🚨 **実体に解決してから比べる。** サーバは repo を
+//    `git rev-parse --show-toplevel` で正規化するので、**git の綴り**が返る:
+//    Windows CI の `os.tmpdir()` は `RUNNER~1`（8.3 短縮名）なのに git は
+//    `runneradmin` を返し、macOS の `/var` は実体 `/private/var`。
+//    素の綴りで比べていたので、**Windows と macOS の CI だけで 6 件落ちた**
+//    （手元の Windows では短縮名にならないので出ない。CLAUDE.md のパスの節）。
+const realish = p => {
+    try { return realpathSync.native(p); } catch { return p; }
+};
+const flatten = p => p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
 const sameish = (x, y) => typeof x === 'string' && typeof y === 'string'
-    && x.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
-    === y.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+    && flatten(realish(x)) === flatten(realish(y));
 
 /** 使い捨てのリポジトリを1本作る（コミット1本 + worktree 1本） */
 async function makeRepo(dir, branch) {

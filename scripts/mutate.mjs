@@ -1305,9 +1305,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'rAF でまとめるのをやめる（1件ごとに scrollHeight を読んで総文字数に対して二次。'
             + '実測 12,000行で 53.8秒、その間 停止ボタンも自動更新も効かない）',
         file: 'v0/app.html',
-        from: '    if (!flushing) { flushing = true; requestAnimationFrame(flush); }',
+        from: '    if (!flushing) { flushing = true; schedule(); }',
         to: '    flush();',
-        gone: 'requestAnimationFrame(flush)',
+        gone: 'if (!flushing) { flushing = true; schedule(); }',
         script: 'v0/render-check.mjs',
     },
     {
@@ -2432,10 +2432,14 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '古い購読の書き込みを捨てない'
             + '（切替で端末を消しても rAF の flush で古い行が入り、2本が混ざる）',
         file: 'v0/app.html',
-        from: '    if (isCurrent && !isCurrent()) return;',
+        from: '    if (isCurrent && !isCurrent()) { queue = []; return; }',
         to: '    /* 変異: 古い購読の書き込みも通す */',
-        gone: 'if (isCurrent && !isCurrent()) return;',
-        platforms: ['darwin', 'linux'],
+        gone: 'if (isCurrent && !isCurrent()) { queue = []; return; }',
+        // 🚨 **以前は `platforms: ['darwin','linux']` で、しかも linux で SURVIVED した。**
+        //    門が `line()`（enqueue の時）にあったので、**切替の前に溜まっていた行**は
+        //    素通りしていた = 門の位置が間違っていた。門を flush 側に移し、
+        //    検査は `__kjpHoldFlush` で「溜まっている状態」を決定的に作るので、
+        //    プラットフォームを限定せずに測れる。
         script: 'v0/render-check.mjs',
     },
     {
