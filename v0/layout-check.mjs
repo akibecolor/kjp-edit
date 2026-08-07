@@ -154,18 +154,41 @@ async function measure(width, from = null) {
     //    3往復かかった）。**捨てた情報は、無かったことと区別できない。**
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', d => { err += d; });
+    // 🚨 **ブラウザの終了を待たない。計測が出たら殺す。**
+    //
+    //    macOS の CI で「幅 390 で 60s の SIGKILL」を3往復追いかけた結果、
+    //    **計測は完走していた**（dump 9444 文字 / `<pre id="out">` も書けている /
+    //    Chrome の stderr は空）。つまり待っていたのは**プロセスの終了だけ**で、
+    //    macOS の Chrome（arm64 + `--headless=new` + 仮想時間）はそこで戻らない。
+    //    欲しいのは dump なので、**dump が揃った瞬間に殺す**のが正しい待ち方。
+    //    ⚠️ 「終わるのを待つ」形は、終わらない実装差を待ちに変えてしまう。
     // ⚠️ 撮影後にブラウザを必ず落とす。放置すると同時実行で数十プロセス残る（実際に53個残した）
-    const done = new Promise(r => child.on('close', r));
+    const DUMP_DONE = /<pre id="out">[\s\S]*?<\/pre>/;
+    const closed = new Promise(r => child.on('close', r));
+    const done = new Promise(resolve => {
+        let settled = false;
+        const finish = why => { if (!settled) { settled = true; resolve(why); } };
+        child.stdout.on('data', () => { if (DUMP_DONE.test(out)) finish('dumped'); });
+        child.on('close', () => finish('closed'));
+    });
     // ⚠️ **上限は「残り時間」に合わせる。** 固定 60s だと、4本立ち上げるだけで
     //    verify の上限（240s）に達し、**外から SIGKILL されて理由が消える**。
     const budget = Math.max(15_000, Math.min(60_000, leftMs() - 20_000));
     let browserKilled = false;
     const kill = setTimeout(() => { browserKilled = true; child.kill('SIGKILL'); }, budget);
     const t0 = Date.now();
-    await done;
+    const why = await done;
     clearTimeout(kill);
-    note(`幅 ${width} を測った`, Date.now() - t0);
-    if (browserKilled) {
+    // dump が出たら用は済んでいる。木ごと落とす（Chrome は helper を持つ）
+    if (why === 'dumped') {
+        try { child.kill('SIGKILL'); } catch { /* 既に死んでいる */ }
+        // ⚠️ **死ぬのを待ってからプロファイルを消す。** 待たずに消すと Windows で
+        //    `EBUSY: unlink … en-US-10-1.bdic`（辞書ファイルを掴んだまま）になり、
+        //    **計測は取れているのに検査が落ちる**（実測）。
+        await Promise.race([closed, new Promise(r => setTimeout(r, 3000))]);
+    }
+    note(`幅 ${width} を測った（${why}）`, Date.now() - t0);
+    if (browserKilled && !DUMP_DONE.test(out)) {
         await rm(profile, { recursive: true, force: true }).catch(() => {});
         // 🚨 **何が起きたかを全部添える。** dump が始まっていたか（out の長さ）、
         //    ハーネスが out を書けたか、Chrome が何か言っていたか（stderr）。
@@ -178,7 +201,13 @@ async function measure(width, from = null) {
             `  chrome の stderr: ${JSON.stringify(err.slice(-800)) || '(空)'}`,
         ].join('\n'));
     }
-    await rm(profile, { recursive: true, force: true });
+    // ⚠️ 消せないことを失敗にしない（計測は取れている）。ただし**黙らない**。
+    let rmErr = null;
+    for (let i = 0; i < 15; i++) {
+        try { await rm(profile, { recursive: true, force: true }); rmErr = null; break; }
+        catch (e) { rmErr = e; await new Promise(r => setTimeout(r, 200)); }
+    }
+    if (rmErr) console.log(`  · 一時プロファイルを消せませんでした: ${rmErr.code ?? rmErr.message}`);
 
     if (leftMs() <= 0) {
         throw new Error(`締切（${DEADLINE_MS / 1000}s）を超えました。経過: ${step.join(' / ')}`);
