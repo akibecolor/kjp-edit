@@ -86,46 +86,8 @@ export function trimTrailingSep(p) {
     return typeof p === 'string' ? p.replace(/[\\/]+$/, '') : p;
 }
 
-/**
- * PowerShell が出した `pid<TAB>ppid` の行を読む。
- *
- * ⚠️ 数値でない行（PowerShell の警告や空行）は捨てる。**捨てた行は数に入れない**
- *    ので、呼び出し側は「調べられた」かどうかを別に持つこと（`{supported, …}`）。
- */
-export function parseProcPairs(text) {
-    return String(text ?? '').split('\n')
-        .map(l => l.trim()).filter(Boolean)
-        .map(l => l.split('\t'))
-        .filter(([a, b]) => /^\d+$/.test(a ?? '') && /^\d+$/.test(b ?? ''))
-        .map(([a, b]) => ({ pid: Number(a), ppid: Number(b) }));
-}
-
-/**
- * プロセス表から、ある pid の**子孫を全部**返す。
- *
- * 🚨 `--stop` は `taskkill /T /F` で**木ごと**落とすので、道連れになるのは
- *    デーモンだけではない（`claude -p` / `npm test` とその子孫が全部死ぬ）。
- *    「止めます」と言う前に何本巻き込むかを見せるために木を辿る。
- * ⚠️ **循環で無限ループしない。** Windows では pid が再利用されるので、
- *    親子関係が輪を作った表（既に死んだ親の pid を新しいプロセスが持つ）を渡されうる。
- */
-export function descendantsOf(pairs, pid) {
-    const kids = new Map();
-    for (const p of pairs ?? []) {
-        if (!kids.has(p.ppid)) kids.set(p.ppid, []);
-        kids.get(p.ppid).push(p.pid);
-    }
-    const seen = new Set([pid]);
-    const out = [];
-    const stack = [pid];
-    while (stack.length) {
-        const cur = stack.pop();
-        for (const k of kids.get(cur) ?? []) {
-            if (seen.has(k)) continue;
-            seen.add(k);
-            out.push(k);
-            stack.push(k);
-        }
-    }
-    return out;
-}
+// 🚨 **実装は v0/proctree.mjs に1つだけ置く（9回目のレビュー）。**
+//    以前はここにしか無く、**サーバ側の killTree() は直接の子しか数え直して
+//    いなかった**（木から外れた孫が生きているのに「停止しました」と言っていた）。
+//    片方にしか無い道具は、もう片方で「無いことに気付かない」形の穴になる。
+export { parseProcPairs, descendantsOf, stillAlive } from '../v0/proctree.mjs';

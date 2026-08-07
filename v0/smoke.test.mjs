@@ -137,13 +137,18 @@ after(async () => {
     if (process.platform === 'win32') {
         const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'node.exe\'" '
             + '| Where-Object { $_.CommandLine -like \'*grandchild.mjs*\' '
-            + '-or $_.CommandLine -like \'*appendFileSync*\' } '
+            + '-or $_.CommandLine -like \'*appendFileSync*\' '
+            // 「木から逃げた孫」の検査の仕込み（自死もするが、ここが最後の砦）
+            + '-or $_.CommandLine -like \'*escaped-grandchild*\' '
+            + '-or $_.CommandLine -like \'*escape-parent*\' } '
             + '| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -Confirm:$false }';
         await new Promise(r => spawn('powershell', ['-NoProfile', '-Command', ps],
             { windowsHide: true, stdio: 'ignore' }).on('close', r));
     } else {
-        await new Promise(r => spawn('pkill', ['-f', 'grandchild.mjs'],
-            { stdio: 'ignore' }).on('close', r));
+        for (const pat of ['grandchild.mjs', 'escaped-grandchild', 'escape-parent']) {
+            await new Promise(r => spawn('pkill', ['-f', pat],
+                { stdio: 'ignore' }).on('close', r));
+        }
     }
     // worktree は repo の外に置いたので個別に消す
     const stem = repo.split(/[\\/]/).pop();
@@ -3269,6 +3274,351 @@ test('🚨 exec: 停止した後の出力が exit の後ろに並ばない', asy
         s.abort();
     } finally { child.kill(); }
 });
+/**
+ * 🚨 **「停止しました」が実態と一致すること（9回目のレビュー / SERIOUS）。**
+ *
+ * `killTree()` の数え直しは**直接の子だけ**を見ていた。木から外れた孫は
+ * `taskkill /T` にも `kill(-pgid)` にも当たらず、しかも数え直しに掛からないので
+ * `/kill` は 200 `{ok:true}` を返し、台帳には `signal:"SIGKILL"` と
+ * 「⚠ 停止しました」が残り、以後 sweeper も候補にしない = **回復経路が無い**。
+ * レビュアーの実測では 200 を返した後も孫（pid 31596）が生きていた。
+ * 観測ツールが「止めたつもりで走り続けている」と言うのは最悪の誤り。
+ *
+ * ここで測るのは **主張と実態の一致**（「殺せること」ではない）:
+ *   孫が生きているなら 200 と「停止しました」を返してはいけない。
+ *   孫が死んでいるなら 200 でよい。
+ * POSIX では孫が `detached` で**プロセスグループから逃げる**ので
+ * `kill(-pgid)` が当たらず生き残る → 修正前は必ず嘘になる（linux/darwin で変異を測る）。
+ * Windows では `taskkill /T` が ppid を辿って孫まで落とすので、
+ * 同じ形でも「殺せてしまう」= 一致する。
+ *
+ * ⚠️ **限界も測る（過大な主張をしないため）。** 撃つ**前**に親が終了していた孫は
+ *    どちらのプラットフォームでも親子関係から辿れない（実測: `procTreePids` が
+ *    「子孫なし」を返す）。これは #45 に残す。ここで守れるのは
+ *    「撃つ時点で木に載っていた pid」だけである。
+ */
+test('🚨 exec: /kill の「停止しました」が実態と一致する（木を数え直す）', async () => {
+    const { child, url } = await startExec();
+    const pidFile = join(repo, 'escaped-grandchild.pid');
+    const script = join(repo, 'escape-parent.mjs');
+    let gcPid = null;
+    try {
+        // 中間（= 直接の子）は生き続け、孫だけがプロセスグループから逃げる。
+        // 🚨 仕込みは必ず自死させる（テストが SIGKILL されたときに残さない）
+        await writeFile(script, [
+            'import { spawn } from "node:child_process";',
+            'import { writeFileSync } from "node:fs";',
+            'const gc = spawn(process.execPath, ["-e",',
+            '    `require("fs").writeFileSync(process.argv[1], String(process.pid));`',
+            '    + `setTimeout(() => process.exit(0), 30000);`,',
+            '    process.argv[2]], { detached: true, stdio: "ignore" });',
+            'gc.unref();',
+            'writeFileSync(process.argv[3], String(gc.pid));',
+            'setTimeout(() => process.exit(0), 30000);',
+        ].join('\n'), 'utf8');
+        const midPidFile = join(repo, 'escaped-mid.pid');
+        const s = await startSession(url,
+            [process.execPath, script, pidFile, midPidFile]);
+        // 孫が起きるまで待つ（固定待ちにしない。#4）
+        const { readFileSync, existsSync } = await import('node:fs');
+        for (let i = 0; i < 100 && !existsSync(pidFile); i++) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        assert.ok(existsSync(pidFile), '孫が起動しなかった（仕込みが壊れている）');
+        gcPid = Number(readFileSync(pidFile, 'utf8'));
+        assert.ok(gcPid > 0, `孫の pid が読めない: ${gcPid}`);
+
+        const kr = await fetch(`${url}/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        const kbody = await kr.text();
+        // 実態: 孫が生きているか（少し待って、死ぬ猶予を与える）
+        await new Promise(r => setTimeout(r, 600));
+        let gcAlive = true;
+        try { process.kill(gcPid, 0); } catch { gcAlive = false; }
+
+        // 台帳の文言も見る（応答だけ直して note が嘘のまま、を防ぐ）
+        const rep = await fetch(`${url}/api/v0/exec/${s.id}/stream?from=0`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        const recs = (await rep.text()).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        // ⚠️ 終端の理由は `exit` レコードではなく、その**直前の `err` 行**に流れる
+        //    （`finish()` の実装。ここを間違えると常に空文字を見て緑になる）
+        const errText = recs.filter(r => r.t === 'err').map(r => r.d ?? '').join('');
+        const said = `${kbody} / 出力=${JSON.stringify(errText.slice(-200))}`;
+
+        if (gcAlive) {
+            assert.notEqual(kr.status, 200,
+                `孫 ${gcPid} が生きているのに /kill が 200 を返した: ${said}`);
+            // 「停止しました」と言い切っていないこと（UI にそのまま出る文言）
+            assert.ok(!/停止しました/.test(errText),
+                `孫が生きているのに「停止しました」と記録した: ${said}`);
+            assert.match(kbody, /確認できませんでした/,
+                `残った pid を告げていない: ${said}`);
+            assert.match(kbody, new RegExp(String(gcPid)),
+                `どの pid が残ったかを告げていない: ${said}`);
+        } else {
+            assert.equal(kr.status, 200,
+                `孫は止まっているのに /kill が失敗した: ${said}`);
+            assert.match(errText, /停止しました/, `終端の理由が残っていない: ${said}`);
+        }
+        s.abort();
+    } finally {
+        if (gcPid) {
+            try { process.kill(gcPid, 'SIGKILL'); } catch { /* 既に死んでいる */ }
+            if (process.platform === 'win32') {
+                await new Promise(r => spawn('taskkill', ['/PID', String(gcPid), '/T', '/F'],
+                    { windowsHide: true, stdio: 'ignore' }).on('close', r));
+            }
+        }
+        child.kill();
+        await rm(pidFile, { force: true });
+        await rm(join(repo, 'escaped-mid.pid'), { force: true });
+        await rm(script, { force: true });
+    }
+});
+
+/**
+ * 🚨 **終了処理（9回目のレビュー / SERIOUS 2件）。**
+ *
+ * (1) ハンドラは `SIGINT` と `SIGTERM` にしか付いていなかった。**`SIGHUP`（端末を
+ *     閉じる）では既定動作でプロセスが消え、子は置き去りになる。** 常用の起動は
+ *     端末に張り付いているので、端末を閉じるのは**普通の終わり方**であり、
+ *     POSIX の子は `detached:true`（別プロセスグループ）なので端末の HUP は届かない。
+ * (2) 終了処理に門が無く、掃き取りと `POST /api/v0/exec` が競争していた
+ *     （`create()` → `spawn()` は実測 36〜43ms）。掃いた後に spawn された子は
+ *     寿命管理の外に落ちる。
+ * (3) `starting`（`child === null`）のセッションは黙って飛ばされていたので、
+ *     終了処理の後に spawn されていた。
+ *
+ * ⚠️ **Windows では測れない。** `process.kill` は TerminateProcess 相当で
+ *    ハンドラが走らない（`SIGBREAK` も同じ）。CI の linux / darwin で測る。
+ *    変異にも `platforms` を書いてある。**ここが skip のときは緑と読まないこと。**
+ */
+/**
+ * コマンド行に `needle` を含むプロセスの pid を数える。
+ *
+ * 🚨 **「調べられない」を「0 件」と言わない**（`{null}` を返して呼び出し側に
+ *    「測れていない」と分からせる）。0 と言うと「置き去りは無い」という**断言**になる。
+ */
+async function pidsRunning(needle) {
+    if (process.platform === 'win32') {
+        // 🚨 **自分自身を数えない。** `-Command` の中に needle が入るので、
+        //    問い合わせている PowerShell 自身が一致する。これで
+        //    「置き去りが1本ある」という**偽の失敗**を出した（実測: 修正は効いて
+        //    いたのに pid 15156 = PowerShell を数えていた）。
+        //    `pgrep` は自分を除外するので POSIX 側では起きない差。
+        const ps = 'Get-CimInstance Win32_Process '
+            + `| Where-Object { $_.CommandLine -like '*${needle}*' `
+            + '-and $_.ProcessId -ne $PID } '
+            + '| ForEach-Object { $_.ProcessId }';
+        return await new Promise(res => {
+            const p = spawn('powershell', ['-NoProfile', '-Command', ps],
+                { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+            let out = '';
+            p.stdout.on('data', d => { out += d; });
+            p.on('error', () => res(null));
+            p.on('close', c => res(c === 0
+                ? out.split('\n').map(x => x.trim()).filter(Boolean) : null));
+        });
+    }
+    return await new Promise(res => {
+        const p = spawn('pgrep', ['-f', needle], { stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        p.stdout.on('data', d => { out += d; });
+        p.on('error', () => res(null));
+        // ⚠️ pgrep は「1件も無い」を **exit 1** で返す。失敗と区別する
+        p.on('close', c => res(c === 0 || c === 1
+            ? out.split('\n').map(x => x.trim()).filter(Boolean) : null));
+    });
+}
+
+test('🚨 終了: 子を回収し、終了処理中の実行を断り、残ったものを告げる', async () => {
+    // 起動途中のセッションを作れるようにする（検査専用フラグ。既定 0）。
+    // ⚠️ 終了処理は `--layout-probe` 配下の `/__shutdown` で起こす
+    //    （Windows では signal でハンドラが走らないので、これが無いと
+    //     終了処理の中身が CI 任せ = 手元で1つも測れない）
+    const { child, url } = await startExec(['--exec-spawn-delay', '1500', '--layout-probe']);
+    const stderr = [];
+    child.stderr.on('data', d => stderr.push(String(d)));
+    const midPidFile = join(repo, 'hup-mid.pid');
+    const gcPidFile = join(repo, 'hup-escaped-grandchild.pid');
+    const script = join(repo, 'hup-parent.mjs');
+    let gcPid = null;
+    try {
+        // 直接の子: 自分の pid を書き、プロセスグループから逃げる孫を持つ
+        await writeFile(script, [
+            'import { spawn } from "node:child_process";',
+            'import { writeFileSync } from "node:fs";',
+            'writeFileSync(process.argv[2], String(process.pid));',
+            'const gc = spawn(process.execPath, ["-e",',
+            '    `require("fs").writeFileSync(process.argv[1], String(process.pid));`',
+            '    + `setTimeout(() => process.exit(0), 30000);`,',
+            '    process.argv[3]], { detached: true, stdio: "ignore" });',
+            'gc.unref();',
+            'setTimeout(() => process.exit(0), 30000);',
+        ].join('\n'), 'utf8');
+
+        const { readFileSync, existsSync } = await import('node:fs');
+        const s = await startSession(url, [process.execPath, script, midPidFile, gcPidFile]);
+        for (let i = 0; i < 150 && !(existsSync(midPidFile) && existsSync(gcPidFile)); i++) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        assert.ok(existsSync(midPidFile) && existsSync(gcPidFile),
+            '仕込みが起動しなかった（子 / 孫の pid が書かれていない）');
+        const midPid = Number(readFileSync(midPidFile, 'utf8'));
+        gcPid = Number(readFileSync(gcPidFile, 'utf8'));
+        const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+        assert.ok(alive(midPid), `直接の子 ${midPid} が既に死んでいる（前提が崩れている）`);
+
+        // (3) 起動途中のセッションを1本仕込む（spawn まで 1500ms 待つ）
+        const startingPidFile = join(repo, 'hup-starting.pid');
+        const startingScript = join(repo, 'hup-starting.mjs');
+        await writeFile(startingScript, [
+            'import { writeFileSync } from "node:fs";',
+            'writeFileSync(process.argv[2], String(process.pid));',
+            'setTimeout(() => process.exit(0), 30000);',
+        ].join('\n'), 'utf8');
+        // 🚨 **中間シェルを挟む。** 直接の子は Windows では libuv の job object に
+        //    入っていて、**デーモンが死ぬと一緒に落ちる**。だから直接の子で測ると
+        //    印を外しても待つのをやめても**置き去りが観測できず、守りが検証されない**
+        //    （実測: `shutdown-skips-starting` / `shutdown-no-wait-for-starting` が
+        //     どちらも SURVIVED した）。孫は job から抜けるので生き残る =
+        //    「終了処理が始末したか」を実際に測れる（既存の孫の検査と同じ理由）。
+        const startingArgv = process.platform === 'win32'
+            ? ['cmd', '/c', process.execPath, startingScript, startingPidFile]
+            : ['sh', '-c', `"${process.execPath}" "${startingScript}" "${startingPidFile}" & wait`];
+        const startingReq = fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({ worktree: repo, argv: startingArgv }),
+        }).then(r => r.text()).catch(() => '');
+
+        // 🚨 **本当に `starting` の状態で SIGHUP を撃つ。** 送った直後に撃つと、
+        //    リクエストが `create()` に届く前に門（503）で断られて
+        //    **「起動途中」を1度も作らずに緑になる**（SKIP を緑と読む型）。
+        //    spawn の遅延は 1500ms なので、300ms 待てば必ず starting に居る。
+        await new Promise(r => setTimeout(r, 300));
+
+        const exited = new Promise(r => child.on('exit', () => r(true)));
+        await fetch(`${url}/__shutdown`).then(r => r.text()).catch(() => '');
+
+        // (2) 終了処理中は 503 を返す（黙って受理しない）。
+        //     ⚠️ シグナルの配送は非同期なので「1回でも 503 を観測できるか」で測る。
+        //     孫が逃げているので killTree が最大2秒数え直す = 窓は十分ある。
+        let saw503 = false;
+        let saw200AfterShutdown = false;
+        for (let i = 0; i < 40; i++) {
+            let st = 0;
+            try {
+                st = (await fetch(`${url}/api/v0/exec`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+                    body: JSON.stringify({ worktree: repo, argv: ['git', '--version'] }),
+                })).status;
+            } catch { break; }   // サーバが閉じた
+            if (st === 503) saw503 = true;
+            else if (st === 200 && saw503) saw200AfterShutdown = true;
+            await new Promise(r => setTimeout(r, 50));
+        }
+        assert.ok(saw503, '終了処理中に 503 を返さなかった（新しい実行を受け付けている）');
+        assert.ok(!saw200AfterShutdown, '503 の後に 200 で受理した（門が閉じ切っていない）');
+
+        await Promise.race([exited, new Promise(r => setTimeout(r, 15000))]);
+        assert.equal(child.exitCode !== null || child.signalCode !== null, true,
+            '終了処理を起こしてもサーバが終わらなかった');
+
+        // (1) 直接の子が回収されている
+        for (let i = 0; i < 30 && alive(midPid); i++) await new Promise(r => setTimeout(r, 100));
+        assert.ok(!alive(midPid),
+            `直接の子 ${midPid} が置き去りになった`);
+
+        // 🚨 止め切れなかったこと（プロセスグループから逃げた孫）を**黙って終わらない**。
+        //    ⚠️ 「殺せること」ではなく **主張と実態の一致**を測る。孫が実際に
+        //    生き残ったときだけ告知を要求する（消せていたなら告知は不要）。
+        const err = stderr.join('');
+        if (alive(gcPid)) {
+            assert.match(err, /止め切れませんでした|確認できませんでした/,
+                `残ったものを告げずに終了した: ${JSON.stringify(err.slice(-300))}`);
+        }
+
+        // (3) 起動途中だったセッションの子も置き去りにならない。
+        //     🚨 pid ファイルの有無で測らない（書く前に殺されると
+        //        「測らずに緑」になる）。**プロセスが居ないこと**を直接見る。
+        await startingReq;
+        await new Promise(r => setTimeout(r, 2500));   // spawn 遅延 1500ms + 余裕
+        const leftover = await pidsRunning('hup-starting.mjs');
+        assert.notEqual(leftover, null,
+            'プロセスを数えられないので測れていない（緑と読まないこと）');
+        for (const pid of leftover) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* noop */ } }
+        assert.deepEqual(leftover, [],
+            `起動途中だったセッションの子が置き去りになった（pid ${leftover.join(', ')}）`);
+        await rm(startingPidFile, { force: true });
+        await rm(startingScript, { force: true });
+        s.abort();
+    } finally {
+        if (gcPid) { try { process.kill(gcPid, 'SIGKILL'); } catch { /* noop */ } }
+        child.kill();
+        for (const f of [midPidFile, gcPidFile, script]) await rm(f, { force: true });
+    }
+});
+
+/**
+ * 🚨 **`SIGHUP`（端末を閉じる）への登録そのものを測る。**
+ *
+ * 上の検査は `/__shutdown` で終了処理の**中身**を測る。中身が正しくても、
+ * **どのシグナルに登録されているか**を間違えると同じ事故が起きる:
+ * ハンドラは `SIGINT` / `SIGTERM` にしか付いていなかったので、
+ * 端末を閉じる（= 常用の終わり方）と既定動作でプロセスが消え、
+ * POSIX の子は別プロセスグループなので HUP が届かず**確実に生き残っていた**。
+ *
+ * ⚠️ **Windows では測れない。** `process.kill` は TerminateProcess 相当で
+ *    ハンドラが走らない（`SIGBREAK` も同じ）。**ここが skip のときは
+ *    「SIGHUP の登録は検証されていない」と読むこと**（CI の linux / darwin で測る）。
+ */
+test('🚨 終了: SIGHUP（端末を閉じる）でも子を置き去りにしない', {
+    skip: process.platform === 'win32'
+        ? 'Windows は process.kill でハンドラが走らない（TerminateProcess 相当）'
+        : false,
+}, async () => {
+    const { child, url } = await startExec();
+    const marker = join(repo, 'sighup-child.mjs');
+    try {
+        await writeFile(marker, 'setTimeout(() => process.exit(0), 30000);\n', 'utf8');
+        const s = await startSession(url, [process.execPath, marker]);
+        // 子が本当に動き出すまで待つ（起動途中に撃つと別の経路を測ってしまう）
+        for (let i = 0; i < 100; i++) {
+            const found = await pidsRunning('sighup-child.mjs');
+            if (found && found.length) break;
+            await new Promise(r => setTimeout(r, 100));
+        }
+        const before = await pidsRunning('sighup-child.mjs');
+        assert.ok(before && before.length, `仕込みが起動していない: ${JSON.stringify(before)}`);
+
+        const exited = new Promise(r => child.on('exit', () => r(true)));
+        process.kill(child.pid, 'SIGHUP');
+        await Promise.race([exited, new Promise(r => setTimeout(r, 15000))]);
+        assert.ok(child.exitCode !== null || child.signalCode !== null,
+            'SIGHUP でサーバが終わらなかった');
+
+        let after = null;
+        for (let i = 0; i < 30; i++) {
+            after = await pidsRunning('sighup-child.mjs');
+            if (after && after.length === 0) break;
+            await new Promise(r => setTimeout(r, 100));
+        }
+        for (const pid of after ?? []) { try { process.kill(Number(pid), 'SIGKILL'); } catch { /* noop */ } }
+        assert.deepEqual(after, [],
+            `SIGHUP で子が置き去りになった（pid ${(after ?? []).join(', ')}）`);
+        s.abort();
+    } finally {
+        child.kill();
+        await rm(marker, { force: true });
+    }
+});
+
 /**
  * 🔒 **全セッションの監視（N 個のエージェントを1画面で見るため）。**
  *

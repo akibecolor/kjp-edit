@@ -36,6 +36,7 @@ import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
 import { collectAgents, transcriptRoot, maskSecrets } from './transcript.mjs';
 import { ExecRegistry, isSessionId } from './execsession.mjs';
+import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -1707,6 +1708,44 @@ function secretsForMasking() {
 const MAX_CONCURRENT_EXEC = 8;
 
 /**
+ * 終了処理が始まったか。
+ *
+ * 🚨 **宣言をここに置くのは意図的。** `shutdown()` の隣に置くと、
+ *    経路側（`POST /api/v0/exec` の門）から見て TDZ の危険が出る形になる。
+ *    門は「必ず立っている値」を見る必要がある。
+ */
+let shuttingDown = false;
+
+/**
+ * 撃つ**前**に、その pid の子孫の pid を集める。
+ *
+ * 🚨 **撃った後では集められない。** 中間プロセスが消えると孫は木から外れるので、
+ *    「何を数え直すべきか」が永久に分からなくなる。だから kill の前に取る。
+ * 🚨 **「調べられない」を「0 件」と言わない**（`scripts/serve.mjs` の `running()` と
+ *    同じ型）。0 と言うと「巻き込むものは無い / 残っているものは無い」という**断言**になる。
+ * @returns {Promise<{supported: boolean, pids: number[], why: string|null}>}
+ */
+async function procTreePids(pid) {
+    const { execFile } = await import('node:child_process');
+    const run = (cmd, args) => new Promise(resolve => {
+        execFile(cmd, args, { windowsHide: true, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+            (err, stdout) => resolve(err ? null : stdout));
+    });
+    let out = null;
+    if (process.platform === 'win32') {
+        // ⚠️ `wmic` は新しい Windows では消えている。CIM で pid と親 pid だけ出す
+        const ps = 'Get-CimInstance Win32_Process | ForEach-Object '
+            + '{ "$($_.ProcessId)`t$($_.ParentProcessId)" }';
+        out = await run('powershell', ['-NoProfile', '-Command', ps]);
+        if (out === null) return { supported: false, pids: [], why: 'PowerShell で木を辿れませんでした' };
+    } else {
+        out = await run('ps', ['-eo', 'pid=,ppid=']);
+        if (out === null) return { supported: false, pids: [], why: 'ps で木を辿れませんでした' };
+    }
+    return { supported: true, pids: descendantsOf(parseProcPairs(out), pid), why: null };
+}
+
+/**
  * プロセスを**木ごと**殺す。
  *
  * ⚠️ Windows の `child.kill()` は TerminateProcess 相当で、その1プロセスしか殺さない。
@@ -1714,10 +1753,15 @@ const MAX_CONCURRENT_EXEC = 8;
  *    `close` イベントが永久に来ない → `runningExec` が戻らない → 8回で exec が死ぬ。
  *    （`.cmd` は shell:false で spawn できないので、Windows で `npm test` を動かす
  *      唯一の道が `cmd /c npm test` = まさにこの形。避けられない経路だった）
+ * ⚠️ **列挙の分だけ /kill の応答が遅くなる**（Windows で実測 390〜414ms。
+ *    大半は PowerShell の起動で、`-Query` で2列に絞っても同じ）。
+ *    「停止を要求されました」は撃つ前に流しているので画面はすぐ反応する。
+ *    嘘をつかないためのコストとして払う。
  */
 async function killTree(child) {
     if (!child.pid) return { killed: true, why: null };
     const pid = child.pid;
+    const tree = await procTreePids(pid);
     let taskkillCode = null;
     if (process.platform === 'win32') {
         // Windows: taskkill /T で木ごと
@@ -1747,17 +1791,36 @@ async function killTree(child) {
     //    適用し忘れる」型）。失敗しても `signal:"SIGKILL"` と記録し、
     //    `/kill` は `{ok:true}` を返し、以後 sweep は候補にせず、
     //    **回復経路が1つも無い**状態になっていた。
+    // 🚨 **数え直しは「木」に対して行う**（9回目のレビュー）。以前は
+    //    **直接の子だけ**を見ていたので、中間が先に死んで木から外れた孫は
+    //    `taskkill /T` でも落ちず、しかも数え直しに掛からないので
+    //    `{ok:true}` / `signal:"SIGKILL"` / 「⚠ 停止しました」を返していた
+    //    （レビュアーの実測: 200 を返した後も pid 31596 が生きていた）。
+    //    観測ツールが「止めたつもりで走り続けている」と言うのは最悪の誤り。
+    const taskkillNote = taskkillCode ? `taskkill は exit ${taskkillCode}` : null;
     for (let i = 0; i < 20; i++) {
-        if (child.exitCode !== null || child.signalCode !== null) return { killed: true, why: null };
-        let alive = true;
-        try { process.kill(pid, 0); } catch { alive = false; }
-        if (!alive) return { killed: true, why: null };
+        const selfDead = child.exitCode !== null || child.signalCode !== null
+            || stillAlive([pid]).length === 0;
+        const left = stillAlive(tree.pids);
+        if (selfDead && left.length === 0) {
+            // 🚨 **成功分岐でも `taskkillCode != 0` と「木を辿れなかった」を捨てない。**
+            //    捨てると「確認できた停止」と「確認できていない停止」が同じ文言になる。
+            const doubts = [
+                tree.supported ? null : `${tree.why}（孫が残っているかは確認できていません）`,
+                taskkillNote,
+            ].filter(Boolean);
+            return { killed: true, why: doubts.length ? doubts.join(' / ') : null };
+        }
         await new Promise(r => setTimeout(r, 100));
     }
+    const survivors = [...new Set([
+        ...(stillAlive([pid]).length && child.exitCode === null && child.signalCode === null ? [pid] : []),
+        ...stillAlive(tree.pids),
+    ])];
     return {
         killed: false,
-        why: `PID ${pid} がまだ生きています`
-            + (taskkillCode !== null ? `（taskkill は exit ${taskkillCode}）` : ''),
+        why: `木の一部を確認できませんでした（pid ${survivors.join(', ') || pid} がまだ生きています）`
+            + (taskkillNote ? `（${taskkillNote}）` : ''),
     };
 }
 
@@ -1927,7 +1990,19 @@ function startExecSweeper() {
                 }, session.repo ?? null);
                 continue;
             }
-            execRegistry.finish(session, { code: null, signal: 'SIGKILL', note });
+            // 🚨 確認できていない点があるなら、それを添えて終端する
+            //    （「停止しました」だけを残すと、確認できた停止と区別が付かない）
+            if (r.why) {
+                execRegistry.emit(session, 'err', `⚠ ${r.why}\n`);
+                await auditExec({
+                    event: 'kill-unverified', reason, session: session.id, repo: session.repo ?? null,
+                    worktree: session.worktree, argv: session.argv, why: r.why,
+                }, session.repo ?? null);
+            }
+            execRegistry.finish(session, {
+                code: null, signal: 'SIGKILL',
+                note: r.why ? `${note}（${r.why}）` : note,
+            });
         }
         for (const s of evict) execRegistry.remove(s);
     }, 1000);
@@ -2011,6 +2086,18 @@ async function handleRequest(req, res) {
     //    砦を外しても落ちない = 砦を測れない（最初にそう書いて測り損ねた）。
     if (opts.layoutProbe && req.url === '/__throw') {
         throw new Error('検査用の例外（デーモンは継続しなければならない）');
+    }
+    // 🚨 **検査専用: 終了処理を起こす経路（既定では存在しない）。**
+    //    `SIGHUP` / `uncaughtException` からの終了処理は Windows では測れない
+    //    （`process.kill` が TerminateProcess 相当でハンドラを走らせない）。
+    //    ここが無いと、終了処理の**中身**（新しい実行を断る門・起動途中の印・
+    //    数え直しと告知）が **Windows では1つも検査されない**まま CI 任せになる。
+    //    シグナルへの登録だけは linux / darwin の検査で測る。
+    if (opts.layoutProbe && req.url === '/__shutdown') {
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('shutting down\n');
+        shutdown('probe').catch(() => { /* 終了処理の失敗で落とさない */ });
+        return;
     }
     // 🚨 new URL() は必ず try で囲む。**認可の手前にある同期例外はプロセスを殺す。**
     //    `GET //[ HTTP/1.1` のような request-target は ERR_INVALID_URL を投げ、
@@ -2221,6 +2308,17 @@ async function handleRequest(req, res) {
         //    対話 TUI をそのまま覗きたくなった時点で PTY を検討する。
         if (url.pathname === '/api/v0/exec') {
             if (!requireExec(req, res)) return;
+            // 🚨 **終了処理が始まったら新しい実行を受けない**（9回目のレビュー / SERIOUS）。
+            //    門が無かったので、終了処理の掃き取りと `POST /api/v0/exec` が競争し、
+            //    **掃いた後に spawn される**（`create()` から `spawn()` までは実測 36〜43ms）。
+            //    その子は寿命管理の外に落ちる: sweeper は止まり、監査に `exit` は残らず、
+            //    POSIX では detached でプロセスグループを切っているので確実に生き残る。
+            //    門は `create()`（枠の予約）より**前**に置く。後ろだと枠を予約したまま
+            //    返す経路が増えるだけで、spawn との競争は消えない。
+            if (shuttingDown) {
+                denyJson(res, 503, '終了処理中です（新しい実行は受け付けません）');
+                return;
+            }
             let body;
             try { body = await readJson(req); } catch (err) { denyJson(res, err.tooLarge ? 413 : 400, err.message); return; }
 
@@ -2370,7 +2468,29 @@ async function handleRequest(req, res) {
             //    セッションが殺されている（猶予切れ / kill）ことがある。
             //    そのまま走らせると「停止した」と告げた後に動き続ける。
             if (!execRegistry.attachChild(session, child)) {
-                await killTree(child);
+                // 🚨 ここでも数え直しの結果を捨てない。セッションは既に「停止した」と
+                //    告げているので、止め切れていないなら**その後ろに**足す
+                //    （終端の後の行になるが、黙って捨てるより読める）
+                const r = await killTree(child);
+                if (!r.killed || r.why) execRegistry.emit(session, 'err', `⚠ ${r.why}\n`);
+                streamSession(req, res, session, 0);
+                return;
+            }
+            // 🚨 **`killRequested` が立っているセッションに子を渡したままにしない。**
+            //    終了処理は `s.child === null`（起動途中）のセッションを殺せないので、
+            //    印だけ付けて先へ進む。その印をここで見ないと、**サーバが死んだ後に
+            //    spawn された子**が寿命管理の外で走り続ける（`attachChild` は
+            //    まだ running なので true を返す = 上の早期 return では捕まらない）。
+            if (session.killRequested) {
+                execRegistry.emit(session, 'err',
+                    `⚠ 起動途中に停止が要求されていたので停止します（${session.killRequested}）\n`);
+                const late = await killTree(child);
+                execRegistry.finish(session, {
+                    code: null, signal: 'SIGKILL',
+                    note: late.killed
+                        ? (late.why ? `⚠ 停止しました（${late.why}）` : '⚠ 停止しました')
+                        : `⚠ ${late.why}`,
+                });
                 streamSession(req, res, session, 0);
                 return;
             }
@@ -2507,14 +2627,25 @@ async function handleRequest(req, res) {
                         denyJson(res, 500, `停止できませんでした: ${r.why}`);
                         return;
                     }
+                    // 🚨 **「停止しました」と言い切れないなら言い切らない。**
+                    //    木を辿れなかった / taskkill が非ゼロだった場合は、その旨を
+                    //    UI（出力と note）と監査の両方にそのまま出す。
+                    if (r.why) {
+                        execRegistry.emit(s, 'err', `⚠ ${r.why}\n`);
+                        await auditExec({
+                            event: 'kill-unverified', reason: 'requested', session: s.id,
+                            repo: s.repo ?? null, worktree: s.worktree, argv: s.argv, why: r.why,
+                        }, s.repo ?? null);
+                    }
                     const was = execRegistry.finish(s, {
-                        code: null, signal: 'SIGKILL', note: '⚠ 停止しました',
+                        code: null, signal: 'SIGKILL',
+                        note: r.why ? `⚠ 停止しました（${r.why}）` : '⚠ 停止しました',
                     });
                     res.writeHead(200, {
                         'content-type': 'application/json; charset=utf-8',
                         'cache-control': 'no-store',
                     });
-                    res.end(JSON.stringify({ ok: true, alreadyDone: !was }));
+                    res.end(JSON.stringify({ ok: true, alreadyDone: !was, warn: r.why ?? null }));
                     return;
                 }
                 if (m[2] === 'input') {
@@ -3498,22 +3629,97 @@ server.listen(opts.port, '127.0.0.1', () => {
     console.log('停止: Ctrl+C');
 });
 
-for (const sig of ['SIGINT', 'SIGTERM']) {
-    process.on(sig, () => {
-        // ⚠️ 走っている exec を置き去りにしない。Windows では libuv が
-        //    SILENT_BREAKAWAY_OK を立てるので、サーバが死んでも孫は回収されない。
-        // ⚠️ 切断では殺さなくなったが、**サーバ終了時は必ず殺す。**
-        //    Windows では libuv が SILENT_BREAKAWAY_OK を立てるので、
-        //    サーバが死んでも孫は回収されない（放置すると溜まる）。
-        for (const s of execRegistry.running) {
-            if (s.child) killTree(s.child).catch(() => {});
+/**
+ * 終了処理。**1つの関数にして、全ての落ち方から必ず通す。**
+ *
+ * 🚨 以前は `SIGINT` と `SIGTERM` の2つにしか登録していなかった（9回目のレビュー）。
+ *    そのため:
+ *    - **`SIGHUP`（端末を閉じる）で子が置き去りになる。** 「Ctrl+C で停止」と
+ *      案内しているが、常用の起動は端末に張り付いているので**端末を閉じる**方が
+ *      普通の終わり方。POSIX の子は `detached:true`（別プロセスグループ）なので
+ *      端末の HUP は子には届かない = 確実に生き残る。
+ *    - **`uncaughtException` / `unhandledRejection` でも置き去りになる。**
+ *      `scripts/mutate.mjs` は同じ形の砦を3段（シグナル・例外・拒否）で持っていて、
+ *      そこには SIGHUP もあるのに、**子を持つ本体側に無かった**
+ *      （「規則を書いた場所から遠いコードには適用し忘れる」型）。
+ * 🚨 **殺した後に数え直す**（`killTree` に任せる）。数え切れなかったものは
+ *    stderr に pid を出す。黙って終わると、残った子を探す手掛かりが消える。
+ */
+async function shutdown(reason, exitCode = 0) {
+    if (shuttingDown) return;
+    // 🚨 印を**最初に**立てる。`await` の後だと、その隙に届いた
+    //    `POST /api/v0/exec` が掃き取りの後で spawn される
+    shuttingDown = true;
+    // ⚠️ 走っている exec を置き去りにしない。Windows では libuv が
+    //    SILENT_BREAKAWAY_OK を立てるので、サーバが死んでも孫は回収されない。
+    // ⚠️ 切断では殺さなくなったが、**サーバ終了時は必ず殺す。**
+    const jobs = [];
+    for (const s of execRegistry.running) {
+        // 🚨 **起動途中（`child === null`）を飛ばさない。** 以前は `if (s.child)` で
+        //    黙って飛ばしていたので、`create()` と `spawn()` の間にいたセッションは
+        //    印も付かずに spawn され、寿命管理の外に落ちていた。
+        //    印を付けておけば spawn 側（attachChild の直後）が始末する。
+        s.killRequested = s.killRequested ?? 'shutdown';
+        if (!s.child) continue;
+        jobs.push(killTree(s.child).then(r => ({ s, r }), () => ({ s, r: null })));
+    }
+    // ⚠️ 集約待ちの認証失敗を落とさない（「何本外されたか」を残して終わる）
+    for (const [peer, rec] of authFails) {
+        flushAuthFailSummary(peer, rec, 'shutdown').catch(() => {});
+    }
+    // 🚨 **数え直しの結果を待って、残ったものを告げる。** 以前は `catch(() => {})` で
+    //    投げっぱなしにして 800ms 後に `process.exit(0)` していたので、
+    //    「止まったか」を一度も見ずに終わっていた。
+    const results = await Promise.race([
+        Promise.all(jobs),
+        new Promise(r => setTimeout(() => r(null), 5000)),
+    ]);
+    if (results === null) {
+        console.error(`⚠ ${reason}: 子プロセスの停止を 5s 以内に確認できませんでした`);
+    } else {
+        const left = results.filter(x => x.r && !x.r.killed);
+        for (const x of left) {
+            console.error(`⚠ ${reason}: ${x.s.id} を止め切れませんでした: ${x.r.why}`);
         }
-        // ⚠️ 集約待ちの認証失敗を落とさない（「何本外されたか」を残して終わる）
-        for (const [peer, rec] of authFails) {
-            flushAuthFailSummary(peer, rec, 'shutdown').catch(() => {});
+        if (left.length) {
+            console.error('   残った pid は手で確認してください'
+                + (process.platform === 'win32' ? '（taskkill /PID <pid> /T /F）' : '（kill -9 <pid>）'));
         }
-        server.close(() => process.exit(0));
-        // ソケットが残っていても確実に終わらせる
-        setTimeout(() => process.exit(0), 800).unref();
-    });
+    }
+    // 🚨 **起動途中のセッションが片付くまで待つ**（印を付けるだけでは足りない）。
+    //    印を見て殺すのは spawn 側なので、そこまで待たずに `process.exit(0)` すると
+    //    **殺している途中でデーモンが消えて子が生き残る**
+    //    （実測: 検査が pid 34404 を捕まえた。撃つ前の木の列挙に約1秒かかるので
+    //      800ms の強制終了と必ず競争する）。`done` になるまで数え直す。
+    for (let i = 0; i < 60 && execRegistry.running.length; i++) {
+        await new Promise(r => setTimeout(r, 100));
+    }
+    const pending = execRegistry.running;
+    for (const s of pending) {
+        console.error(`⚠ ${reason}: ${s.id} が ${s.state} のまま残りました`
+            + `（argv: ${s.argv?.[0] ?? '?'}）`);
+    }
+    // 🚨 **異常終了は 0 で終わらせない。** 例外から来た終了を exit 0 にすると、
+    //    落ちたのに「綺麗に終わった」と読める（起動口や CI が成功と読む）。
+    server.close(() => process.exit(exitCode));
+    // ソケットが残っていても確実に終わらせる
+    setTimeout(() => process.exit(exitCode), 800).unref();
 }
+
+// 🚨 SIGHUP = 端末を閉じたとき。SIGBREAK = Windows の Ctrl+Break。
+//    どちらも「普通に起きる終わり方」なので、ここから漏らすと子が残る。
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
+    // ⚠️ `SIGBREAK` は POSIX に無い（`process.on` は受けるが飛んで来ない）。
+    //    登録しても害は無いので分岐を増やさない。
+    process.on(sig, () => { shutdown(sig).catch(() => process.exit(1)); });
+}
+// 🚨 例外で落ちるときも子を回収する（`finally` はプロセスの即死には効かないが、
+//    ここは即死ではないので効く）。**落ちた理由も必ず出す**（黙って終わらせない）。
+process.on('uncaughtException', err => {
+    console.error(`🚨 uncaughtException: ${err?.stack ?? err}`);
+    shutdown('uncaughtException', 1).catch(() => process.exit(1));
+});
+process.on('unhandledRejection', err => {
+    console.error(`🚨 unhandledRejection: ${err?.stack ?? err}`);
+    shutdown('unhandledRejection', 1).catch(() => process.exit(1));
+});

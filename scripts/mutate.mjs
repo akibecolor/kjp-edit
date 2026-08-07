@@ -275,16 +275,107 @@ const MUTANTS = [
         why: 'サーバ終了時に子プロセスを置き去りにする'
             + '（Windows では libuv が SILENT_BREAKAWAY_OK を立てるので孫が回収されない）',
         file: 'v0/server.mjs',
-        from: `        for (const s of execRegistry.running) {
-            if (s.child) killTree(s.child).catch(() => {});
-        }`,
+        from: '        jobs.push(killTree(s.child).then(r => ({ s, r }), () => ({ s, r: null })));',
         to: '        /* 変異: 終了時の後始末をやめる */',
-        gone: 'execRegistry.running',
-        // ⚠️ Windows では検証できない。child.kill('SIGTERM') は TerminateProcess に
-        //    なるので process.on('SIGTERM') が走らない（= この守り自体が効かない）。
-        //    ubuntu / macOS CI が検証する。
+        gone: 'jobs.push(killTree(s.child)',
+        // ⚠️ 以前は `platforms: ['linux','darwin']` だった（signal でしか終了処理を
+        //    起こせなかったため）。`--layout-probe` の `/__shutdown` を足したので
+        //    **Windows でも測れる**ようになった（シグナルへの登録だけが POSIX 限定）。
+        pattern: '子を回収し、終了処理中の実行を断り',
+    },
+    {
+        // 🚨 数え直しの入口。0 や負値を `process.kill` に渡すと意味が変わる
+        //    （0 = 自分のプロセスグループ、負値 = グループ）。落とさないと
+        //    **自分自身を「まだ生きている子」と数えて永久に killed:false** になる。
+        // ⚠️ `descendantsOf` の循環対策（`seen`）には変異を置いていない。
+        //    外すと**落ちるのではなく停止しなくなる**（無限ループ → 300 秒で打ち切り）。
+        //    打ち切りを結果として読む形は作らない、という規則に従って置かない。
+        //    検査は `v0/proctree.test.mjs`（循環する表を渡して止まることを見る）。
+        name: 'proctree-invalid-pid',
+        why: '0 / 負値 / 整数でない pid を数え直しに渡す'
+            + '（0 は自分のプロセスグループなので、自分を「生きている子」と数える）',
+        file: 'v0/proctree.mjs',
+        from: '        if (!Number.isInteger(pid) || pid <= 0) continue;',
+        to: '        /* 変異: 入口の検証を外す */',
+        gone: 'if (!Number.isInteger(pid) || pid <= 0) continue;',
+        pattern: '0 / 負値 / 整数でない値は数えない',
+        testFile: 'v0/proctree.test.mjs',
+    },
+    {
+        // 🚨 9回目のレビュー: ハンドラは SIGINT / SIGTERM にしか付いていなかった。
+        //    端末を閉じる（SIGHUP）= 常用の終わり方で、子は別プロセスグループなので
+        //    HUP が届かず**確実に生き残る**。
+        name: 'shutdown-no-sighup',
+        why: 'SIGHUP（端末を閉じる）を登録しない。端末を閉じると子が置き去りになる',
+        file: 'v0/server.mjs',
+        from: "for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {",
+        to: "for (const sig of ['SIGINT', 'SIGTERM']) {   /* 変異: SIGHUP を落とす */",
+        gone: "'SIGHUP', 'SIGBREAK'",
+        // ⚠️ Windows では process.kill がハンドラを走らせない（TerminateProcess 相当）
         platforms: ['linux', 'darwin'],
-        pattern: 'サーバを SIGTERM で止めたら孫プロセスも残さない',
+        pattern: 'SIGHUP（端末を閉じる）でも子を置き去りにしない',
+    },
+    {
+        // 🚨 9回目のレビュー: 終了処理と POST /api/v0/exec が競争していた
+        //    （create → spawn は実測 36〜43ms）。掃いた後に spawn された子は
+        //    寿命管理の外に落ちる。
+        name: 'shutdown-exec-gate',
+        why: '終了処理中でも新しい実行を受け付ける（掃き取りの後に spawn された子が残る）',
+        file: 'v0/server.mjs',
+        from: `            if (shuttingDown) {
+                denyJson(res, 503, '終了処理中です（新しい実行は受け付けません）');
+                return;
+            }`,
+        to: '            /* 変異: 終了処理中でも受け付ける */',
+        gone: "denyJson(res, 503, '終了処理中です",
+        pattern: '子を回収し、終了処理中の実行を断り',
+    },
+    {
+        // 🚨 9回目のレビュー: `if (s.child)` で起動途中を黙って飛ばしていた
+        name: 'shutdown-skips-starting',
+        why: '起動途中（child が無い）のセッションに印を付けない'
+            + '（終了処理の後に spawn され、寿命管理の外で走り続ける）',
+        file: 'v0/server.mjs',
+        from: "        s.killRequested = s.killRequested ?? 'shutdown';",
+        to: '        /* 変異: 起動途中に印を付けない */',
+        gone: "s.killRequested = s.killRequested ?? 'shutdown'",
+        pattern: '子を回収し、終了処理中の実行を断り',
+    },
+    {
+        // 🚨 **自分の修正の穴。** 印を付けるだけでは足りず、印を見て殺すのは
+        //    spawn 側なので、待たずに process.exit(0) すると殺している途中で
+        //    デーモンが消えて子が生き残る（検査が実測で捕まえた）。
+        name: 'shutdown-no-wait-for-starting',
+        why: '起動途中のセッションが片付くのを待たずに終わる'
+            + '（撃つ前の木の列挙に約1秒かかるので、800ms の強制終了と必ず競争する）',
+        file: 'v0/server.mjs',
+        from: '    for (let i = 0; i < 60 && execRegistry.running.length; i++) {\n'
+            + '        await new Promise(r => setTimeout(r, 100));\n    }',
+        to: '    /* 変異: 起動途中を待たない */',
+        gone: '60 && execRegistry.running.length',
+        pattern: '子を回収し、終了処理中の実行を断り',
+    },
+    {
+        // 🚨 9回目のレビュー: 数え直しが**直接の子**だけだった。木から外れた孫は
+        //    数え直しに掛からないので `{ok:true}` / 「⚠ 停止しました」を返していた。
+        name: 'exec-kill-tree-recount',
+        why: '数え直しを直接の子だけに戻す'
+            + '（木から逃げた孫が生きているのに「停止しました」と言い切る）',
+        file: 'v0/server.mjs',
+        from: `        const selfDead = child.exitCode !== null || child.signalCode !== null
+            || stillAlive([pid]).length === 0;
+        const left = stillAlive(tree.pids);
+        if (selfDead && left.length === 0) {`,
+        to: `        const selfDead = child.exitCode !== null || child.signalCode !== null
+            || stillAlive([pid]).length === 0;
+        const left = [];   /* 変異: 木を数え直さない */
+        if (selfDead && left.length === 0) {`,
+        gone: 'const left = stillAlive(tree.pids);',
+        // ⚠️ Windows では `taskkill /T` が ppid を辿って孫まで落とすので、
+        //    「逃げた孫」を作っても実際に死ぬ = 主張と実態が一致してしまう。
+        //    POSIX は kill(-pgid) が別グループに届かないので生き残る。
+        platforms: ['linux', 'darwin'],
+        pattern: '「停止しました」が実態と一致する',
     },
     {
         name: 'read-auth-gate',
@@ -706,17 +797,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + "                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);\n",
         to: "            if (false) (async err => {\n"
             + "                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);\n",
+        // ⚠️ **挿入位置は「早期 return の直後にある1行」に固定する。**
+        //    以前は attachChild のブロックを丸ごと書いていたので、
+        //    ブロックの中身を1行足しただけで STALE になった（守りが未検証になる）。
         also: [{
-            from: '            if (!execRegistry.attachChild(session, child)) {\n'
-                + '                await killTree(child);\n'
-                + '                streamSession(req, res, session, 0);\n'
-                + '                return;\n'
-                + '            }\n',
-            to: '            if (!execRegistry.attachChild(session, child)) {\n'
-                + '                await killTree(child);\n'
-                + '                streamSession(req, res, session, 0);\n'
-                + '                return;\n'
-                + '            }\n'
+            from: '            // 🚨 **`killRequested` が立っているセッションに子を渡したままにしない。**\n',
+            to: '            // 🚨 変異: error の listener を早期 return の後ろに移す\n'
                 + '            child.on("error", async err => {\n'
                 + "                execRegistry.emit(session, 'err', `実行エラー: ${err.message}`);\n"
                 + '                if (execRegistry.finish(session, { code: null, signal: null })) {\n'
@@ -1245,25 +1331,16 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'killTree の成否を確かめずに「停止しました」と記録する'
             + '（殺せなくても signal:SIGKILL と書き、以後 sweep も候補にしないので回復経路が無い）',
         file: 'v0/server.mjs',
-        from: `    for (let i = 0; i < 20; i++) {
-        if (child.exitCode !== null || child.signalCode !== null) return { killed: true, why: null };
-        let alive = true;
-        try { process.kill(pid, 0); } catch { alive = false; }
-        if (!alive) return { killed: true, why: null };
-        await new Promise(r => setTimeout(r, 100));
-    }`,
-        to: '    return { killed: true, why: null };',
-        gone: 'if (!alive) return { killed: true, why: null }',
-        // ⚠️ **これは測れない。** 数え直しが効くのは「kill が失敗したとき」だけで、
-        //    落ちないプロセスを移植可能に作る手段が無い（権限で保護されたプロセスが要る）。
-        //    成功経路の差は「応答が返る時点で子が確実に死んでいる」だけで、
-        //    それを assert すると数ミリ秒の競争になり flaky になる。
-        //    **「未検証」を defensive で誤魔化さない**という規則に従って、
-        //    測れない理由をここに書いて残す。
-        defensive: '数え直しが効くのは kill が失敗したときだけで、'
-            + '落ちないプロセスを移植可能に作れないので測れない。'
-            + '成功経路の差は数ミリ秒の競争で flaky になる。理由を明示して残す',
-        pattern: '中間シェルを挟んだ孫プロセス',
+        from: '    const taskkillNote = taskkillCode ? `taskkill は exit ${taskkillCode}` : null;',
+        to: '    return { killed: true, why: null };   /* 変異: 数え直しをしない */',
+        gone: 'const taskkillNote = taskkillCode',
+        // ⚠️ **以前は「測れない」と書いて defensive にしていた**（「落ちないプロセスを
+        //    移植可能に作れない」）。それは**思い込みだった**: プロセスグループから
+        //    逃げる孫（`detached: true`）を作れば、POSIX では `kill(-pgid)` が届かず
+        //    確実に生き残るので、**主張と実態の食い違いとして測れる**。
+        //    Windows は `taskkill /T` が ppid を辿って孫まで落とすので測れない。
+        platforms: ['linux', 'darwin'],
+        pattern: '「停止しました」が実態と一致する',
     },
     {
         name: 'sweep-skip-killing',
