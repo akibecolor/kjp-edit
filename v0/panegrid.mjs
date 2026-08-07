@@ -316,3 +316,93 @@ export function migrateV1(layout) {
     put(layout?.right, 3, 1, g.rows);
     return g;
 }
+
+// ---------------------------------------------------------------------------
+// パターン（プリセット）と結合（#57）
+//
+// 🚨 **座標を手で決めさせない。** 「どこに何列あるか」を毎回ドラッグで作るのは
+//    スマホでは無理（細い画面で 16 セルの当たり判定は押せない）。
+//    使う形は決まっている（1枚 / 1行2列 / 1行3列 / 2×2 … 4×4）ので、
+//    **選ぶ**形にして、そこから結合（2セル分）で微調整する。
+// ---------------------------------------------------------------------------
+
+/**
+ * 選べるパターン。**名前は保存に載る**ので変えない（変えると古い保存が読めなくなる）。
+ *
+ * ⚠️ 行 × 列の順で読む名前にしない（`1x2` は「1行2列」）。
+ *    ここを取り違えると、選んだ形と出る形が食い違う。
+ */
+export const GRID_PRESETS = [
+    { name: '1x1', label: '1枚', cols: 1, rows: 1 },
+    { name: '1x2', label: '1行2列', cols: 2, rows: 1 },
+    { name: '1x3', label: '1行3列', cols: 3, rows: 1 },
+    { name: '2x2', label: '2×2', cols: 2, rows: 2 },
+    { name: '2x3', label: '2行3列', cols: 3, rows: 2 },
+    { name: '3x3', label: '3×3', cols: 3, rows: 3 },
+    { name: '4x4', label: '4×4', cols: 4, rows: 4 },
+];
+
+/** 名前からパターンを引く（知らない名前は null） */
+export function presetByName(name) {
+    return GRID_PRESETS.find(p => p.name === name) ?? null;
+}
+
+/** 今のグリッドに当てはまるパターンの名前（無ければ null） */
+export function presetOf(grid) {
+    const p = GRID_PRESETS.find(x => x.cols === grid?.cols && x.rows === grid?.rows);
+    return p ? p.name : null;
+}
+
+/**
+ * パターンを当てる。
+ *
+ * 🚨 **並びを保つ。** 今の配置の読み順（左上から）を維持して詰め直す。
+ *    順序を捨てると「形を変えたらペインの並びが総入れ替え」になり、
+ *    どれがどれだか分からなくなる（並列で回しているときに一番困る）。
+ * 🚨 **結合（cw/ch）は落とす。** 新しい形に入るとは限らないので 1×1 に戻す。
+ *    ⚠️ 黙って落とさず、戻した件数を `unmerged` で返して呼び出し側が告げる。
+ * ⚠️ 入り切らない分は `overflow`（`autoPlace` と同じ扱い）。
+ * @returns {{grid: object, overflow: string[], unmerged: number}}
+ */
+export function applyPreset(grid, name, ids) {
+    const p = presetByName(name);
+    if (!p) return { grid, overflow: [], unmerged: 0 };
+    // 今の読み順（行 → 列）。配置が無いものは呼び出し側が渡した順の後ろに付ける
+    const placed = [...(grid?.cells ?? [])]
+        .sort((a, b) => (a.row - b.row) || (a.col - b.col))
+        .map(c => c.id);
+    const rest = (Array.isArray(ids) ? ids : []).filter(id => !placed.includes(id));
+    const order = [...placed, ...rest];
+    const unmerged = (grid?.cells ?? []).filter(c => c.cw > 1 || c.ch > 1).length;
+    const fresh = {
+        v: 2, cols: p.cols, rows: p.rows, cells: [],
+        closed: [...(grid?.closed ?? [])],
+    };
+    const out = autoPlace(fresh, order);
+    return { grid: out.grid, overflow: out.overflow, unmerged };
+}
+
+/**
+ * 隣のセルと結合する（そのペインを2セル分に広げる）。
+ *
+ * ⚠️ `resizeCell` の薄い包み。方向を受け取るのは、UI が「右と結合／下と結合」
+ *    のような**押せるボタン**にしたいため（座標を手で入れさせない）。
+ * @param {'right'|'down'} dir
+ */
+export function mergeCell(grid, id, dir) {
+    const me = cellOf(grid, id);
+    if (!me) return { grid, ok: false, why: 'そのペインは配置されていません' };
+    if (dir === 'right') return resizeCell(grid, id, me.cw + 1, me.ch);
+    if (dir === 'down') return resizeCell(grid, id, me.cw, me.ch + 1);
+    return { grid, ok: false, why: `知らない方向です: ${dir}` };
+}
+
+/**
+ * 結合を解く（1セルに戻す）。
+ *
+ * ⚠️ **必ず成功する**（縮めるだけなので他とぶつからない）。
+ *    空いたセルには `autoPlace` が溢れていたペインを置く。
+ */
+export function splitCell(grid, id) {
+    return resizeCell(grid, id, 1, 1);
+}

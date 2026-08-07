@@ -35,6 +35,57 @@ const MUTANTS = [
     // -----------------------------------------------------------------
     // 🚨 #57: 閉じる／開く。守りは「覚える」「一覧に出す」「作り直さない」。
     // -----------------------------------------------------------------
+    // 🚨 #57: パターン（1枚 / 1行2列 / 1行3列 / 2×2 … 4×4）と結合。
+    {
+        name: 'preset-keeps-order',
+        why: 'パターンを当てるときに読み順を捨てる（形を変えるとペインが総入れ替えになる）',
+        file: 'v0/panegrid.mjs',
+        from: "    const placed = [...(grid?.cells ?? [])]\n        .sort((a, b) => (a.row - b.row) || (a.col - b.col))\n        .map(c => c.id);",
+        to: "    const placed = [];   /* 変異: 今の並びを捨てる */",
+        gone: "const placed = [...(grid?.cells ?? [])]",
+        pattern: 'パターンを当てても読み順',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'preset-unmerge-announced',
+        why: '結合を解いたことを告げない（広げたはずのペインが黙って1セルに戻る）',
+        file: 'v0/panegrid.mjs',
+        from: "    const unmerged = (grid?.cells ?? []).filter(c => c.cw > 1 || c.ch > 1).length;",
+        to: "    const unmerged = 0;   /* 変異: 解いたことを言わない */",
+        gone: "const unmerged = (grid?.cells ?? []).filter(c => c.cw > 1 || c.ch > 1).length;",
+        pattern: '結合は解け、解いた件数を返す',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'preset-unknown-name',
+        why: '知らないパターン名で既定の形に変えてしまう（打ち間違いで配置が壊れる）',
+        file: 'v0/panegrid.mjs',
+        from: "    if (!p) return { grid, overflow: [], unmerged: 0 };",
+        to: "    /* 変異: 知らない名前でも進む */",
+        gone: "if (!p) return { grid, overflow: [], unmerged: 0 };",
+        pattern: '知らないパターン名は何も変えない',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'preset-keeps-closed',
+        why: 'パターンを当てると閉じた記憶が消える（形を変えたら閉じたものが戻ってくる）',
+        file: 'v0/panegrid.mjs',
+        from: "        closed: [...(grid?.closed ?? [])],\n    };\n    const out = autoPlace(fresh, order);",
+        to: "        closed: [],   /* 変異: 閉じた記憶を捨てる */\n    };\n    const out = autoPlace(fresh, order);",
+        gone: "closed: [...(grid?.closed ?? [])],\n    };\n    const out = autoPlace(fresh, order);",
+        pattern: '結合は解け、解いた件数を返す',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'merge-direction',
+        why: '知らない方向でも広げる（押した向きと違う方向に広がる）',
+        file: 'v0/panegrid.mjs',
+        from: "    return { grid, ok: false, why: `知らない方向です: ${dir}` };",
+        to: "    return resizeCell(grid, id, me.cw + 1, me.ch);   /* 変異: 右に広げる */",
+        gone: "知らない方向です",
+        pattern: '結合は隣を占め',
+        testFile: 'v0/panegrid.test.mjs',
+    },
     {
         name: 'close-is-remembered',
         why: '閉じたことを覚えない（15秒ごとの更新で戻ってきて閉じられない）',

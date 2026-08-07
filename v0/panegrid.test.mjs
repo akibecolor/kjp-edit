@@ -5,6 +5,7 @@ import {
     GRID_MAX, GRID_DEFAULT, emptyGrid, parseGrid, serializeGrid,
     cellsOverlap, cellFree, cellOf, autoPlace, moveCell, resizeCell,
     closeCell, openCell, isClosed, resizeGrid, pruneGrid, migrateV1,
+    GRID_PRESETS, presetByName, presetOf, applyPreset, mergeCell, splitCell,
 } from './panegrid.mjs';
 
 /** 読みやすい形で配置を並べる（失敗メッセージ用） */
@@ -248,4 +249,91 @@ test('v1 の配置をグリッドへ移す（並びを黙って捨てない）',
     // 壊れた入力で投げない
     assert.deepEqual(migrateV1(null).cells, []);
     assert.deepEqual(migrateV1({ left: 'x' }).cells, []);
+});
+
+/* ===== パターン（プリセット）と結合（#57） ===== */
+
+test('パターンの一覧は名前と大きさが整合している（名前は保存に載るので変えない）', () => {
+    for (const p of GRID_PRESETS) {
+        const [rows, cols] = p.name.split('x').map(Number);
+        assert.equal(p.rows, rows, `${p.name} の行数が名前と違う`);
+        assert.equal(p.cols, cols, `${p.name} の列数が名前と違う`);
+        assert.ok(p.cols >= 1 && p.cols <= GRID_MAX, p.name);
+        assert.ok(p.rows >= 1 && p.rows <= GRID_MAX, p.name);
+        assert.ok(p.label && typeof p.label === 'string', `${p.name} に表示名が無い`);
+    }
+    // 指定された形が全部ある（1枚 / 1行2列 / 1行3列 / 2×2 … 4×4）
+    const names = GRID_PRESETS.map(p => p.name);
+    for (const want of ['1x1', '1x2', '1x3', '2x2', '3x3', '4x4']) {
+        assert.ok(names.includes(want), `${want} が無い`);
+    }
+    assert.equal(presetByName('9x9'), null, '知らない名前を通した');
+});
+
+// 🚨 順序を捨てると「形を変えたらペインが総入れ替え」になり、どれがどれか分からない
+// 🚨 **ids の順ではなく「今の配置の読み順」を保つこと**を測る。
+//    両方を同じ順で渡すと、配置を捨てる実装でも通ってしまう
+//    （最初そう書いて変異が SURVIVED した）。**入れ替えてから**測る。
+test('パターンを当てても読み順（左上から）を保つ', () => {
+    let g = autoPlace(emptyGrid(), ['a', 'b', 'c', 'd', 'e', 'f']).grid;
+    // a と b を入れ替える（= 配置の読み順は b, a, … になる）
+    g = moveCell(g, 'a', { col: 2, row: 1 }).grid;
+    assert.deepEqual(at(g, 'b'), { id: 'b', col: 1, row: 1, cw: 1, ch: 1 }, '前提が崩れている');
+    // ids は元の順（a が先）で渡す。**配置の順が勝つ**のが正しい
+    const r = applyPreset(g, '4x4', ['a', 'b', 'c', 'd', 'e', 'f']);
+    assert.deepEqual(at(r.grid, 'b'), { id: 'b', col: 1, row: 1, cw: 1, ch: 1 },
+        `配置の読み順を捨てて ids の順で並べ直している: ${show(r.grid)}`);
+    assert.deepEqual(at(r.grid, 'a'), { id: 'a', col: 2, row: 1, cw: 1, ch: 1 }, show(r.grid));
+    assert.deepEqual(at(r.grid, 'e'), { id: 'e', col: 1, row: 2, cw: 1, ch: 1 }, show(r.grid));
+    assert.deepEqual(r.overflow, [], '4×4 なら 6 枚は入る');
+    assert.equal(presetOf(r.grid), '4x4');
+});
+
+test('狭いパターンでは入り切らない分を overflow で返す（黙って捨てない）', () => {
+    const g = autoPlace(emptyGrid(), ['a', 'b', 'c', 'd']).grid;
+    const one = applyPreset(g, '1x1', ['a', 'b', 'c', 'd']);
+    assert.equal(one.grid.cells.length, 1, show(one.grid));
+    assert.deepEqual(one.overflow, ['b', 'c', 'd'], '溢れを告げていない');
+    const two = applyPreset(g, '1x2', ['a', 'b', 'c', 'd']);
+    assert.equal(two.grid.cells.length, 2);
+    assert.deepEqual(two.overflow, ['c', 'd']);
+});
+
+// ⚠️ 結合は新しい形に入るとは限らないので落とすが、黙って落とさない
+test('パターンを当てると結合は解け、解いた件数を返す', () => {
+    let g = autoPlace(emptyGrid(), ['a', 'b', 'c']).grid;
+    g = closeCell(g, 'b');
+    g = resizeCell(g, 'a', 2, 1).grid;
+    assert.equal(at(g, 'a').cw, 2);
+    const r = applyPreset(g, '2x2', ['a', 'b', 'c']);
+    assert.equal(r.unmerged, 1, '解いた件数を告げていない');
+    assert.equal(at(r.grid, 'a').cw, 1, '結合が残っている（新しい形に入らないかもしれない）');
+    // 閉じた記憶は保つ（形を変えたら閉じたものが戻ってくる、を作らない）
+    assert.deepEqual(r.grid.closed, ['b']);
+});
+
+test('知らないパターン名は何も変えない（黙って別の形にしない）', () => {
+    const g = autoPlace(emptyGrid(), ['a']).grid;
+    const r = applyPreset(g, 'nope', ['a']);
+    assert.equal(r.grid, g);
+    assert.deepEqual(r.overflow, []);
+});
+
+test('結合は隣を占め、空いていなければ断る。解くのは必ず通る', () => {
+    let g = applyPreset(autoPlace(emptyGrid(), ['a', 'b']).grid, '2x2', ['a', 'b']).grid;
+    // b が右に居るので右への結合は断られる
+    const no = mergeCell(g, 'a', 'right');
+    assert.equal(no.ok, false, no.why ?? '');
+    // 下は空いているので通る
+    const down = mergeCell(g, 'a', 'down');
+    assert.equal(down.ok, true, down.why ?? '');
+    assert.deepEqual(at(down.grid, 'a'), { id: 'a', col: 1, row: 1, cw: 1, ch: 2 });
+    // 解くのは必ず通る（縮めるだけ）
+    const back = splitCell(down.grid, 'a');
+    assert.equal(back.ok, true, back.why ?? '');
+    assert.deepEqual(at(back.grid, 'a'), { id: 'a', col: 1, row: 1, cw: 1, ch: 1 });
+    // 知らない方向は断る（黙って別の方向に広げない）
+    const bad = mergeCell(g, 'a', 'sideways');
+    assert.equal(bad.ok, false);
+    assert.match(bad.why, /知らない方向/);
 });
