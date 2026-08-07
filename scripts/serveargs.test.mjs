@@ -716,11 +716,24 @@ async function withDaemon(extra, body) {
         child.stderr.on('data', d => { out += d; });
         child.on('error', e => { out += `\n[spawn 失敗] ${e.message}`; exited = -1; });
         child.on('close', c => { exited = c ?? 0; });
-        const deadline = Date.now() + 25_000;
+        // 🚨 **上限は「遅さを隠すため」ではなく、ハングを失敗として観測するため。**
+        //    起動口は Windows で PowerShell の CIM 探索を待つので、CI では
+        //    実測で 25s を超えることがある（`サーバが起動していない (exit=null)`
+        //    = まだ生きているのに待ちが尽きた形で落ちた）。上限を広げ、
+        //    **緑でも経過を出す**（遅くなっていく変化を、落ちる前に見えるようにする）。
+        const startWaitMs = 60_000;
+        const waitFrom = Date.now();
+        const deadline = waitFrom + startWaitMs;
         while (!/上限 \d+s/.test(out) && exited === null && Date.now() < deadline) {
             await new Promise(r => setTimeout(r, 100));
         }
-        assert.match(out, /上限 \d+s/, `サーバが起動していない (exit=${exited})`);
+        const startMs = Date.now() - waitFrom;
+        assert.match(out, /上限 \d+s/,
+            `サーバが起動していない (exit=${exited}, ${startMs}ms 待った／上限 ${startWaitMs}ms)`
+            + `\n  出力: ${out.trim().slice(-400) || '(空)'}`);
+        if (startMs > 10_000) {
+            console.log(`  · 起動が遅い: ${startMs}ms（上限 ${startWaitMs}ms）`);
+        }
         await body({ repo, dir, tag, env, port, out: () => out });
     } catch (e) { err = e; }
     const leak = await cleanup(tag, child, port);
