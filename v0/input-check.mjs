@@ -41,7 +41,17 @@ const base = await new Promise((res, rej) => {
 });
 
 const profile = await mkdtemp(join(tmpdir(), 'kjp-input-prof-'));
-const PORT = 9333;
+// ⚠️ **固定ポートにしない。** 他の検査やデーモンと同時に走ると衝突して
+//    「CDP に繋がらない」で落ちる（原因が分かりにくい形の flake になる）。
+const { createServer } = await import('node:net');
+const PORT = await new Promise((res, rej) => {
+    const srv = createServer();
+    srv.on('error', rej);
+    srv.listen(0, '127.0.0.1', () => {
+        const { port } = srv.address();
+        srv.close(() => res(port));
+    });
+});
 const chrome = spawn(browser, [
     '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
     `--user-data-dir=${profile}`, `--remote-debugging-port=${PORT}`,

@@ -230,6 +230,22 @@ if (!quick && !failed) {
     steps.push({ name: 'render', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
+// 6. 入力層の検査（#58）。**合成イベントでは測れない壊れ方**を測る
+//    （click の飲み込み・テキスト選択・ヒットテスト）。ブラウザが無ければ skip。
+if (!quick && !failed) {
+    const r = await run(['v0/input-check.mjs'], { timeout: 240_000 });
+    const skipped = /skipped/.test(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `input ${(r.ms / 1000).toFixed(1)}s`,
+        ok, skipped,
+        detail: ok ? [] : detailLines(r.output, r.timedOut ? 10 : 6, r.timedOut),
+    });
+    if (!ok) failed = true;
+} else {
+    steps.push({ name: 'input', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
+}
+
 // ---- 出力: 20行以内 ----
 // 🚨 **飛ばした検査は緑のときも名前を出す（#52）。**
 //    「このプラットフォームでは測っていない」を毎回目に入れる。
