@@ -279,8 +279,35 @@
   .empty { color: var(--dim); padding: .5rem; }
 
   /* ---- 狭い画面: レイアウトの保持を諦めて縦に積む ---- */
+  /* 🚨 **スマホ横で PC レイアウトを見るための切り替え（`body.wide`）。**
+     既定は今まで通り「狭い画面は1列に畳む」。`.wide` を付けると畳まない。
+     ⚠️ 畳まないと横に溢れるので**横スクロールを許す**（それが意図した状態）。
+     ⚠️ 390px の検査は既定（`.wide` 無し）で走るので、
+        「横溢れ 0」の測定は今まで通り効く。 */
+  body.wide { overflow: auto; }
+  body.wide .shell { min-width: 1100px; }
+  body.wide .shell.gridmode { min-width: 1100px; }
+
   @media (max-width: 1100px) {
-    body { overflow: auto; }
+    body:not(.wide) { overflow: auto; }
+    /* ⚠️ ここから下は `.wide` のときは効かせない（1列に畳まない）。
+       CSS のネストで丸ごと包む。セレクタを1つずつ書き換えると必ず漏れる。 */
+    body:not(.wide) {
+    /* 🚨 **狭い画面ではトップバーを折り返す。**
+       今まで「伸びも折り返しもしない」前提で、要素を1つ足すたびに1つ引いていた。
+       その運用は破れる（「PC表示」を足した瞬間に `#at` が枠外に出て
+       layout-check が落ちた）。**押せないボタンを作るより折り返す方が良い** —
+       高さは1行増えるだけで、操作は全部届く。
+       ⚠️ 狭い画面では `.pane.max` は position:static なので、
+          バーの高さ（--bar）に依存する配置は無い。 */
+    .topbar { flex-wrap: wrap; height: auto; min-height: var(--bar); }
+    /* 🚨 **要素を1つ足したら1つ引く**（トップバーは伸びも折り返しもしない）。
+       「PC表示」を足した分、狭い画面では**パスを詰める**。
+       ⚠️ 消すのは駄目だった: 1本構成（セレクト無し）では
+          **リポジトリ名がどこにも出なくなる**（layout-check が実測して落ちた）。
+       詰めれば名前は残る（フルパスは title で読める）。 */
+    .topbar .path { max-width: 7em; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; flex: 0 1 auto; }
     /* ⚠️ block ではなく flex column にする。block だと order が効かず、
        DOM 順のせいで**グラフが一番下**になって長いスクロールが必要になる。
        スマホで一番見たいのは worktree の状態とグラフなので前に出す。 */
@@ -313,6 +340,7 @@
           どこにも出なくなる。 */
     .topbar:has(select:not([hidden])) #repo { display: none; }
     .topbar select { flex: 1 1 auto; max-width: none; }
+    }
   }
 </style>
 
@@ -327,6 +355,9 @@
   <span class="cap" id="cap" hidden></span>
   <button id="refresh">再読込</button>
   <button id="reset">レイアウト</button>
+  <!-- 🚨 スマホ横で PC レイアウトを見るための切り替え（#57 の実地要望）。
+       畳むのを止めると横に溢れるので、横スクロールで見る形になる。 -->
+  <button id="wide" title="PC レイアウトで見る（狭い画面でも1列に畳まない。横スクロール）">⇔</button>
   <span class="path" id="at" style="flex:0 0 auto"></span>
 </div>
 
@@ -463,6 +494,31 @@ let paneLayout = parseLayout(readStoredLayout());
  *    別の失敗として報告するか、最悪「測っていないのに緑」になる。
  */
 const gridMode = new URLSearchParams(location.search).get('grid') === '1';
+
+/**
+ * 🚨 **スマホ横で PC レイアウトを見る（`body.wide`）。**
+ *
+ *    既定は今まで通り「狭い画面は1列に畳む」。押したら覚える
+ *    （開き直すたびに押し直させない）。`?wide=1` でも入れる。
+ * ⚠️ 畳まないと横に溢れる。それが**意図した状態**なので横スクロールを許す
+ *    （390px の「横溢れ 0」の検査は既定で走るので、そのまま効く）。
+ */
+const WIDE_KEY = 'kjp-edit:wide';
+function readWide() {
+  if (new URLSearchParams(location.search).get('wide') === '1') return true;
+  try { return localStorage.getItem(WIDE_KEY) === '1'; } catch { return false; }
+}
+function applyWide(on) {
+  document.body.classList.toggle('wide', on);
+  const b = $('#wide');
+  // ⚠️ 記号にする（トップバーは伸びないので、文字数がそのまま枠外への押し出しになる）
+  if (b) {
+    b.textContent = on ? '⇕' : '⇔';
+    b.title = on ? 'スマホ向けに1列で見る' : 'PC レイアウトで見る（横スクロール）';
+    b.classList.toggle('on', on);
+  }
+  try { localStorage.setItem(WIDE_KEY, on ? '1' : '0'); } catch { /* 保存できなくても今の画面には効いている */ }
+}
 const GRID_KEY = 'kjp-edit:pane-grid:v2';
 function readStoredGrid() {
   try { return localStorage.getItem(GRID_KEY); } catch { return null; }
@@ -3078,6 +3134,8 @@ if (session.allowExec) {
   } catch { /* 1本しか無い構成と同じ扱いにする（観測は続ける） */ }
 }
 
+applyWide(readWide());
+$('#wide').addEventListener('click', () => applyWide(!document.body.classList.contains('wide')));
 $('#refresh').addEventListener('click', () => load(true));
 await load();
 /**
