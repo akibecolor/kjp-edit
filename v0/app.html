@@ -401,7 +401,7 @@ import {
 // グリッド配置（#57）。セル座標・パターン・結合は純関数側に置いてある
 import {
   GRID_PRESETS, parseGrid, serializeGrid, autoPlace, applyPreset,
-  mergeCell, splitCell, migrateV1, pruneGrid, presetOf, cellOf,
+  mergeCell, splitCell, migrateV1, pruneGrid, presetOf, cellOf, moveCell,
 } from './panegrid.mjs';
 // 「(リポジトリ外)」と言ってよいかの判定も外に出した。ここに書いていたので
 // **中にあるファイルを「外を触った」と断言していた**のに検査が掛からなかった（8回目のレビュー）
@@ -937,6 +937,9 @@ function gridNote(text) {
 }
 
 function renderGridBar(overflow) {
+  // 検査から内部状態を覗く口（?probe=1 のときだけ）
+  if (window.__kjpProbe) window.__kjpGrid = () => JSON.parse(JSON.stringify(paneGrid));
+
   const box = $('#gridbar');
   if (!box || !gridMode) return;
   box.hidden = false;
