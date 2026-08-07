@@ -1868,6 +1868,113 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
     // 🚨 9回目のレビュー / #55（MINOR 2件）: 黙って増える2本目と、
     //    動いたポートでトンネルが切れることの告知。
     // -----------------------------------------------------------------
+    // -----------------------------------------------------------------
+    // 🚨 #57 段階1: グリッドのセルモデル。守りは4つ —
+    //    「重ねない」「はみ出さない」「黙って捨てない」「閉じたものを開かない」。
+    //    2枚が同じセルに描かれると**見えないペインが走り続ける**（観測ツールとして最悪）。
+    // -----------------------------------------------------------------
+    {
+        name: 'grid-no-overlap-move',
+        why: '重なる移動を通す（2枚が同じセルに描かれ、片方が見えないまま走り続ける）',
+        file: 'v0/panegrid.mjs',
+        from: "    const hit = g.cells.filter(c => c.id !== id && cellsOverlap(c, target));",
+        to: "    const hit = [];   /* 変異: 重なりを見ない */",
+        gone: "const hit = g.cells.filter(c => c.id !== id && cellsOverlap(c, target));",
+        pattern: '大きさの違う相手・複数に重なる移動は断る',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-no-overlap-resize',
+        why: '広げる先に他が居ても広げる（同じセルに2枚）',
+        file: 'v0/panegrid.mjs',
+        from: "    if (!cellFree(g, want, id)) {",
+        to: "    if (false) {   /* 変異: 空きを見ない */",
+        gone: "if (!cellFree(g, want, id)) {",
+        // ⚠️ pattern は**テスト名に含まれる文字列**にする（外れると0件走って
+        //    SURVIVED と誤報する。CLAUDE.md の既知の罠）
+        pattern: 'その先に他が居るなら断る',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-bounds',
+        why: 'グリッドの外へのはみ出しを通す（描かれない位置にペインを置く）',
+        file: 'v0/panegrid.mjs',
+        from: "    return c.col + c.cw - 1 <= cols && c.row + c.ch - 1 <= rows;",
+        to: "    return true;   /* 変異: はみ出しを見ない */",
+        gone: "return c.col + c.cw - 1 <= cols && c.row + c.ch - 1 <= rows;",
+        pattern: 'はみ出しを通さない',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-overflow-announced',
+        why: '入り切らないペインを黙って捨てる（「1本も走っていない」と読める）',
+        file: 'v0/panegrid.mjs',
+        from: "        if (!at) { overflow.push(id); continue; }",
+        to: "        if (!at) { continue; }   /* 変異: 溢れを黙って捨てる */",
+        gone: "if (!at) { overflow.push(id); continue; }",
+        pattern: '入り切らない分を overflow で返す',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-closed-stays-closed',
+        why: '閉じたペインを自動配置で開き直す（15秒ごとに戻ってきて閉じられない）',
+        file: 'v0/panegrid.mjs',
+        from: "        if (placed.has(id) || g.closed.includes(id)) continue;",
+        to: "        if (placed.has(id)) continue;   /* 変異: 閉じたことを無視する */",
+        gone: "if (placed.has(id) || g.closed.includes(id)) continue;",
+        pattern: '閉じたペインは自動配置で戻ってこない',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-keeps-placed',
+        why: '自動配置が既にある配置を上書きする（利用者が置いた位置を巻き戻す）',
+        file: 'v0/panegrid.mjs',
+        from: "    const placed = new Set(g.cells.map(c => c.id));",
+        to: "    const placed = new Set();   /* 変異: 既存の配置を見ない */",
+        gone: "const placed = new Set(g.cells.map(c => c.id));",
+        pattern: '既にある配置を動かさない',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-shrink-reports',
+        why: 'グリッドを縮めたときにはみ出す分を黙って消す（どれが消えたか分からない）',
+        file: 'v0/panegrid.mjs',
+        from: "        else dropped.push(cell.id);",
+        to: "        else { /* 変異: 落ちたことを言わない */ }",
+        gone: "else dropped.push(cell.id);",
+        pattern: 'はみ出す分を dropped で返す',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-parse-dedup',
+        why: '保存値の重複した id を両方残す（どちらが本物かが配列順で決まる）',
+        file: 'v0/panegrid.mjs',
+        from: "        if (seen.has(cell.id)) continue;",
+        to: "        /* 変異: 重複を許す */",
+        gone: "if (seen.has(cell.id)) continue;",
+        pattern: '重複した id と重なるセルは後から来た方を落とす',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-parse-no-throw',
+        why: '壊れた保存値で例外を投げる（モジュールの評価が止まりページが真っ白になる）',
+        file: 'v0/panegrid.mjs',
+        from: "    try { raw = JSON.parse(text); } catch { return out; }",
+        to: "    raw = JSON.parse(text);   /* 変異: 壊れた値で投げる */",
+        gone: "try { raw = JSON.parse(text); } catch { return out; }",
+        pattern: '壊れた保存値は「配置なし」にする',
+        testFile: 'v0/panegrid.test.mjs',
+    },
+    {
+        name: 'grid-migrate-v1',
+        why: 'v1 の配置を移行しない（利用者が移した位置が1回全部消える）',
+        file: 'v0/panegrid.mjs',
+        from: "    put(layout?.left, 1, 1, g.rows);",
+        to: "    /* 変異: 移行しない */",
+        gone: "put(layout?.left, 1, 1, g.rows);",
+        pattern: 'v1 の配置をグリッドへ移す',
+        testFile: 'v0/panegrid.test.mjs',
+    },
     {
         // 🚨 #46: 置き直しが `append` で全ペインを動かしていたので、
         //    過去の出力を読んでいる最中にスクロールが先頭へ飛んだ（実測 21258 → 0）。
