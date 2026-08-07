@@ -171,7 +171,14 @@ function renderHarness(w, q) {
 <pre id="out"></pre>
 <script type="module">
 const f = document.getElementById('f');
-await new Promise(r => f.addEventListener('load', r, { once: true }));
+// 🚨 **load を無期限に待たない。** listener を付ける前に発火すると永久に戻らず、
+//    ページは out を書かないままブラウザも終わらない（外から SIGKILL され、
+//    何を待っていたか消える）。上限を付けて、後段のポーリングに判定させる。
+const waitLoad = (ms) => Promise.race([
+  new Promise(r => f.addEventListener('load', r, { once: true })),
+  new Promise(r => setTimeout(r, ms)),
+]);
+await waitLoad(20000);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const win = f.contentWindow;
 for (let i = 0; i < 200 && typeof win.__kjpFeedTerm !== 'function'; i++) await sleep(100);
@@ -219,7 +226,14 @@ function probeHarness(width, mode, token) {
 <pre id="out"></pre>
 <script type="module">
 const f = document.getElementById('f');
-await new Promise(r => f.addEventListener('load', r, { once: true }));
+// 🚨 **load を無期限に待たない。** listener を付ける前に発火すると永久に戻らず、
+//    ページは out を書かないままブラウザも終わらない（外から SIGKILL され、
+//    何を待っていたか消える）。上限を付けて、後段のポーリングに判定させる。
+const waitLoad = (ms) => Promise.race([
+  new Promise(r => f.addEventListener('load', r, { once: true })),
+  new Promise(r => setTimeout(r, ms)),
+]);
+await waitLoad(20000);
 // ⚠️ 固定時間で待たない。描画は state の取得（+ 衝突予測）を待つので、
 //    処理が増えると足りなくなる。実際に 390px だけ「バッジ0個」で
 //    CI が落ちた（幅ごとに別の Chrome を起動するのでレースになる）。
@@ -347,7 +361,9 @@ const paneDuplicates = allPanes.length
   - new Set(allPanes.map(e => e.dataset.paneId)).size;
 // 再読込して、保存された並びが復元されること
 f.contentWindow.location.reload();
-await new Promise(r => f.addEventListener('load', r, { once: true }));
+// ⚠️ ここも上限付き（reload の load はもっと取り逃しやすい）。
+//    取り逃しても下のポーリングが描画完了を待つので、判定は変わらない。
+await waitLoad(20000);
 let doc2 = f.contentDocument;
 for (let i = 0; i < 100; i++) {
   doc2 = f.contentDocument;
