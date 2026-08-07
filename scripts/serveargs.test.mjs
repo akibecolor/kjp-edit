@@ -7,12 +7,12 @@
 // 特に `--allow-host` と観測フラグの引き継ぎは、落ちても**手元では気付けない**
 // （再起動後だけ 403 / ログオン後だけパネルが消える）ので、ここで固定する。
 
-import { test } from 'node:test';
+import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer, createConnection } from 'node:net';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import {
@@ -271,17 +271,75 @@ test('repos を配列で渡し忘れたら黙って通さない', () => {
     assert.throws(() => autostartServeArgs({ argv: [], repo: '/a', port: 1 }), /repos/);
 });
 
+
+/**
+ * 🚨 **本物の `~/.kjp-edit/` を触っていないことを検査で固定する（#56）。**
+ *
+ * 「一時 HOME を渡す」だけでは、渡し忘れた経路が増えたときに気付けない。
+ * 鍵と `last.json` の mtime を前後で比べる。
+ * ⚠️ `exec-audit.jsonl` は**動いているデーモンが正しく追記する**ので見ない
+ *    （見ると「別の理由で落ちる」検査になる）。
+ */
+const STATE_DIR = join(homedir(), '.kjp-edit');
+const WATCHED = ['token-read', 'token-write', 'token-exec', 'last.json'];
+const stampState = async () => {
+    const out = {};
+    for (const name of WATCHED) {
+        out[name] = await stat(join(STATE_DIR, name))
+            .then(st => `${st.mtimeMs}:${st.size}`, () => null);
+    }
+    return out;
+};
+let stateBefore = null;
+before(async () => {
+    scratchHome = await mkdtemp(join(tmpdir(), 'kjp-args-home-'));
+    stateBefore = await stampState();
+});
+after(async () => {
+    const now = await stampState();
+    const changed = WATCHED.filter(n => stateBefore[n] !== now[n]);
+    if (scratchHome) await rm(scratchHome, { recursive: true, force: true }).catch(() => {});
+    assert.deepEqual(changed, [],
+        `検査が本物の ${STATE_DIR} を書き換えた（#56）: ${changed.join(', ')}。`
+        + ' 子を起こす経路に一時 HOME を渡し忘れていないか確認すること'
+        + '（同じ場所に実行トークンがある）');
+});
 // ---- 配線（純関数だけでは「呼んでいない」を検出できない）----
 // 🚨 純関数を全部テストしても、**スクリプトがそれを呼んでいなければ意味が無い**。
 //    実際に起動して、門が exit 1 になることを見る。
 //    ⚠️ ここで見るのは**最初に通る門**だけにする。後ろの門（--port / --allow-host）は
 //       git と PowerShell を叩いてからなので、ユニットの速さを壊す（smoke の仕事）。
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+/**
+ * 🚨 **子は既定で一時 HOME を見る（#56）。**
+ *
+ * 以前は `env` を渡さない呼び出しが**本物の HOME を継承**していたので、
+ * `~/.kjp-edit/last.json` に検査の一時リポジトリが書かれていた（実測）。
+ * 同じディレクトリに `token-read` / `token-write` / `token-exec` があるので、
+ * **書ける経路がある**こと自体が危ない（鍵が変わればスマホから繋がらない）。
+ * ⚠️ 呼び出し側の意志に任せない。**入口で既定にする**（仕組みで防ぐ）。
+ */
+let scratchHome = null;
+/**
+ * 🚨 **子に渡す環境は1箇所で組む（#56）。**
+ *
+ * 「一時 HOME を渡す」処理が2箇所あると、片方を外しても検査が落ちない
+ * = 守りが検証されない（実際にこの形で変異が SURVIVED し、
+ *   変異の `from` も2箇所に一致して STALE になった）。
+ * `os.homedir()` は Windows で USERPROFILE、POSIX で HOME を見るので両方渡す。
+ */
+function childEnv(extra = {}) {
+    return {
+        ...process.env, NO_COLOR: '1',
+        ...(scratchHome ? { HOME: scratchHome, USERPROFILE: scratchHome } : {}),
+        ...extra,
+    };
+}
 function runScript(script, args, env = {}) {
     return new Promise(resolve => {
         const p = spawn(process.execPath, [join(ROOT, 'scripts', script), ...args], {
             cwd: ROOT, shell: false, windowsHide: true,
-            env: { ...process.env, NO_COLOR: '1', ...env },
+            env: childEnv(env),
         });
         let out = '';
         p.stdout.on('data', d => { out += d; });
@@ -689,15 +747,17 @@ async function cleanup(tag, child, port) {
 /**
  * 一時リポジトリ・一時 HOME で `serve.mjs` を実起動し、起動を待って body を呼ぶ。
  *
- * ⚠️ `~/.kjp-edit` を汚さないため HOME/USERPROFILE を一時ディレクトリに向ける
- *    （`os.homedir()` は Windows では USERPROFILE、POSIX では HOME を見る）。
+ * 🚨 **HOME の隔離は1箇所（`scratchHome`）で決める（#56）。**
+ *    ここで別の一時 HOME を作ると「隔離を渡す場所」が2つになり、
+ *    片方を外しても検査が落ちない = **守りが検証されない**状態になる
+ *    （実際に、この形で変異が SURVIVED した）。
+ *    `os.homedir()` は Windows では USERPROFILE、POSIX では HOME を見る。
  * ⚠️ **固定時間で待たない**（起動は git と PowerShell の探索を待つ。CLAUDE.md）。
  */
 async function withDaemon(extra, body) {
-    const home = await mkdtemp(join(tmpdir(), 'kjp-wire-home-'));
     const dir = await mkdtemp(join(tmpdir(), 'kjp-wire-repo-'));
     const tag = dir.split(/[\\/]/).pop();
-    const env = { HOME: home, USERPROFILE: home };
+    const env = {};
     let child = null;
     let port = 0;
     let err = null;
@@ -708,7 +768,7 @@ async function withDaemon(extra, body) {
         child = spawn(process.execPath, [join(ROOT, 'scripts', 'serve.mjs'),
             '--repo', dir, '--port', String(port), '--exec', ...extra], {
             cwd: ROOT, shell: false, windowsHide: true,
-            env: { ...process.env, NO_COLOR: '1', ...env },
+            env: childEnv(env),
         });
         let out = '';
         let exited = null;
@@ -737,7 +797,6 @@ async function withDaemon(extra, body) {
         await body({ repo, dir, tag, env, port, out: () => out });
     } catch (e) { err = e; }
     const leak = await cleanup(tag, child, port);
-    await rm(home, { recursive: true, force: true }).catch(() => {});
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     if (err) {
         if (leak) err.message += `\n（さらに）${leak}`;

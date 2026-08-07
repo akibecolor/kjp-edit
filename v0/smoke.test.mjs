@@ -16,11 +16,33 @@ import { request as httpRequest, Agent as HttpAgent } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { mkdtemp, rm, writeFile, readFile, mkdir, rename } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new URL('./server.mjs', import.meta.url));
+
+/**
+ * 🚨 **本物の `~/.kjp-edit/` を触っていないことを固定する（#56）。**
+ *
+ * 実測: 検査が本物の `last.json` を一時リポジトリで上書きしていた。
+ * 同じディレクトリに `token-read` / `token-write` / `token-exec` があるので、
+ * **書ける経路があること自体**が危ない（鍵が変わればスマホから繋がらない）。
+ * ⚠️ `exec-audit.jsonl` は動いているデーモンが正しく追記するので見ない。
+ */
+const STATE_DIR = join(homedir(), '.kjp-edit');
+const STATE_WATCHED = ['token-read', 'token-write', 'token-exec', 'last.json'];
+const stampState = async () => {
+    const { stat } = await import('node:fs/promises');
+    const out = {};
+    for (const name of STATE_WATCHED) {
+        out[name] = await stat(join(STATE_DIR, name))
+            .then(st => `${st.mtimeMs}:${st.size}`, () => null);
+    }
+    return out;
+};
+let stateBefore = null;
+
 
 let repo;          // 一時リポジトリ
 let proc;          // サーバプロセス
@@ -78,6 +100,7 @@ function g(args, cwd) {
 }
 
 before(async () => {
+    stateBefore = await stampState();   // 本物の状態ディレクトリを触らないことの見張り（#56）
     repo = await mkdtemp(join(tmpdir(), 'kjp-smoke-'));
     emptyConfig = join(repo, '.empty-gitconfig');
     await writeFile(emptyConfig, '', 'utf8');
@@ -129,6 +152,10 @@ before(async () => {
 });
 
 after(async () => {
+    // 🚨 検査が本物の ~/.kjp-edit/ を書き換えていないこと（#56）。
+    //    **最初に見る**（この後の後始末で時間が経つと原因が分かりにくくなる）。
+    const stateNow = await stampState();
+    const stateChanged = STATE_WATCHED.filter(n => stateBefore?.[n] !== stateNow[n]);
     proc?.kill();
     // 🚨 **検査が起動した孫プロセスを掃く（仕組みで防ぐ）。**
     //    仕込みは自死するようにしたが、それは「30秒後」であって
@@ -171,6 +198,12 @@ after(async () => {
             console.error(`    ${s.ms}ms  argv: ${s.argv}`);
         }
     }
+    // 🚨 **最後に判定する（#56）。** 後始末を全部済ませてから落とす
+    //    （ここで throw すると以降の後始末が走らないので、順序が重要）。
+    assert.deepEqual(stateChanged, [],
+        `検査が本物の ${STATE_DIR} を書き換えた（#56）: ${stateChanged.join(', ')}。`
+        + ' 子を起こす経路に一時 HOME を渡し忘れていないか確認すること'
+        + '（同じ場所に実行トークンがある）');
 });
 
 // ⚠️ 必ず fresh=1 で叩く。サーバは短い TTL キャッシュを持つので、

@@ -16,6 +16,8 @@ import { readdir, readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
+// 要約は純関数として切り出してテストしてある（#52）
+import { summarizeTests, detailLines, testDetail } from './testsummary.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const quick = process.argv.includes('--quick');
@@ -58,16 +60,6 @@ function run(args, { timeout = 300_000 } = {}) {
     });
 }
 
-/**
- * 失敗の詳細に出す行を選ぶ。
- *
- * ⚠️ 打ち切り（`fromEnd`）のときは**末尾**を出す。先頭は起動時の案内で埋まり、
- *    「何を待っていたか」が入らない（macOS の layout でこれに遭った）。
- */
-function detailLines(output, n, fromEnd) {
-    const lines = String(output ?? '').split('\n').filter(l => l.trim());
-    return fromEnd ? lines.slice(-n) : lines.slice(0, n);
-}
 /** 拡張子で再帰的に集める（node_modules と .git は除く） */
 async function sources(dir, exts = ['.mjs'], acc = []) {
     for (const e of await readdir(dir, { withFileTypes: true })) {
@@ -116,48 +108,10 @@ async function checkInlineModules(htmlFiles) {
     return bad;
 }
 
-/** node --test の出力から失敗だけを抜き出して短くする */
-function summarizeTests(output) {
-    const lines = output.split('\n');
-    // node --test は ✖ を2回出す（インラインと末尾の "failing tests:" 要約）。
-    // 名前で重複排除し、原因が取れている方を残す。
-    const byName = new Map();
-    for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(/^✖\s+(.+?)\s+\(/);
-        if (!m) continue;
-        const cause = lines.slice(i + 1, i + 6)
-            .map(l => l.trim())
-            .find(l => /Error|Assertion|expected|actual|!==/.test(l)) ?? '';
-        const prev = byName.get(m[1]);
-        if (!prev || (!prev.cause && cause)) byName.set(m[1], { name: m[1], cause });
-    }
-    const failing = [...byName.values()];
-    const counts = {};
-    for (const key of ['pass', 'fail']) {
-        const m = output.match(new RegExp(`^ℹ ${key} (\\d+)`, 'm'));
-        counts[key] = m ? Number(m[1]) : 0;
-    }
-    return { failing, ...counts };
-}
-
-/**
- * テスト1本ぶんの失敗表示を作る。
- *
- * ⚠️ **要約が取れなかったときは生の末尾を出す。** `node --test` は
- * クラッシュや SIGKILL では `ℹ pass N` を出さないので、そのまま整形すると
- * 「smoke (0 pass, 0 fail)」だけが残り、**原因が完全に消える**
- * （CI で失敗したのに手元では再現せず、これで1往復無駄にした）。
- */
-function testDetail(r, s) {
-    if (s.failing.length) return s.failing.slice(0, 5).map(f => `${f.name} — ${f.cause}`);
-    const head = r.timedOut
-        ? [`⏱ ${(r.ms / 1000).toFixed(1)}s で SIGKILL（上限に達した）`]
-        : [`終了コード ${r.code}（テストの要約が出ていない = 途中で落ちた）`];
-    const tail = r.output.split('\n').map(l => l.trim()).filter(Boolean).slice(-8);
-    return [...head, ...tail];
-}
-
 const steps = [];
+// 🚨 **飛ばした検査の名前を集める（#52）。** 件数だけだと
+//    「何が測られていないか」が分からない（SKIP を緑と読む型）。
+const allSkipped = [];
 let failed = false;
 
 // 1. 構文チェック（型チェックの代わり。依存ゼロを保つため tsc は入れない）
@@ -194,13 +148,15 @@ let failed = false;
             'v0/mergeresult.test.mjs',
             'v0/writefile.test.mjs', 'v0/linediff.test.mjs', 'v0/blobview.test.mjs',
             'v0/proctree.test.mjs', 'v0/failtracker.test.mjs',
-            'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs'],
+            'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs',
+            'scripts/testsummary.test.mjs'],
         { timeout: 240_000 },
     );
     const s = summarizeTests(r.output);
+    allSkipped.push(...(s.skippedNames ?? []));
     const ok = r.code === 0;
     steps.push({
-        name: `unit (${s.pass} pass, ${s.fail} fail) ${(r.ms / 1000).toFixed(1)}s`,
+        name: `unit (${s.pass} pass, ${s.fail} fail${s.skipped ? `, ${s.skipped} skip` : ''}) ${(r.ms / 1000).toFixed(1)}s`,
         ok,
         detail: ok ? [] : testDetail(r, s),
     });
@@ -217,9 +173,10 @@ if (!quick && !failed) {
     const r = await run(['--test', '--test-timeout=90000', 'v0/smoke.test.mjs'],
         { timeout: 600_000 });
     const s = summarizeTests(r.output);
+    allSkipped.push(...(s.skippedNames ?? []));
     const ok = r.code === 0;
     steps.push({
-        name: `smoke (${s.pass} pass, ${s.fail} fail) ${(r.ms / 1000).toFixed(1)}s`,
+        name: `smoke (${s.pass} pass, ${s.fail} fail${s.skipped ? `, ${s.skipped} skip` : ''}) ${(r.ms / 1000).toFixed(1)}s`,
         ok,
         detail: ok ? [] : testDetail(r, s),
     });
@@ -274,12 +231,24 @@ if (!quick && !failed) {
 }
 
 // ---- 出力: 20行以内 ----
+// 🚨 **飛ばした検査は緑のときも名前を出す（#52）。**
+//    「このプラットフォームでは測っていない」を毎回目に入れる。
+//    件数だけだと「何が測られていないか」が分からない。
+const skippedTests = [...new Set(allSkipped)];
+
 for (const s of steps) {
     const mark = s.skipped ? '–' : s.ok ? '✔' : '✖';
     // ⚠️ 理由を取り違えない。--quick / 先行ステップの失敗 / ブラウザ無し は別物
     const why = s.skipped ? ` (skipped: ${s.why ?? 'ブラウザ無し'})` : '';
     console.log(`${mark} ${s.name}${why}`);
     for (const d of s.detail ?? []) console.log(`    ${d}`);
+}
+// 🚨 プラットフォームで飛ばした検査は**緑のときも**名前を出す（#52）。
+//    「このプラットフォームでは測っていない」を毎回目に入れる。
+if (skippedTests.length) {
+    console.log(`– このプラットフォームで飛ばした検査 ${skippedTests.length} 件（緑と読まないこと）:`);
+    for (const name of skippedTests.slice(0, 5)) console.log(`    ${name}`);
+    if (skippedTests.length > 5) console.log(`    …他 ${skippedTests.length - 5} 件`);
 }
 if (failed) {
     console.log('\n再現するには:');

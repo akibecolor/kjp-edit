@@ -1832,6 +1832,70 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + 'Cookie 由来の値を渡す形に変えた瞬間に効く第二の砦として残す',
         pattern: '実行トークンの総当たり',
     },
+    // -----------------------------------------------------------------
+    // 🚨 9回目のレビュー / #52: verify の要約が skipped を出していなかった。
+    //    「SKIP を緑と読まない」と書いておきながら、要約自身がそれを破っていた。
+    //    要約は verify.mjs の中にあってテストも変異も掛かっていなかったので、
+    //    純関数として `scripts/testsummary.mjs` に出した。
+    // -----------------------------------------------------------------
+    {
+        // 🚨 9回目のレビュー / #56: 検査が本物の ~/.kjp-edit/ に書いていた
+        //    （実測: last.json が検査の一時リポジトリを指していた）。
+        //    同じ場所に実行トークンがあるので、書ける経路自体が危ない。
+        name: 'test-home-isolation',
+        why: '検査の子プロセスが本物の HOME を継承する'
+            + '（~/.kjp-edit/ の last.json や鍵を検査が書き換えられる）',
+        // ⚠️ **この変異を走らせると、本物の `~/.kjp-edit/last.json` が
+        //    一時リポジトリを指す値で上書きされる**（それが「守りが無いと何が
+        //    起きるか」の証明そのものなので避けられない）。
+        //    `last.json` は参考情報だけなので実害は無い（鍵は既存の値が読まれる
+        //    だけで上書きされない）。気になるなら `serve.mjs` を1回起動し直せば
+        //    正しい値に戻る。
+        file: 'scripts/serveargs.test.mjs',
+        from: '        ...(scratchHome ? { HOME: scratchHome, USERPROFILE: scratchHome } : {}),',
+        to: '        /* 変異: 一時 HOME を渡さない */',
+        gone: '...(scratchHome ? { HOME: scratchHome, USERPROFILE: scratchHome } : {})',
+        // ⚠️ 見張りは after フックなので、pattern はどのテストでも良い
+        //    （フックの失敗はファイル全体の失敗として出る）。
+        // 🚨 **本当にサーバを起動する検査に当てる。** 早期の門で終わる検査に
+        //    当てていたので、本物の HOME を継承しても**何も書かれず SURVIVED**した。
+        //    `last.json` を書くのは「実起動」の経路だけ。
+        pattern: '--timeout が実際にサーバに届く',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'summary-counts-skipped',
+        why: '飛ばした検査の件数を数えない'
+            + '（プラットフォームで測っていない検査が、緑と区別できなくなる）',
+        file: 'scripts/testsummary.mjs',
+        from: "    for (const key of ['pass', 'fail', 'skipped', 'todo']) {",
+        to: "    for (const key of ['pass', 'fail']) {   /* 変異: skip を数えない */",
+        gone: "'pass', 'fail', 'skipped', 'todo'",
+        pattern: 'skipped を数える',
+        testFile: 'scripts/testsummary.test.mjs',
+    },
+    {
+        name: 'summary-lists-skipped',
+        why: 'どの検査が飛ばされたかを返さない'
+            + '（件数だけでは「何が未検証か」が分からない）',
+        file: 'scripts/testsummary.mjs',
+        from: '    const skippedNames = lines',
+        to: '    const skippedNames = [];   /* 変異: 一覧を返さない */\n    const unusedLines = lines',
+        gone: '    const skippedNames = lines',
+        pattern: 'どれが飛ばされたかも返す',
+        testFile: 'scripts/testsummary.test.mjs',
+    },
+    {
+        // ⚠️ 名前に理由（`# …`）が混ざると一覧が読めなくなる
+        name: 'summary-skipped-name-only',
+        why: '飛ばした検査の名前に理由を混ぜる（一覧が読めなくなる）',
+        file: 'scripts/testsummary.mjs',
+        from: "        .map(l => /^\\s*﹣\\s+(.+?)\\s+\\(/.exec(l))",
+        to: "        .map(l => /^\\s*﹣\\s+(.+)/.exec(l))   /* 変異: 括弧まで取らない */",
+        gone: "(.+?)\\s+\\(/.exec(l)",
+        pattern: 'どれが飛ばされたかも返す',
+        testFile: 'scripts/testsummary.test.mjs',
+    },
     {
         name: 'audit-rotate',
         why: '監査ログに大きさの上限が無い（長く動かすだけで伸び、'
