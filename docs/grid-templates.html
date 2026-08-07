@@ -1,0 +1,187 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>kjp-edit グリッドのテンプレ見本（#57）</title>
+<style>
+  /* 本体（v0/app.html）と同じ配色にして、実物の見え方に近づける */
+  :root {
+    --bg: #14161a; --card: #1b1f26; --head: #22272f; --line: #2e3540;
+    --fg: #d8dee9; --dim: #8b95a5; --accent: #61a0ff; --warn: #e8b84b; --danger: #e06c75;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 system-ui, "Segoe UI", "Yu Gothic UI", sans-serif; padding: 1rem 1.2rem 3rem; }
+  h1 { font-size: 17px; margin: 0 0 .2rem; }
+  h2 { font-size: 14px; margin: 1.6rem 0 .4rem; border-bottom: 1px solid var(--line);
+    padding-bottom: .25rem; }
+  p, li { color: var(--dim); max-width: 62rem; }
+  code { background: var(--head); padding: .05rem .3rem; border-radius: 3px; color: var(--fg); }
+  .note { color: var(--dim); font-size: 12px; }
+
+  /* 見本の並べ方 */
+  .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+  .demo { border: 1px solid var(--line); border-radius: 4px; background: #0f1115; padding: .4rem; }
+  .demo > .ttl { display: flex; align-items: baseline; gap: .5rem; margin: 0 .1rem .35rem; }
+  .demo > .ttl b { font-size: 13px; }
+  .demo > .ttl span { color: var(--dim); font-size: 11px; }
+  /* グリッド本体（実装もこの CSS grid をそのまま使う想定） */
+  .grid { display: grid; gap: 4px; width: 320px; height: 200px; }
+  .grid.wide { width: 420px; height: 250px; }
+  .pane { background: var(--card); border: 1px solid var(--line); border-radius: 3px;
+    display: flex; flex-direction: column; overflow: hidden; min-width: 0; min-height: 0; }
+  .pane > header { display: flex; align-items: center; gap: .25rem; background: var(--head);
+    border-bottom: 1px solid var(--line); padding: .12rem .3rem; font-size: 10px; }
+  .pane > header .grow { flex: 1 1 auto; }
+  .pane > header .btn { color: var(--dim); font-size: 10px; }
+  .pane > header .x { color: var(--danger); }
+  .pane > .body { flex: 1 1 auto; padding: .25rem .3rem; font-size: 10px; color: var(--dim);
+    overflow: hidden; }
+  .pane.acc { border-color: var(--accent); }
+  .pane.acc > header { background: #1d2b44; }
+  .bar { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center;
+    border: 1px solid var(--line); background: var(--head); border-radius: 4px;
+    padding: .3rem .4rem; margin: .4rem 0 0; }
+  .bar b { font-size: 12px; }
+  button { font: inherit; font-size: 11px; background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; padding: .12rem .4rem; }
+  button.on { border-color: var(--accent); color: #fff; background: #1d2b44; }
+  .phone { width: 190px; height: 330px; }
+  table { border-collapse: collapse; margin: .4rem 0 0; font-size: 12px; }
+  th, td { border: 1px solid var(--line); padding: .25rem .5rem; text-align: left;
+    vertical-align: top; }
+  th { background: var(--head); }
+</style>
+
+<h1>グリッドのテンプレ見本（#57）— <b>確定した形</b></h1>
+<p style="color:#61a0ff">2026-08-07 に承認。この見本が実装の基準。ここから外れる実装をしたら、それは<b>意図の変更</b>なので issue に理由を書くこと。</p>
+<p>配色と枠は本体（<code>v0/app.html</code>）と同じ。中の文字はダミー。
+<b>この見本の <code>.grid</code> の CSS が、そのまま実装で使う形</b>です
+（<code>display: grid</code> + <code>grid-column</code> / <code>grid-row</code>）。</p>
+
+<h2>1. 選べるパターン（決めた7種）</h2>
+<div class="row" id="presets"></div>
+
+<h2>2. 結合（2セル分にする）— 「広げる」の見え方</h2>
+<p>ヘッダの <code>▭→</code>（右と結合）/ <code>▭↓</code>（下と結合）で広げ、
+<code>▭×</code> で1セルに戻す想定。<b>空いていない方向は押しても断られます</b>
+（押しのけると配置が連鎖的に崩れて元に戻せないため）。</p>
+<div class="row" id="merges"></div>
+
+<h2>3. 形を切り替える口（ツールバー）</h2>
+<div class="bar">
+  <b>配置</b>
+  <button>1枚</button><button>1行2列</button><button class="on">1行3列</button>
+  <button>2×2</button><button>2行3列</button><button>3×3</button><button>4×4</button>
+  <span class="note">｜ 閉じたペイン 2: </span>
+  <button>グラフ</button><button>コンソール: agent-b</button>
+</div>
+<p class="note">⚠️ 入り切らないペインが出たら
+「他 N 本は表示していません（配置を広げるか、閉じたペインから選び直してください）」を
+必ず出します（黙って消さない）。結合を解いたときも件数を出します。</p>
+
+<h2>4. スマホ（390px）では1列に畳む</h2>
+<p>4×4 を選んでいても、狭い画面では<b>1列</b>にします（縦に伸びるだけで読めるので）。
+結合は無視されます。今の実装と同じ考え方です。</p>
+<div class="row">
+  <div class="demo">
+    <div class="ttl"><b>4×4 を選んだ状態の 390px</b><span>1列 + 縦スクロール</span></div>
+    <div class="grid phone" style="grid-template-columns: 1fr; grid-template-rows: repeat(4, 1fr);">
+      <div class="pane"><header><span>worktree</span><span class="grow"></span><span class="btn">–</span><span class="btn">⛶</span><span class="x">×</span></header><div class="body">3本 / dirty 1</div></div>
+      <div class="pane acc"><header><span>agent-a</span><span class="grow"></span><span class="btn">–</span><span class="x">×</span></header><div class="body">$ claude -p …<br>› 応答おわり</div></div>
+      <div class="pane"><header><span>差分 / 全文</span><span class="grow"></span><span class="x">×</span></header><div class="body">src/x.ts +12 −3</div></div>
+      <div class="pane"><header><span>セッション監視</span><span class="grow"></span><span class="x">×</span></header><div class="body">▶ a/wt-main #a1b2c3</div></div>
+    </div>
+  </div>
+</div>
+
+<h2>5. 決めてほしいこと</h2>
+<table>
+  <tr><th>論点</th><th>今の案</th><th>代案</th></tr>
+  <tr><td>形の切り替え</td><td>ボタンを7つ並べる（上の3.）</td><td><code>&lt;select&gt;</code> 1つにする（狭い画面で場所を取らない）</td></tr>
+  <tr><td>結合の操作</td><td>ヘッダのボタン（<code>▭→</code> <code>▭↓</code> <code>▭×</code>）</td><td>ドラッグで縁を引っぱる（スマホでは押しにくい）</td></tr>
+  <tr><td>列幅の調整</td><td><b>やめる</b>（形は等分。スプリッタを廃止）</td><td>スプリッタを残す（実装が倍になり、#46 の再発が起きやすい）</td></tr>
+  <tr><td>入り切らないペイン</td><td>「他 N 本」と告知して閉じたペイン扱い</td><td>スクロールさせて全部出す（狭い画面で潰れる）</td></tr>
+</table>
+
+<script type="module">
+const PRESETS = [
+  { name: '1x1', label: '1枚', cols: 1, rows: 1 },
+  { name: '1x2', label: '1行2列', cols: 2, rows: 1 },
+  { name: '1x3', label: '1行3列', cols: 3, rows: 1 },
+  { name: '2x2', label: '2×2', cols: 2, rows: 2 },
+  { name: '2x3', label: '2行3列', cols: 3, rows: 2 },
+  { name: '3x3', label: '3×3', cols: 3, rows: 3 },
+  { name: '4x4', label: '4×4', cols: 4, rows: 4 },
+];
+// 実物に出るペインの名前（ダミーの中身つき）
+const SAMPLES = [
+  ['worktree', '3本 / dirty 1'],
+  ['agent-a', '$ claude -p …\n› 応答おわり'],
+  ['差分 / 全文', 'src/x.ts +12 −3'],
+  ['セッション監視', '▶ a/wt-main #a1b2c3'],
+  ['グラフ', '48 commits'],
+  ['agent-b', '$ npm test\n› 12 passing'],
+  ['エージェント', '稼働 2'],
+  ['ファイラ', 'src/ 4件'],
+  ['衝突予測', 'なし'],
+  ['agent-c', '待機'],
+  ['差分 / 全文', 'README.md +3'],
+  ['コンソール', '$ git status'],
+  ['agent-d', '停止しました'],
+  ['グラフ', 'main のみ'],
+  ['worktree', 'wt-b'],
+  ['監視', '2/8 稼働'],
+];
+const pane = (i, cls = '') => {
+  const [title, body] = SAMPLES[i % SAMPLES.length];
+  const p = document.createElement('div');
+  p.className = `pane ${cls}`;
+  p.innerHTML = `<header><span>${title}</span><span class="grow"></span>`
+    + `<span class="btn">▭→</span><span class="btn">▭↓</span><span class="x">×</span></header>`
+    + `<div class="body">${body.replace(/\n/g, '<br>')}</div>`;
+  return p;
+};
+const demo = (title, sub, build, wide = false) => {
+  const d = document.createElement('div');
+  d.className = 'demo';
+  d.innerHTML = `<div class="ttl"><b>${title}</b><span>${sub}</span></div>`;
+  const g = document.createElement('div');
+  g.className = wide ? 'grid wide' : 'grid';
+  build(g);
+  d.append(g);
+  return d;
+};
+const host = document.getElementById('presets');
+for (const p of PRESETS) {
+  host.append(demo(p.label, `${p.name}（${p.cols * p.rows} 枚）`, g => {
+    g.style.gridTemplateColumns = `repeat(${p.cols}, 1fr)`;
+    g.style.gridTemplateRows = `repeat(${p.rows}, 1fr)`;
+    for (let i = 0; i < p.cols * p.rows; i++) g.append(pane(i, i === 1 ? 'acc' : ''));
+  }));
+}
+const merges = document.getElementById('merges');
+// 2×2 で左上を横2セルに
+merges.append(demo('2×2 の左上を「右と結合」', '横2セル分。下2枚はそのまま', g => {
+  g.style.gridTemplateColumns = 'repeat(2, 1fr)';
+  g.style.gridTemplateRows = 'repeat(2, 1fr)';
+  const a = pane(1, 'acc'); a.style.gridColumn = '1 / span 2'; g.append(a);
+  g.append(pane(2), pane(3));
+}, true));
+// 3×3 で真ん中を縦2セルに
+merges.append(demo('3×3 の中央を「下と結合」', '縦2セル分。長い出力を読むとき', g => {
+  g.style.gridTemplateColumns = 'repeat(3, 1fr)';
+  g.style.gridTemplateRows = 'repeat(3, 1fr)';
+  g.append(pane(0), pane(2), pane(4));
+  const m = pane(1, 'acc'); m.style.gridRow = '2 / span 2'; g.append(m);
+  g.append(pane(5), pane(6), pane(7), pane(8));
+}, true));
+// 4×4 で 2×2 の塊
+merges.append(demo('4×4 で 2×2 の塊を作る', '主役1枚 + 周りを監視に使う形', g => {
+  g.style.gridTemplateColumns = 'repeat(4, 1fr)';
+  g.style.gridTemplateRows = 'repeat(4, 1fr)';
+  const big = pane(1, 'acc');
+  big.style.gridColumn = '1 / span 2';
+  big.style.gridRow = '1 / span 2';
+  g.append(big);
+  for (let i = 0; i < 12; i++) g.append(pane(i + 2));
+}, true));
+</script>
