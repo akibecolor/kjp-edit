@@ -401,20 +401,34 @@ export function configDiff(argv, cmd, { repos = null } = {}) {
  *    N 個のエージェントを並行で回す前提のツールで、repo A の作業を終えて `--stop` を打つと
  *    **repo B で 8 分走っている会話セッションが無言で消える**。
  *    マシン上の全部を止めるのは `--stop --all` で明示させる。
+ * 🚨 **「別のリポジトリ」と「分からない」を分ける（9回目のレビュー / #54）。**
+ *    以前は `repoOf()` が null（コマンド行から repo を読めなかった）でも
+ *    `others` に入れて **「← 別のリポジトリなので止めません」と断言**していた。
+ *    実際には**分からない**だけなので、止め残しに気付けない。
+ *    「分からないなら分からないと言う」（#31 / `running()` の `{supported, …}`）を、
+ *    同じファイルの表示側が破っていた。
  * @param {{pid:number, port:number|null, cmd:string}[]} list
  * @param {string|null} repo カレントのリポジトリ（`all` のときは見ない）
- * @returns {{targets: object[], others: object[]}} others = 止めないもの（必ず見せる）
+ * @returns {{targets: object[], others: object[], unknown: object[]}}
+ *   others = 別のリポジトリだと**分かっている**もの / unknown = 判定できなかったもの。
+ *   どちらも止めないが、**言い方を変える**（必ず両方見せる）
  */
 export function stopTargets(list, repo, all = false) {
     const items = Array.isArray(list) ? list : [];
-    if (all) return { targets: items, others: [] };
+    if (all) return { targets: items, others: [], unknown: [] };
     const targets = [];
     const others = [];
+    const unknown = [];
     for (const r of items) {
-        if (samePathish(repoOf(r?.cmd), repo)) targets.push(r);
+        const found = repoOf(r?.cmd);
+        // ⚠️ 順序が意味を持つ: 「読めなかった」を先に分ける。
+        //    後ろに回すと `samePathish(null, repo)` が false になって
+        //    「別のリポジトリ」に混ざる（それが #54 の形）。
+        if (found === null || found === undefined || found === '') unknown.push(r);
+        else if (samePathish(found, repo)) targets.push(r);
         else others.push(r);
     }
-    return { targets, others };
+    return { targets, others, unknown };
 }
 
 /**

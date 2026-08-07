@@ -14,7 +14,7 @@ import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer, createConnection } from 'node:net';
 import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import {
     SERVE_FLAGS, AUTOSTART_FLAGS, unknownFlag, checkPort, checkHost,
     collectHosts, collectRepos, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
@@ -600,6 +600,34 @@ test('🚨 --stop の既定はカレントのリポジトリだけ（他のリ�
     assert.deepEqual(stopTargets(null, 'C:/a').targets, [], '壊れた入力で投げない');
 });
 
+/**
+ * 🚨 **「別のリポジトリ」と「分からない」を分ける（#54）。**
+ *
+ * 以前は repo を読めなかった相手も `others` に入れて
+ * **「← 別のリポジトリなので止めません」と断言**していた。実際は**分からない**だけで、
+ * 止め残しに気付けない。「分からないなら分からないと言う」（#31）を、
+ * 同じファイルの表示側が破っていた。
+ */
+test('🚨 --stop は repo を判定できない相手を「別のリポジトリ」と断言しない（#54）', () => {
+    const list = [
+        D(1, 'C:/a'),                                  // 同じ repo
+        D(2, 'C:/b'),                                  // 別の repo（分かっている）
+        { pid: 9, port: 1, cmd: 'node C:/x/v0/server.mjs' },        // --repo が無い
+        { pid: 10, port: 2, cmd: 'node C:/x/v0/server.mjs --repo' }, // 値が欠けている
+    ];
+    const r = stopTargets(list, 'C:/a');
+    assert.deepEqual(r.targets.map(x => x.pid), [1]);
+    assert.deepEqual(r.others.map(x => x.pid), [2],
+        '「別のリポジトリ」に判定できない相手が混ざっている（断言になる）');
+    assert.deepEqual(r.unknown.map(x => x.pid), [9, 10],
+        '判定できない相手を別枠で返していない');
+    // --all なら全部止める（unknown も含む）。止めない枠は空
+    const all = stopTargets(list, 'C:/a', true);
+    assert.deepEqual(all.targets.map(x => x.pid), [1, 2, 9, 10]);
+    assert.deepEqual(all.others, []);
+    assert.deepEqual(all.unknown, []);
+});
+
 test('🚨 --stop は「調べられない」を「止まりました」と読まない', () => {
     const targets = [D(1, 'C:/a')];
     // 🚨 以前は `after.supported ? … : []` だったので、2回目の PowerShell が失敗すると
@@ -849,4 +877,77 @@ test('🚨 既に動いているデーモンとの差分で止まり、--stop �
         assert.match(stop.out, /子孫 \d+ 個/, `巻き込む子プロセスの数を出していない:\n${stop.out}`);
         assert.equal(stop.code, 0, `止められなかった:\n${stop.out}`);
     });
+});
+
+/**
+ * 🚨 **#54 の配線: 判定できない相手の言い方が実際に変わること。**
+ *
+ * 現実にこの状態になるのは「`node v0/server.mjs` を直に起動した」とき
+ * （README が案内している素の起動）。コマンド行に `--repo` が無いので
+ * `--stop` は repo を読めない。それを「別のリポジトリ」と断言すると、
+ * **止め残しに気付けない。**
+ *
+ * ⚠️ Windows 以外では動いているものを調べる実装が無い（`running()` が
+ *    `{supported:false}`）ので、この配線は測れない。skip はそう告知される（#52）。
+ */
+test('🚨 --stop は repo が読めない相手を「分からない」と出す（配線）', {
+    skip: process.platform !== 'win32'
+        ? `${process.platform} では動いているものを調べる実装が無い（running() が supported:false）`
+        : false,
+}, async () => {
+    // ⚠️ 掃除の照合は `kjp-wire-…` の名前だけを許す（誤って他を掃かないため）。
+    //    その規則に合わせて名前を付ける
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-wire-unknown-'));
+    const other = await mkdtemp(join(tmpdir(), 'kjp-wire-scope-'));
+    // ⚠️ Windows のパスは区切りが `\` なので、正規表現で分けると
+    //    エスケープの取り扱いを間違えやすい（実際にここで全パスが tag になった）。
+    //    `basename` を使う。
+    const tag = basename(dir);
+    let child = null;
+    let err = null;
+    try {
+        await new Promise((res, rej) => {
+            execFile('git', ['init', '-q', '-b', 'main'], { cwd: dir }, e => (e ? rej(e) : res()));
+        });
+        await new Promise((res, rej) => {
+            execFile('git', ['init', '-q', '-b', 'main'], { cwd: other }, e => (e ? rej(e) : res()));
+        });
+        const port = await freePort();
+        // 🚨 **`--repo` を渡さずに直起動する**（cwd から読む素の使い方）。
+        //    これで `--stop` から見て「repo が判定できない」相手ができる。
+        child = spawn(process.execPath, [join(ROOT, 'v0', 'server.mjs'), '--port', String(port)],
+            { cwd: dir, shell: false, windowsHide: true, env: childEnv() });
+        let out = '';
+        child.stdout.on('data', d => { out += d; });
+        child.stderr.on('data', d => { out += d; });
+        const deadline = Date.now() + 30_000;
+        while (!/http:\/\/127\.0\.0\.1:/.test(out) && child.exitCode === null && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 100));
+        }
+        assert.match(out, /http:\/\/127\.0\.0\.1:/, `直起動のサーバが立たない: ${out.slice(-300)}`);
+
+        // 別のリポジトリを scope にして --stop（この相手は止まらない）
+        const stop = await runScript('serve.mjs', ['--stop', '--repo', other]);
+        assert.match(stop.out, /リポジトリが分からないので止めません/,
+            `判定できない相手を「分からない」と出していない:\n${stop.out}`);
+        // ⚠️ **断言していないこと**を測る（これが #54 の本体）。
+        //    直起動の相手が「別のリポジトリ」の行に出ていたら断言になっている
+        const lines = stop.out.split('\n').filter(l => l.includes(String(child.pid)));
+        assert.ok(lines.length, `対象の PID ${child.pid} が出力に出ていない:\n${stop.out}`);
+        for (const l of lines) {
+            assert.equal(l.includes('別のリポジトリなので止めません'), false,
+                `判定できないのに「別のリポジトリ」と断言している: ${l}`);
+        }
+        assert.match(stop.out, /--all/, '止める手段（--all）を案内していない');
+    } catch (e) { err = e; }
+    // 後始末（取り残しは仕組みで防ぐ）
+    if (process.platform === 'win32') {
+        const found = await daemonsFor(tag);
+        for (const pid of found.pids) await taskkill(pid);
+    }
+    if (child && child.exitCode === null) { try { child.kill(); } catch { /* noop */ } }
+    await new Promise(r => setTimeout(r, 300));
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+    await rm(other, { recursive: true, force: true }).catch(() => {});
+    if (err) throw err;
 });

@@ -268,18 +268,35 @@ if (has('--stop')) {
         console.log('      pkill -f v0/server.mjs   # 木ごと止めるなら pkill -f -g <pgid>');
         process.exit(1);
     }
-    const { targets, others } = stopTargets(list, scope, wantAll);
+    const { targets, others, unknown } = stopTargets(list, scope, wantAll);
     /** 止める／止めない相手を1行で出す（**repo を必ず添える**） */
     const line = (r, note) => `  PID ${r.pid}  port ${r.port ?? '?'}  ${describeCaps(r.cmd)}`
         + `${note}  ${repoOf(r.cmd) ?? '(repo 不明)'}`;
+    /**
+     * 🚨 **「別のリポジトリ」と「分からない」を言い分ける（#54）。**
+     *    コマンド行から repo が読めなかった相手を「別のリポジトリ」と断言すると、
+     *    止め残しに気付けない（「--stop したのに動いている」の原因になる）。
+     */
+    const showSkipped = () => {
+        for (const r of others) console.log(line(r, '  ← 別のリポジトリなので止めません'));
+        for (const r of unknown) {
+            console.log(line(r, '  ← リポジトリが分からないので止めません'));
+        }
+        if (unknown.length) {
+            console.log('  ⚠ 上の相手はコマンド行から repo を読めませんでした。'
+                + '止めるなら --all か、PID を指定して手で止めてください');
+        }
+    };
     if (!targets.length) {
         console.log(wantAll
             ? '動いている kjp-edit はありません'
             : `このリポジトリの kjp-edit は動いていません: ${scope}`);
         // ⚠️ 「無い」と言った直後に、**止めない相手が居ることを必ず言う**
         //    （「--stop したのに動いている」の原因がこれになる）
-        for (const r of others) console.log(line(r, '  ← 別のリポジトリなので止めません'));
-        if (others.length) console.log('  マシン上の全部を止めるなら: node scripts/serve.mjs --stop --all');
+        showSkipped();
+        if (others.length || unknown.length) {
+            console.log('  マシン上の全部を止めるなら: node scripts/serve.mjs --stop --all');
+        }
         process.exit(0);
     }
     // 🚨 **道連れにする前に見せる。** 以前の出力は PID と port だけで、
@@ -297,7 +314,7 @@ if (has('--stop')) {
         console.log(`  ⚠ 巻き込む子プロセスの数は調べられませんでした: ${kids.why}`);
     }
     if (wantAll) console.log('  （--all なので他のリポジトリのデーモンも含みます）');
-    for (const r of others) console.log(line(r, '  ← 別のリポジトリなので止めません'));
+    showSkipped();
     // 🚨 **`process.kill(pid)` では孫が残る。** Windows の `process.kill` は
     //    TerminateProcess 相当なので、対象の `process.on('SIGTERM')` が**走らない**。
     //    そのハンドラが `killTree()`（`taskkill /T /F`）を呼ぶ唯一の場所なので、

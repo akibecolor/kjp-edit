@@ -1265,10 +1265,11 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '--stop がマシン上の全デーモンを対象にする'
             + '（repo B で 8 分走っている会話セッションが無言で消える。taskkill /T なので子孫も）',
         file: 'scripts/serveargs.mjs',
-        from: `        if (samePathish(repoOf(r?.cmd), repo)) targets.push(r);
+        // #54 で「分からない」を別枠にしたので、判定の行はこの形になった
+        from: `        else if (samePathish(found, repo)) targets.push(r);
         else others.push(r);`,
-        to: '        targets.push(r);   /* 変異: repo で絞らない */',
-        gone: 'samePathish(repoOf(r?.cmd), repo)',
+        to: '        else targets.push(r);   /* 変異: repo で絞らない */',
+        gone: 'else if (samePathish(found, repo)) targets.push(r);',
         pattern: '--stop の既定はカレントのリポジトリだけ',
         testFile: 'scripts/serveargs.test.mjs',
     },
@@ -1862,6 +1863,33 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         //    `last.json` を書くのは「実起動」の経路だけ。
         pattern: '--timeout が実際にサーバに届く',
         testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 🚨 9回目のレビュー / #54: repo が読めなかった相手を
+        //    「別のリポジトリなので止めません」と**断言**していた。
+        //    分からないだけなので、止め残しに気付けない。
+        name: 'stop-unknown-repo-claim',
+        why: 'repo を判定できない相手を「別のリポジトリ」と断言する'
+            + '（止め残しに気付けない。「分からない」と「無い」を混ぜる型）',
+        file: 'scripts/serveargs.mjs',
+        from: "        if (found === null || found === undefined || found === '') unknown.push(r);",
+        to: '        /* 変異: 分からないものを別枠にしない */',
+        gone: "if (found === null || found === undefined || found === '') unknown.push(r);",
+        pattern: '「別のリポジトリ」と断言しない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // ⚠️ 判断が正しくても**出力に出ていなければ**同じ事故が起きる（配線）。
+        name: 'stop-unknown-repo-wiring',
+        why: '「リポジトリが分からない」相手を出力に出さない（黙って止め残す）',
+        file: 'scripts/serve.mjs',
+        from: "            console.log(line(r, '  ← リポジトリが分からないので止めません'));",
+        to: '            /* 変異: 出さない */',
+        gone: "'  ← リポジトリが分からないので止めません'",
+        pattern: '「分からない」と出す',
+        testFile: 'scripts/serveargs.test.mjs',
+        // ⚠️ Windows でしか動いているものを調べられない（running() が supported:false）
+        platforms: ['win32'],
     },
     {
         name: 'summary-counts-skipped',
@@ -3103,6 +3131,40 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         }],
         gone: '// ← 門1: 認可',
         pattern: 'write: 門の順序',
+    },
+    // -----------------------------------------------------------------
+    // 🚨 9回目のレビュー / #53: 大きさの上限に検査も変異も無かった。
+    //    門は**開く側と書く側の2箇所**にあるので、両方を別々に測る。
+    // -----------------------------------------------------------------
+    {
+        name: 'edit-open-size-limit',
+        why: '大きすぎるファイルをそのまま開く'
+            + '（100MB のファイルを読んで母艦のメモリを埋められる）',
+        file: 'v0/server.mjs',
+        from: '        if (st.size > MAX_EDIT_BYTES) {',
+        to: '        if (false) {   /* 変異: 大きさを見ない */',
+        gone: 'if (st.size > MAX_EDIT_BYTES) {',
+        pattern: '512KB を超える中身',
+    },
+    {
+        name: 'edit-write-size-limit',
+        why: '大きすぎる中身をそのまま書く（作業ツリーを埋められる）',
+        file: 'v0/server.mjs',
+        from: '                if (next.length > MAX_EDIT_BYTES) {',
+        to: '                if (false) {   /* 変異: 大きさを見ない */',
+        gone: 'if (next.length > MAX_EDIT_BYTES) {',
+        pattern: '512KB を超える中身',
+    },
+    {
+        // ⚠️ 「断る」だけを測ると、境界の向きを変える変異を見逃す
+        //    （実用的な大きさまで断るようになっても検査が緑になる）。
+        name: 'edit-open-size-boundary',
+        why: '上限ちょうどのファイルも断る（実用的な大きさが開けなくなる）',
+        file: 'v0/server.mjs',
+        from: '        if (st.size > MAX_EDIT_BYTES) {',
+        to: '        if (st.size >= MAX_EDIT_BYTES) {   /* 変異: 境界を含めて断る */',
+        gone: 'if (st.size > MAX_EDIT_BYTES) {',
+        pattern: '512KB を超える中身',
     },
     {
         name: 'write-path-validation',

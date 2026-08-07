@@ -2549,6 +2549,79 @@ test('🚨 write: 並行書き換えを 409 で拒否する（楽観ロック）
     }
 });
 
+/**
+ * 🚨 **大きさの上限に検査が1件も無かった（#53）。**
+ *
+ * `MAX_EDIT_BYTES`（512KB）の門は**開く側と保存する側の2箇所**にあるのに、
+ * どちらもテストが無く変異も無かった。1行の書き戻しで
+ * 「巨大なファイルを丸ごと読んで丸ごと書く」経路に戻る
+ * （スマホから 100MB のファイルを開いて母艦のメモリを埋められる）。
+ *
+ * ⚠️ **上限ちょうどが通ることも測る。** 「大きすぎるものを断る」だけを測ると、
+ *    比較を `>=` にする変異（実用的な大きさまで断る）を見逃す。
+ * ⚠️ 本文の上限（`MAX_WRITE_BODY_BYTES` = 4MB）と混同しない。JSON の文字列
+ *    エスケープで最悪6倍に膨らむので、**中身 512KB を保存できる余地**が要る。
+ */
+test('🔒 write: 512KB を超える中身は開かない・書かない（上限ちょうどは通る）', async () => {
+    const { child, url } = await startWritable();
+    const LIMIT = 512 * 1024;
+    try {
+        await withEditWorktree('big', {
+            tracked: {
+                // 上限ちょうど（改行込みでぴったり）と、上限 + 1
+                'fit.txt': `${'a'.repeat(LIMIT - 1)}\n`,
+                'over.txt': `${'a'.repeat(LIMIT)}\n`,
+                'small.txt': 'x\n',
+            },
+        }, async dir => {
+            // 1. 上限を超えるファイルは**開けない**（413 で理由を言う）
+            const over = await editPost(url, '/api/v0/file', { worktree: dir, path: 'over.txt' });
+            assert.equal(over.status, 413, `上限を超えるファイルを開いた: ${over.status}`);
+            const od = await over.json();
+            assert.match(od.error, /バイトを超えるファイルは画面から編集しません/,
+                `理由が分からない: ${JSON.stringify(od)}`);
+            assert.match(od.error, new RegExp(String(LIMIT + 1)),
+                '実際の大きさを言っていない（どれだけ超えたか分からない）');
+
+            // 2. 上限ちょうどは**開ける**（厳しすぎて実用的な大きさが開けない状態にしない）
+            // ⚠️ **本文は1回しか読めない。** assert のメッセージに `await res.text()` を
+            //    書くと、テンプレートは**先に評価される**ので本文を消費してしまい、
+            //    後の `res.json()` が `Body is unusable` で落ちる（実際に踏んだ）。
+            const fit = await editPost(url, '/api/v0/file', { worktree: dir, path: 'fit.txt' });
+            const fitBody = await fit.text();
+            assert.equal(fit.status, 200, `上限ちょうどのファイルが開けない: ${fitBody.slice(0, 200)}`);
+            const fd = JSON.parse(fitBody);
+            assert.equal(fd.text.length, LIMIT);
+
+            // 3. 上限を超える**中身**は書かない（開けたファイルに足して超えさせる）
+            const small = await (await editPost(url, '/api/v0/file',
+                { worktree: dir, path: 'small.txt' })).json();
+            const big = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: 'small.txt',
+                text: 'y'.repeat(LIMIT + 1), baseOid: small.oid,
+            });
+            assert.equal(big.status, 413, `上限を超える中身を書いた: ${big.status}`);
+            assert.match((await big.json()).error, /バイトを超える内容は書きません/);
+            // **数え直す**: ファイルが変わっていないこと
+            assert.equal(await readFile(join(dir, 'small.txt'), 'utf8'), 'x\n',
+                '413 を返したのに書いている');
+
+            // 4. 上限ちょうどの中身は書ける
+            const ok = await editPost(url, '/api/v0/write', {
+                worktree: dir, path: 'small.txt',
+                text: 'z'.repeat(LIMIT), baseOid: small.oid,
+            });
+            const okBody = await ok.text();
+            assert.equal(ok.status, 200,
+                `上限ちょうどの中身が書けない: ${okBody.slice(0, 200)}`);
+            const wrote = await readFile(join(dir, 'small.txt'));
+            assert.equal(wrote.length, LIMIT, `書かれた大きさが違う: ${wrote.length}`);
+        });
+    } finally {
+        child.kill();
+    }
+});
+
 test('write: CRLF と BOM と日本語ファイル名を保つ（触っていない行を変えない）', async () => {
     const { child, url } = await startWritable();
     try {
