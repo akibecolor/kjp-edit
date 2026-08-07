@@ -130,7 +130,13 @@
      ヘッダは細い帯なので、スクロールの起点として失う面積は小さい。 */
   .pane > header { display: flex; align-items: center; gap: .3rem; flex: 0 0 auto;
     padding: .25rem .45rem; background: var(--head); border-bottom: 1px solid var(--line);
-    font-size: 11px; white-space: nowrap; cursor: grab; touch-action: none; }
+    font-size: 11px; white-space: nowrap; cursor: grab; touch-action: none;
+    /* 🚨 **掴んでも動かず「文字選択」になっていた（実機で指摘）。**
+       マウスでは pointerdown の既定動作が選択の開始なので、`touch-action` だけでは
+       止まらない（あれはタッチのスクロール用）。ヘッダは掴む場所なので選択させない。
+       ⚠️ 合成の pointer 事象では選択が起きないので、**検査では再現できない**
+          （click を飲む問題と同じ型。実機でしか出ない）。 */
+    user-select: none; -webkit-user-select: none; }
   /* ⚠️ タイトルは縮む側、タグとボタンは縮まない側。分けないと狭いペインで
      タグがタイトル文字に重なって読めなくなる。 */
   .pane > header .ttl { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
@@ -749,6 +755,9 @@ function wireDrag(p, h, drag, skip) {
     // 最大化中は画面全面なので、落とす先を選べない
     if (p.classList.contains('max')) return;
     drag.moved = false;
+    // ⚠️ 既定動作（テキスト選択の開始）を止める。ボタンは上で return しているので
+    //    ここに来るのは「掴んだ」場合だけ = click を妨げない。
+    e.preventDefault();
     const x0 = e.clientX, y0 = e.clientY;
     let started = false, last = '';
     // ⚠️ 合成イベント（`--layout-probe` の検査）には対応する実ポインタが無いので
