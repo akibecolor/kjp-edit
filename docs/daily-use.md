@@ -285,6 +285,38 @@ node scripts/serve.mjs --exec    # 🚨 監視盤は --exec が要る（--write 
 
 ---
 
+## 編集を始める前に衝突を止める（`PreToolUse` フック、#59）
+
+画面で見えるだけでは、**エージェントは見ない**。
+`scripts/clash.mjs` は Claude Code のフックとして動き、`Edit` / `Write` の**前に**
+動いているデーモンへ問い合わせて、次のときに止める:
+
+| 状態 | 判定 | 理由 |
+| --- | --- | --- |
+| そのパスが他の worktree と衝突する | `deny` | 後で必ず手作業になる |
+| **自分の worktree が rebase 等の途中で止まっている** | `deny` | `--continue` が意図しない内容を取り込む（乗っ取り） |
+| デーモンが動いていない / 一部を判定できない | `ask` | 🚨 **「衝突なし」とは言わない** |
+| 衝突なし | `allow`（無言） | |
+
+`.claude/settings.json` に入れる:
+
+```json
+{"hooks": {"PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
+  "hooks": [{"type": "command", "command": "node scripts/clash.mjs"}]}]}}
+```
+
+⚠️ **既定では入れていない。** デーモンを止めている間は毎回 `ask` になるので、
+「常用のデーモンを上げっぱなしにする」運用（上の自動起動）が前提。
+それが嫌なら入れない — **黙って `allow` に倒す実装にはしない**
+（判定の本体は `v0/clashguard.mjs` の純関数で、
+`clash-daemon-down-allows` などの変異が「倒れていないこと」を測っている）。
+
+🔒 使うのは `~/.kjp-edit/token-read` だけで、**読み取り経路しか叩かない**
+（`merge-tree --write-tree` が loose object を書くだけで、ref / index /
+作業ツリーには触らない。スモークテストが「触っていないこと」を固定している）。
+
+---
+
 ## 何が「ローンチ」か
 
 これが揃った状態で数日使って、`docs/scope.md` の問いに答える:

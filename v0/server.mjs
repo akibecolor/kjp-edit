@@ -39,6 +39,7 @@ import { ExecRegistry, isSessionId } from './execsession.mjs';
 import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
 import { makeFailTracker, makeInflightGate, makeGoodSet, failDelay } from './failtracker.mjs';
 import { collisionFullLabels } from './dirlabel.mjs';
+import { readSecretOf } from './readsecret.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -1072,10 +1073,9 @@ const AUTH_COOKIE = 'kjp_auth';
  *    トンネル側の Cookie は host-only なので他の tailnet ホストには行かない。
  */
 function cookieSecret() {
-    if (!opts.token) return null;
-    return createHash('sha256')
-        .update(`${opts.token}\nkjp-edit auth cookie v1`, 'utf8')
-        .digest('base64url');
+    // 🔒 式は `v0/readsecret.mjs` に1本化してある（配る側とずれると
+    //    `token-read` の中身が「実際に通らない値」になる。実際にそうなっていた）
+    return readSecretOf(opts.token);
 }
 
 /**
@@ -2256,6 +2256,115 @@ async function handleRequest(req, res) {
         //    Claude Code は `claude -p "..."` で非対話実行できるので、
         //    エージェントを遠隔から動かすのに PTY は要らない。
         //    対話 TUI をそのまま覗きたくなった時点で PTY を検討する。
+        /**
+         * 🔒 **衝突の事前問い合わせ（#59）。読み取り専用。**
+         *
+         * 設計当初（`docs/s0-verification.md`）に「他所に無い」と判定した中核が
+         * これ。今までは**画面で見えるだけ**で、エージェントが編集を始める前に
+         * 機械が問い合わせる口が無かった（`PreToolUse` フックから使う）。
+         *
+         * 🔒 触るのは `merge-tree --write-tree`（loose object を書くだけ）と
+         *    `.git` の読み取りのみ。ref / index / 作業ツリーは変えないので
+         *    **読み取りトークンで通す**（`--allow-write` も `--allow-exec` も要らない）。
+         * ⚠️ **「調べられない」を「衝突なし」と答えない。** ref が解決できない、
+         *    merge-tree が落ちた等は `unknown` に積み、`decided:false` を返す。
+         *    呼ぶ側が「衝突ゼロ = 安全」と読める形にしない。
+         */
+        if (url.pathname === '/api/v0/clash') {
+            if (req.method !== 'POST') { denyJson(res, 405, 'POST のみ受け付けます'); return; }
+            let body;
+            try { body = await readJson(req); } catch (err) {
+                denyJson(res, err.tooLarge ? 413 : 400, err.message); return;
+            }
+            const wantPath = toNFC(String(body.worktree ?? ''));
+            const only = Array.isArray(body.paths) && body.paths.length
+                ? new Set(body.paths.map(x => toNFC(String(x)))) : null;
+            let worktrees;
+            try { worktrees = await listWorktrees(repo); }
+            catch (err) { denyJson(res, 500, `worktree を読めません: ${err.message}`); return; }
+            const me = worktrees.find(w => samePath(w.path, wantPath));
+            if (!me) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
+            const drivers = await mergeDriverNames(repo).catch(() => []);
+            const others = worktrees.filter(w => !samePath(w.path, me.path) && !w.bare);
+            const conflicts = [];
+            const unknown = [];
+            const refA = me.ref ?? me.branch ?? me.head;
+            if (!refA) unknown.push({ worktree: me.path, why: '自分の ref を解決できません' });
+            for (const other of others) {
+                const refB = other.ref ?? other.branch ?? other.head;
+                if (!refA || !refB) {
+                    unknown.push({ worktree: other.path, why: 'ref を解決できません' });
+                    continue;
+                }
+                try {
+                    const r = await mergePreview(repo, refA, refB, drivers);
+                    for (const f of r.conflicts ?? []) {
+                        if (only && !only.has(toNFC(f))) continue;
+                        conflicts.push({
+                            path: f, worktree: other.path,
+                            branch: other.shortBranch ?? other.branch ?? null,
+                            synthetic: Boolean(r.synthetic?.has?.(f)),
+                        });
+                    }
+                } catch (err) {
+                    unknown.push({ worktree: other.path, why: err.message });
+                }
+            }
+            // 🚨 **相手が rebase / cherry-pick の途中なら、衝突が無くても触らせない。**
+            //    シーケンサの途中に別のエージェントが書くと、`git rebase --continue`
+            //    が意図しない内容を取り込む（乗っ取り）。ここを落とすと
+            //    「衝突なし」だけ見て通してしまうので、判定できない場合も unknown に積む。
+            const busy = [];
+            // 🚨 **自分の worktree のシーケンサも返す。** 乗っ取りが起きるのは
+            //    「rebase が止まっている worktree で編集を続ける」形なので、
+            //    他所との衝突より先にこれを見る必要がある。
+            let self = null;
+            let gitDirs = null;
+            try { gitDirs = await worktreeGitDirs(repo); }
+            catch (err) { unknown.push({ worktree: repo, why: `$GIT_DIR を引けません: ${err.message}` }); }
+            if (gitDirs) {
+                try {
+                    const seq = await sequencerState(me.path, gitDirs.get(me.path) ?? null);
+                    self = {
+                        rebasing: !!seq.rebasing, merging: !!seq.merging,
+                        cherryPicking: !!seq.cherryPicking, reverting: !!seq.reverting,
+                        bisecting: !!seq.bisecting, sequencing: !!seq.sequencing,
+                        warnings: seq.warnings ?? [],
+                    };
+                } catch (err) {
+                    unknown.push({ worktree: me.path, why: `sequencer: ${err.message}` });
+                }
+                for (const other of others) {
+                    try {
+                        const seq = await sequencerState(other.path, gitDirs.get(other.path) ?? null);
+                        const active = Boolean(seq.rebasing || seq.merging || seq.cherryPicking
+                            || seq.reverting || seq.bisecting || seq.sequencing);
+                        if (active) {
+                            busy.push({
+                                worktree: other.path, branch: other.shortBranch ?? other.branch ?? null,
+                                rebasing: !!seq.rebasing, merging: !!seq.merging,
+                                cherryPicking: !!seq.cherryPicking, reverting: !!seq.reverting,
+                                bisecting: !!seq.bisecting, sequencing: !!seq.sequencing,
+                            });
+                        }
+                    } catch (err) {
+                        unknown.push({ worktree: other.path, why: `sequencer: ${err.message}` });
+                    }
+                }
+            }
+            res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'no-store',
+            });
+            res.end(JSON.stringify({
+                worktree: me.path, branch: me.shortBranch ?? me.branch ?? null,
+                self, conflicts, busy, unknown,
+                // ⚠️ 呼ぶ側が「安全」と読んでよいのは decided が true のときだけ
+                decided: unknown.length === 0,
+            }));
+            return;
+        }
+
         if (url.pathname === '/api/v0/exec') {
             if (!await gateExec(req, res)) return;
             // 🚨 **終了処理が始まったら新しい実行を受けない**（9回目のレビュー / SERIOUS）。

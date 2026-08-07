@@ -29,6 +29,7 @@ import { createConnection } from 'node:net';
 // 🚨 Windows のコマンドラインを作る／読む規則は共有モジュールに集約している
 //    （純粋な関数なのでユニットテストで固定できる。scripts/winargs.test.mjs）
 import { repoOf, samePathish, parseProcPairs, descendantsOf } from './winargs.mjs';
+import { readSecretOf } from '../v0/readsecret.mjs';
 // 🚨 argv の組み立てと門は純関数に切り出してテストで固定している
 //    （scripts/serveargs.test.mjs。#45 まではここに検査が1件も無かった）
 import {
@@ -519,6 +520,34 @@ child.on('exit', code => process.exit(code ?? 0));
 for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => { try { child.kill(); } catch { /* noop */ } });
 }
+/**
+ * 🚨 **`token-read` に「実際に読み取りが通る値」を書く（#59）。**
+ *
+ * `--exec` のときは `--token-file` に**実行トークン**を渡すので、
+ * サーバが読み取りとして受け付けるのは**そこから派生した秘密**（案内 URL の
+ * `?token=` に載る値）だけで、`token-read` に残っていた古い生の値では**通らない**。
+ * 実測: フックが毎回 401 を受け、`ask` に倒れて初めて気付いた。
+ * 「読み取り用トークンはこのファイル」と書いてある以上、中身を事実に合わせる。
+ * ⚠️ 派生の式は `v0/readsecret.mjs` の1本（サーバもここを通る）。
+ */
+{
+    const i = args.indexOf('--token-file');
+    const tokenFile = i >= 0 ? args[i + 1] : null;
+    if (tokenFile) {
+        // サーバが生成する場合があるので、出るまで少し待つ（出なければ黙って諦める）
+        for (let n = 0; n < 40; n++) {
+            const raw = await readFile(tokenFile, 'utf8').catch(() => null);
+            const secret = readSecretOf(raw?.trim());
+            if (secret) {
+                await writeFile(join(STATE_DIR, 'token-read'), `${secret}\n`,
+                    { encoding: 'utf8', mode: 0o600 }).catch(() => {});
+                break;
+            }
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }
+}
+
 // 状態を書き残す（--status が PowerShell に頼らずに済む足がかり。今は参考情報）
 await writeFile(join(STATE_DIR, 'last.json'),
     `${JSON.stringify({ repo, repos, port, exec: wantExec, write: wantWrite, pid: child.pid }, null, 1)}\n`,

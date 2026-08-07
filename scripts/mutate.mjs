@@ -32,6 +32,76 @@ process.chdir(ROOT);
  *      そうしないと「置換が効いていない」と誤判定する（実際に踏んだ）。
  */
 const MUTANTS = [
+    {
+        name: 'read-secret-not-derived',
+        why: '案内 URL とフックに配る鍵を派生させない（read が RCE に昇格する）',
+        file: 'v0/readsecret.mjs',
+        from: '    return derive(token);',
+        to: '    return token;   /* 変異: 生トークンをそのまま配る */',
+        gone: '    return derive(token);',
+        pattern: '案内の URL の鍵では実行できない',
+    },
+    // -----------------------------------------------------------------
+    // 🚨 #59: 編集前の衝突ガード。守りは「調べられなかったを衝突なしと言わない」。
+    // -----------------------------------------------------------------
+    {
+        name: 'clash-daemon-down-allows',
+        why: 'デーモンに繋がらないとき黙って通す（見ていないのに「見た」と言う）',
+        file: 'v0/clashguard.mjs',
+        from: 'const UNREACHABLE = ASK;',
+        to: 'const UNREACHABLE = ALLOW;   /* 変異: 繋がらなくても通す */',
+        gone: 'const UNREACHABLE = ASK;',
+        pattern: 'デーモンに繋がらないとき allow にしない',
+        testFile: 'v0/clashguard.test.mjs',
+    },
+    {
+        name: 'clash-undecided-allows',
+        why: '一部を判定できなくても通す（unknown を無視する）',
+        file: 'v0/clashguard.mjs',
+        from: 'const UNDECIDED = ASK;',
+        to: 'const UNDECIDED = ALLOW;   /* 変異: 判定できなくても通す */',
+        gone: 'const UNDECIDED = ASK;',
+        pattern: '一部でも判定できなければ allow にしない',
+        testFile: 'v0/clashguard.test.mjs',
+    },
+    {
+        name: 'clash-ignores-stopped-sequencer',
+        why: 'rebase 停止中の worktree での編集を通す（シーケンサ乗っ取りの本体）',
+        file: 'v0/clashguard.mjs',
+        from: '    if (stopped) {',
+        to: '    if (false && stopped) {   /* 変異: 停止中でも通す */',
+        gone: '    if (stopped) {',
+        pattern: '自分がシーケンサ停止中なら拒否する',
+        testFile: 'v0/clashguard.test.mjs',
+    },
+    {
+        name: 'clash-ignores-conflicts',
+        why: '衝突が見つかっても通す（問い合わせの意味が消える）',
+        file: 'v0/clashguard.mjs',
+        from: '    if (hits.length) {',
+        to: '    if (false && hits.length) {   /* 変異: 衝突しても通す */',
+        gone: '    if (hits.length) {',
+        pattern: '触るパスが衝突していれば拒否',
+        testFile: 'v0/clashguard.test.mjs',
+    },
+    {
+        name: 'clash-hides-self-sequencer',
+        why: '自分の worktree のシーケンサ状態を返さない（フックが乗っ取りを見落とす）',
+        file: 'v0/server.mjs',
+        from: '                self, conflicts, busy, unknown,',
+        to: '                conflicts, busy, unknown,   /* 変異: self を返さない */',
+        gone: '                self, conflicts, busy, unknown,',
+        pattern: '自分がシーケンサ停止中なら self に出す',
+    },
+    {
+        name: 'clash-unknown-worktree-falls-back',
+        why: '知らない worktree を1本目にすり替える（別の worktree の判定を返す）',
+        file: 'v0/server.mjs',
+        from: '            const me = worktrees.find(w => samePath(w.path, wantPath));',
+        to: '            const me = worktrees.find(w => samePath(w.path, wantPath)) ?? worktrees[0];   /* 変異 */',
+        gone: '            const me = worktrees.find(w => samePath(w.path, wantPath));',
+        pattern: '知らない worktree に「衝突なし」と答えない',
+    },
     // -----------------------------------------------------------------
     // 🚨 #57: 閉じる／開く。守りは「覚える」「一覧に出す」「作り直さない」。
     // -----------------------------------------------------------------

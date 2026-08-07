@@ -122,6 +122,20 @@ HEAD は今: hijacked
 同様に `git checkout -b` は解決済み未コミットのマージの **`MERGE_HEAD` を無警告で削除**し、
 次の commit を単一親にします（マージの内容は残るが関係が消える）。
 
+### 見せるだけでなく、書く前に止める（#59）
+
+`POST /api/v0/clash`（**読み取り専用**）が、編集を始める前の問い合わせ口です。
+
+```
+{"worktree": "<絶対パス>", "paths": ["src/a.ts"]}
+  → {"self": {"rebasing": …}, "conflicts": [{"path","worktree","branch"}],
+     "busy": […], "unknown": […], "decided": true}
+```
+
+`decided` が `false` のときは**一部を判定できていない**ので、`conflicts` が空でも
+「衝突なし」とは読めません。Claude Code から使うフックは `scripts/clash.mjs`
+（手順は `docs/daily-use.md`）。
+
 ## 別端末（スマホ）から見る
 
 UI は縦に積む折り畳みパネルで、各セクションは畳んだままでも要約が読めます
