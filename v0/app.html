@@ -433,23 +433,47 @@ const hostEl = h => $('#' + h);
  *    切断後の猶予まで走り続ける。
  */
 function placePanes(host, ids) {
-  // スプリッタは状態を持たないので作り直してよい
-  for (const sp of [...host.querySelectorAll(':scope > .split')]) sp.remove();
   const rowward = host.classList.contains('row');
+  const want = ids.map(id => panes.get(id)?.p).filter(Boolean);
+  // 🚨 **既に望む順序なら DOM を1つも動かさない（#46）。**
+  //
+  //    `append` は既存の要素を**取り外して再挿入する**ので、その子孫の
+  //    `scrollTop` が 0 に戻る。端末は `overflow:auto` の中なので、
+  //    過去の出力を読んでいる最中に置き直しが走ると**先頭へ飛ぶ**
+  //    （実測: 21258 → 0）。さらに 0 に戻った直後の `scroll` イベントで
+  //    追従（`follow`）が切れ、**以降の出力を自動で追いかけなくなる**。
+  //    「ペインは作り直さない」という設計を、置き直しが部分的に壊していた。
+  const have = [...host.children].filter(n => n.classList.contains('pane'));
+  const sameOrder = have.length === want.length && have.every((n, i) => n === want[i]);
+  if (sameOrder) {
+    // スプリッタの本数だけ合わせる（ペインは触らない）
+    const splits = [...host.querySelectorAll(':scope > .split')];
+    const need = rowward ? Math.max(0, want.length - 1) : 0;
+    if (splits.length === need) return;
+    for (const sp of splits) sp.remove();
+    for (let i = 1; i < want.length && rowward; i++) {
+      const sp = el('div', 'split x');
+      host.insertBefore(sp, want[i]);
+      wireSplit(sp);
+    }
+    return;
+  }
+  // 並びが違うときだけ置き直す。スプリッタは状態を持たないので作り直してよい
+  for (const sp of [...host.querySelectorAll(':scope > .split')]) sp.remove();
   // ⚠️ 「他 N 本は表示していません」の告知はペインの**後ろ**に戻す。
   //    ペインだけを append すると先に居た告知が先頭に残り、
   //    ペインが1つも無いように読める（省略の告知が別の誤解を作る）。
   const trailing = [...host.children].filter(n => !n.classList.contains('pane'));
   let first = true;
-  for (const id of ids) {
-    const obj = panes.get(id);
-    if (!obj) continue;
+  for (const obj of want) {
     if (rowward && !first) {
       const sp = el('div', 'split x');
       host.append(sp);
       wireSplit(sp);
     }
-    host.append(obj.p);
+    // ⚠️ 既に正しい位置に居る要素は動かさない（動かすと scrollTop が飛ぶ）。
+    //    `append` は「末尾へ移動」なので、**末尾に居るなら何もしない**
+    if (host.lastElementChild !== obj || trailing.length) host.append(obj);
     first = false;
   }
   for (const n of trailing) host.append(n);

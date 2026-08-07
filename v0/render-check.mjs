@@ -501,6 +501,59 @@ const DUAL_CHECK = `(async () => {
  * （合成 pointerup では click が生成されないので、ブラウザと同じ順で自分で撃つ）。
  * ⚠️ ここはテンプレートリテラルの中。**バックティックを書かない。**
  */
+/**
+ * 🚨 **更新でスクロール位置を失わないこと（#46）。**
+ *
+ * 過去の出力を読んでいる最中に位置が先頭へ戻ると、**長い出力を読めない**
+ * （並列でエージェントを回して結果を追うためのツールなので致命的）。
+ * さらに `scrollTop` が 0 に戻ると `scroll` イベントで追従が切れ、
+ * 以降の出力が自動で追いかけられなくなる。
+ *
+ * ⚠️ **測る対象は「更新の経路」全部。** 手で押す更新（#refresh）と、
+ *    ペインの増減（applyLayout が走る経路）の両方で測る。
+ */
+const SCROLL_CHECK = `(async () => {
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const paneOf = () => [...document.querySelectorAll('[data-pane-id]')]
+    .find(e => e.dataset.paneId.startsWith('console-'));
+  const pane = paneOf();
+  if (!pane) return { error: 'コンソールのペインが無い' };
+  const sc = pane.querySelector('.term')?.parentElement;
+  if (!sc) return { error: '端末のスクロール要素が無い' };
+  if (sc.scrollHeight <= sc.clientHeight + 10) {
+    return { error: 'スクロールできる高さが無い（出力が足りない）: ' + sc.scrollHeight };
+  }
+  // 真ん中あたりまで戻して「過去を読んでいる」状態を作る
+  sc.scrollTop = Math.floor(sc.scrollHeight / 3);
+  await wait(200);
+  const before = sc.scrollTop;
+  // 1. 手で押す更新
+  const cardsWas = document.querySelector('.cards');
+  document.getElementById('refresh').click();
+  for (let i = 0; i < 100; i++) {
+    const now = document.querySelector('.cards');
+    if (now && now !== cardsWas) break;
+    await wait(100);
+  }
+  await wait(300);
+  const afterRefresh = sc.scrollTop;
+  // 2. ペインの増減（applyLayout が走る経路）。レイアウトを既定に戻すボタンで
+  //    置き直しを起こす（並べ替えの経路そのもの）
+  let afterLayout = afterRefresh;
+  const reset = document.getElementById('reset');
+  if (reset) {
+    sc.scrollTop = Math.floor(sc.scrollHeight / 3);
+    await wait(150);
+    reset.click();
+    await wait(400);
+    afterLayout = sc.scrollTop;
+  }
+  return {
+    before, afterRefresh, afterLayout,
+    height: sc.scrollHeight, view: sc.clientHeight,
+    sameEl: sc === (paneOf()?.querySelector('.term')?.parentElement),
+  };
+})()`;
 const DRAG_LIVE_CHECK = `(async () => {
   const wait = ms => new Promise(r => setTimeout(r, ms));
   const cin = [...document.querySelectorAll('.cmdbar input')].find(e =>
@@ -1111,6 +1164,8 @@ try {
 
     const probeValue = await evaluate(MEASURE);
     const probe = probeValue;
+    // 🚨 #46: 更新でスクロール位置が飛ばないこと（MEASURE の後 = 端末に十分な高さがある）
+    const scroll = await evaluate(SCROLL_CHECK);
     if (!probe) throw new Error('計測結果が取れない（評価が値を返さなかった）');
     if (probe.error) throw new Error(probe.error);
 
@@ -1294,6 +1349,22 @@ try {
         }
     }
     // 🚨 二重購読: 1ペイン1セッションの不変条件
+    // 🚨 #46: スクロール位置を失うと長い出力が読めない（追従も切れる）
+    if (!scroll || scroll.error) {
+        problems.push(`スクロール位置を測れなかった: ${scroll?.error ?? '結果が取れない'}`);
+    } else {
+        const keep = (name, got) => {
+            // 完全一致は求めない（更新で高さが変わる）。**先頭に飛んでいない**ことを見る
+            if (got >= scroll.before - 40) return;
+            problems.push(`${name} でスクロール位置が飛んだ（#46）: `
+                + `${scroll.before} → ${got}（高さ ${scroll.height} / 表示 ${scroll.view}）`);
+        };
+        keep('更新（#refresh）', scroll.afterRefresh);
+        keep('置き直し（レイアウト）', scroll.afterLayout);
+        if (!scroll.sameEl) {
+            problems.push('端末のスクロール要素が作り直された（追従も購読も切れる）');
+        }
+    }
     if (!dual || dual.error) {
         problems.push(`二重購読を測れなかった: ${dual?.error ?? '結果が取れない'}`);
     } else {

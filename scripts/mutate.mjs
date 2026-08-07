@@ -1869,6 +1869,19 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
     //    動いたポートでトンネルが切れることの告知。
     // -----------------------------------------------------------------
     {
+        // 🚨 #46: 置き直しが `append` で全ペインを動かしていたので、
+        //    過去の出力を読んでいる最中にスクロールが先頭へ飛んだ（実測 21258 → 0）。
+        //    さらに 0 に戻った直後の scroll で追従が切れ、以降を追いかけなくなる。
+        name: 'layout-keeps-scroll',
+        why: '置き直しで既に正しい位置のペインも動かす'
+            + '（scrollTop が 0 に戻り、長い出力が読めず追従も切れる）',
+        file: 'v0/app.html',
+        from: '  if (sameOrder) {',
+        to: '  if (false) {   /* 変異: 毎回置き直す */',
+        gone: '  if (sameOrder) {',
+        script: 'v0/render-check.mjs',
+    },
+    {
         name: 'other-daemons-note',
         why: '他に動いているデーモンを告げない'
             + '（--status を打つまで何本動いているか分からない。実行枠と監査が別々に増える）',
