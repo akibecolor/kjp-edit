@@ -1154,6 +1154,179 @@ test('🔒 401 は並列でも縛られる（比較の本数と記録の増分�
 });
 
 /**
+ * 🚨 **実行トークンの壁にも同じ3点セットが要る（9回目のレビュー / #48。SERIOUS）。**
+ *
+ * 7回目・8回目で塞いだのは**読み取りの壁（401）だけ**だった。実行・書き込みの壁
+ * （`gateMutation()` = 403）には遅延も記録も並列の門も無く、**痕跡ゼロで
+ * 総当たり**できた。実測（同じ機械・同じ手順、`--audit-log` を外に置いて計測）:
+ *   修正前: 並列 1200 本 = 479 ms / **403 が 1200 本**（= 2,505 回/秒 比較された）/ 監査 **0 B**
+ *   修正後: 並列 1200 本 = 869 ms / 403 が **6 本** / 429 が 1194 本 / 監査 682 B
+ *
+ * 🚨 **効く相手が「読み取りの鍵を持っている人」であることが重要。** 入口の
+ *    `authed()` は案内 URL に載る読み取り用の派生秘密でも通る。その値は
+ *    スマホのブックマークや履歴に残って広く出回るので、**read から exec への
+ *    昇格路**になっていた（capability の分界が壊れる）。
+ *    だからこの検査は「読み取り鍵の Cookie を持った相手」として撃つ。
+ */
+test('🔒 実行トークンの総当たりが縛られ、痕跡が残る（read から exec への昇格）', async () => {
+    const audit = join(repo, '..', `mut-brute-${Date.now()}.jsonl`);
+    const s = await startAuthServer(['--require-auth', '--allow-exec',
+        '--token', EXEC_TOKEN, '--audit-log', audit]);
+    // 案内 URL に載る読み取り専用の派生秘密（生トークンではない）
+    const readSecret = (s.banner().match(/\?token=([A-Za-z0-9_-]+)/) ?? [])[1];
+    const agent = new HttpAgent({ keepAlive: true, maxSockets: 320 });
+    const tryExec = token => new Promise(res => {
+        const body = JSON.stringify({ worktree: repo, argv: ['git', '--version'] });
+        const r = httpRequest({
+            host: '127.0.0.1', port: s.port, path: '/api/v0/exec', method: 'POST', agent,
+            headers: {
+                'content-type': 'application/json',
+                'content-length': Buffer.byteLength(body),
+                'x-kjp-token': token,
+                'sec-fetch-site': 'same-origin',
+                cookie: `kjp_auth=${readSecret}`,
+            },
+        }, x => {
+            let b = '';
+            x.on('data', d => { b += d; });
+            x.on('end', () => res({ code: x.statusCode, body: b }));
+        });
+        r.on('error', e => res({ code: 0, body: e.message }));
+        r.end(body);
+    });
+    try {
+        assert.ok(readSecret, `案内 URL の読み取り鍵が取れない: ${s.banner().slice(0, 300)}`);
+        // 前提: 読み取り鍵だけで入口は通る（= 昇格の起点が実在する）
+        const rd = await authGet(s.port, '/api/v0/state?fresh=1', { cookie: `kjp_auth=${readSecret}` });
+        assert.equal(rd.code, 200, `読み取り鍵で入口が通らない（前提が崩れている）: ${rd.code}`);
+
+        const N = 300;
+        const t0 = Date.now();
+        const rs = await Promise.all(Array.from({ length: N }, (_, i) => tryExec(`wrong-exec-${i}`)));
+        const ms = Date.now() - t0;
+        const by = {};
+        for (const r of rs) by[r.code] = (by[r.code] ?? 0) + 1;
+        const compared = by[403] ?? 0;
+        const shed = by[429] ?? 0;
+        assert.equal(compared + shed, N, `403/429 以外が返った: ${JSON.stringify(by)}`);
+        // 🔒 **比較された本数に上限がある**こと（門が無いと N 本すべて比較される）
+        assert.ok(compared <= 40,
+            `並列 ${N} 本のうち ${compared} 本が比較された`
+            + `（${ms}ms, ${(compared / (ms / 1000)).toFixed(1)} 回/秒）。修正前は全部が比較された`);
+        assert.ok(shed >= 100, `429 で切られた本数が少なすぎる: ${shed}`);
+
+        // 🔒 **痕跡が残る**こと（修正前は 0 B = 何も残らなかった）
+        await new Promise(r => setTimeout(r, 400));
+        const grew = await sizeOrZero(audit);
+        assert.ok(grew > 0, '実行トークンを外しても監査に1行も残らない（痕跡ゼロで総当たりできる）');
+        // 🔒 ただし増幅もしない（外からログを無制限に伸ばせない）
+        assert.ok(grew <= 8 * 1024, `監査ログが ${grew} B に伸びた（集約が効いていない）`);
+        const lines = (await readFile(audit, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const kinds = new Set(lines.map(r => r.event));
+        assert.ok(kinds.has('mutation-token-failed') || kinds.has('mutation-token-failed-summary'),
+            `実行トークンの失敗が記録されていない: ${JSON.stringify([...kinds])}`);
+        // 🔒 **候補の値を残さない**（記録がトークン辞書になってはいけない）
+        assert.equal(lines.some(r => JSON.stringify(r).includes('wrong-exec-')), false,
+            '試された値が記録に残っている');
+
+        // 🔒 正しい実行トークンは通る（縛った代わりに使えなくしていない）。
+        //    ⚠️ 攻撃直後の初回は 429 になりうる（まだ「通った値」として覚えられて
+        //       いないため。残る穴として docs に書いてある）。数回試して通ること。
+        let ok = 0;
+        for (let i = 0; i < 5 && ok === 0; i++) {
+            const r = await tryExec(EXEC_TOKEN);
+            if (r.code === 200) ok++;
+            else await new Promise(res => setTimeout(res, 300));
+        }
+        assert.equal(ok, 1, '総当たりの直後に正しい実行トークンが通らない');
+    } finally {
+        agent.destroy();
+        s.child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **実行の壁でも「縛った代わりに実行できなくなった」を作らない（#48）。**
+ *
+ * これが読み取り側より重い理由: 総当たりが続いている間に**走っているコマンドを
+ * 止められない**と、観測ツールとして最悪の状態になる（暴走している `claude` を
+ * スマホから止めに行けない）。だから持続攻撃の最中に測る。
+ *
+ * ⚠️ 上の「総当たりが縛られる」検査だけでは足りなかった: あれは攻撃が**終わった後**に
+ *    正規トークンを試すので、混雑の門が空いていて通ってしまう
+ *    （変異 `mutation-known-good-bypass` が SURVIVED した）。
+ */
+test('🔒 実行トークンの総当たり中でも、正しい鍵で実行と停止ができる', async () => {
+    const audit = join(repo, '..', `mut-sus-${Date.now()}.jsonl`);
+    const s = await startAuthServer(['--require-auth', '--allow-exec',
+        '--token', EXEC_TOKEN, '--audit-log', audit]);
+    const readSecret = (s.banner().match(/\?token=([A-Za-z0-9_-]+)/) ?? [])[1];
+    const PAR = 12;
+    const agent = new HttpAgent({ keepAlive: true, maxSockets: PAR + 4 });
+    const post = (token, path, bodyObj) => new Promise(res => {
+        const body = JSON.stringify(bodyObj);
+        const r = httpRequest({
+            host: '127.0.0.1', port: s.port, path, method: 'POST', agent,
+            headers: {
+                'content-type': 'application/json',
+                'content-length': Buffer.byteLength(body),
+                'x-kjp-token': token,
+                'sec-fetch-site': 'same-origin',
+                cookie: `kjp_auth=${readSecret}`,
+            },
+        }, x => {
+            let b = '';
+            x.on('data', d => { b += d; });
+            x.on('end', () => res({ code: x.statusCode, body: b }));
+        });
+        r.on('error', e => res({ code: 0, body: e.message }));
+        r.end(body);
+    });
+    const runOnce = token => post(token, '/api/v0/exec', { worktree: repo, argv: ['git', '--version'] });
+    try {
+        assert.ok(readSecret, '案内 URL の読み取り鍵が取れない');
+        // 実運用で言えば「スマホの画面に鍵を貼ってある」状態を作る
+        assert.equal((await runOnce(EXEC_TOKEN)).code, 200, '最初の1回が通らない');
+
+        const deadline = Date.now() + 2500;
+        let sent = 0;
+        const attack = {};
+        const worker = async () => {
+            while (Date.now() < deadline) {
+                const r = await runOnce(`wrong-sustained-exec-${sent++}`);
+                attack[r.code] = (attack[r.code] ?? 0) + 1;
+            }
+        };
+        const legit = [];
+        const legitLoop = async () => {
+            while (Date.now() < deadline) {
+                legit.push((await runOnce(EXEC_TOKEN)).code);
+                await new Promise(r => setTimeout(r, 300));
+            }
+        };
+        const t0 = Date.now();
+        await Promise.all([...Array.from({ length: PAR }, worker), legitLoop()]);
+        const ms = Date.now() - t0;
+
+        // 🔒 正しい鍵は**全部**通る（1本でも 429 なら締め出している）
+        assert.ok(legit.length >= 5, `正規の実行が少なすぎる: ${legit.length} 本`);
+        assert.ok(legit.every(c => c === 200),
+            `総当たりの最中に正しい鍵で実行できなかった: ${JSON.stringify(legit)}`);
+        // 当てる速さは縛られたまま
+        const compared = attack[403] ?? 0;
+        const rate = compared / (ms / 1000);
+        assert.ok(rate <= 20,
+            `総当たりが ${rate.toFixed(1)} 回/秒（要求 ${sent} 本）。`
+            + `修正前は 2,505 回/秒。${JSON.stringify(attack)}`);
+    } finally {
+        agent.destroy();
+        s.child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+/**
  * 🚨 **縛った代わりに正規の利用者を締め出していないこと。**
  *
  * トンネル越しでは peer が全部 127.0.0.1 なので、peer だけでは攻撃と

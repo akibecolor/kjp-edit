@@ -1660,11 +1660,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
     {
         name: 'auth-fail-delay',
         why: '連続失敗に遅延を掛けない（総当たりが 1500 req/s で通る。実測）',
-        file: 'v0/server.mjs',
-        from: "    if (!Number.isFinite(count) || count <= 3) return 0;\n"
-            + '    return Math.min(AUTH_FAIL_MAX_DELAY_MS, 2 ** (count - 3) * 50);',
+        file: 'v0/failtracker.mjs',
+        // 遅延の実装は module に移った（読み取りの壁と実行の壁で共有する）
+        from: "    if (!Number.isFinite(count) || count <= free) return 0;\n"
+            + '    return Math.min(maxMs, 2 ** (count - free) * baseMs);',
         to: '    return 0;   /* 変異: 遅延を掛けない */',
-        gone: '2 ** (count - 3) * 50',
+        gone: '2 ** (count - free) * baseMs',
         pattern: '認証失敗は記録され',
     },
     {
@@ -1673,9 +1674,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'preauth-inflight-gate',
         why: '認証前の同時本数を縛らない（並列度がそのまま当てる速さになる。実測 485 回/秒）',
         file: 'v0/server.mjs',
-        from: '        if (!trusted && !preAuthAcquire(peer)) {',
+        from: '        if (!trusted && !authGate.acquire(peer)) {',
         to: '        if (false) {   /* 変異: 並列を縛らない */',
-        gone: '!preAuthAcquire(peer)',
+        gone: '!authGate.acquire(peer)',
         pattern: '401 は並列でも縛られる',
     },
     {
@@ -1685,30 +1686,91 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（トンネル越しでは peer が全部 127.0.0.1 なので、'
             + '総当たりの間 正規の利用者が 429 で締め出される。実測 15 本中 0 本）',
         file: 'v0/server.mjs',
-        from: '        const trusted = knownGoodSecret(vals, now);',
+        from: '        const trusted = knownGoodSecret(vals);',
         to: '        const trusted = false;   /* 変異: 一度通った値も門に掛ける */',
-        gone: 'const trusted = knownGoodSecret(vals, now)',
+        gone: 'const trusted = knownGoodSecret(vals)',
         pattern: '総当たりが続いている間も正しい鍵は通り',
     },
     {
         name: 'auth-fail-aggregate',
         why: '401 を1本1行で追記する'
             + '（認証前の要求で .git の中のファイルを無制限に伸ばせる。実測 400 本で 61 KB）',
-        file: 'v0/server.mjs',
-        from: '    if (rec.logged < AUTH_FAIL_LOG_FIRST) {',
-        to: '    if (true) {   /* 変異: 常に個別行を書く */',
-        gone: 'rec.logged < AUTH_FAIL_LOG_FIRST',
+        file: 'v0/failtracker.mjs',
+        from: '            if (rec.logged < logFirst) {',
+        to: '            if (true) {   /* 変異: 常に個別行を書く */',
+        gone: 'rec.logged < logFirst',
         pattern: '認証失敗は記録され',
     },
     {
         name: 'auth-fail-summary-rate',
         why: '集約行を件数ごとに出す（429 は毎秒1万本以上撃てるので、'
             + '「50件ごとに1行」でも 7 秒で 503 KB 伸びた。実測）',
-        file: 'v0/server.mjs',
-        from: '    return rec.reported === 0 || now - rec.reportedAt >= AUTH_FAIL_SUMMARY_MS;',
-        to: '    return true;   /* 変異: 毎回集約行を出す */',
-        gone: 'now - rec.reportedAt >= AUTH_FAIL_SUMMARY_MS',
+        file: 'v0/failtracker.mjs',
+        from: '        return rec.reported === 0 || t - rec.reportedAt >= summaryMs;',
+        to: '        return true;   /* 変異: 毎回集約行を出す */',
+        gone: 't - rec.reportedAt >= summaryMs',
         pattern: '総当たりが続いている間も正しい鍵は通り',
+    },
+    // ---------------------------------------------------------------------
+    // 🚨 9回目のレビュー / #48: 実行・書き込みトークンの壁には3点セットが無かった。
+    //    読み取り側（401）と**同じ数の変異を置く**（片方だけ測る状態を作らない）。
+    // ---------------------------------------------------------------------
+    {
+        name: 'mutation-fail-record',
+        why: '実行・書き込みトークンの失敗を記録も遅延もしない'
+            + '（読み取り鍵を持つ相手が痕跡ゼロで総当たりできる。実測 2,505 回/秒・監査 0 B）',
+        file: 'v0/server.mjs',
+        from: '        else await mutationFails.note(peer, { ...originHint(req), path: pathOf(req) });',
+        to: '        /* 変異: 実行の失敗を記録も遅延もしない */',
+        gone: 'await mutationFails.note(peer',
+        pattern: '実行トークンの総当たり',
+    },
+    {
+        name: 'mutation-inflight-gate',
+        why: '実行トークンの比較の同時本数を縛らない（並列度がそのまま当てる速さになる）',
+        // 🚨 **順序（門が比較の手前にあること）もこれで測れている。**
+        //    門を比較の後ろに置くと 403 が門より先に返るので、門は誰も止めない =
+        //    **「門が無い」と観測上まったく同じ**になる。だから順序専用の変異は置かない
+        //    （置いてみたが `DEFENSIVE` にしかならず、測れない守りを飾るだけだった）。
+        file: 'v0/server.mjs',
+        from: '    if (!trusted && !mutationGate.acquire(peer)) {',
+        to: '    if (false) {   /* 変異: 並列を縛らない */',
+        gone: '!mutationGate.acquire(peer)',
+        pattern: '実行トークンの総当たり',
+    },
+    {
+        name: 'mutation-known-good-bypass',
+        why: '1度通った実行トークンも混雑の門に掛ける'
+            + '（総当たりの間、正規の端末が実行できなくなる = 暴走を止めに行けない）',
+        file: 'v0/server.mjs',
+        from: '    const trusted = goodTokens.has(vals);',
+        to: '    const trusted = false;   /* 変異: 一度通った値も門に掛ける */',
+        gone: 'const trusted = goodTokens.has(vals)',
+        // ⚠️ **攻撃が終わった後**に試す検査では測れない（門が空いているので通る）。
+        //    持続攻撃の最中を測る検査に当てる（最初はこれを間違えて SURVIVED した）。
+        pattern: '総当たり中でも',
+    },
+    {
+        // 🚨 **読み取り側の控えを使い回すと直した意味が消える。**
+        //    `goodSecrets` は読み取り用の派生秘密でも真になるので、
+        //    その鍵を持つ相手が混雑の門を素通りして総当たりを続けられる。
+        name: 'mutation-reuses-read-goodset',
+        why: '実行の門で読み取り側の控えを使う'
+            + '（案内 URL に載る読み取り鍵を持つ相手が門を素通りする）',
+        file: 'v0/server.mjs',
+        from: '    const trusted = goodTokens.has(vals);',
+        to: '    const trusted = goodSecrets.has(vals);   /* 変異: 読み取りの控えを使う */',
+        gone: 'goodTokens.has(vals)',
+        // ⚠️ **実測: この変異は SURVIVED する。攻略できないから。**
+        //    門に渡す値は `x-kjp-token` ヘッダの1本だけで、**推測値そのもの**。
+        //    読み取り鍵をヘッダに入れれば門は素通りできるが、その回は推測を
+        //    載せられない（比較されるのも同じヘッダ）。つまり「門を抜けつつ当てる」
+        //    が同時に成立しない。控えを分けているのは、将来 Cookie 由来の値を
+        //    渡す形に変えたときに読み取り鍵が門を抜けるのを防ぐ**第二の砦**。
+        defensive: '門に渡すのはヘッダ1本（= 推測値そのもの）なので、'
+            + '読み取り鍵で門を抜けても同じ回に推測を載せられない = 到達不能。'
+            + 'Cookie 由来の値を渡す形に変えた瞬間に効く第二の砦として残す',
+        pattern: '実行トークンの総当たり',
     },
     {
         name: 'audit-rotate',
@@ -2183,9 +2245,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（出力はコマンドの結果なので、read だけの相手に渡ると分界が崩れる）',
         file: 'v0/server.mjs',
         from: "        if (url.pathname === '/api/v0/exec/list') {\n"
-            + '            if (!requireExec(req, res)) return;',
+            + '            if (!await gateExec(req, res)) return;',
         to: "        if (url.pathname === '/api/v0/exec/list') {",
-        gone: "'/api/v0/exec/list') {\n            if (!requireExec",
+        gone: "'/api/v0/exec/list') {\n            if (!await gateExec",
         pattern: '全セッションの状態と最後の出力',
     },
     {
@@ -2836,7 +2898,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '編集経路の認可を外す（トークン無し・GET・別サイト起点で作業ツリーに書ける）',
         file: 'v0/server.mjs',
         // ⚠️ merge / checkout にも同じ呼び出しがあるので、末尾のコメントで一意にする
-        from: '            if (!requireMutation(req, res)) return;   // ← 門1: 認可\n',
+        from: '            if (!await gateMutation(req, res)) return;   // ← 門1: 認可\n',
         to: '',
         gone: '// ← 門1: 認可',
         pattern: 'write: 関門',
@@ -2848,11 +2910,11 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         // 🚨 順序そのものが守り。`--allow-exec` の門が自動生成より後ろにあって
         //    消えていたのと同じ型なので、**順序を変異で測る**。
         file: 'v0/server.mjs',
-        from: '            if (!requireMutation(req, res)) return;   // ← 門1: 認可\n',
+        from: '            if (!await gateMutation(req, res)) return;   // ← 門1: 認可\n',
         to: '',
         also: [{
             from: '            if (!t) return;                          // ← 応答は関門が書いている',
-            to: '            if (!t) return;\n            if (!requireMutation(req, res)) return;',
+            to: '            if (!t) return;\n            if (!await gateMutation(req, res)) return;',
         }],
         gone: '// ← 門1: 認可',
         pattern: 'write: 門の順序',

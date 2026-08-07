@@ -37,6 +37,7 @@ import { planMerge } from './mergeplan.mjs';
 import { collectAgents, transcriptRoot, maskSecrets } from './transcript.mjs';
 import { ExecRegistry, isSessionId } from './execsession.mjs';
 import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
+import { makeFailTracker, makeInflightGate, makeGoodSet, failDelay } from './failtracker.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -1127,51 +1128,30 @@ function tokenMatches(given) {
  * ⚠️ 遅延は**指数**にするが上限を付ける（無限に伸ばすとイベントループに
  *    タイマーが溜まり、正規の利用者も締め出す）。
  */
-const authFails = new Map();   // peer -> { count, firstAt, logged, shed, reported, reportedAt }
+// ⚠️ 実装は `v0/failtracker.mjs` に1つだけ置く（読み取りの壁と実行の壁で共有）。
+//    窓 5 分 / 個別行は先頭3本 / 集約は 10 秒に1行 / 遅延は 3 回まで無料で最大 2 秒。
 const AUTH_FAIL_WINDOW_MS = 5 * 60 * 1000;
-const AUTH_FAIL_MAX_DELAY_MS = 2000;
 
 /**
  * 🚨 **遅延だけではレートを縛れない（8回目のレビュー。SERIOUS）。**
  *
  * 遅延は「1本ずつを遅くする」だけで、**同じ相手が同時に何本投げられるか**を
  * 制限しない。だから総当たりの速さは遅延ではなく**攻撃側の並列度**で決まる。
- * 実測（このリポジトリ、`--require-auth --token <40字>`、node:http で同一 peer）:
+ * 実測（`--require-auth --token <40字>`、node:http で同一 peer）:
  *   直列 8 本   : 1,556 ms（= 遅延は効いている。7回目のテストが見ていたのはこれだけ）
- *   並列 300 本 : 2,142 ms / 全部 401 / **140 回/秒** / 監査 +46,092 B
- *   並列 1200 本: 2,474 ms / 全部 401 / **485 回/秒** / 監査 +184,893 B
- * 7回目の「痕跡ゼロの総当たりを塞いだ」という主張は、**測っていない軸で崩れていた。**
+ *   並列 300 本 : 2,142 ms / 全部 401 / **140 回/秒**
+ *   並列 1200 本: 2,474 ms / 全部 401 / **485 回/秒**
  *
- * だから縛るのは**比較そのものの同時本数**にする。
- *
- * ⚠️ **門は比較の手前に置く。** 401 を返した後で絞っても、外した相手には
- *    「外れた」が即座に伝わるので当てる速さは並列度で決まったままになる
- *    （429 を返すのが比較の後だと、429 は「その値は違った」の同義語になる）。
- * ⚠️ **枠を握るのは失敗した要求だけ**になる。`authed()` は同期なので、
- *    通る要求は await を1つも挟まずに枠を返す（正規の利用者は 429 を踏まない）。
- *    枠を長く握るのは指数遅延の中に居る失敗だけ = 上限は
- *    PREAUTH_MAX_INFLIGHT / AUTH_FAIL_MAX_DELAY_MS ≒ **1 回/秒**。
  * ⚠️ **トレードオフを隠さない:** トンネル越しでは peer が全部 127.0.0.1 なので
  *    攻撃と正規の利用者を区別できない。総当たりが続いている間は正規の要求も
  *    429（Retry-After）になりうる。**唯一の壁がトークンである**以上、
  *    「当てる速さを縛る」を「無中断で応答する」より優先する。
  */
 const PREAUTH_MAX_INFLIGHT = 2;
-/** 窓の中で 401 を個別に記録する本数。これを超えたら集約行にまとめる */
-const AUTH_FAIL_LOG_FIRST = 3;
-/**
- * 集約行を挟む最短間隔（活動中は少なくともこの間隔で件数を残す）。
- *
- * ⚠️ **「N 件ごとに1行」にしてはいけない。** 429 は 1 秒間に1万本以上撃てるので
- *    （実測: 並列50で 18,000 req/s）、50件ごとに1行でも **7秒で 503 KB** 伸びた。
- *    追記の本数は要求数から切り離し、**時間**で縛る（1 peer あたり 10 秒に1行）。
- */
-const AUTH_FAIL_SUMMARY_MS = 10 * 1000;
 
 /** 連続失敗から遅延（ms）を決める。純関数なのでテストで固定できる */
 export function authFailDelay(count) {
-    if (!Number.isFinite(count) || count <= 3) return 0;
-    return Math.min(AUTH_FAIL_MAX_DELAY_MS, 2 ** (count - 3) * 50);
+    return failDelay(count);
 }
 
 function peerKey(req) {
@@ -1179,22 +1159,42 @@ function peerKey(req) {
 }
 
 /**
- * 🔒 認証前の要求を同時に何本処理しているか（peer ごと）。
- *
- * 取れなければ **比較せずに** 429 で切る。
+ * 🔒 読み取りの壁（`authed()` = 401）の3点セット。
  */
-const preAuthInFlight = new Map();   // peer -> 本数
-function preAuthAcquire(peer) {
-    const n = preAuthInFlight.get(peer) ?? 0;
-    if (n >= PREAUTH_MAX_INFLIGHT) return false;
-    preAuthInFlight.set(peer, n + 1);
-    return true;
-}
-function preAuthRelease(peer) {
-    const n = (preAuthInFlight.get(peer) ?? 1) - 1;
-    if (n > 0) preAuthInFlight.set(peer, n);
-    else preAuthInFlight.delete(peer);
-}
+const authGate = makeInflightGate(PREAUTH_MAX_INFLIGHT);
+const authFails = makeFailTracker({
+    audit: rec => auditExec(rec),
+    event: 'auth-failed', summaryEvent: 'auth-failed-summary',
+    windowMs: AUTH_FAIL_WINDOW_MS,
+});
+
+/**
+ * 🔒 **実行・書き込みの壁（`gateMutation()` = 403）の3点セット（#48）。**
+ *
+ * 🚨 **読み取りの壁と共有してはいけない。** 別の capability の壁なので、
+ *    数と遅延を混ぜると「読み取りの失敗で実行が絞られる」「その逆」が起きる。
+ * 🚨 **なぜ要るか（実測 8,955 req/s）。** 入口の `authed()` は**読み取り用の
+ *    派生秘密**でも通る。その秘密は案内の URL に載り、スマホのブックマークや
+ *    履歴に残る = 広く出回る。だから「読み取りの鍵を持っている相手」が
+ *    実行トークンを**絞りも記録も無しに**総当たりできる状態だった
+ *    （read から exec への昇格路。7回目に読み取り側だけ塞いだのが取り残し）。
+ */
+const MUTATION_MAX_INFLIGHT = 2;
+const mutationGate = makeInflightGate(MUTATION_MAX_INFLIGHT);
+const mutationFails = makeFailTracker({
+    audit: rec => auditExec(rec),
+    event: 'mutation-token-failed', summaryEvent: 'mutation-token-failed-summary',
+    windowMs: AUTH_FAIL_WINDOW_MS,
+});
+/**
+ * 🔒 **実行トークンを1度でも通した値の控え。**
+ *
+ * 🚨 **読み取り側の控え（`goodSecrets`）を使い回してはいけない。** あれは
+ *    読み取り用の派生秘密でも真になるので、読み取りの鍵を持つ相手が
+ *    混雑の門を素通りして総当たりを続けられる（= 直した意味が消える）。
+ *    ここに入るのは**実行トークンに合った値だけ**。
+ */
+const goodTokens = makeGoodSet({});
 
 /**
  * 🚨 **一度通った資格情報は門の外に置く（正規の利用者を締め出さないため）。**
@@ -1207,14 +1207,10 @@ function preAuthRelease(peer) {
  *
  * ⚠️ **これは認可の代わりではない。** 素通りするのは**混雑の門だけ**で、
  *    `authed()` は必ず通る（つまり値が本当に合っていなければ 401 になる）。
- * ⚠️ 総当たり側がここに入る道は無い（**成功した後にしか登録されない**）。
- *    覚えるのはハッシュだけ・件数と TTL で上限を付ける。
  * ⚠️ 残る穴を隠さない: **攻撃が始まった後の「初回」の認証**は 429 になりうる
  *    （まだ1度も通っていない端末は覚えられていない）。再試行が要る。
  */
-const goodSecrets = new Map();   // sha256(hex) -> 最後に通った時刻
-const GOOD_SECRET_TTL_MS = 60 * 60 * 1000;
-const GOOD_SECRET_MAX = 64;
+const goodSecrets = makeGoodSet({});
 
 function presentedSecrets(req, url) {
     const vals = [];
@@ -1226,121 +1222,25 @@ function presentedSecrets(req, url) {
     return vals;
 }
 
-const secretHash = v => createHash('sha256').update(v, 'utf8').digest('hex');
-
-function knownGoodSecret(vals, now) {
-    for (const v of vals) {
-        const at = goodSecrets.get(secretHash(v));
-        if (at !== undefined && now - at < GOOD_SECRET_TTL_MS) {
-            goodSecrets.set(secretHash(v), now);
-            return true;
-        }
-    }
-    return false;
+function knownGoodSecret(vals) {
+    return goodSecrets.has(vals);
 }
 
-function rememberGoodSecret(vals, now) {
+function rememberGoodSecret(vals) {
     // ⚠️ **通った要求が提示した値を全部覚えてはいけない。** 偽の Cookie を
     //    正しいトークンと一緒に送るだけで、その偽の値が門を素通りする鍵になる
     //    （#43 と同じ「合っていない本数は理由にならない」型）。**合った値だけ**覚える。
-    for (const v of vals) {
-        if (!tokenMatches(v) && !secretMatches(v, cookieSecret())) continue;
-        goodSecrets.set(secretHash(v), now);
-    }
-    if (goodSecrets.size > GOOD_SECRET_MAX) {
-        for (const [k, at] of goodSecrets) {
-            if (goodSecrets.size <= GOOD_SECRET_MAX) break;
-            if (now - at >= GOOD_SECRET_TTL_MS) goodSecrets.delete(k);
-        }
-        // それでも溢れるなら古い順に落とす（Map は挿入順）
-        for (const k of goodSecrets.keys()) {
-            if (goodSecrets.size <= GOOD_SECRET_MAX) break;
-            goodSecrets.delete(k);
-        }
-    }
-}
-
-/** 窓の中の記録を取り出す（窓が変わっていたら前の窓を締めてから作り直す） */
-function authFailRecord(peer, now) {
-    const cur = authFails.get(peer);
-    if (cur && now - cur.firstAt < AUTH_FAIL_WINDOW_MS) return cur;
-    if (cur) flushAuthFailSummary(peer, cur, 'window-rolled').catch(() => {});
-    const rec = { count: 0, firstAt: now, logged: 0, shed: 0, reported: 0, reportedAt: 0 };
-    authFails.set(peer, rec);
-    // 台帳が無限に増えないよう古いものを落とす
-    if (authFails.size > 256) {
-        for (const [k, v] of authFails) {
-            if (k !== peer && now - v.firstAt >= AUTH_FAIL_WINDOW_MS) authFails.delete(k);
-        }
-    }
-    return rec;
-}
-
-/**
- * 🚨 **記録を捨てるなら「捨てた」と分かる形にする。**
- *
- * 認証前の要求は誰でも撃てるので、1本1行で追記していると
- * **外から `.git` の中のファイルを無制限に伸ばせる**（実測: 400本で 61 KB。
- * 既定の置き場所は `<GIT_DIR>/kjp-exec-audit.jsonl` で、実行の監査記録と
- * 同じファイルなので埋められると本来の記録が読めなくなる）。
- * だから個別行は窓の先頭 AUTH_FAIL_LOG_FIRST 本だけにして、
- * **残りは件数だけの集約行**にする。黙って落とさない。
- */
-async function flushAuthFailSummary(peer, rec, why) {
-    const dropped = (rec.count - rec.logged) + rec.shed;
-    if (dropped <= rec.reported) return;
-    rec.reported = dropped;
-    rec.reportedAt = Date.now();
-    await auditExec({
-        event: 'auth-failed-summary', peer, why,
-        // 比較して外れた本数（401）と、比較せずに切った本数（429）を分けて残す
-        attempts: rec.count, logged: rec.logged,
-        suppressed: rec.count - rec.logged, shed: rec.shed,
-        windowStartedAt: new Date(rec.firstAt).toISOString(),
-    }).catch(() => { /* 監査に書けなくても応答は返す */ });
-}
-
-/** 集約行を出す条件（最初の1件と、そこから一定時間ごと） */
-function authFailSummaryDue(rec, now) {
-    const dropped = (rec.count - rec.logged) + rec.shed;
-    if (dropped <= rec.reported) return false;
-    return rec.reported === 0 || now - rec.reportedAt >= AUTH_FAIL_SUMMARY_MS;
-}
-
-/** 比較せずに切った（429）ことを数える。**ここでは追記しない**（増幅を断つため） */
-function noteAuthShed(peer) {
-    const now = Date.now();
-    const rec = authFailRecord(peer, now);
-    rec.shed++;
-    if (authFailSummaryDue(rec, now)) {
-        flushAuthFailSummary(peer, rec, 'shed').catch(() => {});
-    }
-    return rec;
+    goodSecrets.remember(vals.filter(v => tokenMatches(v) || secretMatches(v, cookieSecret())));
 }
 
 async function noteAuthFail(req, url) {
-    const peer = peerKey(req);
-    const now = Date.now();
-    const rec = authFailRecord(peer, now);
-    rec.count++;
-    // 🔒 **本文は残さない。** 誰が何回外したかだけ
-    if (rec.logged < AUTH_FAIL_LOG_FIRST) {
-        rec.logged++;
-        await auditExec({
-            event: 'auth-failed', ...originHint(req),
-            path: url.pathname, count: rec.count,
-        }).catch(() => { /* 監査に書けなくても応答は返す */ });
-    } else if (authFailSummaryDue(rec, now)) {
-        await flushAuthFailSummary(peer, rec, 'threshold');
-    }
-    const delay = authFailDelay(rec.count);
-    if (delay > 0) await new Promise(r => setTimeout(r, delay));
-    return rec.count;
+    return authFails.note(peerKey(req), { ...originHint(req), path: url.pathname });
 }
-/**
- * その要求が認証済みか。`--require-auth` が無いときは常に true
- * （ループバック限定の従来の使い方を壊さないため）。
- */
+
+function noteAuthShed(peer) {
+    return authFails.shed(peer);
+}
+
 /**
  * 🔒 その要求が**トークン本体**を提示しているか（Cookie では真にならない）。
  *
@@ -1362,8 +1262,6 @@ function presentedToken(req, url) {
  * ブックマーク（= クラウド同期）に残り、クエリを記録する中継にも残る。
  * ページ側の `history.replaceState` はカレントの履歴エントリを差し替えるだけで、
  * それらは消せない。
- * 6回目に token-read / token-write / token-exec を分けたが、分界は**デーモン間**
- * にしか効いておらず、実際に使う `--exec` 1本の中では read と exec が同じ値だった。
  */
 function presentedReadSecret(req, url) {
     const s = cookieSecret();
@@ -1371,7 +1269,6 @@ function presentedReadSecret(req, url) {
     return secretMatches(req.headers[TOKEN_HEADER], s)
         || secretMatches(url.searchParams.get('token'), s);
 }
-
 function authed(req, url) {
     if (!opts.requireAuth) return true;
     // 🚨 Cookie は**読み取り用の別の秘密**とだけ照合する。
@@ -1398,7 +1295,7 @@ function authed(req, url) {
  *      ⚠️ これが CSRF 対策の本体。フォーム POST は preflight されないので、
  *      カスタムヘッダを必須にしないと素通りする）
  */
-function requireMutation(req, res) {
+async function gateMutation(req, res) {
     if (!opts.allowWrite) {
         denyJson(res, 403, '書き込みは無効です。--allow-write を付けて起動してください');
         return false;
@@ -1412,11 +1309,48 @@ function requireMutation(req, res) {
         denyJson(res, 403, `別サイト起点の書き込みは拒否します (Sec-Fetch-Site: ${site})`);
         return false;
     }
-    if (!tokenMatches(req.headers[TOKEN_HEADER])) {
+    // 🚨 **ここから下がトークンの壁（#48）。比較の手前に混雑の門を置く。**
+    //    ⚠️ 順序が守りの本体。比較の後ろに置くと 429 が「その値は違った」の
+    //       同義語になり、当てる速さは並列度で決まったままになる。
+    const peer = peerKey(req);
+    const given = req.headers[TOKEN_HEADER];
+    const vals = typeof given === 'string' ? [given] : [];
+    // 🔒 1度でも実行トークンを通した値は混雑の門を素通りさせる
+    //    （素通りするのは門だけ。比較は必ず通るので、合っていなければ 403）。
+    const trusted = goodTokens.has(vals);
+    if (!trusted && !mutationGate.acquire(peer)) {
+        mutationFails.shed(peer);
+        res.writeHead(429, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+            'retry-after': '1',
+        });
+        res.end(JSON.stringify({
+            error: '認証前の要求が同時に多すぎます。少し待ってから試してください',
+        }));
+        return false;
+    }
+    let ok;
+    try {
+        ok = tokenMatches(given);
+        if (ok) goodTokens.remember(vals);
+        // 🚨 **外したら記録して遅延する。** ここが無いと痕跡ゼロで総当たりできた
+        //    （実測 8,955 req/s。読み取り側だけ塞いで実行側が取り残しだった）。
+        //    ⚠️ 遅延の間も枠を握る。これが「並列でも縛れる」の本体。
+        else await mutationFails.note(peer, { ...originHint(req), path: pathOf(req) });
+    } finally {
+        if (!trusted) mutationGate.release(peer);
+    }
+    if (!ok) {
         denyJson(res, 403, `${TOKEN_HEADER} が一致しません`);
         return false;
     }
     return true;
+}
+
+/** 記録に残す経路名。**トークンの候補は残さない**（本文もクエリも入れない） */
+function pathOf(req) {
+    try { return new URL(req.url, 'http://localhost').pathname; } catch { return null; }
 }
 
 /**
@@ -1428,12 +1362,12 @@ function requireMutation(req, res) {
  *    `git -c alias.x='!sh -c ...' x` から任意コードが動くので、
  *    ゆるい allowlist は気休めにしかならない。**扉を守る方に賭ける。**
  */
-function requireExec(req, res) {
+async function gateExec(req, res) {
     if (!opts.allowExec) {
         denyJson(res, 403, '実行は無効です。--allow-exec を付けて起動してください');
         return false;
     }
-    return requireMutation(req, res);
+    return gateMutation(req, res);
 }
 
 /**
@@ -2127,12 +2061,11 @@ async function handleRequest(req, res) {
     //       同義語になり、当てる速さは並列度で決まったままになる。
     if (opts.requireAuth) {
         const peer = peerKey(req);
-        const now = Date.now();
         // 🔒 一度通った値そのものを提示している要求は、混雑の門を通さない
         //    （素通りするのは門だけ。authed() は必ず通る）。
         const vals = presentedSecrets(req, url);
-        const trusted = knownGoodSecret(vals, now);
-        if (!trusted && !preAuthAcquire(peer)) {
+        const trusted = knownGoodSecret(vals);
+        if (!trusted && !authGate.acquire(peer)) {
             noteAuthShed(peer);
             res.writeHead(429, {
                 'content-type': 'text/plain; charset=utf-8',
@@ -2146,13 +2079,13 @@ async function handleRequest(req, res) {
         let pass;
         try {
             pass = authed(req, url);
-            if (pass) rememberGoodSecret(vals, now);
+            if (pass) rememberGoodSecret(vals);
             // 🚨 **失敗を記録して、連続失敗には遅延を掛ける。** ここが無いと
             //    痕跡ゼロで総当たりできる（実測で29回目に通った）。
             //    ⚠️ 遅延の間も枠を握る。これが「並列でも縛れる」の本体。
             else await noteAuthFail(req, url);
         } finally {
-            if (!trusted) preAuthRelease(peer);
+            if (!trusted) authGate.release(peer);
         }
         if (!pass) {
             // ⚠️ 「トークンが違う」と「トークンが無い」を区別して返さない
@@ -2307,7 +2240,7 @@ async function handleRequest(req, res) {
         //    エージェントを遠隔から動かすのに PTY は要らない。
         //    対話 TUI をそのまま覗きたくなった時点で PTY を検討する。
         if (url.pathname === '/api/v0/exec') {
-            if (!requireExec(req, res)) return;
+            if (!await gateExec(req, res)) return;
             // 🚨 **終了処理が始まったら新しい実行を受けない**（9回目のレビュー / SERIOUS）。
             //    門が無かったので、終了処理の掃き取りと `POST /api/v0/exec` が競争し、
             //    **掃いた後に spawn される**（`create()` から `spawn()` までは実測 36〜43ms）。
@@ -2557,7 +2490,7 @@ async function handleRequest(req, res) {
          * 🚨 秘密は argv と出力の両方でマスクする（打った値が残りうる）。
          */
         if (url.pathname === '/api/v0/exec/list') {
-            if (!requireExec(req, res)) return;
+            if (!await gateExec(req, res)) return;
             const now = Date.now();
             const secrets = secretsForMasking();
             const sessions = execRegistry.sessionsForMonitor(now).map(x => {
@@ -2593,7 +2526,7 @@ async function handleRequest(req, res) {
             const m = /^\/api\/v0\/exec\/([^/]+)\/(stream|kill|input)$/.exec(url.pathname);
             if (m) {
                 // 🔒 実行と同じ関門を通す（GET にしない。POST + トークン + 同一オリジン）
-                if (!requireExec(req, res)) return;
+                if (!await gateExec(req, res)) return;
                 if (!isSessionId(m[1])) { denyJson(res, 400, 'セッション id が不正です'); return; }
                 const s = execRegistry.get(m[1]);
                 if (!s) { denyJson(res, 404, 'そのセッションはありません（保持期間を過ぎたか、id が違います）'); return; }
@@ -2759,7 +2692,7 @@ async function handleRequest(req, res) {
          *    それ以外は端末でやる、という線を引いている。
          */
         if (url.pathname === '/api/v0/merge') {
-            if (!requireMutation(req, res)) return;
+            if (!await gateMutation(req, res)) return;
             let body;
             try {
                 body = await readJson(req);
@@ -2973,7 +2906,7 @@ async function handleRequest(req, res) {
             return;
         }
         if (url.pathname === '/api/v0/checkout') {
-            if (!requireMutation(req, res)) return;
+            if (!await gateMutation(req, res)) return;
             let body;
             try {
                 body = await readJson(req);
@@ -3083,7 +3016,7 @@ async function handleRequest(req, res) {
          *   `POST /api/v0/file`  … 編集のために作業ツリーの中身を読む
          *   `POST /api/v0/write` … 作業ツリーに書く
          *
-         * なぜ2つとも POST か: どちらも `requireMutation()`（`--allow-write` /
+         * なぜ2つとも POST か: どちらも `gateMutation()`（`--allow-write` /
          * POST / same-origin / `X-Kjp-Token`）を通す。読む側も **write の
          * capability の中**に置くのが分界の要点で、読み取り専用のデーモンからは
          * 経路そのものが存在しない（`fs` で作業ツリーを読むのはここだけ）。
@@ -3107,7 +3040,7 @@ async function handleRequest(req, res) {
             //    (b) 未認可の相手に大きな本文を送らせることになる
             //    ので、**フォールバックや解析より前**に置く。順序は変異で測っている
             //    （`write-gate-order`）。
-            if (!requireMutation(req, res)) return;   // ← 門1: 認可
+            if (!await gateMutation(req, res)) return;   // ← 門1: 認可
             let body;
             try {
                 body = await readJson(req, forWrite ? MAX_WRITE_BODY_BYTES : 64 * 1024);
@@ -3664,9 +3597,8 @@ async function shutdown(reason, exitCode = 0) {
         jobs.push(killTree(s.child).then(r => ({ s, r }), () => ({ s, r: null })));
     }
     // ⚠️ 集約待ちの認証失敗を落とさない（「何本外されたか」を残して終わる）
-    for (const [peer, rec] of authFails) {
-        flushAuthFailSummary(peer, rec, 'shutdown').catch(() => {});
-    }
+    authFails.flushAll('shutdown').catch(() => {});
+    mutationFails.flushAll('shutdown').catch(() => {});
     // 🚨 **数え直しの結果を待って、残ったものを告げる。** 以前は `catch(() => {})` で
     //    投げっぱなしにして 800ms 後に `process.exit(0)` していたので、
     //    「止まったか」を一度も見ずに終わっていた。

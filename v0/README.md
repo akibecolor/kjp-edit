@@ -244,7 +244,7 @@ rebase / マージ未コミット / cherry-pick / revert / bisect の進行中�
 git はこれを exit 0 で通しますが、続きの `rebase --continue` は
 **別のブランチにリプレイ**し、`MERGE_HEAD` は無警告で消えます。
 
-副作用のある操作は `requireMutation()` を必ず通ります
+副作用のある操作は `gateMutation()` を必ず通ります
 （`--allow-write` / POST / `Sec-Fetch-Site: same-origin` / `X-Kjp-Token`）。
 順序と理由は [../docs/auth-ordering.md](../docs/auth-ordering.md)。
 
