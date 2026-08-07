@@ -512,3 +512,28 @@ export function portShiftNote({ from, to, hosts }) {
         `  戻すなら: node scripts/serve.mjs --stop --repo <path> して ${from} が空いてから起動`,
     ];
 }
+
+/**
+ * 🚨 **`token-read` に派生秘密を書き戻してよいか（#59 の回帰。10回目のレビュー / SERIOUS）。**
+ *
+ * `--exec` / `--write` のときサーバに渡すのは実行（書き込み）トークンなので、
+ * 読み取りとして通るのは**そこから派生した秘密**だけ。だから `token-read` には
+ * その派生値を書く必要がある（書かないと「読み取り用」と名乗るファイルで読めない）。
+ *
+ * ⚠️ **読み取り専用のときは書いてはいけない。** その構成では `--token-file` に
+ *    渡すのが `token-read` **そのもの**なので、読んで派生させて同じファイルに
+ *    書き戻すと、**起動のたびに鍵が回る**（`token-read` → `f(token-read)` →
+ *    `f(f(token-read))` …）。`--token-file` で固定できると告知しながら、
+ *    スマホのブックマークが再起動のたびに 401 になる。
+ *
+ * @param {string|null} tokenFile サーバに `--token-file` で渡すファイル
+ * @param {string} readFile `~/.kjp-edit/token-read`
+ * @returns {boolean} 派生秘密を readFile に書くべきなら true
+ */
+export function shouldWriteReadSecret(tokenFile, readFile) {
+    if (!tokenFile || !readFile) return false;
+    // 区切り文字と大文字小文字の違いだけで「別ファイル」と誤判定しない
+    const norm = s => s.split(String.fromCharCode(92)).join('/')
+        .replace(/\/+$/, '').toLowerCase();
+    return norm(tokenFile) !== norm(readFile);
+}

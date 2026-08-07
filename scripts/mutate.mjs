@@ -33,6 +33,49 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        name: 'read-secret-rotates-on-restart',
+        why: '読み取り専用でも token-read に書き戻す（起動のたびに鍵が回り、ブックマークが 401 になる）',
+        file: 'scripts/serveargs.mjs',
+        from: '    return norm(tokenFile) !== norm(readFile);',
+        to: '    return true;   /* 変異: 同じファイルでも書き戻す */',
+        gone: 'return norm(tokenFile) !== norm(readFile);',
+        pattern: 'token-file が token-read 自身なら書かない',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    // -----------------------------------------------------------------
+    // 🚨 #58: 入力層の検査（CDP）。**この検査を動かす変異が1件も無かった**
+    //    （しかも検査は末尾の process.exit(0) で構造的に落ちられなかった）。
+    // -----------------------------------------------------------------
+    {
+        name: 'grid-drag-does-not-move',
+        why: 'グリッドで掴んでもセルを動かさない（直近3回連続で壊れた場所）',
+        file: 'v0/app.html',
+        from: '        const r = moveCell(paneGrid, p.dataset.paneId, c);',
+        to: '        const r = { ok: false };   /* 変異: 掴んでも動かさない */',
+        gone: 'const r = moveCell(paneGrid, p.dataset.paneId, c);',
+        script: 'v0/input-check.mjs',
+    },
+    {
+        // 🚨 **守りが2枚あるので、1枚だけ外しても差が出ない**（実測: 片方ずつ外した
+        //    `header-drag-selects-text` / `header-user-select-none` は**どちらも SURVIVED**）。
+        //    「片方が残っているから落ちない」のを「検査が弱い」と読み違えると、
+        //    検査を無駄に強くする方に行く。**測りたいのは利用者に見えた壊れ方**
+        //    （ヘッダを掴んだら文字選択になって動かせない）なので、`also` で2枚とも外す。
+        name: 'header-drag-selects-text',
+        why: 'ヘッダの掴みで文字選択を止めない2枚（preventDefault と user-select）を両方外す',
+        file: 'v0/app.html',
+        also: [{
+            // ⚠️ 先頭の改行 + 4 空白まで含めて一意にする（もう1箇所の user-select は
+            //    `color: var(--dim);` と同じ行にあるので、これで衝突しない）
+            from: '\n    user-select: none; -webkit-user-select: none; }',
+            to: '\n    }   /* 変異: 選択を許す */',
+        }],
+        from: '    e.preventDefault();\n    const x0 = e.clientX, y0 = e.clientY;',
+        to: '    /* 変異: 既定動作を止めない */\n    const x0 = e.clientX, y0 = e.clientY;',
+        gone: 'e.preventDefault();\n    const x0 = e.clientX',
+        script: 'v0/input-check.mjs',
+    },
+    {
         name: 'read-secret-not-derived',
         why: '案内 URL とフックに配る鍵を派生させない（read が RCE に昇格する）',
         file: 'v0/readsecret.mjs',

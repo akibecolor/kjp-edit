@@ -90,10 +90,15 @@ node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
 | **取り込み順序の提案** | 衝突グラフの独立集合を貪欲に取る。**追加の git 呼び出しは0、AI も使わない**。仮説であって保証ではない |
 | **差分 / 全文** | ファイラかタブから開く。**差分**は `base...HEAD`、**全文**はファイルの中身（行番号付き。ref を選べる）。上限 4000 行で切り、切ったら必ず告知する |
 | **🚨 警告** | シーケンサ乗っ取りと `MERGE_HEAD` の消失リスク |
+| **書く前のガード**（#59） | `POST /api/v0/clash` と `scripts/clash.mjs`（`PreToolUse` フック）。**画面を見ないエージェントを止める**唯一の経路。既定では `.claude/settings.json` に入れていない |
 | **エージェントの活動**（`--watch-agents`） | 稼働中 / 待機 / 記録なし、直近のツールと触ったパス、件数。**既定オフ**（リポジトリ外の記録を読むため） |
 
 **ペインは自由に動かせます。** ヘッダを掴んで並べ替え、列（左 / 差分 / コンソール / 右）を
 またいで移動できます（マウスとタッチの両方。スマホでも掴めます）。
+**`?grid=1`** を付けると格子配置になります（1枚 / 1行2列 / 1行3列 / 2×2 … 4×4、
+セルの結合・分割・閉じる・開き直し。#57）。**まだオプトイン**で、既定にするには
+実ブラウザ検査の assert を入れ物 id から座標に書き換える必要があります。
+狭い画面で PC レイアウトを見たいときは **`?wide=1`**（スマホの横画面用）。
 並びは `localStorage` に **ペインの id（worktree の path 由来。序数ではない）** で覚えるので、
 再読込しても戻りません。自動更新（15秒）でも巻き戻りません。
 既定に戻すのは上のバーの「レイアウト」。
@@ -202,6 +207,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `git.mjs` | git の起動と解析。worktree 列挙、log、diff、シーケンサ状態検出 |
 | `swimlanes.mjs` | レーン割当。VS Code の `scmHistory.ts`（MIT）を参考に再実装 |
 | `swimlanes.test.mjs` | 回帰テスト。実際に踏んだバグを固定 |
+| `paths.test.mjs` | パスの正規化・同一性判定（NFC / 区切り / 8.3 短縮名 / symlink）の unit テスト |
 | `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe` と、必ず throw する `/__throw` / `/__throw-inner`） |
 | `app.html` | **統合 UI**（`/` と `/layout` が返す）。広い画面はドック、狭い画面は縦積み |
 | `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
@@ -213,7 +219,20 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `chatfilter.mjs` / `.test.mjs` | 会話モード（stream-json）の出力の解釈。**同じ理由で共有** |
 | `mergeplan.mjs` / `.test.mjs` | 取り込み順序の提案（純関数）と unit テスト9件 |
 | `panelayout.mjs` / `.test.mjs` | ペインの配置（ドラッグで決めた並び）の表現と永続化の形。**同じ理由で共有** |
+| `panegrid.mjs` / `.test.mjs` | グリッド配置（`?grid=1`）のパターン・結合・移動・閉じる（純関数。#57） |
 | `blobview.mjs` / `.test.mjs` | 全文ビューアの表示上限と告知。**同じ理由で共有** |
+| `linediff.mjs` / `.test.mjs` | 行単位の差分（エディタの表示用） |
+| `mergeresult.mjs` / `.test.mjs` | merge の結果の解釈（成功・衝突・判定不能の区別） |
+| `dirlabel.mjs` / `.test.mjs` | 同じ basename の worktree を取り違えないための表示名（最小の親で曖昧さを解く） |
+| `pathlabel.mjs` | パスの短縮表示 |
+| `writefile.mjs` / `.test.mjs` | 作業ツリーへの書き込み（改行・BOM・エンコーディングの保存、上限） |
+| `execsession.mjs` / `.test.mjs` | 実行セッションの寿命（同時数・絶対上限・切断後の猶予・掃除）を1箇所に集める |
+| `proctree.mjs` / `.test.mjs` | プロセスの親子関係（`killTree` が孫を取り残さないため。純関数） |
+| `failtracker.mjs` / `.test.mjs` | 認証失敗の記録・遅延・同時実行の門（総当たりへの壁） |
+| `readsecret.mjs` | 🔒 **読み取り専用の派生秘密**。案内 URL・Cookie・フックに配る値の式を1本化 |
+| `clashguard.mjs` / `.test.mjs` | 🔒 編集前の衝突ガードの判定（純関数）。**「調べられない」を allow に倒さない**（#59） |
+| `transcript.mjs` / `.test.mjs` | エージェントの活動記録の読み取りとマスキング（`--watch-agents`） |
+| `input-check.mjs` | CDP の入力層で**実際のマウス入力**を流して測る（合成イベントでは測れない。#58） |
 
 🚨 **ブラウザで動くロジックは `app.html` の中に置かない。**
 中に置くとテストできないので、**宣言が破れても気付けない**。
@@ -236,7 +255,11 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `POST /api/v0/merge` | 取り込み（merge）。**`--allow-write` が必要**。**衝突しないと予測できたものだけ**実行する |
 | `POST /api/v0/file` | 編集のために作業ツリーの中身を読む。**`--allow-write` が必要**。`{worktree, path}` → `{text, oid, eol, bom, bytes}` |
 | `POST /api/v0/write` | 作業ツリーに書く。**`--allow-write` が必要**。`{worktree, path, text, baseOid}`。`baseOid` が今の中身と違えば **409** |
+| `POST /api/v0/clash` | 🔒 **編集前の衝突の問い合わせ（読み取り専用）**。`{worktree, paths[]}` → `{self, conflicts, busy, unknown, decided}`。**`decided:false` のときは「衝突なし」と読めない**（#59） |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
+| `/api/v0/exec/list` | 走っている（と、終わって保持中の）実行セッションの一覧。**`--allow-exec` が必要** |
+| `POST /api/v0/exec/<id>/kill` | 実行を**本当に止める**（木ごと落として数え直す）。切断（`abort`）は購読解除でしかない |
+| `POST /api/v0/exec/<id>/input` | 実行中のプロセスの標準入力へ送る（`eof` で閉じる） |
 | `/layout` | `/` の別名（互換のため） |
 
 どの経路も `?repo=<登録済みパス>` で対象を選べます（指定なしは既定 = 1本目）。

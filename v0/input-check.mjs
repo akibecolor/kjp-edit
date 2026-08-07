@@ -182,4 +182,17 @@ server.kill();
 await new Promise(r => setTimeout(r, 600));
 await rm(profile, { recursive: true, force: true }).catch(() => {});
 await rm(repo, { recursive: true, force: true }).catch(() => {});
-process.exit(0);
+
+// 🚨 **`process.exit(0)` で終わらせない。** 引数が `process.exitCode` を**上書きする**ので、
+//    上で `✖ input` を印字して 1 を立てた回でも終了コードが 0 になり、
+//    `verify.mjs` は `r.code === 0` しか見ないので **`✔ input` と表示していた**
+//    （= この検査は構造的に一度も落ちられなかった。10回目のレビュー / BLOCKING）。
+//    守る対象（グリッドの移動）は直近で3回連続して壊れている場所なので、
+//    「落ちない検査は無意味」がそのまま当てはまる。
+// ⚠️ それでも即死させたいのは、閉じかけのハンドルが残ると Windows の libuv が
+//    `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` で**異常終了**するため
+//    （CLAUDE.md のブラウザ規則8）。なので **exitCode を保ったまま**、
+//    かつ**イベントループが自然に終わらないときだけ**発火する保険にする
+//    （`unref()` なので、他に生きているものが無ければこのタイマー自体は動かない）。
+const bail = setTimeout(() => process.exit(process.exitCode ?? 0), 5000);
+bail.unref();

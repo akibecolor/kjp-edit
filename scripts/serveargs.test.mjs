@@ -20,7 +20,7 @@ import {
     collectHosts, collectRepos, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
     runningCaps, requestedCaps, describeCaps,
     runningConfig, requestedConfig, configDiff, stopTargets, stopOutcome,
-    otherDaemonsNote, portShiftNote,
+    otherDaemonsNote, portShiftNote, shouldWriteReadSecret,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
@@ -993,4 +993,25 @@ test('🚨 --allow-host 付きでポートが動いたら向き先を告げる�
     // 動いていないなら黙る
     assert.deepEqual(portShiftNote({ from: 7749, to: 7749, hosts: ['box.ts.net'] }), []);
     assert.deepEqual(portShiftNote({ from: NaN, to: 7750, hosts: ['box.ts.net'] }), []);
+});
+
+/**
+ * 🚨 **読み取り専用のときに `token-read` を書き戻さない（10回目のレビュー / SERIOUS）。**
+ *
+ * その構成では `--token-file` が `token-read` そのものなので、
+ * 派生値を書き戻すと**起動のたびに鍵が回る**（スマホのブックマークが毎回 401）。
+ */
+test('shouldWriteReadSecret: --token-file が token-read 自身なら書かない', () => {
+    const read = 'C:/Users/me/.kjp-edit/token-read';
+    assert.equal(shouldWriteReadSecret(read, read), false);
+    // 区切り文字と大文字小文字の違いで「別ファイル」と誤判定しない（Windows）
+    // ⚠️ バックスラッシュは書き換えの3段でエスケープが失われる（CLAUDE.md 規則8）ので
+    //    リテラルに書かず組み立てる
+    const bs = String.fromCharCode(92);
+    assert.equal(shouldWriteReadSecret(read.split('/').join(bs), read), false);
+    assert.equal(shouldWriteReadSecret('C:/USERS/ME/.kjp-edit/TOKEN-READ', read), false);
+    // 実行・書き込みトークンなら書く（読み取りとして通るのは派生値だけなので必要）
+    assert.equal(shouldWriteReadSecret('C:/Users/me/.kjp-edit/token-exec', read), true);
+    assert.equal(shouldWriteReadSecret('C:/Users/me/.kjp-edit/token-write', read), true);
+    assert.equal(shouldWriteReadSecret(null, read), false);
 });

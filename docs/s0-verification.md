@@ -173,6 +173,24 @@ git 状態の read→decide→write を守るものではありません。
 | **5** | **並行安全な git 実行** — `GIT_OPTIONAL_LOCKS=0` on reads、`gc.auto=0`、read→decide→write を跨ぐロック | 最強の既存実装がプロセス内 `threading.Lock()` |
 | **6** | **統合**（エディタ + ターミナル + エージェント監督 + グラフが1アプリ） | clash は CLI+TUI、GitUp は macOS 専用スタンドアロン、lazygit はエディタの横に置く TUI |
 
+### 実装状況（2026-08-08 追記）
+
+| # | v0 での状態 |
+|---|---|
+| **1** | 🟢 **実装した**（#59）。`POST /api/v0/clash` が**自分の worktree のシーケンサ状態**（`self`）を返し、`scripts/clash.mjs`（`PreToolUse` フック）が rebase 停止中の編集を `deny` する。checkout / merge 側の 409 は以前から。**未検証だったのは「フックから機械が聞けること」**で、そこが埋まった |
+| **2** | ⬜ 未着手（共有 `refs/stash`） |
+| **3** | 🟢 実装済み（`swimlanes.mjs`。全 worktree の HEAD を1枚に） |
+| **4** | 🟢 実装済み（`mergeplan.mjs`。payload の `mergePlan`） |
+| **5** | 🟡 一部（読みは `GIT_OPTIONAL_LOCKS=0`。read→decide→write を跨ぐロックは無い） |
+| **6** | 🟡 統合は進行中（グラフ + 差分 + 最小エディタ + コンソール + 活動観測 + グリッド配置） |
+
+⚠️ **名前が既存ツール `clash`（MIT）と重なっている。**
+`POST /api/v0/clash` と `scripts/clash.mjs` は**この文書が指す `clash` とは別物**で、
+コードも借りていない（`v0/git.mjs` の `mergePreview` を再利用している）。
+紛らわしいので、外に出すなら改名する（`preflight` など）。
+⚠️ 上の「clash を依存として取り込む」という提案は**採っていない**。
+依存パッケージゼロの制約と、`merge-tree` は既に自前で叩いていたため。
+
 **そして正直に降ろすもの:**
 - ~~「グラフ + 履歴編集」~~ → lazygit と GitUp が全項目実装済み（第2回レビュー R2-1）
 - ~~「クロスworktreeのコンフリクト予測」~~ → **clash がやっている**

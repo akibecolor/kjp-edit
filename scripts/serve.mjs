@@ -35,7 +35,7 @@ import { readSecretOf } from '../v0/readsecret.mjs';
 import {
     SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, collectRepos, serverArgs,
     configDiff, describeCaps, stopTargets, stopOutcome,
-    otherDaemonsNote, portShiftNote,
+    otherDaemonsNote, portShiftNote, shouldWriteReadSecret,
 } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -533,13 +533,19 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
 {
     const i = args.indexOf('--token-file');
     const tokenFile = i >= 0 ? args[i + 1] : null;
-    if (tokenFile) {
+    // ⚠️ 変数名を `readFile` にしない（`node:fs/promises` の import を覆い隠して
+    //    「文字列を関数として呼ぶ」TypeError になる。しかも spawn の後なので
+    //     デーモンだけ残って起動口が落ちる）
+    const readTokenPath = join(STATE_DIR, 'token-read');
+    // 🚨 読み取り専用のときは `--token-file` が token-read 自身なので、
+    //    書き戻すと**起動のたびに鍵が回る**（10回目のレビュー / SERIOUS）
+    if (tokenFile && shouldWriteReadSecret(tokenFile, readTokenPath)) {
         // サーバが生成する場合があるので、出るまで少し待つ（出なければ黙って諦める）
         for (let n = 0; n < 40; n++) {
             const raw = await readFile(tokenFile, 'utf8').catch(() => null);
             const secret = readSecretOf(raw?.trim());
             if (secret) {
-                await writeFile(join(STATE_DIR, 'token-read'), `${secret}\n`,
+                await writeFile(readTokenPath, `${secret}\n`,
                     { encoding: 'utf8', mode: 0o600 }).catch(() => {});
                 break;
             }

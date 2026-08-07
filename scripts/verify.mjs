@@ -143,13 +143,19 @@ let failed = false;
 //    1テストで 25 秒かかる（CI の Windows は更に遅い）。上限が 30 秒だと
 //    **配線のテストだけが SIGKILL され、原因が消える**ので広げてある。
 {
+    // 🚨 **一覧を手で書かない（10回目のレビュー / SERIOUS）。**
+    //    手書きのリテラルだったので、新しく足した `clashguard.test.mjs` と
+    //    `dirlabel.test.mjs` の**15 テストが verify にも CI にも1度も載っていなかった**
+    //    （突然変異のときだけ、しかも「落ちる前提」で走っていた）。
+    //    テストを足した人が一覧を更新し忘れる形の穴なので、**探して並べる**。
+    //    ⚠️ smoke / layout / render / input は別の段で扱うので除く（重い・順序がある）。
+    const SEPARATE = new Set(['smoke.test.mjs']);
+    const unitTests = (await Promise.all(['v0', 'scripts'].map(async dir =>
+        (await readdir(join(ROOT, dir)))
+            .filter(f => f.endsWith('.test.mjs') && !SEPARATE.has(f))
+            .map(f => `${dir}/${f}`)))).flat().sort();
     const r = await run(
-        ['--test', '--test-timeout=90000', 'v0/swimlanes.test.mjs', 'v0/paths.test.mjs', 'v0/ndjson.test.mjs', 'v0/mergeplan.test.mjs', 'v0/argv.test.mjs', 'v0/transcript.test.mjs', 'v0/execsession.test.mjs', 'v0/chatfilter.test.mjs', 'v0/panelayout.test.mjs',
-            'v0/mergeresult.test.mjs',
-            'v0/writefile.test.mjs', 'v0/linediff.test.mjs', 'v0/blobview.test.mjs',
-            'v0/proctree.test.mjs', 'v0/failtracker.test.mjs', 'v0/panegrid.test.mjs',
-            'scripts/winargs.test.mjs', 'scripts/serveargs.test.mjs',
-            'scripts/testsummary.test.mjs'],
+        ['--test', '--test-timeout=90000', ...unitTests],
         { timeout: 240_000 },
     );
     const s = summarizeTests(r.output);
