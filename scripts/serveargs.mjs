@@ -466,3 +466,49 @@ export function describeCaps(cmd) {
     parts.push(hosts.length ? `Host許可: ${hosts.join(', ')}` : 'ループバックのみ');
     return parts.join(' / ');
 }
+
+/**
+ * 🚨 **他に動いているデーモンを黙らせない（9回目のレビュー / #55）。**
+ *
+ * 二重起動の門は「同じリポジトリ」だけを見るので、別のリポジトリの2本目は
+ * **正しく**立ち上がる。ただし今まで一言も言わなかったので、
+ * 「今マシン上で何本動いているか」を `--status` を打つまで知る手段が無かった
+ * （N 個のエージェントを並行で回す前提のツールで、実行枠と監査が別々に増える）。
+ *
+ * ⚠️ **「調べられない」を「0 本」と言わない**（`running()` と同じ型）。
+ * @param {{supported: boolean, list?: object[]}} probe `running()` の戻り
+ * @param {string|null} repo これから見るリポジトリ（自分と同じものは数えない）
+ * @returns {{count: number, lines: string[]} | null} 言うことが無ければ null
+ */
+export function otherDaemonsNote(probe, repo) {
+    if (!probe?.supported) return null;
+    const others = (probe.list ?? []).filter(r => !samePathish(repoOf(r?.cmd), repo));
+    if (!others.length) return null;
+    return {
+        count: others.length,
+        lines: others.map(r => `PID ${r.pid}  port ${r.port ?? '?'}  `
+            + `${describeCaps(r.cmd)}  ${repoOf(r.cmd) ?? '(repo 不明)'}`),
+    };
+}
+
+/**
+ * 🚨 **ポートが動いたら、トンネルの向き先も動いたことを言う（#55）。**
+ *
+ * `--allow-host` はトンネル越しに使うためのフラグで、トンネル（`tailscale serve`）は
+ * **固定のポート**を指している。ポートが空きに移ると母艦では正常に見えるのに
+ * **スマホからだけ繋がらない**（`--allow-host` を渡し忘れたときと同じ壊れ方で、
+ * 手元では絶対に気付けない）。
+ *
+ * @param {{from: number, to: number, hosts: string[]}} o
+ * @returns {string[]} 追加で出す行（言うことが無ければ空）
+ */
+export function portShiftNote({ from, to, hosts }) {
+    if (!Array.isArray(hosts) || !hosts.length) return [];
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return [];
+    return [
+        `🚨 トンネルの向き先が ${from} のままだと、スマホからは繋がりません`
+        + `（Host許可: ${hosts.join(', ')}）。`,
+        `  向き先を ${to} に変えてください: tailscale serve --bg ${to}`,
+        `  戻すなら: node scripts/serve.mjs --stop --repo <path> して ${from} が空いてから起動`,
+    ];
+}

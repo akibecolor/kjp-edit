@@ -1864,6 +1864,43 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: '--timeout が実際にサーバに届く',
         testFile: 'scripts/serveargs.test.mjs',
     },
+    // -----------------------------------------------------------------
+    // 🚨 9回目のレビュー / #55（MINOR 2件）: 黙って増える2本目と、
+    //    動いたポートでトンネルが切れることの告知。
+    // -----------------------------------------------------------------
+    {
+        name: 'other-daemons-note',
+        why: '他に動いているデーモンを告げない'
+            + '（--status を打つまで何本動いているか分からない。実行枠と監査が別々に増える）',
+        file: 'scripts/serveargs.mjs',
+        from: '    if (!others.length) return null;',
+        to: '    return null;   /* 変異: 何も言わない */',
+        gone: '    if (!others.length) return null;',
+        pattern: '他に動いているデーモンを告げる',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // ⚠️ 「調べられない」を「0 本」と言わない側も測る（#31 と同型）
+        name: 'other-daemons-unknown',
+        why: '調べられないときに「他に 0 本」と断言する（止め残しと同じ型の嘘）',
+        file: 'scripts/serveargs.mjs',
+        from: '    if (!probe?.supported) return null;',
+        to: '    /* 変異: 調べられなくても数える */',
+        gone: '    if (!probe?.supported) return null;',
+        pattern: '他に動いているデーモンを告げる',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        name: 'port-shift-tunnel-note',
+        why: 'ポートが動いてもトンネルの向き先を告げない'
+            + '（母艦では正常・スマホからだけ繋がらない = 手元では気付けない）',
+        file: 'scripts/serveargs.mjs',
+        from: '    if (!Array.isArray(hosts) || !hosts.length) return [];',
+        to: '    return [];   /* 変異: 何も言わない */',
+        gone: '    if (!Array.isArray(hosts) || !hosts.length) return [];',
+        pattern: 'ポートが動いたら向き先を告げる',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
     {
         // 🚨 9回目のレビュー / #54: repo が読めなかった相手を
         //    「別のリポジトリなので止めません」と**断言**していた。

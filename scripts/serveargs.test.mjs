@@ -20,6 +20,7 @@ import {
     collectHosts, collectRepos, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
     runningCaps, requestedCaps, describeCaps,
     runningConfig, requestedConfig, configDiff, stopTargets, stopOutcome,
+    otherDaemonsNote, portShiftNote,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
@@ -950,4 +951,46 @@ test('🚨 --stop は repo が読めない相手を「分からない」と出�
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     await rm(other, { recursive: true, force: true }).catch(() => {});
     if (err) throw err;
+});
+
+/* ===== #55: 黙って増える2本目と、動いたポートの告知（純関数） ===== */
+
+test('🚨 他に動いているデーモンを告げる（黙って2本目にしない。#55）', () => {
+    const list = [D(1, 'C:/a'), D(2, 'C:/b'), D(3, 'C:/A')];
+    // 自分と同じ repo（表記違いも）は数えない
+    const n = otherDaemonsNote({ supported: true, list }, 'C:/a');
+    assert.equal(n.count, 1, `同じ repo を他人として数えている: ${JSON.stringify(n)}`);
+    assert.match(n.lines[0], /PID 2/);
+    assert.match(n.lines[0], /C:\/b/, '行に repo が入っていない（どれのことか分からない）');
+    // 他に無ければ黙る
+    assert.equal(otherDaemonsNote({ supported: true, list: [D(1, 'C:/a')] }, 'C:/a'), null);
+    assert.equal(otherDaemonsNote({ supported: true, list: [] }, 'C:/a'), null);
+    // 🚨 **「調べられない」を「0 本」と言わない**（running() と同じ型）。
+    //    ⚠️ `list: []` だけで測ると、`supported` を見ない実装でも通ってしまう
+    //    （最初そう書いて変異が SURVIVED した）。**中途半端な list が来ても
+    //    黙る**ことを測る = 「supported を見ている」ことの検査になる。
+    assert.equal(otherDaemonsNote({ supported: false, why: 'x' }, 'C:/a'), null,
+        '調べられないのに「他に 0 本」と断言する形になっている');
+    assert.equal(otherDaemonsNote({ supported: false, list: [D(2, 'C:/b')] }, 'C:/a'), null,
+        'supported:false の list を信じている（調べられていない結果を数えている）');
+});
+
+/**
+ * 🚨 **ポートが動いたら、トンネルの向き先も動いたことを言う（#55）。**
+ *
+ * `tailscale serve` は固定ポートを指しているので、空きに移ると
+ * **母艦では正常・スマホからだけ繋がらない**（手元では絶対に気付けない）。
+ */
+test('🚨 --allow-host 付きでポートが動いたら向き先を告げる（#55）', () => {
+    const lines = portShiftNote({ from: 7749, to: 7750, hosts: ['box.ts.net'] });
+    assert.ok(lines.length >= 2, `告知が足りない: ${JSON.stringify(lines)}`);
+    const all = lines.join('\n');
+    assert.match(all, /スマホからは繋がりません/, '何が起きるかを言っていない');
+    assert.match(all, /tailscale serve --bg 7750/, '直し方（新しいポート）を出していない');
+    assert.match(all, /box\.ts\.net/, 'どの Host の話か分からない');
+    // トンネルを使っていないなら黙る（関係ない警告で埋めない）
+    assert.deepEqual(portShiftNote({ from: 7749, to: 7750, hosts: [] }), []);
+    // 動いていないなら黙る
+    assert.deepEqual(portShiftNote({ from: 7749, to: 7749, hosts: ['box.ts.net'] }), []);
+    assert.deepEqual(portShiftNote({ from: NaN, to: 7750, hosts: ['box.ts.net'] }), []);
 });

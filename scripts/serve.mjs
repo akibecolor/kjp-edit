@@ -34,6 +34,7 @@ import { repoOf, samePathish, parseProcPairs, descendantsOf } from './winargs.mj
 import {
     SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, collectRepos, serverArgs,
     configDiff, describeCaps, stopTargets, stopOutcome,
+    otherDaemonsNote, portShiftNote,
 } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -384,6 +385,18 @@ if (!probe.supported) {
         + 'watcher・キャッシュ・実行枠・監査が二重になります。');
 }
 const already = probe.list.find(r => samePathish(repoOf(r.cmd), repo));
+// 🚨 **他に動いているデーモンを黙らせない（#55）。** 別リポジトリの2本目は
+//    正しく立ち上がるが、今まで一言も言わなかったので「今マシン上で何本
+//    動いているか」を --status を打つまで知る手段が無かった
+//    （実行枠・監査・watcher が別々に増える）。
+{
+    const note = otherDaemonsNote(probe, repo);
+    if (note) {
+        console.log(`ℹ 他に ${note.count} 本の kjp-edit が動いています（--status で一覧）:`);
+        for (const l of note.lines.slice(0, 5)) console.log(`    ${l}`);
+        if (note.lines.length > 5) console.log(`    …他 ${note.lines.length - 5} 本`);
+    }
+}
 if (already) {
     console.log(`既に動いています → http://127.0.0.1:${already.port ?? '?'}`);
     console.log(`  PID ${already.pid}  repo ${repo}`);
@@ -449,6 +462,11 @@ if (await inUse(port)) {
         //    カレントのリポジトリだけを止めるので、相手の repo を添えて案内する
         console.log('  止めるには: node scripts/serve.mjs --stop --repo '
             + `${repoOf(holder.cmd) ?? '<path>'}`);
+    }
+    // 🚨 **トンネルの向き先が動いたことを言う（#55）。** 母艦では正常に見えるのに
+    //    スマホからだけ繋がらない（手元では絶対に気付けない壊れ方）。
+    for (const l of portShiftNote({ from: port, to: found, hosts: hostCheck.hosts })) {
+        console.log(l);
     }
     port = found;
 }
