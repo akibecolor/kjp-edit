@@ -570,6 +570,19 @@ const CLOSE_CHECK = `(async () => {
   const btn = [...paneOf(target).querySelectorAll('header > button')]
     .find(b => b.textContent === '×');
   if (!btn) return { error: '閉じるボタンが無い' };
+  // 🚨 実際の指と同じ順で撃つ。click() だけだと、ヘッダの pointerdown が
+  //    ポインタを掴んで click を飲む壊れ方（実機で × と結合ボタンが無反応だった）を
+  //    測れない。pointerdown → pointerup → click の順にする。
+  //    ⚠️ ここはテンプレートリテラルの中なのでバックティックを書かない。
+  const box0 = btn.getBoundingClientRect();
+  const fire = (type, x, y) => btn.dispatchEvent(new PointerEvent(type, {
+    bubbles: true, cancelable: true, composed: true,
+    pointerId: 7, pointerType: 'mouse', isPrimary: true, button: 0,
+    buttons: type === 'pointerup' ? 0 : 1, clientX: x, clientY: y,
+  }));
+  const cx = box0.left + box0.width / 2, cy = box0.top + box0.height / 2;
+  fire('pointerdown', cx, cy);
+  fire('pointerup', cx, cy);
   btn.click();
   await wait(300);
   const goneNow = !paneOf(target);

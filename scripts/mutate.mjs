@@ -129,6 +129,27 @@ const MUTANTS = [
         script: 'v0/render-check.mjs',
     },
     {
+        // 🚨 実機で × と結合ボタンが**無反応**だった原因。ヘッダの pointerdown が
+        //    ポインタを掴むと、以降の事象がヘッダに再ターゲットされて click が飛ばない。
+        //    検査が `.click()` を直接呼んでいたのでこの壊れ方が見えなかった。
+        name: 'pane-drag-skips-buttons',
+        why: 'ヘッダのボタンでもドラッグを始める（掴むので click が飛ばず、'
+            + '閉じる・結合・最小化が実際の指では無反応になる）',
+        file: 'v0/app.html',
+        from: "    if (e.target?.closest?.('button')) return;",
+        to: '    /* 変異: ボタンでも掴む */',
+        gone: "if (e.target?.closest?.('button')) return;",
+        script: 'v0/render-check.mjs',
+        // ⚠️ **この守りは検査環境では測れない（実測して確認した）。**
+        //    ブラウザは**合成の pointer 事象から click を生成しない**ので、
+        //    「掴んで click が飲まれる」形が再現できない（検査は click() を
+        //    直接呼ぶしかなく、直接呼べば capture に関係なく発火する）。
+        //    実機（Android / Chrome）でだけ起きる壊れ方で、そこで見つかった。
+        defensive: 'ブラウザは合成 pointer 事象から click を生成しないので、'
+            + 'capture が click を飲む形を検査環境で再現できない。'
+            + '実機で見つけた壊れ方なので、守りは残して理由を書く',
+    },
+    {
         // 🚨 一覧が無いと「閉じたら二度と開けない」= 閉じるのが危険な操作になる
         name: 'closed-list-shown',
         why: '閉じたペインの一覧を出さない（開き直す手段が無くなる）',

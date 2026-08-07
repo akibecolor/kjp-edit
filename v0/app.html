@@ -104,6 +104,17 @@
   .shell.gridmode .pane { margin: 0; min-width: 0; min-height: 0; }
   /* 入り切らないペイン（溢れ）。**消さずに畳んで、告知で件数を出す** */
   .shell.gridmode .pane.overflowed { display: none; }
+  /* ⚠️ グリッドの子には `flex` が効かない（`.pane.min { flex: 0 0 auto }` が無効）。
+     最小化はセルの上端に寄せて高さを内容（ヘッダだけ）にする。 */
+  .shell.gridmode .pane.min { align-self: start; }
+  /* 最大化は position:fixed なのでグリッドでもそのまま効く（座標は無視される） */
+  /* 🚨 **帯は縮ませない。** `flex-shrink` の既定は 1 なので、縦が詰まると
+     0 まで潰れて**ボタンが見えなくなる**（実機で「レイアウトのボタンが隠れる」）。
+     `#alerts` と同じ `flex: 0 0 auto` にする。 */
+  .bar { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: .3rem; align-items: center;
+    padding: .25rem .5rem; background: var(--head); border-bottom: 1px solid var(--line);
+    font-size: 12px; }
+  .bar:empty { display: none; }
   .split { flex: 0 0 var(--split); position: relative; }
   .split::after { content: ''; position: absolute; inset: 0; background: var(--line); }
   .split:hover::after, .split.dragging::after { background: var(--accent); }
@@ -652,6 +663,13 @@ function commitMove(p, spot) {
  */
 function wireDrag(p, h, drag, skip) {
   h.addEventListener('pointerdown', e => {
+    // 🚨 **ヘッダのボタンではドラッグを始めない。** 掴む（setPointerCapture）と
+    //    以降のポインタ事象がヘッダに再ターゲットされ、**ボタンの click が飛ばない**。
+    //    以前は `skip`（=[bmin, bmax]）で数えていたので、後から足した × と
+    //    結合のボタンが**実際の指・マウスでは無反応**だった
+    //    （検査は `.click()` を直接呼ぶので、この壊れ方が見えなかった）。
+    //    **一覧を数えるのをやめて、ボタン全部を仕組みで除く。**
+    if (e.target?.closest?.('button')) return;
     if (skip.includes(e.target)) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     // 最大化中は画面全面なので、落とす先を選べない
