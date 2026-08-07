@@ -684,6 +684,24 @@ function hostAt(x, y) {
   return null;
 }
 
+/**
+ * 座標がどのセルか（グリッドのとき）。
+ *
+ * ⚠️ セルは等分（列幅の調整はしない設計）なので、矩形を割るだけで求まる。
+ *    範囲外は端に丸める（画面の外へドラッグしても落とせるように）。
+ */
+function cellFromPoint(x, y) {
+  const shell = document.getElementById('shell');
+  if (!shell) return null;
+  const r = shell.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return null;
+  const clamp = (n, hi) => Math.min(hi, Math.max(1, n));
+  return {
+    col: clamp(Math.floor((x - r.left) / (r.width / paneGrid.cols)) + 1, paneGrid.cols),
+    row: clamp(Math.floor((y - r.top) / (r.height / paneGrid.rows)) + 1, paneGrid.rows),
+  };
+}
+
 /** 落とす先（入れ物と、その手前に挿すペイン）。中点を越えたら後ろに回る */
 function dropSpot(dragged, x, y) {
   const host = hostAt(x, y);
@@ -745,6 +763,24 @@ function wireDrag(p, h, drag, skip) {
         started = true;
         drag.moved = true;
         p.classList.add('dragging');
+      }
+      // 🚨 **グリッドではセル座標へ動かす（#57）。**
+      //    ドラッグは v1 の「入れ物の並び」を書き換える作りだったので、
+      //    座標で描くグリッドには**何も反映されなかった**（実機で指摘された）。
+      if (gridMode) {
+        const c = cellFromPoint(ev.clientX, ev.clientY);
+        if (!c) return;
+        const gkey = `${c.col},${c.row}`;
+        if (gkey === last) return;
+        last = gkey;
+        const r = moveCell(paneGrid, p.dataset.paneId, c);
+        // ⚠️ 断られたら黙って動かさない（ドラッグ中に理由を出すと連打で埋まる）。
+        //    「動かない」ことが手応えになる。理由が要る操作はボタン側で出す。
+        if (!r.ok) return;
+        paneGrid = r.grid;
+        saveGrid();
+        applyGridLayout();
+        return;
       }
       const spot = dropSpot(p, ev.clientX, ev.clientY);
       if (!spot) return;
