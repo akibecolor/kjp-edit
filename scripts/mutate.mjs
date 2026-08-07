@@ -353,6 +353,14 @@ const MUTANTS = [
             + '        await new Promise(r => setTimeout(r, 100));\n    }',
         to: '    /* 変異: 起動途中を待たない */',
         gone: '60 && execRegistry.running.length',
+        // ⚠️ **POSIX では観測可能な差が出ない（CI の ubuntu で SURVIVED）。**
+        //    待ちが要るのは「印を見て殺す側」が終わる前にプロセスが消えるときで、
+        //    その窓の幅は**撃つ前の木の列挙にかかる時間**で決まる:
+        //      Windows: PowerShell の CIM で実測 390〜414ms → 800ms の強制終了と競争する
+        //      POSIX:   `ps -eo pid=,ppid=` で 10〜20ms → 競争にならない
+        //    つまり Windows でだけ効く守り。手元（Windows）で KILLED を確認済み。
+        //    🚨 CI の変異は ubuntu で走るので、**ここは CI では測られない**。
+        platforms: ['win32'],
         pattern: '子を回収し、終了処理中の実行を断り',
     },
     {

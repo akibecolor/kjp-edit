@@ -48,6 +48,23 @@ const repo = repoArg !== -1 ? process.argv[repoArg + 1] : process.cwd();
 //    （別々に書くと片方だけ変えて「描かれないのに緑」に戻る）。
 const TOKEN = 'layout-check-token-0123456789';
 
+/**
+ * 🚨 **verify の上限（240s）より前に、自分で理由を出して落ちる。**
+ *
+ * 以前は上限で SIGKILL され、`✖ layout 240.0s` の1行だけが残って
+ * **何を待っていたか消えていた**（macOS の CI で実際にこれを踏んだ）。
+ * 「打ち切られた結果を緑と読まない」の裏返しで、**打ち切るなら理由を残す**。
+ */
+const DEADLINE_MS = 200_000;
+const startedAt = Date.now();
+const leftMs = () => DEADLINE_MS - (Date.now() - startedAt);
+/** 経過を必ず出す（verify は失敗時に末尾を見せるので、ここが手掛かりになる） */
+const step = [];
+const note = (what, ms) => {
+    step.push(`${what} ${(ms / 1000).toFixed(1)}s`);
+    console.log(`  · ${what} ${(ms / 1000).toFixed(1)}s（残り ${Math.round(leftMs() / 1000)}s）`);
+};
+
 const browser = await findBrowser();
 if (!browser) {
     console.log('– layout: skipped (Chrome/Edge が見つからない)');
@@ -132,11 +149,26 @@ async function measure(width, from = null) {
     child.stdout.on('data', d => { out += d; });
     // ⚠️ 撮影後にブラウザを必ず落とす。放置すると同時実行で数十プロセス残る（実際に53個残した）
     const done = new Promise(r => child.on('close', r));
-    const kill = setTimeout(() => child.kill('SIGKILL'), 60_000);
+    // ⚠️ **上限は「残り時間」に合わせる。** 固定 60s だと、4本立ち上げるだけで
+    //    verify の上限（240s）に達し、**外から SIGKILL されて理由が消える**。
+    const budget = Math.max(15_000, Math.min(60_000, leftMs() - 20_000));
+    let browserKilled = false;
+    const kill = setTimeout(() => { browserKilled = true; child.kill('SIGKILL'); }, budget);
+    const t0 = Date.now();
     await done;
     clearTimeout(kill);
+    note(`幅 ${width} を測った`, Date.now() - t0);
+    if (browserKilled) {
+        await rm(profile, { recursive: true, force: true }).catch(() => {});
+        throw new Error(`幅 ${width}: ブラウザが ${Math.round(budget / 1000)}s で終わらなかった`
+            + '（SIGKILL）。--virtual-time-budget は実時間の上限ではないので、'
+            + 'ページの fetch が返っていない可能性がある');
+    }
     await rm(profile, { recursive: true, force: true });
 
+    if (leftMs() <= 0) {
+        throw new Error(`締切（${DEADLINE_MS / 1000}s）を超えました。経過: ${step.join(' / ')}`);
+    }
     const m = out.match(/<pre id="out">([\s\S]*?)<\/pre>/);
     if (!m) throw new Error(`幅 ${width}: 計測結果が取れなかった`);
     const decode = s => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<')

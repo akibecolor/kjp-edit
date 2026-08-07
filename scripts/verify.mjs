@@ -39,14 +39,35 @@ function run(args, { timeout = 300_000 } = {}) {
         });
         child.on('close', code => {
             clearTimeout(t);
+            // 🚨 **打ち切ったことと、途中までの出力を必ず返す。**
+            //    以前は SIGKILL された検査の output が空のままだったので、
+            //    `✖ layout 240.0s` の1行しか残らず**何を待っていたか消えた**
+            //    （macOS の CI でこれを踏み、原因の切り分けに1往復かかった）。
+            //    「打ち切られた結果を緑と読まない」の裏返しで、
+            //    **打ち切られた結果は必ず理由付きで残す**。
+            const raw = Buffer.concat(out).toString('utf8');
+            const head = timedOut
+                ? `⏱ 上限 ${Math.round(timeout / 1000)}s で打ち切りました（SIGKILL）。`
+                    + `出力は途中までです（${raw.length} 文字）:\n`
+                : '';
             resolve({
-                code: code ?? 1, output: Buffer.concat(out).toString('utf8'),
+                code: code ?? 1, output: head + raw,
                 ms: Date.now() - started, timedOut,
             });
         });
     });
 }
 
+/**
+ * 失敗の詳細に出す行を選ぶ。
+ *
+ * ⚠️ 打ち切り（`fromEnd`）のときは**末尾**を出す。先頭は起動時の案内で埋まり、
+ *    「何を待っていたか」が入らない（macOS の layout でこれに遭った）。
+ */
+function detailLines(output, n, fromEnd) {
+    const lines = String(output ?? '').split('\n').filter(l => l.trim());
+    return fromEnd ? lines.slice(-n) : lines.slice(0, n);
+}
 /** 拡張子で再帰的に集める（node_modules と .git は除く） */
 async function sources(dir, exts = ['.mjs'], acc = []) {
     for (const e of await readdir(dir, { withFileTypes: true })) {
@@ -221,7 +242,9 @@ if (!quick && !failed) {
         name: `layout ${(r.ms / 1000).toFixed(1)}s`,
         ok,
         skipped,
-        detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),
+        // ⚠️ 打ち切りのときは**末尾**が知りたい（何を待っていたか）。
+        //    先頭6行だけだと起動時の案内で埋まる。
+        detail: ok ? [] : detailLines(r.output, r.timedOut ? 10 : 6, r.timedOut),
     });
     if (!ok) failed = true;
 } else {
@@ -238,7 +261,9 @@ if (!quick && !failed) {
         name: `render ${(r.ms / 1000).toFixed(1)}s`,
         ok,
         skipped,
-        detail: ok ? [] : r.output.split('\n').filter(l => l.trim()).slice(0, 6),
+        // ⚠️ 打ち切りのときは**末尾**が知りたい（何を待っていたか）。
+        //    先頭6行だけだと起動時の案内で埋まる。
+        detail: ok ? [] : detailLines(r.output, r.timedOut ? 10 : 6, r.timedOut),
     });
     if (!ok) failed = true;
 } else {
