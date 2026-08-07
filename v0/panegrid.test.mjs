@@ -319,11 +319,22 @@ test('知らないパターン名は何も変えない（黙って別の形に�
     assert.deepEqual(r.overflow, []);
 });
 
-test('結合は隣を占め、空いていなければ断る。解くのは必ず通る', () => {
+// 🚨 **実機の指摘で挙動を変えた**: 隣が埋まっていても押し出して広げる。
+//    以前は「空いていなければ断る」だったので、画面が埋まっている普通の状態では
+//    常に断られ、「拡張のボタンが効かない」ように見えた。
+//    押し出した相手は配置から外れ、autoPlace が空きに置く（無ければ溢れて告知）。
+test('結合は隣を占め、埋まっていれば押し出す。解くのは必ず通る', () => {
     let g = applyPreset(autoPlace(emptyGrid(), ['a', 'b']).grid, '2x2', ['a', 'b']).grid;
-    // b が右に居るので右への結合は断られる
-    const no = mergeCell(g, 'a', 'right');
-    assert.equal(no.ok, false, no.why ?? '');
+    // b が右に居ても**押し出して**広がる（押し出した id を返す）
+    const push = mergeCell(g, 'a', 'right');
+    assert.equal(push.ok, true, push.why ?? '');
+    assert.deepEqual(push.displaced, ['b'], '押し出した相手を返していない');
+    assert.equal(at(push.grid, 'a').cw, 2, show(push.grid));
+    assert.equal(at(push.grid, 'b'), null, '押し出した相手の配置が残っている（重なる）');
+    // 押し出した相手は空きに置き直される（2×2 なら空きがある）
+    const replaced = autoPlace(push.grid, ['a', 'b']);
+    assert.ok(at(replaced.grid, 'b'), '押し出した相手が置き直されない');
+    assert.deepEqual(replaced.overflow, [], show(replaced.grid));
     // 下は空いているので通る
     const down = mergeCell(g, 'a', 'down');
     assert.equal(down.ok, true, down.why ?? '');

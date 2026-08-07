@@ -787,13 +787,15 @@ function pane(id, title, tags = []) {
   const bwide = el('button', null, '▭→'); bwide.title = '右のセルと結合';
   const btall = el('button', null, '▭↓'); btall.title = '下のセルと結合';
   const bunit = el('button', null, '▭×'); bunit.title = '結合を解く（1セルに戻す）';
-  for (const b of [bwide, btall, bunit]) b.hidden = !gridMode;
+  // 🚨 グリッドでないときは**作らない**（hidden に頼ると、作者スタイルに負けて
+  //    「押せるのに何も起きないボタン」になる。CLAUDE.md の既知の罠）。
+  const mergeBtns = gridMode ? [bwide, btall, bunit] : [];
   bwide.addEventListener('click', ev => { ev.stopPropagation(); mergePane(id, 'right'); });
   btall.addEventListener('click', ev => { ev.stopPropagation(); mergePane(id, 'down'); });
   bunit.addEventListener('click', ev => { ev.stopPropagation(); mergePane(id, 'split'); });
   const bclose = el('button', null, '×');
   bclose.title = '閉じる（実行は止まりません。監視盤から戻せます）';
-  h.append(ttl, el('span', 'grow'), tagBox, bwide, btall, bunit, bmin, bmax, bclose);
+  h.append(ttl, el('span', 'grow'), tagBox, ...mergeBtns, bmin, bmax, bclose);
   const body = el('div', 'body');
   p.append(h, body);
 
@@ -917,8 +919,18 @@ function setPreset(name) {
  * ⚠️ 断られた理由をそのまま出す（押しても何も起きないのが一番分からない）。
  */
 function mergePane(id, dir) {
+  // 🚨 **配置が無いなら先に置く。** ここが無いと「そのペインは配置されていません」で
+  //    黙って終わる（実機で「隣を消しても広がらない」= この経路だった）。
+  //    配置は applyGridLayout が作るが、押した時点で未配置のことがある。
+  if (!cellOf(paneGrid, id)) {
+    const ids = [...panes.keys()].sort((a, b) => panes.get(a).defaultRank - panes.get(b).defaultRank);
+    paneGrid = autoPlace(paneGrid, ids).grid;
+  }
   const r = dir === 'split' ? splitCell(paneGrid, id) : mergeCell(paneGrid, id, dir);
   if (!r.ok) { gridNote(`広げられません: ${r.why}`); return; }
+  if (r.displaced?.length) {
+    gridNote(`${r.displaced.length} 枚を空きに移しました（入り切らない分は下に出ます）`);
+  }
   paneGrid = r.grid;
   saveGrid();
   applyGridLayout();

@@ -391,10 +391,35 @@ export function applyPreset(grid, name, ids) {
  */
 export function mergeCell(grid, id, dir) {
     const me = cellOf(grid, id);
-    if (!me) return { grid, ok: false, why: 'そのペインは配置されていません' };
-    if (dir === 'right') return resizeCell(grid, id, me.cw + 1, me.ch);
-    if (dir === 'down') return resizeCell(grid, id, me.cw, me.ch + 1);
-    return { grid, ok: false, why: `知らない方向です: ${dir}` };
+    if (!me) return { grid, ok: false, why: 'そのペインは配置されていません', displaced: [] };
+    let want;
+    if (dir === 'right') want = { ...me, cw: me.cw + 1 };
+    else if (dir === 'down') want = { ...me, ch: me.ch + 1 };
+    else return { grid, ok: false, why: `知らない方向です: ${dir}`, displaced: [] };
+
+    // 空いていればそのまま広げる
+    const direct = resizeCell(grid, id, want.cw, want.ch);
+    if (direct.ok) return { ...direct, displaced: [] };
+
+    // 🚨 **埋まっていても押し出して広げる（実機で指摘された）。**
+    //    以前は「隣が空いていなければ断る」だけだったので、画面が埋まっている
+    //    普通の状態では**常に断られて「拡張のボタンが効かない」**ように見えた。
+    //    押し出したペインは配置から外すだけ（autoPlace が空きに置き直す）。
+    //    入り切らなければ溢れとして告知される = 黙って消えない。
+    // ⚠️ グリッドの外にはみ出す広げ方は押し出しても不可能なので断る。
+    const cols = grid?.cols ?? 0, rows = grid?.rows ?? 0;
+    if (want.col + want.cw - 1 > cols || want.row + want.ch - 1 > rows) {
+        return { grid, ok: false, why: 'グリッドの外にはみ出します', displaced: [] };
+    }
+    const blockers = (grid.cells ?? []).filter(c => c.id !== id && cellsOverlap(c, want));
+    const freed = {
+        v: 2, cols, rows,
+        cells: (grid.cells ?? [])
+            .filter(c => !blockers.some(b => b.id === c.id))
+            .map(c => (c.id === id ? { ...want } : { ...c })),
+        closed: [...(grid?.closed ?? [])],
+    };
+    return { grid: freed, ok: true, why: null, displaced: blockers.map(b => b.id) };
 }
 
 /**

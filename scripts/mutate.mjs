@@ -80,7 +80,7 @@ const MUTANTS = [
         name: 'merge-direction',
         why: '知らない方向でも広げる（押した向きと違う方向に広がる）',
         file: 'v0/panegrid.mjs',
-        from: "    return { grid, ok: false, why: `知らない方向です: ${dir}` };",
+        from: "    else return { grid, ok: false, why: `知らない方向です: ${dir}`, displaced: [] };",
         to: "    return resizeCell(grid, id, me.cw + 1, me.ch);   /* 変異: 右に広げる */",
         gone: "知らない方向です",
         pattern: '結合は隣を占め',
