@@ -145,8 +145,15 @@ async function measure(width, from = null) {
         `${at}/__probe?w=${width}&token=${TOKEN}`,
     ], { shell: false, windowsHide: true });
     let out = '';
+    let err = '';
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', d => { out += d; });
+    // 🚨 **stderr を捨てない。** Chrome が落ちた / sandbox で起動できない /
+    //    GPU で待っている、といった理由は全部こちらに出る。捨てていたので
+    //    「60s で終わらなかった」以外に手掛かりが無かった（macOS の CI で
+    //    3往復かかった）。**捨てた情報は、無かったことと区別できない。**
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', d => { err += d; });
     // ⚠️ 撮影後にブラウザを必ず落とす。放置すると同時実行で数十プロセス残る（実際に53個残した）
     const done = new Promise(r => child.on('close', r));
     // ⚠️ **上限は「残り時間」に合わせる。** 固定 60s だと、4本立ち上げるだけで
@@ -160,9 +167,16 @@ async function measure(width, from = null) {
     note(`幅 ${width} を測った`, Date.now() - t0);
     if (browserKilled) {
         await rm(profile, { recursive: true, force: true }).catch(() => {});
-        throw new Error(`幅 ${width}: ブラウザが ${Math.round(budget / 1000)}s で終わらなかった`
-            + '（SIGKILL）。--virtual-time-budget は実時間の上限ではないので、'
-            + 'ページの fetch が返っていない可能性がある');
+        // 🚨 **何が起きたかを全部添える。** dump が始まっていたか（out の長さ）、
+        //    ハーネスが out を書けたか、Chrome が何か言っていたか（stderr）。
+        //    これが無いと「終わらなかった」しか残らない。
+        const dumped = out.includes('<pre id="out">');
+        throw new Error([
+            `幅 ${width}: ブラウザが ${Math.round(budget / 1000)}s で終わらなかった（SIGKILL）`,
+            `  dump の出力: ${out.length} 文字 / ハーネスの out: ${dumped ? "書けている" : "無い"}`,
+            `  html の断片: ${JSON.stringify(out.slice(0, 200))}`,
+            `  chrome の stderr: ${JSON.stringify(err.slice(-800)) || '(空)'}`,
+        ].join('\n'));
     }
     await rm(profile, { recursive: true, force: true });
 
@@ -170,7 +184,10 @@ async function measure(width, from = null) {
         throw new Error(`締切（${DEADLINE_MS / 1000}s）を超えました。経過: ${step.join(' / ')}`);
     }
     const m = out.match(/<pre id="out">([\s\S]*?)<\/pre>/);
-    if (!m) throw new Error(`幅 ${width}: 計測結果が取れなかった`);
+    if (!m) {
+        throw new Error(`幅 ${width}: 計測結果が取れなかった`
+            + `（dump ${out.length} 文字 / stderr ${JSON.stringify(err.slice(-400))}）`);
+    }
     const decode = s => s.replace(/&quot;/g, '"').replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>').replace(/&amp;/g, '&');
     return JSON.parse(decode(m[1]));
