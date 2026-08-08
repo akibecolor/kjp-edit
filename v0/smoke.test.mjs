@@ -6865,3 +6865,64 @@ test('🔒 state/session の実行トークン当て判定にも門・記録・�
         await rm(audit, { force: true }).catch(() => {});
     }
 });
+
+/**
+ * 🔒 **検査専用の経路も門の後ろ（#64。10回目のレビュー / SERIOUS）。**
+ *
+ * `/__shutdown` と `/__throw` は `handleRequest` の**先頭**にあったので、
+ * **Host 検証も認証も通らずにデーモンを落とせた**。
+ * 「既定では存在しない経路」は「門の外にあってよい経路」ではない。
+ *
+ * ⚠️ 同時に `--layout-probe` と `--allow-host` の併用を起動時に拒否する
+ *    （そもそもトンネルに出さない）。二段にする理由は、門は将来の変更で
+ *    順序がずれうるが、起動を止める門は構成そのものを作らせないため。
+ */
+test('🔒 検査専用の /__shutdown は認証を通らないと落とせない（#64）', async () => {
+    const s = await startAuthServer(['--layout-probe', '--require-auth', '--token', EXEC_TOKEN]);
+    try {
+        // 🔒 トークン無しでは 401（そして**デーモンは生きている**）
+        const no = await authGet(s.port, '/__shutdown');
+        assert.equal(no.code, 401, `無認証で /__shutdown が通った: ${no.code}`);
+        const alive = await authGet(s.port, '/api/v0/state?fresh=1',
+            { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(alive.code, 200,
+            '無認証の /__shutdown でデーモンが落ちた（門の外にある）');
+
+        // 認証を通せば従来どおり落とせる（検査用の経路そのものは残す）
+        const ok = await authGet(s.port, '/__shutdown', { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(ok.code, 200, `認証付きの /__shutdown が通らない: ${ok.code}`);
+        await new Promise(r => setTimeout(r, 800));
+    } finally {
+        s.child.kill();
+    }
+});
+
+test('🔒 --layout-probe と --allow-host は併用できない（#64）', async () => {
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--layout-probe',
+            '--allow-host', 'probe.example.com'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    let err = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', d => { err += d; });
+    // 🚨 **「起動しないはず」を待ち続ける形にしない。** 守りを外すとサーバは
+    //    正常に起動して**永久に終わらない**ので、`exit` だけを待つと
+    //    `node --test` ごとハングして SIGKILL され、要約が消える
+    //    （実測: この検査で変異が KILLED ではなく HUNG になった）。
+    //    上限で打ち切り、**失敗として観測できる形**にする。
+    let code;
+    try {
+        code = await Promise.race([
+            new Promise((resolve, reject) => {
+                child.on('exit', c => resolve(c));
+                child.on('error', e => reject(e));
+            }),
+            new Promise(resolve => setTimeout(() => resolve('(15秒たっても終了しない)'), 15000)),
+        ]);
+    } finally {
+        child.kill();
+    }
+    assert.equal(code, 1, `併用が起動できてしまった（exit=${code}）: ${err.slice(0, 200)}`);
+    assert.match(err, /--layout-probe と --allow-host/,
+        `理由が出ていない: ${err.slice(0, 200)}`);
+});

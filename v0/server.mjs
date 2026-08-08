@@ -2085,28 +2085,6 @@ const server = createServer((req, res) => {
 });
 
 async function handleRequest(req, res) {
-    // 🚨 **検査専用: 必ず throw する経路（既定では存在しない）。**
-    //    認可の手前の同期例外でデーモンが exit 1 する事故を2回起こしている
-    //    （`new URL` と `decodeURIComponent`）。その2つには個別の try/catch と変異が
-    //    あるのに、**汎用の砦である top-level `.catch()` には検査が1つも無かった**
-    //    （丸ごと消しても smoke は全緑。#42）。
-    // ⚠️ **内側の try/catch より手前に置く。** 中に置くと内側が捕まえてしまい、
-    //    砦を外しても落ちない = 砦を測れない（最初にそう書いて測り損ねた）。
-    if (opts.layoutProbe && req.url === '/__throw') {
-        throw new Error('検査用の例外（デーモンは継続しなければならない）');
-    }
-    // 🚨 **検査専用: 終了処理を起こす経路（既定では存在しない）。**
-    //    `SIGHUP` / `uncaughtException` からの終了処理は Windows では測れない
-    //    （`process.kill` が TerminateProcess 相当でハンドラを走らせない）。
-    //    ここが無いと、終了処理の**中身**（新しい実行を断る門・起動途中の印・
-    //    数え直しと告知）が **Windows では1つも検査されない**まま CI 任せになる。
-    //    シグナルへの登録だけは linux / darwin の検査で測る。
-    if (opts.layoutProbe && req.url === '/__shutdown') {
-        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('shutting down\n');
-        shutdown('probe').catch(() => { /* 終了処理の失敗で落とさない */ });
-        return;
-    }
     // 🚨 new URL() は必ず try で囲む。**認可の手前にある同期例外はプロセスを殺す。**
     //    `GET //[ HTTP/1.1` のような request-target は ERR_INVALID_URL を投げ、
     //    async ハンドラの unhandled rejection でデーモンが exit 1 で落ちる。
@@ -2196,6 +2174,32 @@ async function handleRequest(req, res) {
     //    「新しい経路で照合を忘れる」余地が構造として無くなる
     //    （副作用のある経路を足すときに必ず通る関門を同じコミットで作る、の実装）。
     // ⚠️ 登録外は 400 で落とす（読み取りも書き込みも実行も等しく）。
+    // 🚨 **検査専用の経路は、門より後ろ・内側の try より手前に置く（#64）。**
+    //
+    //    以前は `handleRequest` の**先頭**にあったので、
+    //    **Host 検証も認証も通らずに `/__shutdown` でデーモンを落とせた**
+    //    （10回目のレビュー / SERIOUS）。`--layout-probe` は検査用とはいえ、
+    //    「既定では存在しない経路」は「門の外にあってよい経路」ではない。
+    //    ⚠️ 起動時に `--layout-probe` と `--allow-host` の併用も拒否している
+    //       （下の起動処理）。門を通すことと、そもそも外に出さないことの二段。
+    //
+    // ⚠️ **内側の try/catch より手前**であることは維持する。中に置くと
+    //    内側が捕まえてしまい、汎用の砦（top-level `.catch()`）を測れない（#42）。
+    if (opts.layoutProbe && url.pathname === '/__throw') {
+        throw new Error('検査用の例外（デーモンは継続しなければならない）');
+    }
+    // 🚨 **検査専用: 終了処理を起こす経路（既定では存在しない）。**
+    //    `SIGHUP` / `uncaughtException` からの終了処理は Windows では測れない
+    //    （`process.kill` が TerminateProcess 相当でハンドラを走らせない）。
+    //    ここが無いと、終了処理の**中身**（新しい実行を断る門・起動途中の印・
+    //    数え直しと告知）が **Windows では1つも検査されない**まま CI 任せになる。
+    //    シグナルへの登録だけは linux / darwin の検査で測る。
+    if (opts.layoutProbe && url.pathname === '/__shutdown') {
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('shutting down\n');
+        shutdown('probe').catch(() => { /* 終了処理の失敗で落とさない */ });
+        return;
+    }
     const picked = pickRepo(url);
     if (picked.error) {
         res.writeHead(400, {
@@ -3619,6 +3623,18 @@ if (opts.requireAuth === false && opts.allowHosts.size > 0) {
     console.error('\n✖ --no-auth と --allow-host は併用できません。');
     console.error('  トンネルに届く相手が全員、無認証で差分を読める状態になります。');
     console.error('  ループバックだけで使うなら --allow-host を外してください。\n');
+    process.exit(1);
+}
+// 🚨 **検査専用の経路をトンネルに出さない（#64。10回目のレビュー / SERIOUS）。**
+//    `--layout-probe` は `/__shutdown`（デーモンを落とす）と `/__throw`
+//    （必ず例外を起こす）を生やす。門の後ろに移したとはいえ、
+//    **検査のためだけの経路をトンネルに届く相手に見せる理由が無い。**
+//    ⚠️ `--no-auth` × `--allow-host` と同じ「黙って危ない構成を作らない」型なので、
+//       警告ではなく起動を止める（警告は読まれない）。
+if (opts.layoutProbe && opts.allowHosts.size > 0) {
+    console.error('\n✖ --layout-probe と --allow-host は併用できません。');
+    console.error('  検査専用の経路（/__shutdown /__throw）をトンネルに出すことになります。');
+    console.error('  レイアウト検査はループバックで走らせてください。\n');
     process.exit(1);
 }
 // 🚨 **実行の門は自動生成より「前」に置く。**

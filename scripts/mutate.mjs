@@ -33,6 +33,27 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🔒 #64: 検査専用の経路を門の手前に戻す（無認証でデーモンを落とせる）
+        name: 'probe-shutdown-before-gate',
+        why: '検査専用の /__shutdown を Host 検証・認証より前に置く（無認証で落とせる）',
+        file: 'v0/server.mjs',
+        from: "    if (opts.layoutProbe && url.pathname === '/__shutdown') {",
+        to: '    if (false) {   /* 変異: 門の後ろでは受けない */',
+        also: [{ from: 'async function handleRequest(req, res) {', to: "async function handleRequest(req, res) {\\n    if (opts.layoutProbe && req.url === '/__shutdown') {   /* 変異: 門の手前 */\\n        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });\\n        res.end('shutting down');\\n        shutdown('probe').catch(() => {});\\n        return;\\n    }" }],
+        gone: "if (opts.layoutProbe && url.pathname === '/__shutdown') {",
+        pattern: '検査専用の /__shutdown は認証を通らないと落とせない',
+    },
+    {
+        // 🔒 #64: トンネルに検査経路を出せてしまう構成を作らせない門
+        name: 'probe-with-allow-host',
+        why: '--layout-probe と --allow-host の併用を許す（検査経路をトンネルに出す）',
+        file: 'v0/server.mjs',
+        from: 'if (opts.layoutProbe && opts.allowHosts.size > 0) {',
+        to: 'if (false) {   /* 変異: 併用を許す */',
+        gone: 'if (opts.layoutProbe && opts.allowHosts.size > 0) {',
+        pattern: '--layout-probe と --allow-host は併用できない',
+    },
+    {
         // 🔒 #63: `/state` の execSessions 可視判定を壁の外に戻す
         //    （読み取り鍵だけの相手が実行トークンを1要求1bitで総当たりできる）
         name: 'state-token-oracle-unwalled',

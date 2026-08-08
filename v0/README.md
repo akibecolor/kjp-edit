@@ -208,7 +208,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `swimlanes.mjs` | レーン割当。VS Code の `scmHistory.ts`（MIT）を参考に再実装 |
 | `swimlanes.test.mjs` | 回帰テスト。実際に踏んだバグを固定 |
 | `paths.test.mjs` | パスの正規化・同一性判定（NFC / 区切り / 8.3 短縮名 / symlink）の unit テスト |
-| `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe` と、必ず throw する `/__throw` / `/__throw-inner`） |
+| `server.mjs` | HTTP + `/api/v0/state`（+ `--layout-probe` で検査用の `/__probe` / `/__shutdown` と、必ず throw する `/__throw` / `/__throw-inner`）。🔒 検査用の経路も **Host 検証と認証の後ろ**にあり、`--layout-probe` は `--allow-host` と併用できない（#64） |
 | `app.html` | **統合 UI**（`/` と `/layout` が返す）。広い画面はドック、狭い画面は縦積み |
 | `smoke.test.mjs` | 一時リポジトリを作って端から端まで検証 |
 | `layout-check.mjs` | 実ブラウザで 390 / 768 / 1280px を測る。ブラウザが無ければスキップ |
