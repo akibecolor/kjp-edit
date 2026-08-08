@@ -250,7 +250,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `/api/v0/state` | 全状態。`?fresh=1` で TTL キャッシュを無視。`stats.gitSpawns` に git の起動回数（定数5 + worktree 1本あたり3） |
 | `/api/v0/diff?base=&ref=&path=` | 1ファイルの unified diff |
 | `/api/v0/blob?ref=&path=` | ファイルの中身。512KB 超は `tooLarge`（`limitBytes` 付き。**読んでいないので `binary` は `null`**）、NUL 混入は `binary` |
-| `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す。**`--require-auth` では認証済みにしか返さない**） |
+| `/api/v0/session` | 書き込み可否とトークン（同一オリジンにのみ返す。**`--require-auth` では認証済みにしか返さない**）。🔒 実行トークンを提示したかの判定は `tokenWall()`（門・記録・遅延）を通る（#63） |
 | `POST /api/v0/checkout` | ブランチ切り替え。**`--allow-write` が必要** |
 | `POST /api/v0/merge` | 取り込み（merge）。**`--allow-write` が必要**。**衝突しないと予測できたものだけ**実行する |
 | `POST /api/v0/file` | 編集のために作業ツリーの中身を読む。**`--allow-write` が必要**。`{worktree, path}` → `{text, oid, eol, bom, bytes}` |

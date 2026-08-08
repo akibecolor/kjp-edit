@@ -1243,6 +1243,87 @@ function knownGoodSecret(vals) {
     return goodSecrets.has(vals);
 }
 
+/**
+ * 🔒 **実行トークンの提示を「壁」として判定する（#63。10回目のレビュー / SERIOUS）。**
+ *
+ * `/api/v0/state` は `execSessions`（argv = 打ったコマンド行）を
+ * **生の実行トークンを提示した相手にだけ**返す。その判定に `presentedToken()` を
+ * 直接呼んでいたので、**読み取りの鍵しか持たない相手が実行トークンを
+ * 1要求1bit で総当たり**できた。読み取りの門は既に通っているので 200 が返り、
+ * `execSessionsHidden` の有無が**完全なオラクル**になる。
+ *
+ * 実測: Cookie（読み取り用）を付けて `?token=<誤り>` を300回 → **120ms（2500 req/s）、
+ * 401 も 429 も遅延も無く、監査ログに1行も残らない**。
+ * 同じ誤り値を `/api/v0/exec/list` に投げると1回あたり約1.6秒（門が効いている）。
+ *
+ * 🚨 **「唯一の壁になるものには下限・記録・遅延を必ず付ける」の対象そのもの。**
+ *    当たれば実行トークンが確定し、そのまま任意コード実行に昇格する。
+ *
+ * ⚠️ **「提示していない」を失敗として数えない。** UI は15秒ごとに `/state` を叩くので、
+ *    トークンを持たない普通の読み取りを失敗に数えると**正規の利用が遅くなる**
+ *    （壁が利用者を殴る）。
+ * ⚠️ **読み取り用の派生秘密は「推測」ではない。** 案内 URL の `?token=` はこの値なので、
+ *    それを失敗に数えると**スマホで開くたびに遅延が積まれる**。
+ *
+ * @returns {Promise<{ok: boolean, handled: boolean}>} handled=true なら応答済み（429）
+ */
+async function presentedTokenAudited(req, res, url) {
+    const vals = presentedSecrets(req, url);
+    if (!vals.length) return { ok: false, handled: false };
+    // 既に実行トークンとして通った値は、門を素通りさせる（比較は必ず通る）
+    if (goodTokens.has(vals)) return { ok: presentedToken(req, url), handled: false };
+    // 読み取り用の秘密しか提示していないなら「実行トークンの試行」ではない
+    const secret = cookieSecret();
+    if (!vals.some(v => !secretMatches(v, secret))) return { ok: false, handled: false };
+    return tokenWall(req, res, vals, () => presentedToken(req, url));
+}
+
+/**
+ * 🔒 **実行トークンの壁（#48）。門 → 比較 → 外したら記録して遅延。**
+ *
+ * ⚠️ **1箇所だけに置く。** #63 で `/state` と `/session` にも壁が要ると分かったとき、
+ *    最初は同じ手順を書き写した。すると **`gateMutation` を測っていた変異4件が
+ *    「2箇所に一致する」で STALE**（= 実行の壁が1つも検証されない状態）になった。
+ *    CLAUDE.md の「`gone` は同じ式が他所にできた瞬間に無効化される」の実例。
+ *    守りを増やすときは**写すのではなく1箇所に集める**。
+ *
+ * ⚠️ 順序が守りの本体。混雑の門は**比較の手前**。後ろに置くと 429 が
+ *    「その値は違った」の同義語になり、当てる速さは並列度で決まったままになる。
+ *
+ * @param {string[]} vals 提示された候補（門を素通しさせてよいかの判定に使う）
+ * @param {() => boolean} compare 実際の比較（ここだけが値を見る）
+ * @returns {Promise<{ok: boolean, handled: boolean}>} handled=true なら応答済み（429）
+ */
+async function tokenWall(req, res, vals, compare) {
+    const peer = peerKey(req);
+    // 🔒 1度でも実行トークンを通した値は混雑の門を素通りさせる
+    //    （素通りするのは門だけ。比較は必ず通るので、合っていなければ弾かれる）。
+    const trusted = goodTokens.has(vals);
+    if (!trusted && !mutationGate.acquire(peer)) {
+        mutationFails.shed(peer);
+        res.writeHead(429, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+            'retry-after': '1',
+        });
+        res.end(JSON.stringify({
+            error: '認証前の要求が同時に多すぎます。少し待ってから試してください',
+        }));
+        return { ok: false, handled: true };
+    }
+    try {
+        const ok = compare();
+        if (ok) goodTokens.remember(vals);
+        // 🚨 **外したら記録して遅延する。** ここが無いと痕跡ゼロで総当たりできた
+        //    （実測 8,955 req/s。読み取り側だけ塞いで実行側が取り残しだった）。
+        //    ⚠️ 遅延の間も枠を握る。これが「並列でも縛れる」の本体。
+        else await mutationFails.note(peer, { ...originHint(req), path: pathOf(req) });
+        return { ok, handled: false };
+    } finally {
+        if (!trusted) mutationGate.release(peer);
+    }
+}
+
 function rememberGoodSecret(vals) {
     // ⚠️ **通った要求が提示した値を全部覚えてはいけない。** 偽の Cookie を
     //    正しいトークンと一緒に送るだけで、その偽の値が門を素通りする鍵になる
@@ -1329,36 +1410,12 @@ async function gateMutation(req, res) {
     // 🚨 **ここから下がトークンの壁（#48）。比較の手前に混雑の門を置く。**
     //    ⚠️ 順序が守りの本体。比較の後ろに置くと 429 が「その値は違った」の
     //       同義語になり、当てる速さは並列度で決まったままになる。
-    const peer = peerKey(req);
     const given = req.headers[TOKEN_HEADER];
     const vals = typeof given === 'string' ? [given] : [];
-    // 🔒 1度でも実行トークンを通した値は混雑の門を素通りさせる
-    //    （素通りするのは門だけ。比較は必ず通るので、合っていなければ 403）。
-    const trusted = goodTokens.has(vals);
-    if (!trusted && !mutationGate.acquire(peer)) {
-        mutationFails.shed(peer);
-        res.writeHead(429, {
-            'content-type': 'application/json; charset=utf-8',
-            'cache-control': 'no-store',
-            'retry-after': '1',
-        });
-        res.end(JSON.stringify({
-            error: '認証前の要求が同時に多すぎます。少し待ってから試してください',
-        }));
-        return false;
-    }
-    let ok;
-    try {
-        ok = tokenMatches(given);
-        if (ok) goodTokens.remember(vals);
-        // 🚨 **外したら記録して遅延する。** ここが無いと痕跡ゼロで総当たりできた
-        //    （実測 8,955 req/s。読み取り側だけ塞いで実行側が取り残しだった）。
-        //    ⚠️ 遅延の間も枠を握る。これが「並列でも縛れる」の本体。
-        else await mutationFails.note(peer, { ...originHint(req), path: pathOf(req) });
-    } finally {
-        if (!trusted) mutationGate.release(peer);
-    }
-    if (!ok) {
+    // 壁の中身は `tokenWall()` に1本化してある（写すと変異が効かなくなる。#63）
+    const r = await tokenWall(req, res, vals, () => tokenMatches(given));
+    if (r.handled) return false;
+    if (!r.ok) {
         denyJson(res, 403, `${TOKEN_HEADER} が一致しません`);
         return false;
     }
@@ -2179,11 +2236,15 @@ async function handleRequest(req, res) {
              //   7回目のレビューで transcript 側を直したのと同型の穴がここにも残っていた）。
             //    ⚠️ **キャッシュは共有**なので、payload を作り直すのではなく
             //    応答の時点で落とす。
+            // 🔒 **判定は必ず壁を通す**（#63）。直接 `presentedToken()` を呼ぶと
+            //    記録も遅延も無い当たり判定になり、実行トークンの総当たり口になる。
+            const shown = await presentedTokenAudited(req, res, url);
+            if (shown.handled) return;
             const body = JSON.stringify(
                 // ⚠️ 隠すのは **`--require-auth` のときだけ**。認証が要らない構成は
                 //    ループバック限定で Cookie の脅威（他ポートのページ）が無く、
                 //    ここで隠すと素の利用を壊すだけで守りにならない。
-                (state.execSessions && opts.requireAuth && !presentedToken(req, url))
+                (state.execSessions && opts.requireAuth && !shown.ok)
                     ? { ...state, execSessions: null, execSessionsHidden: true }
                     : state,
             );
@@ -2216,6 +2277,10 @@ async function handleRequest(req, res) {
         if (url.pathname === '/api/v0/session') {
             const site = req.headers['sec-fetch-site'];
             const sameOrigin = !site || site === 'same-origin' || site === 'none';
+            // 🔒 ここも当たり判定（しかも当たれば**トークンそのもの**を返す）なので、
+            //    壁を通す（#63。`/state` と同じ理由）。
+            const shown = await presentedTokenAudited(req, res, url);
+            if (shown.handled) return;
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',
@@ -2238,14 +2303,14 @@ async function handleRequest(req, res) {
                 //    ブラウザは `?token=` で1回渡され、sessionStorage に持つ
                 //    （sessionStorage は**ポートを含むオリジン単位**なので
                 //     他のポートからは読めない。Cookie との決定的な違い）。
-                token: opts.allowWrite && sameOrigin && presentedToken(req, url)
+                token: opts.allowWrite && sameOrigin && shown.ok
                     ? opts.token : null,
                 // 🔒 **どちらの秘密で来たかを伝える。**
                 //    案内の URL には読み取り専用の派生秘密しか載せないので、
                 //    ページはそれを「読める鍵」として保持するが、
                 //    **書き込み・実行の鍵と混同してはいけない**
                 //    （混同すると「有効に見えて必ず 403」の状態を作る）。
-                presented: presentedToken(req, url) ? 'token'
+                presented: shown.ok ? 'token'
                     : (presentedReadSecret(req, url) ? 'read' : 'none'),
             }));
             return;

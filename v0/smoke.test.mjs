@@ -6792,3 +6792,76 @@ test('🚨 precheck: 自分がシーケンサ停止中なら self に出す（�
         await rm(wt, { recursive: true, force: true }).catch(() => {});
     }
 });
+
+/**
+ * 🔒 **`/state` と `/session` の「実行トークンの当たり判定」も壁を通す（#63）。**
+ *
+ * 10回目のレビュー / SERIOUS。`--allow-exec` の壁（#48）は `gateMutation` の中にしか
+ * 無く、`/api/v0/state` の `execSessions` 可視判定と `/api/v0/session` の
+ * トークン払い出し判定は **`presentedToken()` を直接呼んでいた**ので、
+ * 読み取りの鍵を持つ相手が**1要求1bitで実行トークンを総当たり**できた。
+ * 実測: Cookie 付きで `?token=<誤り>` を300回 → **120ms（2500 req/s）、
+ * 401 も 429 も遅延も無く、監査ログに1行も残らない**。
+ * 当たれば execSessions（argv）が出て実行トークンが確定 = そのまま RCE に昇格する。
+ *
+ * ⚠️ **正規の読み取りを殴らないこと**も同時に測る。UI は15秒ごとに `/state` を叩き、
+ *    スマホは案内 URL の `?token=<読み取り鍵>` で開く。これらを「失敗」に数えると
+ *    壁が利用者を遅くする。
+ */
+test('🔒 state/session の実行トークン当て判定にも門・記録・遅延がある（#63）', async () => {
+    const audit = join(repo, '..', `state-brute-${Date.now()}.jsonl`);
+    const s = await startAuthServer(['--require-auth', '--allow-exec',
+        '--token', EXEC_TOKEN, '--audit-log', audit]);
+    const readSecret = (s.banner().match(/\?token=([A-Za-z0-9_-]+)/) ?? [])[1];
+    const agent = new HttpAgent({ keepAlive: true, maxSockets: 320 });
+    const guess = token => new Promise(res => {
+        const r = httpRequest({
+            host: '127.0.0.1', port: s.port, agent,
+            path: `/api/v0/state?token=${encodeURIComponent(token)}`,
+            headers: { cookie: `kjp_auth=${readSecret}` },
+        }, x => {
+            let b = '';
+            x.on('data', d => { b += d; });
+            x.on('end', () => res({ code: x.statusCode, body: b }));
+        });
+        r.on('error', e => res({ code: 0, body: e.message }));
+        r.end();
+    });
+    try {
+        assert.ok(readSecret, `案内 URL の読み取り鍵が取れない: ${s.banner().slice(0, 300)}`);
+        const N = 200;
+        const rs = await Promise.all(Array.from({ length: N }, (_, i) => guess(`wrong-state-${i}`)));
+        const by = {};
+        for (const r of rs) by[r.code] = (by[r.code] ?? 0) + 1;
+        const shed = by[429] ?? 0;
+        // 🔒 全部が比較されない（門が無いと 200 が N 件返る = 当て放題）
+        assert.ok(shed >= 50,
+            `429 で切られたのが ${shed} 件しかない: ${JSON.stringify(by)}`
+            + '（修正前は 200 が全件で、当たり判定が無制限に取れた）');
+        // 🔒 痕跡が残る
+        await new Promise(r => setTimeout(r, 400));
+        const grew = await sizeOrZero(audit);
+        assert.ok(grew > 0, '誤った実行トークンを当て続けても監査に1行も残らない');
+        const lines = (await readFile(audit, 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l));
+        const kinds = new Set(lines.map(r => r.event));
+        assert.ok(kinds.has('mutation-token-failed') || kinds.has('mutation-token-failed-summary'),
+            `当て判定の失敗が記録されていない: ${JSON.stringify([...kinds])}`);
+        assert.equal(lines.some(r => JSON.stringify(r).includes('wrong-state-')), false,
+            '試された値が記録に残っている');
+
+        // ⚠️ **正規の読み取りは殴られない。** 読み取り鍵そのものを ?token= で出しても
+        //    「実行トークンの試行」ではないので、遅延も 429 も付かない。
+        const t0 = Date.now();
+        for (let i = 0; i < 5; i++) {
+            const r = await authGet(s.port, `/api/v0/state?token=${encodeURIComponent(readSecret)}`,
+                { cookie: `kjp_auth=${readSecret}` });
+            assert.equal(r.code, 200, `案内 URL の鍵で読めない（壁が利用者を殴っている）: ${r.code}`);
+        }
+        const ms = Date.now() - t0;
+        assert.ok(ms < 3000, `読み取り鍵での5回が ${ms}ms かかった（遅延が正規利用に掛かっている）`);
+    } finally {
+        agent.destroy();
+        s.child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});

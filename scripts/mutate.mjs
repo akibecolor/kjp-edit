@@ -33,6 +33,17 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🔒 #63: `/state` の execSessions 可視判定を壁の外に戻す
+        //    （読み取り鍵だけの相手が実行トークンを1要求1bitで総当たりできる）
+        name: 'state-token-oracle-unwalled',
+        why: '実行トークンの当たり判定を門・記録・遅延の外に出す（read から exec への昇格）',
+        file: 'v0/server.mjs',
+        from: '            const shown = await presentedTokenAudited(req, res, url);\n            if (shown.handled) return;\n            const body = JSON.stringify(',
+        to: '            const shown = { ok: presentedToken(req, url), handled: false };   /* 変異 */\n            const body = JSON.stringify(',
+        gone: 'const shown = await presentedTokenAudited(req, res, url);\n            if (shown.handled) return;\n            const body',
+        pattern: 'state/session の実行トークン当て判定',
+    },
+    {
         name: 'read-secret-rotates-on-restart',
         why: '読み取り専用でも token-read に書き戻す（起動のたびに鍵が回り、ブックマークが 401 になる）',
         file: 'scripts/serveargs.mjs',
@@ -957,10 +968,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'Cookie 認証の要求に実行トークンを返す。Cookie はポートで分離されないので、'
             + '他ポートを開いた相手がリクエスト1本多いだけで任意コード実行に到達する（実測）',
         file: 'v0/server.mjs',
-        from: '                token: opts.allowWrite && sameOrigin && presentedToken(req, url)\n                    ? opts.token : null,',
+        from: '                token: opts.allowWrite && sameOrigin && shown.ok\n                    ? opts.token : null,',
         to: '                token: opts.allowWrite && sameOrigin ? opts.token : null,',
         // ⚠️ `presentedToken(` は関数定義側にも出るので、呼び出しの形で一意にする
-        gone: 'sameOrigin && presentedToken',
+        gone: 'sameOrigin && shown.ok',
         pattern: 'Cookie の値は実行トークンと別で',
     },
     // spawn 失敗（'exit' が来ない）と孫が stdio を握る場合（'close' が来ない）を
@@ -2064,7 +2075,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         file: 'v0/server.mjs',
         from: '    const trusted = goodTokens.has(vals);',
         to: '    const trusted = goodSecrets.has(vals);   /* 変異: 読み取りの控えを使う */',
-        gone: 'goodTokens.has(vals)',
+        gone: 'const trusted = goodTokens.has(vals)',
         // ⚠️ **実測: この変異は SURVIVED する。攻略できないから。**
         //    門に渡す値は `x-kjp-token` ヘッダの1本だけで、**推測値そのもの**。
         //    読み取り鍵をヘッダに入れれば門は素通りできるが、その回は推測を
@@ -2732,9 +2743,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'Cookie だけの相手に exec の argv を出す'
             + '（コマンド行に秘密が載りうるので「read は読み取りまで」が崩れる）',
         file: 'v0/server.mjs',
-        from: '                (state.execSessions && opts.requireAuth && !presentedToken(req, url))',
+        from: '                (state.execSessions && opts.requireAuth && !shown.ok)',
         to: '                (false)',
-        gone: 'state.execSessions && opts.requireAuth && !presentedToken',
+        gone: 'state.execSessions && opts.requireAuth && !shown.ok',
         pattern: 'argv は Cookie だけでは読めず',
     },
     {
