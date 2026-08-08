@@ -33,6 +33,36 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #62: precheck の同時実行を縛らない（1要求で worktree 本数分の git）
+        name: 'precheck-no-inflight-gate',
+        why: 'precheck の同時実行を縛らない（読み取り鍵だけで worktree 本数×並列の git を起動できる）',
+        file: 'v0/server.mjs',
+        from: '            if (!precheckGate.acquire(peerKey(req))) {',
+        to: '            if (false) {   /* 変異: 並列を縛らない */',
+        gone: 'if (!precheckGate.acquire(peerKey(req))) {',
+        pattern: '連投は畳まれ、同時実行に上限がある',
+    },
+    {
+        // 🚨 #62: 連投を畳まない（TTL キャッシュ・重複排除を外す）
+        name: 'precheck-no-cache',
+        why: 'precheck の連投を畳まない（同じ問い合わせのたびに worktree 本数分の git を起動する）',
+        file: 'v0/server.mjs',
+        from: '    if (hit) return hit.p;',
+        to: '    if (false) return hit.p;   /* 変異: 毎回計算する */',
+        gone: 'if (hit) return hit.p;',
+        pattern: '連投は畳まれ、同時実行に上限がある',
+    },
+    {
+        // 🔒 #62: 別オリジン起点（他ポート / 同一 tailnet の別ノード）から撃てる
+        name: 'precheck-any-origin',
+        why: 'precheck を別オリジンのページから撃てるようにする（blind でコストだけ掛けられる）',
+        file: 'v0/server.mjs',
+        from: '                if (site && site !== \'same-origin\') {\n                    denyJson(res, 403,\n                        `別オリジン起点の問い合わせは拒否します (Sec-Fetch-Site: ${site})`);',
+        to: '                if (false) {\n                    denyJson(res, 403,\n                        `別オリジン起点の問い合わせは拒否します (Sec-Fetch-Site: ${site})`);',
+        gone: 'if (site && site !== \'same-origin\') {\n                    denyJson(res, 403,',
+        pattern: '連投は畳まれ、同時実行に上限がある',
+    },
+    {
         // 🔒 #64: 検査専用の経路を門の手前に戻す（無認証でデーモンを落とせる）
         name: 'probe-shutdown-before-gate',
         why: '検査専用の /__shutdown を Host 検証・認証より前に置く（無認証で落とせる）',
@@ -172,9 +202,9 @@ const MUTANTS = [
         name: 'precheck-unknown-worktree-falls-back',
         why: '知らない worktree を1本目にすり替える（別の worktree の判定を返す）',
         file: 'v0/server.mjs',
-        from: '            const me = worktrees.find(w => samePath(w.path, wantPath));',
-        to: '            const me = worktrees.find(w => samePath(w.path, wantPath)) ?? worktrees[0];   /* 変異 */',
-        gone: '            const me = worktrees.find(w => samePath(w.path, wantPath));',
+        from: '    const me = worktrees.find(w => samePath(w.path, wantPath));',
+        to: '    const me = worktrees.find(w => samePath(w.path, wantPath)) ?? worktrees[0];   /* 変異 */',
+        gone: '    const me = worktrees.find(w => samePath(w.path, wantPath));',
         pattern: '知らない worktree に「衝突なし」と答えない',
     },
     // -----------------------------------------------------------------

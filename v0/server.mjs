@@ -2084,6 +2084,123 @@ const server = createServer((req, res) => {
     });
 });
 
+
+/**
+ * 🚨 **`/api/v0/precheck` の計算（#62）。TTL キャッシュ + 重複排除つき。**
+ *
+ * この経路は1要求で **worktree 本数に比例して git を起動する**
+ * （実測: worktree 9本で 1要求 64 spawn。`/api/v0/state` は並列30要求でも 90）。
+ * 他の読み取り経路は `collect()` の TTL キャッシュと inFlight 重複排除で
+ * 守られているのに、**この経路だけ素で回していた**（10回目のレビュー / SERIOUS）。
+ *
+ * ⚠️ **`paths` で絞る前の結果をキャッシュする。** フックは触るファイルごとに
+ *    別の `paths` で聞くので、絞り込み後をキャッシュすると当たらない。
+ * ⚠️ 短い TTL にする。「編集を始める前に聞く」用途なので、
+ *    数秒前の状態を返すと**乗っ取りを見落とす**（守りの意味が消える）。
+ */
+const PRECHECK_TTL_MS = 1500;
+const PRECHECK_MAX_INFLIGHT = 2;
+const precheckGate = makeInflightGate(PRECHECK_MAX_INFLIGHT);
+const precheckCache = new Map();   // `${repo}\u0000${worktree}` → {at, p}
+
+async function precheckFull(repo, wantPath) {
+    const now = Date.now();
+    // 古いものを捨てる（外から無制限に増やせない形にする）
+    for (const [k, v] of precheckCache) {
+        if (now - v.at > PRECHECK_TTL_MS) precheckCache.delete(k);
+    }
+    const key = `${repo}\u0000${wantPath}`;
+    const hit = precheckCache.get(key);
+    // ⚠️ **promise を入れる**（結果ではなく）。同時に来た同じ問い合わせを
+    //    1回の計算に畳むのが目的なので、完了を待たずに共有する。
+    if (hit) return hit.p;
+    const p = precheckCompute(repo, wantPath).catch(err => {
+        precheckCache.delete(key);   // 失敗は覚えない
+        throw err;
+    });
+    precheckCache.set(key, { at: now, p });
+    return p;
+}
+
+async function precheckCompute(repo, wantPath) {
+    let worktrees;
+    try { worktrees = await listWorktrees(repo); }
+    catch (err) { return { error: `worktree を読めません: ${err.message}`, code: 500 }; }
+    const me = worktrees.find(w => samePath(w.path, wantPath));
+    if (!me) return { error: `既知の worktree ではありません: ${wantPath}`, code: 400 };
+    const drivers = await mergeDriverNames(repo).catch(() => []);
+    const others = worktrees.filter(w => !samePath(w.path, me.path) && !w.bare);
+    const conflicts = [];
+    const unknown = [];
+    const refA = me.ref ?? me.branch ?? me.head;
+    if (!refA) unknown.push({ worktree: me.path, why: '自分の ref を解決できません' });
+    for (const other of others) {
+        const refB = other.ref ?? other.branch ?? other.head;
+        if (!refA || !refB) {
+            unknown.push({ worktree: other.path, why: 'ref を解決できません' });
+            continue;
+        }
+        try {
+            const r = await mergePreview(repo, refA, refB, drivers);
+            for (const f of r.conflicts ?? []) {
+                // ⚠️ ここでは `paths` で絞らない。絞り込みは**キャッシュより後**
+                //    （フックは触るファイルごとに別の `paths` で聞くので、
+                //     絞り込み後を覚えるとキャッシュが当たらない。#62）
+                conflicts.push({
+                    path: f, worktree: other.path,
+                    branch: other.shortBranch ?? other.branch ?? null,
+                    synthetic: Boolean(r.synthetic?.has?.(f)),
+                });
+            }
+        } catch (err) {
+            unknown.push({ worktree: other.path, why: err.message });
+        }
+    }
+    // 🚨 **相手が rebase / cherry-pick の途中なら、衝突が無くても触らせない。**
+    //    シーケンサの途中に別のエージェントが書くと、`git rebase --continue`
+    //    が意図しない内容を取り込む（乗っ取り）。ここを落とすと
+    //    「衝突なし」だけ見て通してしまうので、判定できない場合も unknown に積む。
+    const busy = [];
+    // 🚨 **自分の worktree のシーケンサも返す。** 乗っ取りが起きるのは
+    //    「rebase が止まっている worktree で編集を続ける」形なので、
+    //    他所との衝突より先にこれを見る必要がある。
+    let self = null;
+    let gitDirs = null;
+    try { gitDirs = await worktreeGitDirs(repo); }
+    catch (err) { unknown.push({ worktree: repo, why: `$GIT_DIR を引けません: ${err.message}` }); }
+    if (gitDirs) {
+        try {
+            const seq = await sequencerState(me.path, gitDirs.get(me.path) ?? null);
+            self = {
+                rebasing: !!seq.rebasing, merging: !!seq.merging,
+                cherryPicking: !!seq.cherryPicking, reverting: !!seq.reverting,
+                bisecting: !!seq.bisecting, sequencing: !!seq.sequencing,
+                warnings: seq.warnings ?? [],
+            };
+        } catch (err) {
+            unknown.push({ worktree: me.path, why: `sequencer: ${err.message}` });
+        }
+        for (const other of others) {
+            try {
+                const seq = await sequencerState(other.path, gitDirs.get(other.path) ?? null);
+                const active = Boolean(seq.rebasing || seq.merging || seq.cherryPicking
+                    || seq.reverting || seq.bisecting || seq.sequencing);
+                if (active) {
+                    busy.push({
+                        worktree: other.path, branch: other.shortBranch ?? other.branch ?? null,
+                        rebasing: !!seq.rebasing, merging: !!seq.merging,
+                        cherryPicking: !!seq.cherryPicking, reverting: !!seq.reverting,
+                        bisecting: !!seq.bisecting, sequencing: !!seq.sequencing,
+                    });
+                }
+            } catch (err) {
+                unknown.push({ worktree: other.path, why: `sequencer: ${err.message}` });
+            }
+        }
+    }
+    return { me, self, conflicts, busy, unknown };
+}
+
 async function handleRequest(req, res) {
     // 🚨 new URL() は必ず try で囲む。**認可の手前にある同期例外はプロセスを殺す。**
     //    `GET //[ HTTP/1.1` のような request-target は ERR_INVALID_URL を投げ、
@@ -2341,6 +2458,19 @@ async function handleRequest(req, res) {
          */
         if (url.pathname === '/api/v0/precheck') {
             if (req.method !== 'POST') { denyJson(res, 405, 'POST のみ受け付けます'); return; }
+            // 🔒 **同一オリジンだけ（#62）。** 入口の `siteAllowed()` は `same-site` と
+            //    「ヘッダ無し」を通すので、**同じマシンの別ポートのページ**や、
+            //    `--allow-host` 構成では**同一 tailnet の別ノードのページ**から
+            //    blind で撃てた（`ts.net` は PSL にあるので `*.tailnetX.ts.net` 同士は same-site）。
+            //    副作用は無いが**コストがある**経路なので、書き込みと同じ基準にする。
+            {
+                const site = req.headers['sec-fetch-site'];
+                if (site && site !== 'same-origin') {
+                    denyJson(res, 403,
+                        `別オリジン起点の問い合わせは拒否します (Sec-Fetch-Site: ${site})`);
+                    return;
+                }
+            }
             let body;
             try { body = await readJson(req); } catch (err) {
                 denyJson(res, err.tooLarge ? 413 : 400, err.message); return;
@@ -2348,79 +2478,33 @@ async function handleRequest(req, res) {
             const wantPath = toNFC(String(body.worktree ?? ''));
             const only = Array.isArray(body.paths) && body.paths.length
                 ? new Set(body.paths.map(x => toNFC(String(x)))) : null;
-            let worktrees;
-            try { worktrees = await listWorktrees(repo); }
-            catch (err) { denyJson(res, 500, `worktree を読めません: ${err.message}`); return; }
-            const me = worktrees.find(w => samePath(w.path, wantPath));
-            if (!me) { denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`); return; }
-            const drivers = await mergeDriverNames(repo).catch(() => []);
-            const others = worktrees.filter(w => !samePath(w.path, me.path) && !w.bare);
-            const conflicts = [];
-            const unknown = [];
-            const refA = me.ref ?? me.branch ?? me.head;
-            if (!refA) unknown.push({ worktree: me.path, why: '自分の ref を解決できません' });
-            for (const other of others) {
-                const refB = other.ref ?? other.branch ?? other.head;
-                if (!refA || !refB) {
-                    unknown.push({ worktree: other.path, why: 'ref を解決できません' });
-                    continue;
-                }
-                try {
-                    const r = await mergePreview(repo, refA, refB, drivers);
-                    for (const f of r.conflicts ?? []) {
-                        if (only && !only.has(toNFC(f))) continue;
-                        conflicts.push({
-                            path: f, worktree: other.path,
-                            branch: other.shortBranch ?? other.branch ?? null,
-                            synthetic: Boolean(r.synthetic?.has?.(f)),
-                        });
-                    }
-                } catch (err) {
-                    unknown.push({ worktree: other.path, why: err.message });
-                }
+            // 🚨 **同時実行を peer ごとに縛る（#62。10回目のレビュー / SERIOUS）。**
+            //    この経路は1要求で worktree 本数分の `merge-tree` と `sequencerState` を
+            //    起動する（実測: worktree 9本で **1要求 64 spawn**）。読み取りの鍵しか
+            //    持たない相手が並列120本投げると 13.7 秒かかり、
+            //    同時に投げた `/api/v0/repos` が 1ms → 643ms に伸びた。
+            //    副作用が無くても**コストがある経路**は縛る。
+            if (!precheckGate.acquire(peerKey(req))) {
+                res.writeHead(429, {
+                    'content-type': 'application/json; charset=utf-8',
+                    'cache-control': 'no-store', 'retry-after': '1',
+                });
+                res.end(JSON.stringify({
+                    error: '衝突の問い合わせが同時に多すぎます。少し待ってから試してください',
+                }));
+                return;
             }
-            // 🚨 **相手が rebase / cherry-pick の途中なら、衝突が無くても触らせない。**
-            //    シーケンサの途中に別のエージェントが書くと、`git rebase --continue`
-            //    が意図しない内容を取り込む（乗っ取り）。ここを落とすと
-            //    「衝突なし」だけ見て通してしまうので、判定できない場合も unknown に積む。
-            const busy = [];
-            // 🚨 **自分の worktree のシーケンサも返す。** 乗っ取りが起きるのは
-            //    「rebase が止まっている worktree で編集を続ける」形なので、
-            //    他所との衝突より先にこれを見る必要がある。
-            let self = null;
-            let gitDirs = null;
-            try { gitDirs = await worktreeGitDirs(repo); }
-            catch (err) { unknown.push({ worktree: repo, why: `$GIT_DIR を引けません: ${err.message}` }); }
-            if (gitDirs) {
-                try {
-                    const seq = await sequencerState(me.path, gitDirs.get(me.path) ?? null);
-                    self = {
-                        rebasing: !!seq.rebasing, merging: !!seq.merging,
-                        cherryPicking: !!seq.cherryPicking, reverting: !!seq.reverting,
-                        bisecting: !!seq.bisecting, sequencing: !!seq.sequencing,
-                        warnings: seq.warnings ?? [],
-                    };
-                } catch (err) {
-                    unknown.push({ worktree: me.path, why: `sequencer: ${err.message}` });
-                }
-                for (const other of others) {
-                    try {
-                        const seq = await sequencerState(other.path, gitDirs.get(other.path) ?? null);
-                        const active = Boolean(seq.rebasing || seq.merging || seq.cherryPicking
-                            || seq.reverting || seq.bisecting || seq.sequencing);
-                        if (active) {
-                            busy.push({
-                                worktree: other.path, branch: other.shortBranch ?? other.branch ?? null,
-                                rebasing: !!seq.rebasing, merging: !!seq.merging,
-                                cherryPicking: !!seq.cherryPicking, reverting: !!seq.reverting,
-                                bisecting: !!seq.bisecting, sequencing: !!seq.sequencing,
-                            });
-                        }
-                    } catch (err) {
-                        unknown.push({ worktree: other.path, why: `sequencer: ${err.message}` });
-                    }
-                }
+            let full;
+            try {
+                full = await precheckFull(repo, wantPath);
+            } finally {
+                precheckGate.release(peerKey(req));
             }
+            if (full.error) { denyJson(res, full.code ?? 400, full.error); return; }
+            const { conflicts: allConflicts, busy, unknown, self, me } = full;
+            const conflicts = only
+                ? allConflicts.filter(c => only.has(toNFC(c.path)))
+                : allConflicts;
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',

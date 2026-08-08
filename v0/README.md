@@ -255,7 +255,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `POST /api/v0/merge` | 取り込み（merge）。**`--allow-write` が必要**。**衝突しないと予測できたものだけ**実行する |
 | `POST /api/v0/file` | 編集のために作業ツリーの中身を読む。**`--allow-write` が必要**。`{worktree, path}` → `{text, oid, eol, bom, bytes}` |
 | `POST /api/v0/write` | 作業ツリーに書く。**`--allow-write` が必要**。`{worktree, path, text, baseOid}`。`baseOid` が今の中身と違えば **409** |
-| `POST /api/v0/precheck` | 🔒 **編集前の衝突の問い合わせ（読み取り専用）**。`{worktree, paths[]}` → `{self, conflicts, busy, unknown, decided}`。**`decided:false` のときは「衝突なし」と読めない**（#59） |
+| `POST /api/v0/precheck` | 🔒 **編集前の衝突の問い合わせ（読み取り専用）**。`{worktree, paths[]}` → `{self, conflicts, busy, unknown, decided}`。**`decided:false` のときは「衝突なし」と読めない**（#59）。同一オリジンのみ / 1.5秒の TTL キャッシュ / peer ごと同時2本（#62。1要求で worktree 本数分の git を起動するため） |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
 | `/api/v0/exec/list` | 走っている（と、終わって保持中の）実行セッションの一覧。**`--allow-exec` が必要** |
 | `POST /api/v0/exec/<id>/kill` | 実行を**本当に止める**（木ごと落として数え直す）。切断（`abort`）は購読解除でしかない |

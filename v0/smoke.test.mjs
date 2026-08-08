@@ -6926,3 +6926,52 @@ test('🔒 --layout-probe と --allow-host は併用できない（#64）', asyn
     assert.match(err, /--layout-probe と --allow-host/,
         `理由が出ていない: ${err.slice(0, 200)}`);
 });
+
+/**
+ * 🚨 **`/api/v0/precheck` の予算と門（#62。10回目のレビュー / SERIOUS）。**
+ *
+ * この経路は1要求で **worktree 本数に比例して git を起動する**
+ * （レビュアーの実測: worktree 9本で **1要求 64 spawn**。
+ *  読み取りの鍵だけで並列120本 → 13.7 秒、同時の `/api/v0/repos` が 1ms → 643ms）。
+ * 他の読み取り経路は `collect()` の TTL キャッシュと重複排除で守られているのに、
+ * ここだけ素で回していた。**副作用が無くてもコストがある経路は縛る。**
+ */
+test('🚨 precheck: 連投は畳まれ、同時実行に上限がある（#62）', async () => {
+    const post = (headers = {}) => fetch(`${baseUrl}/api/v0/precheck`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ worktree: repo, paths: ['shared.txt'] }),
+    });
+    const spawns = async () => (await (await fetch(`${baseUrl}/api/v0/state?fresh=1`)).json())
+        .stats.gitSpawnsTotal;
+
+    // 🔒 別オリジン起点は拒否（同じマシンの別ポート / 同一 tailnet の別ノード）
+    const cross = await post({ 'sec-fetch-site': 'same-site' });
+    assert.equal(cross.status, 403, `same-site から撃てる: ${cross.status}`);
+
+    // ⚠️ キャッシュの TTL を跨いでから測る（前の検査の分を数えない）
+    await new Promise(r => setTimeout(r, 1700));
+    const before = await spawns();
+    const first = await post({ 'sec-fetch-site': 'same-origin' });
+    assert.equal(first.status, 200);
+    await first.json();
+    const mid = await spawns();
+    // 🔒 **連投が畳まれる**（TTL の中なので git を1本も起動しない）
+    const second = await post({ 'sec-fetch-site': 'same-origin' });
+    assert.equal(second.status, 200);
+    await second.json();
+    const after = await spawns();
+    const firstCost = mid - before;
+    const secondCost = after - mid;
+    assert.ok(firstCost > 0, `1回目が git を起動していない（前提が崩れている）: ${firstCost}`);
+    assert.ok(secondCost < firstCost,
+        `連投が畳まれていない（1回目 ${firstCost} / 2回目 ${secondCost} spawn）`);
+
+    // 🔒 **同時実行に上限がある**（門が無いと全部通る）
+    await new Promise(r => setTimeout(r, 1700));
+    const many = await Promise.all(Array.from({ length: 12 },
+        () => post({ 'sec-fetch-site': 'same-origin' }).then(r => r.status)));
+    const shed = many.filter(s => s === 429).length;
+    assert.ok(shed > 0,
+        `並列 ${many.length} 本が全部通った（門が無い）: ${JSON.stringify(many)}`);
+});
