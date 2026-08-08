@@ -169,6 +169,53 @@ console.log('  グリッド:', before.cols + '列 × ' + before.rows + '行 / �
 const problems = [];
 if (before.style === after.style) problems.push('掴んで動かしてもセルが変わらない（#57 の移動）');
 if (after.selection) problems.push('ヘッダのドラッグが文字選択になっている: ' + after.selection);
+// ---------------------------------------------------------------------------
+// 🚨 **ヘッダのボタンを「実際のマウス」で押す（#58 の残り）。**
+//
+// 実機（Android / Chrome）で「×・結合・最小化が指で無反応」だった原因は、
+// ヘッダの `pointerdown` が `setPointerCapture` でポインタを掴むと、以降の事象が
+// ヘッダに再ターゲットされて **click が飛ばない**こと。
+// 守り（`if (e.target?.closest?.('button')) return;`）は入れたが、
+// **ブラウザは合成 pointer 事象から click を生成しない**ので、
+// `render-check` では再現できず変異を `defensive` にするしかなかった。
+// CDP の Input ドメインならブラウザの入力層を通るので、実機と同じに click が出る。
+// ---------------------------------------------------------------------------
+const btn = await evaluate(`(() => {
+  const ps = [...document.querySelectorAll('.pane')];
+  // 閉じるボタン（×）を持つペインを1枚選ぶ
+  for (const p of ps) {
+    const b = [...p.querySelectorAll('header button')].find(x => x.textContent === '\u00d7');
+    if (!b) continue;
+    const r = b.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) continue;
+    return {
+      id: p.dataset.paneId, panes: ps.length,
+      x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+    };
+  }
+  return null;
+})()`);
+if (!btn) {
+    problems.push('閉じるボタン（×）が1つも描かれていない（検査が対象を描けていない）');
+} else {
+    // 実際のマウスとして押す（press → release の間に動かさない = ドラッグではない）
+    await mouse('mousePressed', btn.x, btn.y);
+    await mouse('mouseReleased', btn.x, btn.y);
+    await new Promise(r => setTimeout(r, 500));
+    const after = await evaluate(`(() => {
+      const ps = [...document.querySelectorAll('.pane')];
+      return {
+        panes: ps.length,
+        gone: !document.querySelector('[data-pane-id=' + JSON.stringify(${JSON.stringify(btn.id)}) + ']'),
+      };
+    })()`);
+    console.log('× を押した:', JSON.stringify({ before: btn.panes, ...after }));
+    if (!after.gone) {
+        problems.push('ヘッダの × を実際のマウスで押してもペインが閉じない'
+            + '（掴みが click を飲んでいる = 実機で指が効かない形）');
+    }
+}
+
 if (problems.length) {
     console.log('');
     console.log('✖ input');

@@ -647,15 +647,14 @@ const MUTANTS = [
         from: "    if (e.target?.closest?.('button')) return;",
         to: '    /* 変異: ボタンでも掴む */',
         gone: "if (e.target?.closest?.('button')) return;",
-        script: 'v0/render-check.mjs',
-        // ⚠️ **この守りは検査環境では測れない（実測して確認した）。**
-        //    ブラウザは**合成の pointer 事象から click を生成しない**ので、
-        //    「掴んで click が飲まれる」形が再現できない（検査は click() を
-        //    直接呼ぶしかなく、直接呼べば capture に関係なく発火する）。
-        //    実機（Android / Chrome）でだけ起きる壊れ方で、そこで見つかった。
-        defensive: 'ブラウザは合成 pointer 事象から click を生成しないので、'
-            + 'capture が click を飲む形を検査環境で再現できない。'
-            + '実機で見つけた壊れ方なので、守りは残して理由を書く',
+        // 🚨 **以前は `defensive`（測れない）と書いていた（#58）。**
+        //    理由は「ブラウザは合成 pointer 事象から click を生成しないので、
+        //    capture が click を飲む形を検査環境で再現できない」で、
+        //    `render-check`（合成イベント）では確かに測れなかった。
+        //    **CDP の Input ドメインならブラウザの入力層を通る**ので、
+        //    実機と同じに click が出る = 測れる。
+        //    「未検証を defensive で誤魔化さない」（CLAUDE.md）の実践。
+        script: 'v0/input-check.mjs',
     },
     {
         // 🚨 一覧が無いと「閉じたら二度と開けない」= 閉じるのが危険な操作になる
