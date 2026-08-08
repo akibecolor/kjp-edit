@@ -1057,3 +1057,37 @@ test('maskSecrets: 記号を飛ばす対応で普通の形を壊していない'
     const q = maskSecrets('--password "pass phrase X"', []);
     assert.equal(q.text.includes('phrase'), false, `引用の途中で切れている: ${q.text}`);
 });
+
+/**
+ * ⚠️ **切ったことを告げる / 未来の時刻を「稼働中」と断言しない（MINOR。10回目のレビュー）。**
+ */
+test('🚨 summarize: 直近の活動を切ったら件数を返す', () => {
+    const WT2 = 'C:/wt';
+    const lines = [];
+    for (let i = 0; i < LIMITS.maxRecent + 5; i++) {
+        lines.push(JSON.stringify({
+            type: 'assistant', timestamp: new Date(Date.now() - i * 1000).toISOString(),
+            sessionId: 's', cwd: WT2,
+            message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: `${WT2}/f${i}.txt` } }] },
+        }));
+    }
+    const s = summarize(lines, { worktreePath: WT2, now: Date.now(), allowText: false });
+    assert.equal(s.recent.length, LIMITS.maxRecent);
+    assert.ok(s.recentDropped >= 5,
+        `切った件数を返していない（「これで全部」に見える）: ${s.recentDropped}`);
+});
+
+test('🚨 summarize: 記録の時刻が未来なら「稼働中」と断言しない', () => {
+    const WT2 = 'C:/wt';
+    const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const lines = [JSON.stringify({
+        type: 'assistant', timestamp: future, sessionId: 's', cwd: WT2,
+        message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: `${WT2}/a.txt` } }] },
+    })];
+    const s = summarize(lines, { worktreePath: WT2, now: Date.now(), allowText: false });
+    assert.notEqual(s.state, 'active',
+        '時刻が未来なのに「今まさに動いている」と断言した');
+    assert.equal(s.ageMs, null, `経過を数字で断言している: ${s.ageMs}`);
+    assert.equal(s.clockSkew, true);
+    assert.match(s.why ?? '', /時計|未来/, `理由が無い: ${s.why}`);
+});

@@ -1744,7 +1744,13 @@ function consoleBody(wt, paneObj) {
       `⚠ このworktreeで ${mine.length} 件のセッションが走っています（別の画面から実行したもの）:`));
     for (const s of mine) {
       const row = el('div', 'ab');
-      row.append(document.createTextNode(`${s.argv.join(' ')} — ${Math.round(s.ageMs / 1000)}秒経過`));
+      // 🚨 **ここだけ argv を丸ごと出していた（MINOR。10回目のレビュー）。**
+      //    監視盤とコンソールの $ 行には上限があるのに、この一覧だけ素通しだった。
+      //    長いコマンド行で画面が埋まり、**秘密を落としたことの告知も出ていなかった**。
+      const sum = argvSummary(s.argv ?? []);
+      row.append(document.createTextNode(`${sum.text} — ${Math.round(s.ageMs / 1000)}秒経過`));
+      if (sum.clipped) row.append(el('span', 'note', ' ← 長いので省略'));
+      if (s.argvMasked) row.append(el('span', 'note', ' ← 秘密は落としています'));
       if (s.detachedMs !== null && !s.keepAlive) {
         row.append(el('span', 'note', ` / 切断中 ${Math.round(s.detachedMs / 1000)}秒`));
       }
@@ -2520,7 +2526,19 @@ function renderAgents(s) {
       }
       runs.push({ ...r, n: 1 });
     }
-    for (const r of runs.slice(0, 6)) {
+    // 🚨 **切ったことを告げる（MINOR。10回目のレビュー）。**
+    //    payload は 12 件・画面は 6 行で切っているのに、どこにも書いていなかった
+    //    （「これで全部」に見える = 省略を無言で作らない、の違反）。
+    const shown = runs.slice(0, 6);
+    const hiddenRuns = runs.length - shown.length;
+    const dropped = Number(a.recentDropped ?? 0);
+    if (hiddenRuns > 0 || dropped > 0) {
+      const parts = [];
+      if (hiddenRuns > 0) parts.push(`画面で ${hiddenRuns} 行`);
+      if (dropped > 0) parts.push(`収集で ${dropped} 件`);
+      d.append(el('div', 'note warn', `⚠ 直近の活動を省略しています（${parts.join(' / ')}）`));
+    }
+    for (const r of shown) {
       const line = el('div', 'ab');
       line.style.margin = '0';
       // 🚨 **「外」と言ってよいのは outside だけ。** worktree ルート自身と

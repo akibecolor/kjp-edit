@@ -33,6 +33,38 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // ⚠️ MINOR: merge の bare 門は検査があるのに変異が無かった
+        //    （prunable だけ後から足されていた）
+        name: 'merge-bare-gate',
+        why: '作業ツリーの無い bare に取り込む（checkout と同じ門を後から足したのに変異が無かった）',
+        file: 'v0/server.mjs',
+        from: "            if (wt.bare) { denyJson(res, 400, 'bare worktree では取り込めません'); return; }\n"
+            + "            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }",
+        to: "            if (wt.prunable) { denyJson(res, 409, '作業ツリーが失われています'); return; }",
+        gone: "'bare worktree では取り込めません'",
+        pattern: 'bare と prunable の門が実際に効く',
+    },
+    {
+        name: 'recent-dropped-silent',
+        why: '直近の活動を切ったことを数えない（12件で切っているのに「これで全部」に見える）',
+        file: 'v0/transcript.mjs',
+        from: '                if (out.recent.length >= limits.maxRecent) { out.recentDropped++; continue; }',
+        to: '                if (out.recent.length >= limits.maxRecent) continue;   /* 変異: 黙って切る */',
+        gone: 'out.recentDropped++',
+        pattern: '直近の活動を切ったら件数を返す',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
+        name: 'clock-skew-as-active',
+        why: '未来の timestamp を 0 に丸めて「稼働中」と断言する（動いていないものを動いていると言う）',
+        file: 'v0/transcript.mjs',
+        from: '        if (delta < 0) {',
+        to: '        if (false) {   /* 変異: 未来でも稼働中と言う */',
+        gone: 'if (delta < 0) {',
+        pattern: '記録の時刻が未来なら',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
         name: 'lastoutput-cut-by-length',
         why: '切ったかを長さ比較で決める（上限ちょうどのとき告知なしで古い出力が消える）',
         file: 'v0/execsession.mjs',

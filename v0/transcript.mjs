@@ -334,6 +334,8 @@ export function summarize(lines, {
         permissionMode: null,
         toolCounts: {},
         recent: [],
+        // 何件を切ったか（0 なら「全部出している」と言ってよい）
+        recentDropped: 0,
         talk: 0,             // 発話の件数（本文は allowText のときだけ text に入る）
         text: [],
         sidechains: 0,
@@ -394,7 +396,10 @@ export function summarize(lines, {
                 const name = toolName(b.name);
                 if (!name) continue;
                 out.toolCounts[name] = (out.toolCounts[name] ?? 0) + 1;
-                if (out.recent.length >= limits.maxRecent) continue;
+                // ⚠️ **切ったことを告げる（MINOR。10回目のレビュー）。**
+                //    payload は 12 件・画面は 6 行で切っているのに、
+                //    **どこにも「切った」と書いていなかった**（「これで全部」に見える）。
+                if (out.recent.length >= limits.maxRecent) { out.recentDropped++; continue; }
                 const input = b.input && typeof b.input === 'object' ? b.input : {};
                 let seen = { path: null, outside: false, clipped: false };
                 for (const k of PATH_KEYS) {
@@ -456,9 +461,22 @@ export function summarize(lines, {
 
     out.lastActivityAt = newestTs;
     if (newestTs) {
-        out.ageMs = Math.max(0, now - Date.parse(newestTs));
-        out.state = out.ageMs <= limits.activeMs ? 'active'
-            : out.ageMs <= limits.idleMs ? 'idle' : 'stale';
+        // 🚨 **時計がずれていたら「稼働中」と断言しない（MINOR）。**
+        //    以前は `Math.max(0, …)` で負を 0 に丸めていたので、
+        //    記録の timestamp が未来だと**必ず 'active'**（= 今まさに動いている）になった。
+        //    「調べられない」を「無い」と言わないのと同じ型なので、
+        //    経過は null にして理由を添える（`{supported, why}` の扱いに合わせる）。
+        const delta = now - Date.parse(newestTs);
+        if (delta < 0) {
+            out.ageMs = null;
+            out.state = 'unknown';
+            out.clockSkew = true;
+            out.why = '記録の時刻が未来なので経過を判定できません（時計のずれ）';
+        } else {
+            out.ageMs = delta;
+            out.state = out.ageMs <= limits.activeMs ? 'active'
+                : out.ageMs <= limits.idleMs ? 'idle' : 'stale';
+        }
     } else {
         // 🚨 なぜ何も出なかったのかを言う。実データには**許可リスト外の type が
         //    304KB 連続する箇所**があり、既定の窓（256KB）を超える。
