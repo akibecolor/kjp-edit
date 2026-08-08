@@ -32,6 +32,46 @@ process.chdir(ROOT);
  *      そうしないと「置換が効いていない」と誤判定する（実際に踏んだ）。
  */
 const MUTANTS = [
+    // -----------------------------------------------------------------
+    // 配色（ダーク / ライト）。守りは「実際に当たっている」「読める」「覚える」。
+    // -----------------------------------------------------------------
+    {
+        name: 'theme-light-palette-missing',
+        why: 'ライト専用の配色を消す（ダーク用の色が白地に残って読めない）',
+        file: 'v0/app.html',
+        from: "  :root[data-theme='light'] {",
+        to: "  :root[data-theme='never-matches'] {",
+        gone: "  :root[data-theme='light'] {",
+        script: 'v0/theme-check.mjs',
+    },
+    {
+        name: 'theme-attr-not-set',
+        why: 'data-theme を書かない（選んでも当たらない = 切り替えが効かない）',
+        file: 'v0/app.html',
+        from: "  document.documentElement.dataset.theme = r.choice;",
+        to: "  /* 変異: 属性を書かない */",
+        gone: "document.documentElement.dataset.theme = r.choice;",
+        script: 'v0/theme-check.mjs',
+    },
+    {
+        // 🚨 実際にあった壊れ方: 差分だけ直値で、ライトの上書きが OS だけを見ていた
+        name: 'theme-diff-hardcoded',
+        why: '差分の色を変数から直値に戻す（OS がダークのままライトを選ぶと差分だけ読めない）',
+        file: 'v0/app.html',
+        from: "  .diff .add { color: var(--add); background: rgba(78,201,176,.10); }",
+        to: "  .diff .add { color: #4ec9b0; background: rgba(78,201,176,.10); }",
+        gone: ".diff .add { color: var(--add);",
+        script: 'v0/theme-check.mjs',
+    },
+    {
+        name: 'theme-choice-not-saved',
+        why: '選んだ配色を保存しない（再読込のたびに戻る）',
+        file: 'v0/app.html',
+        from: "    try { localStorage.setItem(THEME_KEY, nxt); } catch { /* 使えない環境 */ }",
+        to: "    /* 変異: 覚えない */",
+        gone: "localStorage.setItem(THEME_KEY, nxt)",
+        script: 'v0/theme-check.mjs',
+    },
     {
         // 🔒 B4: 記録の自由文を読み取りの鍵で返す（argv だけ隠しても意味が無い）
         name: 'transcript-text-to-read-key',
@@ -2283,6 +2323,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + "            || url.pathname === '/dirlabel.mjs'\n"
             + "            || url.pathname === '/mergeplan.mjs'\n"
             + "            || url.pathname === '/inputnote.mjs'\n"
+            + "            || url.pathname === '/theme.mjs'\n"
             + "            || url.pathname === '/panegrid.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",

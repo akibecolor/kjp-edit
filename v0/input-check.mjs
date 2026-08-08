@@ -5,17 +5,15 @@
 // ⚠️ 依存ゼロ: Node 22+ の global WebSocket を使う（Playwright は入れない）。
 // ⚠️ iframe を挟まない（ページを直接開く）。座標計算を単純にするため。
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile, access } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { fileURLToPath } from 'node:url';
+import { findChrome, openPage } from './cdp.mjs';
 // ⚠️ 絶対パスを埋めない（他の環境で動かない）
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const CH = ['C:/Program Files/Google/Chrome/Application/chrome.exe',
-    'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'];
-let browser = null;
-for (const c of CH) { try { await access(c); browser = c; break; } catch { /* 次 */ } }
+const browser = await findChrome();
 if (!browser) { console.log('– skipped: Chrome が無い'); process.exit(0); }
 
 const repo = await mkdtemp(join(tmpdir(), 'kjp-input-'));
@@ -40,61 +38,10 @@ const base = await new Promise((res, rej) => {
     });
 });
 
-const profile = await mkdtemp(join(tmpdir(), 'kjp-input-prof-'));
-// ⚠️ **固定ポートにしない。** 他の検査やデーモンと同時に走ると衝突して
-//    「CDP に繋がらない」で落ちる（原因が分かりにくい形の flake になる）。
-const { createServer } = await import('node:net');
-const PORT = await new Promise((res, rej) => {
-    const srv = createServer();
-    srv.on('error', rej);
-    srv.listen(0, '127.0.0.1', () => {
-        const { port } = srv.address();
-        srv.close(() => res(port));
-    });
-});
-const chrome = spawn(browser, [
-    '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
-    `--user-data-dir=${profile}`, `--remote-debugging-port=${PORT}`,
-    '--window-size=1280,900',
-    `${base}/?grid=1&probe=1&token=${TOKEN}`,
-], { shell: false, windowsHide: true });
+// ⚠️ 定型（Chrome 起動 → CDP 接続 → evaluate）は `v0/cdp.mjs` に集約してある
+const page = await openPage(`${base}/?grid=1&probe=1&token=${TOKEN}`, { browser });
+const { evaluate, cmd } = page;
 
-/** CDP に繋ぐ（ターゲットが出るまで待つ） */
-const wsUrl = await (async () => {
-    for (let i = 0; i < 60; i++) {
-        try {
-            const r = await fetch(`http://127.0.0.1:${PORT}/json/list`);
-            const list = await r.json();
-            const page = list.find(t => t.type === 'page' && t.webSocketDebuggerUrl);
-            if (page) return page.webSocketDebuggerUrl;
-        } catch { /* まだ立っていない */ }
-        await new Promise(r => setTimeout(r, 250));
-    }
-    throw new Error('CDP に繋がらない');
-})();
-
-const ws = new WebSocket(wsUrl);
-await new Promise((res, rej) => { ws.onopen = res; ws.onerror = e => rej(new Error('ws: ' + e.message)); });
-let id = 0;
-const pending = new Map();
-ws.onmessage = ev => {
-    const m = JSON.parse(ev.data);
-    if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
-};
-const cmd = (method, params = {}) => new Promise((res, rej) => {
-    const n = ++id;
-    pending.set(n, m => (m.error ? rej(new Error(`${method}: ${m.error.message}`)) : res(m.result)));
-    ws.send(JSON.stringify({ id: n, method, params }));
-});
-const evaluate = async expr => {
-    const r = await cmd('Runtime.evaluate', {
-        expression: expr, awaitPromise: true, returnByValue: true,
-    });
-    if (r.exceptionDetails) throw new Error('評価で例外: ' + JSON.stringify(r.exceptionDetails).slice(0, 300));
-    return r.result?.value;
-};
-
-await cmd('Runtime.enable');
 // 描画が済むまで待つ（固定時間で待たない）
 for (let i = 0; i < 80; i++) {
     const n = await evaluate("document.querySelectorAll('[data-pane-id]').length");
@@ -223,11 +170,8 @@ if (problems.length) {
     process.exitCode = 1;
 } else console.log('✔ input');
 
-try { ws.close(); } catch { /* noop */ }
-chrome.kill();
+await page.close();
 server.kill();
-await new Promise(r => setTimeout(r, 600));
-await rm(profile, { recursive: true, force: true }).catch(() => {});
 await rm(repo, { recursive: true, force: true }).catch(() => {});
 
 // 🚨 **`process.exit(0)` で終わらせない。** 引数が `process.exitCode` を**上書きする**ので、

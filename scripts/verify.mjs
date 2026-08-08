@@ -252,6 +252,23 @@ if (!quick && !failed) {
     steps.push({ name: 'input', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
+// 7. 配色の検査。**値の下限は unit で固定してあるので、ここが測るのは
+//    「CSS が実際にその値を当てているか」**（data-theme の書き忘れ・変数の使い忘れは
+//    unit では1件も捕まらない）。ブラウザが無ければ skip。
+if (!quick && !failed) {
+    const r = await run(['v0/theme-check.mjs'], { timeout: 240_000 });
+    const skipped = /skipped/.test(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `theme ${(r.ms / 1000).toFixed(1)}s`,
+        ok, skipped,
+        detail: ok ? [] : detailLines(r.output, r.timedOut ? 10 : 6, r.timedOut),
+    });
+    if (!ok) failed = true;
+} else {
+    steps.push({ name: 'theme', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
+}
+
 // ---- 出力: 20行以内 ----
 // 🚨 **飛ばした検査は緑のときも名前を出す（#52）。**
 //    「このプラットフォームでは測っていない」を毎回目に入れる。
