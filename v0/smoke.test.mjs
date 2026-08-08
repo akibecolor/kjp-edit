@@ -7116,3 +7116,133 @@ test('🚨 merge: シーケンサ停止中は拒否する（git は通してし�
         await rm(src, { recursive: true, force: true }).catch(() => {});
     }
 });
+
+/**
+ * 🚨 **終了済みへの `/kill` が事実と違う記録を残さない（#71。10回目のレビュー）。**
+ *
+ * `/kill` に `!s.running` の門が無かったので、保持期間（既定600秒）の間に
+ * 終了済みの id へ kill を撃つと **reap 済みの pid に `taskkill /T /F`** が走り、
+ * `code:0` で正常終了した実行が監査に
+ * 「強制停止したが止まったか確認できていない」と残っていた（監査は唯一の記録）。
+ * さらに `exit` の後ろに `⚠ 停止を要求されました` が積まれ、
+ * 監視盤の「最後の出力」が強制停止の告知に化ける。
+ */
+test('🚨 exec: 終了済みへの /kill は撃たず、事実と違う記録も残さない（#71）', async () => {
+    // ⚠️ **監査ログの置き場所を明示して渡す。** `startExec()` は audit を返さないので、
+    //    最初これを分割代入で受けて `undefined` を読んでいた。
+    //    `readFile(undefined)` は catch に落ちるだけなので**検査が空振りし**、
+    //    変異 `kill-on-exited-session` が SURVIVED した（測っていないのに緑）。
+    const audit = join(repo, '..', `kill-done-${Date.now()}.jsonl`);
+    const { child, url } = await startExec(['--audit-log', audit]);
+    try {
+        const s = await startSession(url, ['git', '--version']);
+        await s.until(r => r.t === 'exit');
+        await new Promise(res => setTimeout(res, 200));
+        const before = await readFile(audit, 'utf8').catch(() => '');
+        const r = await fetch(`${url}/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        assert.equal(r.status, 200);
+        const body = await r.json();
+        assert.equal(body.alreadyDone, true,
+            `終了済みと言っていない: ${JSON.stringify(body)}`);
+        await new Promise(res => setTimeout(res, 300));
+        const after = (await readFile(audit, 'utf8').catch(() => '')).slice(before.length);
+        const events = after.split('\n').filter(Boolean).map(l => JSON.parse(l))
+            .map(e => e.event);
+        assert.equal(events.includes('kill-unverified'), false,
+            `正常終了を「確認できていない強制停止」と記録した: ${JSON.stringify(events)}`);
+        assert.equal(events.includes('kill'), false,
+            `終了済みに kill を記録した: ${JSON.stringify(events)}`);
+        s.cancel();
+    } finally {
+        child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **停止処理中の入力を「送った」と言わない（#68。10回目のレビュー）。**
+ *
+ * `/kill` は「印を立てる → 告知を流す → await killTree()」の順なので、
+ * その await の間セッションは running のまま。この窓に入力すると
+ * 200 `{ok:true}` が返り記録に `{t:"in"}` が残るので、
+ * **実際には子が SIGKILL されて一度も読んでいない**のに
+ * 「停止を要求した後に1行送り、それから停止した」という記録になる。
+ */
+test('🚨 exec: 停止処理中の入力は 409 で断る（#68）', async () => {
+    const { child, url } = await startExec();
+    try {
+        // 標準入力を読み続ける子（すぐには終わらない）
+        const s = await startSession(url, [process.execPath, '-e',
+            'process.stdin.resume(); setTimeout(() => {}, 60000);']);
+        // kill を投げっぱなしにして、その窓で入力を送る
+        const killing = fetch(`${url}/api/v0/exec/${s.id}/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+        });
+        let sawReject = false;
+        for (let i = 0; i < 40; i++) {
+            const r = await sendInput(url, s.id, { data: `line ${i}\n` });
+            if (r.status === 409) {
+                const b = await r.json();
+                assert.match(b.error ?? '', /停止処理中/, `理由が違う: ${JSON.stringify(b)}`);
+                sawReject = true;
+                break;
+            }
+            await r.text();
+            if (r.status !== 200) break;
+        }
+        await killing;
+        assert.equal(sawReject, true,
+            '停止処理中に入力が 200 で通った（「送った」と嘘をつく窓が残っている）');
+        s.cancel();
+    } finally {
+        child.kill();
+    }
+});
+
+/**
+ * 🚨 **まとめて上限切れになっても、1本につき kill は1回（#70。10回目のレビュー）。**
+ *
+ * `setInterval` は前の tick を待たない。`killRequested` の印を**ループの中**で
+ * 立てていたので、8本まとめて上限切れになると、まだループが届いていない
+ * セッションは印が立たないまま次の tick に**もう一度**拾われた。
+ * 結果 (1) 監査に同じ session の `kill` が複数、(2) `finish()` 済みに `emit()` が走って
+ * **`exit` の後ろに行が積まれる**、(3) reap 済みの pid に taskkill、が起きる。
+ * killTree は Windows で PowerShell の全プロセス列挙を伴い実測 400ms〜2s なので、
+ * 本数が増えるほど確実に踏む。
+ */
+test('🚨 exec: まとめて上限切れでも kill は1本につき1回（#70）', async () => {
+    const audit = join(repo, '..', `sweep-batch-${Date.now()}.jsonl`);
+    const { child, url } = await startExec(['--exec-timeout', '1', '--audit-log', audit]);
+    const sessions = [];
+    try {
+        // 同時に4本走らせ、全部が同じ tick で上限切れになるようにする
+        for (let i = 0; i < 4; i++) {
+            sessions.push(await startSession(url, [process.execPath, '-e',
+                'setTimeout(() => process.exit(0), 30000)']));
+        }
+        // 全部が終わるまで待つ（上限1秒 + sweeper の周期 + killTree）
+        for (const s of sessions) await s.until(r => r.t === 'exit', 20000);
+        await new Promise(res => setTimeout(res, 2500));
+
+        const lines = (await readFile(audit, 'utf8')).split('\n').filter(Boolean)
+            .map(l => JSON.parse(l));
+        const killsBySession = new Map();
+        for (const e of lines) {
+            if (e.event !== 'kill' && e.event !== 'kill-unverified') continue;
+            killsBySession.set(e.session, (killsBySession.get(e.session) ?? 0) + 1);
+        }
+        for (const s of sessions) {
+            const n = killsBySession.get(s.id) ?? 0;
+            assert.ok(n <= 1,
+                `session ${s.id} に kill が ${n} 件記録された（二重に殺しに行っている）`);
+        }
+        for (const s of sessions) s.cancel();
+    } finally {
+        child.kill();
+        await rm(audit, { force: true }).catch(() => {});
+    }
+});

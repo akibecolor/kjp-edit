@@ -2349,8 +2349,12 @@ async function renderMonitor() {
     const live = sessions.filter(x => x.state === 'starting' || x.state === 'running');
     setTags(pane.tagBox, [['', `${live.length}/${limits.maxConcurrent ?? '?'} 稼働`]]);
     ui.status.className = 'note';
+    // 🚨 **上限で省略したら必ず告知する（#72）。** カードはあるのに一覧が無い、
+    //    という状態を無言で作らない（終了済みの古いものから落ちる）。
+    const omitted = Number(body.omitted ?? 0);
     ui.status.textContent = sessions.length
       ? `${sessions.length} 件（稼働 ${live.length}）。打ちたい方に直接送れます`
+        + (omitted > 0 ? ` ⚠ 古い終了済み ${omitted} 件は省略しています` : '')
       : 'セッションはありません（下のコンソールから起動できます）';
     // 🚨 **見出しは basename では足りない（#50）。** 並列でエージェントを
     //    回すと `.../a/wt-main` と `.../b/wt-main` のように basename が同じ

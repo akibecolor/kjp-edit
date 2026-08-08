@@ -1768,6 +1768,14 @@ async function procTreePids(pid) {
  */
 async function killTree(child) {
     if (!child.pid) return { killed: true, why: null };
+    // 🚨 **reap 済みの子に二度と signal を送らない（#71。10回目のレビュー / SERIOUS）。**
+    //    早期 return が `!child.pid` だけだったので、**既に終了した子**にも
+    //    `taskkill /PID <pid> /T /F` が走り、pid が再利用されていれば
+    //    **無関係のプロセスを撃つ**。しかも監査には
+    //    「強制停止したが止まったか確認できていない」という**事実と違う記録**が残る。
+    if (child.exitCode !== null || child.signalCode !== null) {
+        return { killed: true, why: null };
+    }
     const pid = child.pid;
     const tree = await procTreePids(pid);
     let taskkillCode = null;
@@ -1963,20 +1971,34 @@ function streamSession(req, res, s, from) {
 
 /** 台帳の判断に従って実際に殺す・消す。1秒ごと。 */
 let sweepTimer = null;
+let sweepBusy = false;
 function startExecSweeper() {
     if (sweepTimer) return;
     sweepTimer = setInterval(async () => {
+        // 🚨 **前の tick を待たずに次が走る（#70。10回目のレビュー / SERIOUS）。**
+        //    `setInterval` は await を待たないので、killTree が遅い
+        //    （Windows は PowerShell の全プロセス列挙で実測 400ms〜2s）と
+        //    次の tick が同じセッションを**もう一度**拾う。
+        if (sweepBusy) return;
+        sweepBusy = true;
+        try {
         const { kill, evict } = execRegistry.sweep();
+        // 🚨 **印は「バッチ全件に、await を1つも挟まずに」立てる（#70）。**
+        //    以前はループの中（await の直前）で立てていたので、
+        //    8本まとめて猶予切れになると**まだループが届いていないセッション**は
+        //    `killRequested === null` のまま次の tick に拾われ、
+        //    (1) 監査に同じ session の `kill` が最大4件、
+        //    (2) `finish()` 済みに `emit()` が走って **`exit` の後ろに行が積まれ**、
+        //    (3) reap 済みの pid に taskkill を撃つ、という3つが起きていた。
+        for (const { session, reason } of kill) session.killRequested = reason;
         for (const { session, reason } of kill) {
             const note = reason === 'timeout'
                 ? `⚠ 上限時間 ${opts.execTimeoutMs / 1000}s を超えたので停止します`
                 : `⚠ 切断されたまま ${opts.execDetachedGraceMs / 1000}s 経ったので停止します`;
-            // ⚠️ 二重に殺しに行くのを防ぐため `killRequested` を先に立てる
-            //    （`sweep()` はこれが立っているセッションを候補にしない）。
+            // ⚠️ 印は上でバッチ全件に立ててある（#70）。ここでは立て直さない。
             // 🚨 **殺してから終端する。** finish が先だと、実際に死ぬまでの出力が
             //    `exit` の後ろに並んで live には届かず、殺せなかった場合も
             //    「停止しました」と記録してしまう（`/kill` と同じ理由）。
-            session.killRequested = reason;
             // 🚨 **理由は殺す前に流す。** 殺してから終端する順序にしたので、
             //    子の 'exit' ハンドラが先に終端することがあり（実測: `code:1`）、
             //    finish に載せた note が**捨てられて停止理由が消えた**
@@ -2013,6 +2035,9 @@ function startExecSweeper() {
             });
         }
         for (const s of evict) execRegistry.remove(s);
+        } finally {
+            sweepBusy = false;
+        }
     }, 1000);
     // ⚠️ unref しておく。これだけでイベントループを生かし続けない
     sweepTimer.unref?.();
@@ -2772,7 +2797,8 @@ async function handleRequest(req, res) {
             if (!await gateExec(req, res)) return;
             const now = Date.now();
             const secrets = secretsForMasking();
-            const sessions = execRegistry.sessionsForMonitor(now).map(x => {
+            const monitor = execRegistry.sessionsForMonitor(now);
+            const sessions = monitor.sessions.map(x => {
                 const argv = x.argv.map(a => maskSecrets(a, secrets));
                 const last = x.lastOutput === null
                     ? { text: null, masked: false }
@@ -2791,6 +2817,8 @@ async function handleRequest(req, res) {
             });
             res.end(JSON.stringify({
                 sessions,
+                // ⚠️ 上限で切ったら必ず告げる（#72）。UI がこれを見て「N 件省略」と描く
+                omitted: monitor.omitted,
                 limits: {
                     maxConcurrent: MAX_CONCURRENT_EXEC,
                     timeoutMs: opts.execTimeoutMs,
@@ -2810,6 +2838,29 @@ async function handleRequest(req, res) {
                 const s = execRegistry.get(m[1]);
                 if (!s) { denyJson(res, 404, 'そのセッションはありません（保持期間を過ぎたか、id が違います）'); return; }
                 if (m[2] === 'kill') {
+                    // 🚨 **終了済みには撃たない（#71。10回目のレビュー / SERIOUS）。**
+                    //    保持期間（既定600秒）の間は終わったセッションも台帳に残るので、
+                    //    その id に kill を撃つと **reap 済みの pid に taskkill** が走り、
+                    //    `code:0` で正常終了した実行が監査に
+                    //    「強制停止したが止まったか確認できていない」と残る
+                    //    （= **事実と違う記録**。監査は事故を後から追う唯一の記録）。
+                    //    さらに `exit` の後ろに `⚠ 停止を要求されました` が積まれ、
+                    //    監視盤の「最後の出力」が強制停止の告知に化ける。
+                    if (!s.running) {
+                        await auditExec({
+                            event: 'kill-noop', reason: 'already-exited', session: s.id,
+                            repo: s.repo ?? null, worktree: s.worktree, argv: s.argv,
+                        }, s.repo ?? null);
+                        res.writeHead(200, {
+                            'content-type': 'application/json; charset=utf-8',
+                            'cache-control': 'no-store',
+                        });
+                        res.end(JSON.stringify({
+                            ok: true, alreadyDone: true, warn: null,
+                            message: 'そのセッションは既に終了しています（何もしていません）',
+                        }));
+                        return;
+                    }
                     await auditExec({
                         event: 'kill', reason: 'requested', session: s.id,
                         repo: s.repo ?? null, worktree: s.worktree, argv: s.argv,
@@ -2872,6 +2923,18 @@ async function handleRequest(req, res) {
                     let inBody;
                     try { inBody = await readJson(req); } catch (err) { denyJson(res, err.tooLarge ? 413 : 400, err.message); return; }
                     if (!s.running) { denyJson(res, 409, 'そのセッションは終了しています'); return; }
+                    // 🚨 **停止処理中も受け付けない（#68。10回目のレビュー / SERIOUS）。**
+                    //    `/kill` は「印を立てる → 告知を流す → await killTree()」の順なので、
+                    //    その await の間セッションは running のまま。この窓に入力すると
+                    //    200 `{ok:true}` が返り、記録に `{t:"in"}` が残るので、
+                    //    **「停止を要求した後に利用者が1行送り、それから停止した」**という
+                    //    実際には起きていない出来事（子は SIGKILL されて一度も読んでいない）が
+                    //    記録に残る。`killRequested` は sweep が二重に殺さないための印なので、
+                    //    判定に使う場所が1つ抜けていた形。
+                    if (s.killRequested) {
+                        denyJson(res, 409, '停止処理中です（送った内容は読まれません）');
+                        return;
+                    }
                     const eof = inBody.eof === true;
                     const data = typeof inBody.data === 'string' ? inBody.data : null;
                     if (!eof && data === null) { denyJson(res, 400, 'data（文字列）か eof が必要です'); return; }

@@ -33,6 +33,73 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #68: 停止処理中の入力を「送った」と言う
+        name: 'input-ignores-kill-requested',
+        why: '停止処理中の入力を 200 ok:true で受ける（読まれない1行が「送った」として記録に残る）',
+        file: 'v0/server.mjs',
+        from: '                    if (s.killRequested) {',
+        to: '                    if (false) {   /* 変異: 停止処理中でも受ける */',
+        gone: 'if (s.killRequested) {',
+        pattern: '停止処理中の入力は 409 で断る',
+    },
+    {
+        // 🚨 #71: 終了済みへの /kill が reap 済みの pid に taskkill を撃つ
+        name: 'kill-on-exited-session',
+        why: '終了済みセッションにも kill を撃つ（正常終了を「確認できない強制停止」と記録する）',
+        file: 'v0/server.mjs',
+        from: '                    if (!s.running) {\n                        await auditExec({\n                            event: \'kill-noop\',',
+        to: '                    if (false) {\n                        await auditExec({\n                            event: \'kill-noop\',',
+        gone: 'if (!s.running) {\n                        await auditExec({\n                            event: \'kill-noop\',',
+        pattern: '終了済みへの /kill は撃たず',
+    },
+    {
+        // 🚨 #71: reap 済みの子に signal を送る（pid 再利用で無関係を撃つ）
+        name: 'killtree-hits-reaped',
+        why: '終了済みの子にも taskkill を撃つ（pid が再利用されていれば無関係のプロセスを殺す）',
+        file: 'v0/server.mjs',
+        from: '    if (child.exitCode !== null || child.signalCode !== null) {',
+        to: '    if (false) {   /* 変異: reap 済みでも撃つ */',
+        gone: 'if (child.exitCode !== null || child.signalCode !== null) {',
+        pattern: '終了済みへの /kill は撃たず',
+        defensive: '/kill 側の門（kill-on-exited-session）が先に効くので、現状この2枚目に到達する経路はスモークからは作れない。sweeper と /kill の両方から呼ばれる関数なので、入口の門が1つ外れたときの2枚目として残す',
+    },
+    {
+        // 🚨 #70: バッチの印を await の前に立てないと、次の tick が二重に殺す
+        name: 'sweep-marks-inside-loop',
+        why: '二重に殺しに行く守りを2枚とも外す（バッチの印 + tick の再入防止）',
+        file: 'v0/server.mjs',
+        from: '        for (const { session, reason } of kill) session.killRequested = reason;',
+        // 🚨 **守りが2枚あるので1枚だけ外しても差が出ない**（実測で SURVIVED）。
+        //    再入防止（sweepBusy）だけで重なりは消えるので、`also` で2枚とも外す。
+        //    「検査が弱い」と読み違えて検査を強くしに行かないこと。
+        also: [{ from: '        if (sweepBusy) return;', to: '        if (false) return;' }],
+        to: '        /* 変異: 印をバッチで立てない */',
+        gone: 'for (const { session, reason } of kill) session.killRequested = reason;',
+        pattern: 'まとめて上限切れでも kill は1本',
+    },
+    {
+        // 🚨 #72: 終了済みの件数に上限が無いと台帳が伸び続ける
+        name: 'retain-no-count-cap',
+        why: '終了済みの件数を切らない（監視盤の payload が台帳の本数に比例して伸びる）',
+        file: 'v0/execsession.mjs',
+        from: '        const cap = this.limits.maxRetained;',
+        to: '        const cap = 0;   /* 変異: 件数で切らない */',
+        gone: 'const cap = this.limits.maxRetained;',
+        pattern: '終了済みの件数が上限を超えたら古いものから捨てる',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        // 🚨 #72: 省略したのに告知しない
+        name: 'monitor-omits-silently',
+        why: '監視盤の一覧を切ったことを告げない（カードはあるのに一覧に無い状態を無言で作る）',
+        file: 'v0/execsession.mjs',
+        from: '            omitted: all.length - kept.length,',
+        to: '            omitted: 0,   /* 変異: 省略を黙る */',
+        gone: 'omitted: all.length - kept.length,',
+        pattern: '監視盤に返す件数を切ったら、切った数を返す',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
         // 🚨 #66: 記号1つを値として食い、本物の秘密を次の行に残す（告知が嘘になる）
         name: 'mask-punct-eats-value',
         why: '鍵の直後の記号1つを値として食う（「秘密を落としました」と言いながら本物が残る）',

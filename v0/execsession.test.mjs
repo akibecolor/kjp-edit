@@ -439,3 +439,45 @@ test('🚨 監視盤の最後の出力は、長い result 行でも解釈でき�
 // ⚠️ 「先頭を行の境界に揃える」テストは**置かない。**
 //    解釈する側は後ろから走査するので観測可能な差が無く、変異が SURVIVED した
 //    （守りごと削除した。測れない守りを残さない）。
+
+/**
+ * 🚨 **終了済みの「件数」にも上限を置く（#72。10回目のレビュー / SERIOUS）。**
+ *
+ * 冒頭が掲げる「守りを緩めた代わりの制約」は 同時数 / 絶対上限 / 猶予 /
+ * 保持期間 / リングのバイト数の5つで、**件数だけが無かった**。
+ * `sweep()` の evict は経過時間しか見ないので、既定10分に終わった実行が全部残り、
+ * 監視盤は4秒ごとに全件（各 lastOutput 付き）を引く。
+ * 短いコマンドを回すのは**本来の使い方**なので悪意なしに踏む。
+ */
+test('🚨 終了済みの件数が上限を超えたら古いものから捨てる', () => {
+    const reg = new ExecRegistry({ execTimeoutMs: 600_000, limits: { maxRetained: 3, retainMs: 60_000 } });
+    let clock = 1000;
+    reg.now = () => clock;
+    const made = [];
+    for (let i = 0; i < 6; i++) {
+        const s = reg.create({ worktree: '/w', argv: ['git', '--version'] });
+        reg.finish(s, { code: 0 });
+        made.push(s);
+        clock += 1;
+    }
+    const { evict } = reg.sweep(clock);
+    assert.equal(evict.length, 3, `件数の上限が効いていない: ${evict.length}`);
+    // 落ちるのは**古い方**（新しいものほど読みに戻る）
+    assert.deepEqual(evict.map(s => s.id), made.slice(0, 3).map(s => s.id));
+});
+
+test('🚨 監視盤に返す件数を切ったら、切った数を返す（黙って省略しない）', () => {
+    const reg = new ExecRegistry({ execTimeoutMs: 600_000, limits: { maxRetained: 100, retainMs: 60_000 } });
+    let clock = 1000;
+    reg.now = () => clock;
+    for (let i = 0; i < 10; i++) {
+        const s = reg.create({ worktree: '/w', argv: ['git', '--version'] });
+        reg.finish(s, { code: 0 });
+        clock += 1;
+    }
+    const r = reg.sessionsForMonitor(clock, 4);
+    assert.equal(r.sessions.length, 4);
+    assert.equal(r.omitted, 6, `省略した件数を返していない: ${JSON.stringify(r.omitted)}`);
+    // 上限に掛からないときは 0（「省略しました」と嘘を言わない）
+    assert.equal(reg.sessionsForMonitor(clock, 50).omitted, 0);
+});

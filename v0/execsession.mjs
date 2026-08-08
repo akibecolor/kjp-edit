@@ -32,6 +32,14 @@ export const DEFAULTS = {
     bufferRecords: 4000,       // 件数の上限（極端に小さい行が大量に来る場合）
     detachedGraceMs: 5 * 60 * 1000,
     retainMs: 10 * 60 * 1000,  // 終了後、台帳に残す時間
+    // 🚨 **終了済みの「件数」の上限（#72。10回目のレビュー / SERIOUS）。**
+    //    このファイル冒頭が掲げる「守りを緩めた代わりの制約」は
+    //    同時数 / 絶対上限 / 猶予 / 保持期間 / リングのバイト数の5つで、
+    //    **件数だけが無かった**。evict は経過時間しか見ないので、既定の10分に
+    //    終わった実行が全部台帳に残り、監視盤は4秒ごとに全件（各 lastOutput 付き）を
+    //    引く。短いコマンドを回すのは**このツールの本来の使い方**なので悪意なしに踏む
+    //    （スマホ + トンネル越しでは4秒ごとの数MB転送になる）。
+    maxRetained: 200,
     // 🚨 標準入力の**総量**の上限（#26）。1回 64KB を縛っても、相手が読まなければ
     //    書いた分は親のメモリに無限に溜まる。「守りを緩めた代わりの制約」の表に
     //    **入力の総量だけが無かった**。しかも溜まっている間も ok:true を返すので
@@ -361,6 +369,18 @@ export class ExecRegistry {
             const doneAt = s.exit ? Date.parse(s.exit.at) : s.createdAt;
             if (now - doneAt >= this.limits.retainMs) evict.push(s);
         }
+        // 🚨 **件数でも切る（#72）。** 時間だけだと、短い実行を回すほど台帳が伸びる。
+        //    落とすのは**古い終了済みから**（新しいものほど読みに戻る可能性が高い）。
+        const cap = this.limits.maxRetained;
+        if (cap > 0) {
+            const dropping = new Set(evict);
+            const done = [...this.sessions.values()]
+                .filter(x => !x.running && !dropping.has(x))
+                .sort((a, b) => (a.exit ? Date.parse(a.exit.at) : a.createdAt)
+                    - (b.exit ? Date.parse(b.exit.at) : b.createdAt));
+            const over = done.length - cap;
+            for (let i = 0; i < over; i++) evict.push(done[i]);
+        }
         return { kill, evict };
     }
 
@@ -384,10 +404,20 @@ export class ExecRegistry {
      *    （Cookie だけの相手に渡すと「read は読み取りまで」が崩れる）。
      * ⚠️ 並びは**古い順**（起動した順に読める。`list()` は新しい順で用途が違う）。
      */
-    sessionsForMonitor(now = this.now()) {
-        return [...this.sessions.values()]
-            .sort((a, b) => a.createdAt - b.createdAt)
-            .map(s => ({ ...s.describe(now), lastOutput: s.lastOutput() }));
+    sessionsForMonitor(now = this.now(), max = 60) {
+        const all = [...this.sessions.values()].sort((a, b) => a.createdAt - b.createdAt);
+        // 🚨 **走っているものを先に残す。** 古い順に切ると、走っている実行が
+        //    画面から消えて「1本も走っていない」に見える（見えない取り残しを作らない）。
+        const running = all.filter(s => s.running);
+        const done = all.filter(s => !s.running);
+        const room = Math.max(0, max - running.length);
+        const kept = [...running, ...done.slice(Math.max(0, done.length - room))]
+            .sort((a, b) => a.createdAt - b.createdAt);
+        return {
+            sessions: kept.map(s => ({ ...s.describe(now), lastOutput: s.lastOutput() })),
+            // ⚠️ **切ったら必ず告げる**（省略を黙って作らない）。0 のときも数を返す
+            omitted: all.length - kept.length,
+        };
     }
 
     get running() {
