@@ -20,6 +20,8 @@ import { tmpdir, homedir } from 'node:os';
 import { join, dirname, sep, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { mergeTargets } from './mergeplan.mjs';
+
 const SERVER = fileURLToPath(new URL('./server.mjs', import.meta.url));
 
 /**
@@ -6974,4 +6976,143 @@ test('🚨 precheck: 連投は畳まれ、同時実行に上限がある（#62�
     const shed = many.filter(s => s === 429).length;
     assert.ok(shed > 0,
         `並列 ${many.length} 本が全部通った（門が無い）: ${JSON.stringify(many)}`);
+});
+
+/**
+ * 🚨 **取り込みボタンがラベルではなく ref を送る（#60。10回目のレビュー / BLOCKING）。**
+ *
+ * `mergePlan.batch` の中身は `w.label`（**worktree のディレクトリ名**由来の表示名）で
+ * ref ではないのに、UI がそのまま `branch` として送っていた。
+ * レビュアーの実測: ボタン「hotfix」（worktree `hotfix/` の中身はブランチ `alpha`）を
+ * 押すと、**無関係なブランチ `hotfix`** が main に入り 200 と「✔ 取り込みました」が出た。
+ * 門は送られた ref で `mergePreview` するので、**予測したペアと実行したペアが別物**になる
+ * = 「衝突しないと分かっているものだけ実行する」という約束自体が成立していなかった。
+ *
+ * ここで測るのは**UI が押したときに何が送られるか**なので、
+ * UI と同じ純関数（`mergeTargets`）を通してから実際に POST する。
+ */
+test('🚨 merge: 提案のボタンはラベルではなくブランチを送る（#60）', async () => {
+    const { child, url } = await startWritable();
+    const stem = basename(repo);
+    // ⚠️ ディレクトリ名 `<stem>-hotfix`、中身はブランチ `m60-alpha`
+    const wt = join(repo, '..', `${stem}-hotfix`);
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'm60-alpha', wt, 'main'], repo);
+        await writeFile(join(wt, 'm60-alpha.txt'), 'alpha 側\n', 'utf8');
+        await g(['add', '-A'], wt);
+        await g(['commit', '-q', '-m', 'alpha の作業'], wt);
+        // 🚨 **囮**: ディレクトリ名と同じ名前のブランチを、どの worktree にも置かずに作る
+        const label = basename(wt);
+        await g(['branch', label, 'main'], repo);
+
+        const s = await (await fetch(`${url}/api/v0/state?fresh=1`)).json();
+        const picked = mergeTargets(s.mergePlan, s.worktrees, s.base);
+        const entry = picked.entries.find(e => e.label === label);
+        assert.ok(entry, `提案に ${label} が無い: ${JSON.stringify(s.mergePlan?.batch)}`);
+        // 🔒 **ラベルではなくブランチを送る**（ここが #60 の本体）
+        assert.equal(entry.branch, 'm60-alpha',
+            `ラベルを ref として送っている（囮のブランチ ${label} が取り込まれる）`);
+
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': WRITE_TOKEN,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: picked.target.path, branch: entry.branch }),
+        });
+        assert.equal(r.status, 200, `取り込みが通らない: ${r.status} ${await r.text()}`);
+        // 🔒 入ったのは alpha 側の中身であって、囮ではない
+        const files = await g(['ls-tree', '--name-only', 'HEAD'], picked.target.path);
+        assert.ok(files.includes('m60-alpha.txt'),
+            `alpha の中身が入っていない: ${files}`);
+    } finally {
+        child.kill();
+        await g(['worktree', 'remove', '--force', wt], repo).catch(() => {});
+        await g(['branch', '-D', 'm60-alpha'], repo).catch(() => {});
+        await g(['branch', '-D', basename(wt)], repo).catch(() => {});
+        await rm(wt, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+/**
+ * 🚨 **merge のシーケンサ門を検査する（#65。10回目のレビュー / SERIOUS）。**
+ *
+ * checkout 側には「シーケンサ停止中を拒否する」テストと変異があるのに、
+ * **merge 側は門を外しても smoke 171 件が全部緑**だった（= 守りが1件も検証されていない）。
+ * git 2.48.1 は clean な rebase 停止中の `git merge` を **exit 0 で通し**、
+ * `rebase --continue` の完走後にマージコミットが**元のブランチに残る**
+ * （レビュアーが実測）。観測ツールが「取り込みました」と言いながら
+ * 別のブランチを壊す形なので、checkout と同じ重さで守る必要がある。
+ */
+test('🚨 merge: シーケンサ停止中は拒否する（git は通してしまう操作。#65）', async () => {
+    const { child, url } = await startWritable();
+    const stem = basename(repo);
+    const base = join(repo, '..', `${stem}-m65-base`);
+    const src = join(repo, '..', `${stem}-m65-src`);
+    try {
+        await g(['worktree', 'add', '-q', '-b', 'm65-base', base, 'main'], repo);
+        await g(['worktree', 'add', '-q', '-b', 'm65-src', src, 'main'], repo);
+        await writeFile(join(src, 'm65.txt'), '取り込む側\n', 'utf8');
+        await g(['add', '-A'], src);
+        await g(['commit', '-q', '-m', 'm65 の作業'], src);
+
+        // 取り込み**先**を rebase 停止中にする（clean index で止める）
+        await writeFile(join(base, 'm65-base.txt'), 'one\n', 'utf8');
+        await g(['add', '-A'], base);
+        await g(['commit', '-q', '-m', 'base 1'], base);
+        await writeFile(join(base, 'm65-base.txt'), 'two\n', 'utf8');
+        await g(['add', '-A'], base);
+        await g(['commit', '-q', '-m', 'base 2'], base);
+        await new Promise((resolve, reject) => {
+            const c = spawn('git', ['rebase', '-i', 'HEAD~2'], {
+                cwd: base, shell: false, windowsHide: true,
+                env: {
+                    ...process.env, ...isolatedConfig(),
+                    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com',
+                    GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com',
+                    GIT_SEQUENCE_EDITOR: `${JSON.stringify(process.execPath)} -e `
+                        + JSON.stringify(
+                            'const f=process.argv[1],fs=require("fs");'
+                            + 'const l=fs.readFileSync(f,"utf8").split("\n");'
+                            + 'l.splice(1,0,"break");fs.writeFileSync(f,l.join("\n"));'),
+                },
+            });
+            c.on('error', reject);
+            c.on('close', () => resolve());
+        });
+        const head = await g(['rev-parse', 'HEAD'], base);
+
+        const r = await fetch(`${url}/api/v0/merge`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-kjp-token': WRITE_TOKEN,
+                'sec-fetch-site': 'same-origin',
+            },
+            body: JSON.stringify({ worktree: base, branch: 'm65-src' }),
+        });
+        // ⚠️ 本文は1回しか読めない。assert のメッセージで `await r.text()` を
+        //    呼ぶとテンプレートが先に評価されて本文を食い、後の `r.json()` が
+        //    `Body has already been read` で落ちる（実際に踏んだ）
+        const raw = await r.text();
+        assert.equal(r.status, 409,
+            `rebase 停止中の取り込みが拒否されない: ${r.status} ${raw.slice(0, 200)}`);
+        const body = JSON.parse(raw);
+        assert.match(body.error ?? '', /rebase/, `理由が出ていない: ${JSON.stringify(body)}`);
+        // 🔒 **本当に取り込んでいない**（409 と言いながら実行していない）
+        assert.equal(await g(['rev-parse', 'HEAD'], base), head, 'HEAD が動いた');
+        const files = await g(['ls-tree', '--name-only', 'HEAD'], base);
+        assert.equal(files.includes('m65.txt'), false, `取り込まれている: ${files}`);
+    } finally {
+        child.kill();
+        await g(['rebase', '--abort'], base).catch(() => {});
+        await g(['worktree', 'remove', '--force', base], repo).catch(() => {});
+        await g(['worktree', 'remove', '--force', src], repo).catch(() => {});
+        await g(['branch', '-D', 'm65-base'], repo).catch(() => {});
+        await g(['branch', '-D', 'm65-src'], repo).catch(() => {});
+        await rm(base, { recursive: true, force: true }).catch(() => {});
+        await rm(src, { recursive: true, force: true }).catch(() => {});
+    }
 });

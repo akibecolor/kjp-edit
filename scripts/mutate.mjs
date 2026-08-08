@@ -33,6 +33,55 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #65: merge のシーケンサ門（外しても smoke が全部緑だった）
+        name: 'merge-sequencer-gate',
+        why: 'rebase 停止中でも取り込む（git は exit 0 で通し、--continue が別ブランチに残す）',
+        file: 'v0/server.mjs',
+        // ⚠️ `if (blockers.length) {` は checkout 側にもあるので**一意にならない**。
+        //    後ろの行（merge だけの文言）まで含めて指定する
+        from: '            if (blockers.length) {\n                denyJson(res, 409,\n'
+            + '                    `${blockers.join(\' / \')} のため取り込みを拒否しました。`',
+        to: '            if (false) {   /* 変異: 停止中でも取り込む */\n                denyJson(res, 409,\n'
+            + '                    `${blockers.join(\' / \')} のため取り込みを拒否しました。`',
+        // ⚠️ `gone` も改行込みで一意にする（checkout 側の同じ文言に当たるため）
+        gone: 'if (blockers.length) {\n                denyJson(res, 409,\n'
+            + '                    `${blockers.join(\' / \')} のため取り込みを拒否しました。`',
+        pattern: 'merge: シーケンサ停止中は拒否する',
+    },
+    {
+        // 🚨 #60: ラベル（表示名）を ref として送る = 別のブランチが取り込まれる
+        name: 'merge-label-as-ref',
+        why: '提案のラベルをそのまま branch として送る（無関係なブランチが取り込まれ、門も別ペアを見る）',
+        file: 'v0/mergeplan.mjs',
+        from: '        entries.push({ label, branch: w.branch });',
+        to: '        entries.push({ label, branch: label });   /* 変異: ラベルを ref にする */',
+        gone: 'entries.push({ label, branch: w.branch });',
+        pattern: 'ラベルではなくブランチを返す',
+        testFile: 'v0/mergeplan.test.mjs',
+    },
+    {
+        // 🚨 #60: 解決できないものを黙って落とす（省略の告知が消える）
+        name: 'merge-skips-silently',
+        why: '解決できない候補を理由なしで落とす（ボタンが黙って減る）',
+        file: 'v0/mergeplan.mjs',
+        from: "        if (!w) { skipped.push({ label, why: 'この worktree が一覧にありません' }); continue; }",
+        to: "        if (!w) { continue; }   /* 変異: 黙って落とす */",
+        gone: "skipped.push({ label, why: 'この worktree が一覧にありません' })",
+        pattern: '解決できないものは黙って落とさず理由を返す',
+        testFile: 'v0/mergeplan.test.mjs',
+    },
+    {
+        // 🚨 #60: payload に無いフィールド（shortBranch）で取り込み先を選ぶ
+        name: 'merge-target-wrong-field',
+        why: 'payload に存在しない shortBranch で取り込み先を探す（常に一覧の先頭になる）',
+        file: 'v0/mergeplan.mjs',
+        from: '    const target = list.find(w => w.branch && w.branch === base) ?? list[0] ?? null;',
+        to: '    const target = list.find(w => w.shortBranch === base) ?? list[0] ?? null;   /* 変異 */',
+        gone: 'w.branch && w.branch === base',
+        pattern: '取り込み先は先頭ではなく base の worktree',
+        testFile: 'v0/mergeplan.test.mjs',
+    },
+    {
         // 🚨 #62: precheck の同時実行を縛らない（1要求で worktree 本数分の git）
         name: 'precheck-no-inflight-gate',
         why: 'precheck の同時実行を縛らない（読み取り鍵だけで worktree 本数×並列の git を起動できる）',
@@ -1948,6 +1997,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'\n"
             + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'\n"
             + "            || url.pathname === '/dirlabel.mjs'\n"
+            + "            || url.pathname === '/mergeplan.mjs'\n"
             + "            || url.pathname === '/panegrid.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",

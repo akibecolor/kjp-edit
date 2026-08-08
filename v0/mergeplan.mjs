@@ -104,3 +104,46 @@ export function planMerge(candidates, conflicts) {
 
     return { batch, deferred, unknown, untestedPairs, testedPairs: tested };
 }
+
+/**
+ * 🚨 **提案のラベルを「git に渡す ref」に解決する（#60。10回目のレビュー / BLOCKING）。**
+ *
+ * `batch` の中身は `w.label`（**worktree のディレクトリ名**由来の表示名）であって
+ * ref ではない。UI がそれをそのまま `branch` として `/api/v0/merge` に送っていたので:
+ *
+ * - ディレクトリ名がたまたま**別のブランチ名と一致**すると、
+ *   **提案とは無関係なブランチが取り込まれる**（実測: ボタン「hotfix」＝
+ *   worktree `hotfix/`（中身はブランチ `alpha`）を押すと、ブランチ `hotfix` が
+ *   main に入り、200 と「✔ 取り込みました」が出た）。
+ *   しかも門は送られた ref で `mergePreview` するので、
+ *   **予測したペアと実行したペアが別物**になる = この経路の存在理由が消える
+ * - ディレクトリ名≠ブランチ名という**普通の構成では常に 400**（`解決できない ref です`）
+ *
+ * 併せて、UI は payload に**存在しない** `w.shortBranch` を読んでいた
+ * （サーバは `branch` に改名済み）。そのため取り込み先が常に一覧の先頭になり、
+ * ヘッダが常に「(detached)」になり、自己取り込みの保護が一度も成立していなかった。
+ *
+ * ⚠️ **解決できないものは黙って落とさない。** `skipped` に理由付きで返し、
+ *    UI がそれを出す（「省略したら必ず告知する」）。
+ *
+ * @param {{batch: string[]}} plan `planMerge()` の結果
+ * @param {{name: string, branch: string|null, path: string}[]} worktrees payload の worktrees
+ * @param {string|null} base 取り込み先のブランチ名（payload の `base`）
+ * @returns {{target: object|null, entries: {label: string, branch: string}[],
+ *            skipped: {label: string, why: string}[]}}
+ */
+export function mergeTargets(plan, worktrees, base) {
+    const list = worktrees ?? [];
+    // ⚠️ payload のフィールドは `branch`（`shortBranch` はサーバ内部の名前）
+    const target = list.find(w => w.branch && w.branch === base) ?? list[0] ?? null;
+    const entries = [];
+    const skipped = [];
+    for (const label of plan?.batch ?? []) {
+        const w = list.find(x => x.name === label);
+        if (!w) { skipped.push({ label, why: 'この worktree が一覧にありません' }); continue; }
+        if (!w.branch) { skipped.push({ label, why: 'detached HEAD なので取り込めません' }); continue; }
+        if (target && w.path === target.path) continue;   // 取り込み先自身（告知は不要）
+        entries.push({ label, branch: w.branch });
+    }
+    return { target, entries, skipped };
+}

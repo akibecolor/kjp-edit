@@ -412,6 +412,7 @@ import { uniqueLabels } from './dirlabel.mjs';
 // 取り込みの応答の解釈も外に出した（「失敗しても数え直す」「半端な状態の告知は
 // 再描画で消さない」は、壊れても静かなので字面ではなく挙動で固定する。8回目のレビュー）
 import { mergeOutcome } from './mergeresult.mjs';
+import { mergeTargets } from './mergeplan.mjs';
 // 保存前に見せる差分。編集中の内容はまだどこにも無いので `git diff` に渡せない
 // （渡すには「先に書く」しかなく、「書く前に見せる」と矛盾する）
 import { diffLines } from './linediff.mjs';
@@ -2703,15 +2704,20 @@ function render(s) {
       //    押せるのは `--allow-write` があるときだけ。サーバ側は
       //    「衝突しないと予測できたもの」しか実行しない（それ以外は 409 で理由を返す）。
       if (session.allowWrite && session.canMutate) {
-        const target = (state?.worktrees ?? []).find(w => w.shortBranch === state?.base)
-          ?? (state?.worktrees ?? [])[0];
+        // 🚨 **ラベル（表示名）と ref を型で分ける（#60）。** 解決は共有の純関数で、
+        //    unit テストが「ディレクトリ名≠ブランチ名」を固定している
+        //    （ここに直接書くとテストできず、宣言が破れても気付けない）。
+        const picked = mergeTargets(plan, state?.worktrees ?? [], state?.base);
+        const target = picked.target;
         if (target) {
           const row = el('div', 'ab');
-          row.append(el('span', 'note', `${target.name} (${target.shortBranch ?? 'detached'}) に取り込む: `));
-          for (const br of plan.batch) {
-            // 取り込み先自身は押せない（サーバも 400 で断る）
-            if (br === target.shortBranch) continue;
-            const b = el('button', null, br);
+          row.append(el('span', 'note', `${target.name} (${target.branch ?? 'detached'}) に取り込む: `));
+          // ⚠️ **解決できなかったものは黙って落とさない**（省略したら必ず告知する）
+          for (const sk of picked.skipped) {
+            row.append(el('div', 'note warn', `⚠ ${sk.label}: ${sk.why}`));
+          }
+          for (const { label, branch: br } of picked.entries) {
+            const b = el('button', null, label);
             b.title = `${br} を ${target.name} に取り込む（衝突しないと予測できた場合だけ実行されます）`;
             b.addEventListener('click', async () => {
               b.disabled = true;

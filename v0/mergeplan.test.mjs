@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planMerge } from './mergeplan.mjs';
+import { planMerge, mergeTargets } from './mergeplan.mjs';
 
 const c = (label, ahead = 1) => ({ label, ahead });
 const pair = (a, b, clean) => ({ a, b, clean });
@@ -183,4 +183,66 @@ test('clean が null のペアを「衝突する」と提示しない（安全�
     assert.equal(r.batch.length, 1, '両方を塊に入れてはいけない（未検査なので）');
     assert.deepEqual(r.deferred, [], '不明を衝突として提示している');
     assert.equal(r.unknown.length, 1, '不明として提示していない');
+});
+
+/**
+ * 🚨 **#60（BLOCKING）: ラベルを ref として送らない。**
+ *
+ * 実測で「hotfix」ボタン（中身はブランチ `alpha`）を押すと
+ * **無関係なブランチ `hotfix`** が main に入り、200 と「✔ 取り込みました」が出た。
+ */
+test('mergeTargets: ラベルではなくブランチを返す（ディレクトリ名と別のとき）', () => {
+    const worktrees = [
+        { name: 'demo', branch: 'main', path: '/r/demo' },
+        // ⚠️ ディレクトリ名 hotfix、中身はブランチ alpha
+        { name: 'hotfix', branch: 'alpha', path: '/r/hotfix' },
+    ];
+    const r = mergeTargets({ batch: ['hotfix'] }, worktrees, 'main');
+    assert.equal(r.target.name, 'demo', '取り込み先が base の worktree ではない');
+    assert.deepEqual(r.entries, [{ label: 'hotfix', branch: 'alpha' }],
+        'ラベルをそのまま ref として返している（別ブランチが取り込まれる）');
+});
+
+test('mergeTargets: 取り込み先自身は候補にしない', () => {
+    const worktrees = [
+        { name: 'demo', branch: 'main', path: '/r/demo' },
+        { name: 'wt-a', branch: 'agent-a', path: '/r/wt-a' },
+    ];
+    const r = mergeTargets({ batch: ['demo', 'wt-a'] }, worktrees, 'main');
+    assert.deepEqual(r.entries.map(e => e.label), ['wt-a']);
+});
+
+test('🚨 mergeTargets: 解決できないものは黙って落とさず理由を返す', () => {
+    const worktrees = [
+        { name: 'demo', branch: 'main', path: '/r/demo' },
+        { name: 'det', branch: null, path: '/r/det' },
+    ];
+    const r = mergeTargets({ batch: ['det', 'いない'] }, worktrees, 'main');
+    assert.deepEqual(r.entries, [], 'detached を候補にしている');
+    assert.deepEqual(r.skipped.map(s => s.label).sort(), ['det', 'いない'].sort());
+    for (const s of r.skipped) assert.ok(s.why, `理由が無い: ${JSON.stringify(s)}`);
+});
+
+test('mergeTargets: base の worktree が見つからなければ先頭に落とす（黙って別物にしない）', () => {
+    const worktrees = [{ name: 'demo', branch: 'main', path: '/r/demo' }];
+    const r = mergeTargets({ batch: [] }, worktrees, 'いない枝');
+    assert.equal(r.target.name, 'demo');
+});
+
+/**
+ * 🚨 **取り込み先は payload の `branch` で探す（#60）。**
+ *
+ * UI は payload に**存在しない** `w.shortBranch` を読んでいたので、
+ * 取り込み先が**常に一覧の先頭**になっていた（base の worktree ではない）。
+ * 先頭がたまたま正解の並びでは差が出ないので、**base を先頭以外に置いて**測る。
+ */
+test('🚨 mergeTargets: 取り込み先は先頭ではなく base の worktree', () => {
+    const worktrees = [
+        { name: 'wt-a', branch: 'agent-a', path: '/r/wt-a' },
+        { name: 'demo', branch: 'main', path: '/r/demo' },
+    ];
+    const r = mergeTargets({ batch: ['wt-a'] }, worktrees, 'main');
+    assert.equal(r.target.name, 'demo',
+        '一覧の先頭を取り込み先にしている（base の worktree ではない）');
+    assert.deepEqual(r.entries, [{ label: 'wt-a', branch: 'agent-a' }]);
 });

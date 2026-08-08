@@ -217,7 +217,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `ndjson.test.mjs` | 行割れ・マルチバイト割れの回帰テスト |
 | `argv.mjs` | コマンド行の分割と会話モードの判定（`isChatArgv`）。同じ理由で共有 |
 | `chatfilter.mjs` / `.test.mjs` | 会話モード（stream-json）の出力の解釈。**同じ理由で共有** |
-| `mergeplan.mjs` / `.test.mjs` | 取り込み順序の提案（純関数）と unit テスト9件 |
+| `mergeplan.mjs` / `.test.mjs` | 取り込み順序の提案（純関数）と、提案のラベルを **git に渡す ref に解決する** `mergeTargets()`（#60）。**同じ理由で共有** |
 | `panelayout.mjs` / `.test.mjs` | ペインの配置（ドラッグで決めた並び）の表現と永続化の形。**同じ理由で共有** |
 | `panegrid.mjs` / `.test.mjs` | グリッド配置（`?grid=1`）のパターン・結合・移動・閉じる（純関数。#57） |
 | `blobview.mjs` / `.test.mjs` | 全文ビューアの表示上限と告知。**同じ理由で共有** |
