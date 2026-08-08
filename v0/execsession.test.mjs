@@ -516,3 +516,28 @@ test('🚨 since: 負の通番でも「省略しました」と嘘を言わな�
     assert.equal(r.records.length, 2);
     assert.equal(log.since(0).missing, 0);
 });
+
+/**
+ * 🚨 **自分の入力で「最後の出力」を消さない（MINOR。10回目のレビュー）。**
+ *
+ * `in` は出力と同じリングに積まれるので、長文を貼るだけで子の出力が押し出され、
+ * `lastOutput()` が null になって監視盤の行から出力表示ごと消えていた。
+ * しかも押し出したのは利用者自身の入力なのに「出力 N 件省略」と言う。
+ */
+test('🚨 長い入力はリングに本文を残さない（live には流す）', () => {
+    const reg = new ExecRegistry({ execTimeoutMs: 600_000 });
+    const s = reg.create({ worktree: '/w', argv: ['x'] });
+    const live = [];
+    reg.subscribe(s, 0, r => live.push(r));
+    reg.emit(s, 'out', '大事な出力');
+    const big = 'あ'.repeat(50_000);
+    reg.emit(s, 'in', big);
+    // 🔒 リングには本文が残らない（出力が押し出されない）
+    const stored = s.log.records.find(r => r.t === 'in');
+    assert.ok(stored.d.length < 300, `入力の本文がリングに残っている: ${stored.d.length} 文字`);
+    assert.match(stored.d, /送信 \d+ バイト/, `送った量を言っていない: ${stored.d}`);
+    assert.equal(s.lastOutput(), '大事な出力', '自分の入力で出力が押し出されている');
+    // ⚠️ 購読者（端末）には**打った本文**がそのまま届く
+    const sent = live.find(r => r.t === 'in');
+    assert.equal(sent.d, big, '端末に打った内容が届いていない');
+});

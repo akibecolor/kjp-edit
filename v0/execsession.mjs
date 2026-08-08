@@ -26,6 +26,9 @@
 
 import { randomBytes } from 'node:crypto';
 
+// 入力レコードをリングに残す長さ（超えた分は「送った事実」だけにする。#5 の MINOR）
+export const IN_KEEP_CHARS = 200;
+
 export const DEFAULTS = {
     maxConcurrent: 8,
     bufferBytes: 256 * 1024,   // 1セッションあたりの再生用バッファ
@@ -318,6 +321,20 @@ export class ExecRegistry {
 
     /** 出力を1件積んで購読者に流す */
     emit(s, t, d) {
+        // 🚨 **自分の入力でリングを食い潰さない（MINOR。10回目のレビュー）。**
+        //    `in` は出力と同じ 256KB のリングに積まれるので、
+        //    64KB の貼り付けを数回送るだけで**子の出力が全部押し出される**。
+        //    `lastOutput()` は `in` を読み飛ばすため、走っているセッションの
+        //    「最後の出力」が null になり、監視盤の行から出力表示ごと消えていた
+        //    （しかも押し出したのは利用者自身の入力なのに「出力N件省略」と言う）。
+        //    ⚠️ **live には本文をそのまま流す**（端末の `▸` は打った内容を出す）。
+        //       リングに残すのは「送った」という事実とバイト数だけ。
+        if (t === 'in' && typeof d === 'string' && d.length > IN_KEEP_CHARS) {
+            const rec = s.log.push(t, `${d.slice(0, IN_KEEP_CHARS)}…（送信 ${Buffer.byteLength(d, 'utf8')} バイト）`);
+            // 購読者には**元の本文**を流す（通番は同じ）
+            this.#fanout(s, { ...rec, d });
+            return;
+        }
         this.#fanout(s, s.log.push(t, d));
     }
 

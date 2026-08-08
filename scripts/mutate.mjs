@@ -33,6 +33,16 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        name: 'input-eats-ring',
+        why: '長い入力の本文をリングに積む（自分の貼り付けで子の出力が全部押し出され、最後の出力が消える）',
+        file: 'v0/execsession.mjs',
+        from: "        if (t === 'in' && typeof d === 'string' && d.length > IN_KEEP_CHARS) {",
+        to: '        if (false) {   /* 変異: 入力もそのまま積む */',
+        gone: "if (t === 'in' && typeof d === 'string' && d.length > IN_KEEP_CHARS) {",
+        pattern: '長い入力はリングに本文を残さない',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
         // ⚠️ MINOR: merge の bare 門は検査があるのに変異が無かった
         //    （prunable だけ後から足されていた）
         name: 'merge-bare-gate',
