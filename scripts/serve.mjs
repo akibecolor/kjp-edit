@@ -36,6 +36,7 @@ import {
     SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, collectRepos, serverArgs,
     configDiff, describeCaps, stopTargets, stopOutcome,
     otherDaemonsNote, portShiftNote, shouldWriteReadSecret, servesRepo,
+    portFrom, stopRepoFrom,
 } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -125,7 +126,8 @@ if (has('--all') && !has('--stop')) {
 //    `--timeout abc` も `--port 99999` も**一言も言われないまま exit 0** していた
 //    （打った値が捨てられたことが分からない = #30 と同じ形。8回目のレビュー）。
 //    門はフォールバックより前に置く。
-const portCheck = checkPort(val('--port', undefined), DEFAULT_PORT);
+// ⚠️ 値の欠落も error にする（`serve.mjs --port` が黙って既定で起動していた）
+const portCheck = portFrom(argv, DEFAULT_PORT);
 if (portCheck.error !== undefined) {
     console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
     process.exit(1);
@@ -254,7 +256,15 @@ if (has('--stop')) {
     const wantAll = has('--all');
     let scope = null;
     if (!wantAll) {
-        scope = await topLevel(val('--repo', process.cwd()));
+        // 🚨 **値が無い `--repo` をカレントに落とさない。**
+        //    落とすと**意図と違うデーモンを `taskkill /T /F`** する（子ごと死ぬ）。
+        const want = stopRepoFrom(argv);
+        if (want.error !== undefined) {
+            console.error('\n✖ --repo にパスを指定してください'
+                + `（受け取った値: ${want.error}）\n`);
+            process.exit(1);
+        }
+        scope = await topLevel(want.repo ?? process.cwd());
         if (!scope) {
             console.error('\n✖ git リポジトリの中ではありません（どのデーモンを止めるか決められません）');
             console.error('  リポジトリを指定するか、マシン上の全部を止めると明示してください:');

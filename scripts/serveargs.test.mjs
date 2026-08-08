@@ -21,6 +21,7 @@ import {
     runningCaps, requestedCaps, describeCaps,
     runningConfig, requestedConfig, configDiff, stopTargets, stopOutcome,
     otherDaemonsNote, portShiftNote, shouldWriteReadSecret, servesRepo,
+    portFrom, stopRepoFrom,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
@@ -1091,4 +1092,29 @@ test('🚨 autostart install: 開けないパスは登録を拒否する（#74�
     assert.match(out, /リポジトリとして開けません/, `理由が出ていない: ${out.slice(0, 300)}`);
     // 「登録しました」と言っていないこと（嘘の成功を出さない）
     assert.equal(out.includes('登録しました'), false, `拒否したのに成功と言った: ${out}`);
+});
+
+/**
+ * 🚨 **値の欠落を黙って既定に落とさない（MINOR。10回目のレビュー）。**
+ *
+ * `--timeout` と `--repo` は error にしていたのに `--port` だけ
+ * `val('--port', undefined)` で読んでいたので、**`serve.mjs --port`（値を忘れた）が
+ * 黙って 7749 で起動**していた。`--stop --repo`（値なし）はもっと悪く、
+ * カレントに落ちて**意図と違うデーモンを `taskkill /T /F`** する。
+ */
+test('🚨 portFrom: --port の値が無い／フラグなら error（既定に落とさない）', () => {
+    assert.equal(portFrom(['--port'], 7749).error, '(無し)');
+    assert.equal(portFrom(['--port', '--exec'], 7749).error, '--exec');
+    assert.equal(portFrom(['--port', '0abc'], 7749).error, '0abc');
+    // 指定が無ければ既定（打っていないものを error にしない）
+    assert.equal(portFrom(['--exec'], 7749).port, 7749);
+    assert.equal(portFrom(['--port', '8080'], 7749).port, 8080);
+});
+
+test('🚨 stopRepoFrom: --repo の値が無ければ error（カレントに落とさない）', () => {
+    assert.equal(stopRepoFrom(['--stop', '--repo']).error, '(無し)');
+    assert.equal(stopRepoFrom(['--stop', '--repo', '--all']).error, '--all');
+    // 指定が無ければ null（= 呼ぶ側がカレントを使う。打っていないので error ではない）
+    assert.equal(stopRepoFrom(['--stop']).repo, null);
+    assert.equal(stopRepoFrom(['--stop', '--repo', 'C:/x']).repo, 'C:/x');
 });

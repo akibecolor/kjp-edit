@@ -481,3 +481,38 @@ test('🚨 監視盤に返す件数を切ったら、切った数を返す（黙
     // 上限に掛からないときは 0（「省略しました」と嘘を言わない）
     assert.equal(reg.sessionsForMonitor(clock, 50).omitted, 0);
 });
+
+/**
+ * ⚠️ **上限ちょうどのときに「切った」告知が消える（MINOR。10回目のレビュー）。**
+ *
+ * `text.length > max` で判定していたので、`acc.length === max` で break した回は
+ * 前のレコードを**捨てているのに** `…` が付かず、告知なしで古い出力が消えていた。
+ */
+test('🚨 lastOutput: 上限ちょうどで切ったときも「…」を付ける', () => {
+    const reg = new ExecRegistry({ execTimeoutMs: 600_000 });
+    const s = reg.create({ worktree: '/w', argv: ['x'] });
+    reg.emit(s, 'out', 'AAA');   // これは押し出される
+    reg.emit(s, 'out', 'BB');
+    reg.emit(s, 'out', 'CC');
+    // 上限 4 = 'BB' + 'CC' でちょうど。前に 'AAA' が残っているので切っている
+    const out = s.lastOutput(4);
+    assert.equal(out, '…BBCC', `切ったのに告知が無い: ${JSON.stringify(out)}`);
+    // 全部入るときは付けない（嘘の省略を出さない）
+    assert.equal(s.lastOutput(100), 'AAABBCC');
+});
+
+/**
+ * ⚠️ **1件も捨てていないのに「N 件を省略しました」と言わない（MINOR）。**
+ *
+ * `since(-1)` のような負の通番で再購読すると `firstKept - n - 1` が正になり、
+ * 嘘の告知が出ていた。
+ */
+test('🚨 since: 負の通番でも「省略しました」と嘘を言わない', () => {
+    const log = new RingLog({ bytes: 1024, records: 100 });
+    log.push({ t: 'out', d: 'a' });
+    log.push({ t: 'out', d: 'b' });
+    const r = log.since(-5);
+    assert.equal(r.missing, 0, `捨てていないのに省略と言った: ${r.missing}`);
+    assert.equal(r.records.length, 2);
+    assert.equal(log.since(0).missing, 0);
+});

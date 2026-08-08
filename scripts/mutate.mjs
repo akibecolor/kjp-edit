@@ -33,6 +33,67 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        name: 'lastoutput-cut-by-length',
+        why: '切ったかを長さ比較で決める（上限ちょうどのとき告知なしで古い出力が消える）',
+        file: 'v0/execsession.mjs',
+        from: '        return (cut || text.length > max) ? `…${text.slice(-max)}` : text;',
+        to: '        return text.length > max ? `…${text.slice(-max)}` : text;   /* 変異 */',
+        gone: 'return (cut || text.length > max)',
+        pattern: '上限ちょうどで切ったときも',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'since-negative-from',
+        why: '負の通番を 0 に丸めない（1件も捨てていないのに「N 件を省略しました」と告知する）',
+        file: 'v0/execsession.mjs',
+        from: '        const n = Number.isFinite(from) && from > 0 ? from : 0;',
+        to: '        const n = Number.isFinite(from) ? from : 0;   /* 変異 */',
+        gone: 'Number.isFinite(from) && from > 0',
+        pattern: '負の通番でも',
+        testFile: 'v0/execsession.test.mjs',
+    },
+    {
+        name: 'input-starting-lies',
+        why: '起動途中を「標準入力は既に閉じています」と言う（送り直せば通るのに諦めさせる）',
+        file: 'v0/server.mjs',
+        from: '                    if (!s.child) {',
+        to: '                    if (false) {   /* 変異: 起動途中も「閉じています」と言う */',
+        gone: 'if (!s.child) {',
+        pattern: '起動途中への入力',
+    },
+    {
+        // ⚠️ MINOR: --port の値の欠落を黙って既定に落とす
+        name: 'port-missing-value-default',
+        why: '--port の値が無いのを黙って既定にする（打ったつもりのポートで起動しない）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (raw === undefined || String(raw).startsWith('-')) return { error: raw ?? '(無し)' };\n    return checkPort(raw, def);",
+        to: '    return checkPort(raw, def);   /* 変異: 値が無くても既定に落とす */',
+        gone: "return { error: raw ?? '(無し)' };\n    return checkPort(raw, def);",
+        pattern: 'portFrom: --port の値が無い',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 🚨 MINOR だが実害が大きい: --stop --repo の値の欠落でカレントを殺す
+        name: 'stop-repo-missing-value',
+        why: '--stop --repo の値が無いのをカレントに落とす（意図と違うデーモンを子ごと taskkill する）',
+        file: 'scripts/serveargs.mjs',
+        from: '        return { error: raw ?? \'(無し)\' };\n    }\n    return { repo: String(raw) };',
+        to: '        return { repo: null };   /* 変異: 値が無ければカレント */\n    }\n    return { repo: String(raw) };',
+        gone: 'return { error: raw ?? \'(無し)\' };\n    }\n    return { repo: String(raw) };',
+        pattern: 'stopRepoFrom: --repo の値が無ければ',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // ⚠️ MINOR: --allow-host の値の欠落で 'undefined' を登録する
+        name: 'allow-host-missing-value',
+        why: '--allow-host の値が無いと undefined をホストとして登録する（https://undefined/?token= を案内する）',
+        file: 'v0/server.mjs',
+        from: "            if (h === undefined || String(h).startsWith('-') || !String(h).trim()) {",
+        to: '            if (false) {   /* 変異: 値が無くても登録する */',
+        gone: "if (h === undefined || String(h).startsWith('-') || !String(h).trim()) {",
+        pattern: 'allow-host の値が無ければ起動を止める',
+    },
+    {
         // 🚨 #74: 解決できないパスをそのまま Run キーに書く（ログオン時だけ壊れる）
         name: 'autostart-repo-unchecked',
         why: 'install が --repo を解決せずに登録する（ログオン時にだけ起動に失敗する = 手元では気付けない）',
@@ -1663,9 +1724,11 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'serve-timeout-value-missing',
         why: '--timeout の値が無い形を既定に落とす（延ばしたつもりで 600 秒のまま起動）',
         file: 'scripts/serveargs.mjs',
-        from: "    if (raw === undefined || String(raw).startsWith('-')) return { error: raw ?? '(無し)' };",
-        to: '    /* 変異: 値が無い形を見ない */',
-        gone: "String(raw).startsWith('-')",
+        // ⚠️ `portFrom()` に同じ形の行ができたので、**後ろの行まで含めて一意にする**
+        //    （`gone` が同じ式だと「他所にできた瞬間に無効化される」の再発）
+        from: "    if (raw === undefined || String(raw).startsWith('-')) return { error: raw ?? '(無し)' };\n    return checkTimeout(raw);",
+        to: '    return checkTimeout(raw);   /* 変異: 値が無い形を見ない */',
+        gone: "return { error: raw ?? '(無し)' };\n    return checkTimeout(raw);",
         pattern: '--timeout の値が無い形を既定に落とさない',
         testFile: 'scripts/serveargs.test.mjs',
     },

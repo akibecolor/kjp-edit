@@ -34,6 +34,7 @@ import { winQuote, trimTrailingSep } from './winargs.mjs';
 //    （再起動後だけ 403 / ログオン後だけパネルが消える）。純関数にして固定した（#45）
 import {
     AUTOSTART_FLAGS, unknownFlag, checkPort, collectRepos, autostartServeArgs,
+    portFrom,
 } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -174,7 +175,8 @@ const repos = (repoCheck.repos.length ? repoCheck.repos : [ROOT]).map(trimTraili
     repos.push(...resolved);
 }
 
-const portCheck = checkPort(val('--port', undefined), '7749');
+// ⚠️ 値の欠落も error にする（Run キーに黙って既定が載るのを防ぐ）
+const portCheck = portFrom(argv, '7749');
 if (portCheck.error !== undefined) {
     console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
     process.exit(1);

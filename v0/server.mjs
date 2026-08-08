@@ -103,7 +103,19 @@ function parseArgs(argv) {
         else if (a === '--limit') opts.limit = num('--limit', 1, 100000);
         else if (a === '--base') opts.base = argv[++i];
         else if (a === '--layout-probe') opts.layoutProbe = true;
-        else if (a === '--allow-host') opts.allowHosts.add(String(argv[++i]).toLowerCase());
+        else if (a === '--allow-host') {
+            // 🚨 **値が無いと文字列 'undefined' をホストとして登録していた。**
+            //    しかも `--allow-host` は requireAuth を自動でオンにするので、
+            //    **`https://undefined/?token=…` を案内**して「なぜか繋がらない」になる。
+            //    打ったフラグを黙って捨てない（#30）の値側。
+            const h = argv[++i];
+            if (h === undefined || String(h).startsWith('-') || !String(h).trim()) {
+                console.error('\n✖ --allow-host にはホスト名を指定してください'
+                    + `（受け取った値: ${h ?? '(無し)'}）\n`);
+                process.exit(1);
+            }
+            opts.allowHosts.add(String(h).toLowerCase());
+        }
         else if (a === '--allow-write') opts.allowWrite = true;
         else if (a === '--allow-exec') { opts.allowExec = true; opts.allowWrite = true; }
         else if (a === '--exec-timeout') opts.execTimeoutMs = num('--exec-timeout', 1, 86400) * 1000;
@@ -2938,7 +2950,15 @@ async function handleRequest(req, res) {
                     const eof = inBody.eof === true;
                     const data = typeof inBody.data === 'string' ? inBody.data : null;
                     if (!eof && data === null) { denyJson(res, 400, 'data（文字列）か eof が必要です'); return; }
-                    if (!s.child?.stdin || s.child.stdin.destroyed || !s.child.stdin.writable) {
+                    // ⚠️ **「まだ始まっていない」を「もう終わった」と言わない**（MINOR）。
+                    //    spawn 前（state='starting'）は `s.child` が null なので、
+                    //    以前は「標準入力は既に閉じています」と**嘘**を返していた。
+                    //    利用者は送り直せば通ると分からない（諦める方に倒れる）。
+                    if (!s.child) {
+                        denyJson(res, 409, 'まだ起動中です（少し待ってから送り直してください）');
+                        return;
+                    }
+                    if (!s.child.stdin || s.child.stdin.destroyed || !s.child.stdin.writable) {
                         denyJson(res, 409, '標準入力は既に閉じています');
                         return;
                     }

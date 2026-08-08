@@ -7246,3 +7246,78 @@ test('🚨 exec: まとめて上限切れでも kill は1本につき1回（#70�
         await rm(audit, { force: true }).catch(() => {});
     }
 });
+
+/**
+ * 🚨 **`--allow-host` の値が無いと 'undefined' をホスト登録していた（MINOR）。**
+ *
+ * しかも `--allow-host` は requireAuth を自動でオンにするので、
+ * **`https://undefined/?token=…` を案内**して「なぜか繋がらない」になる。
+ */
+test('🚨 --allow-host の値が無ければ起動を止める（MINOR）', async () => {
+    const child = spawn(process.execPath, [SERVER, '--repo', repo, '--port', '0', '--allow-host'],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    let out = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { out += d; });
+    // 🚨 待ち続ける形にしない（守りを外すと起動して終わらない）
+    const code = await Promise.race([
+        new Promise(res => child.on('exit', c => res(c))),
+        new Promise(res => setTimeout(() => res('(15秒たっても終了しない)'), 15000)),
+    ]).finally(() => child.kill());
+    assert.equal(code, 1, `値なしで起動できてしまった（exit=${code}）: ${out.slice(0, 200)}`);
+    assert.match(out, /--allow-host にはホスト名/, `理由が出ていない: ${out.slice(0, 200)}`);
+    assert.equal(out.includes('undefined'), false,
+        `'undefined' をホストとして扱っている: ${out.slice(0, 300)}`);
+});
+
+/**
+ * ⚠️ **「まだ始まっていない」を「もう終わった」と言わない（MINOR。10回目のレビュー）。**
+ *
+ * spawn 前（`state='starting'`）は `s.child` が null なので、
+ * `/input` は「標準入力は既に閉じています」と**嘘**を返していた。
+ * 送り直せば通るのに、利用者は諦める方に倒れる。
+ */
+test('⚠ exec: 起動途中への入力は「まだ起動中」と言う（MINOR）', async () => {
+    // 🚨 **starting の窓を検査専用フラグで決定的にする**（CLAUDE.md）。
+    //    素のままでは spawn が速すぎて窓を外し、守りを外しても緑になる
+    //    （実測: 変異 input-starting-lies が SURVIVED した）。
+    // ⚠️ **id は `/exec/list` から取る。** 応答のストリームは **spawn の後**で
+    //    始まるので、`session` レコードを待つと窓は必ず閉じている（最初これで外した）。
+    const { child, url } = await startExec(['--exec-spawn-delay', '2000']);
+    try {
+        const posting = fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({
+                worktree: repo,
+                argv: [process.execPath, '-e', 'setTimeout(()=>{}, 3000);'],
+            }),
+        });
+        let id = null;
+        for (let i = 0; i < 40 && !id; i++) {
+            const r = await fetch(`${url}/api/v0/exec/list`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            });
+            const j = await r.json();
+            const starting = (j.sessions ?? []).find(x => x.state === 'starting');
+            if (starting) id = starting.id;
+            else await new Promise(res => setTimeout(res, 50));
+        }
+        assert.ok(id, 'starting のセッションを掴めない（窓が開いていない）');
+        const r = await sendInput(url, id, { data: 'x\n' });
+        assert.equal(r.status, 409, `起動途中なのに ${r.status} が返った`);
+        const b = await r.json();
+        assert.equal(/既に閉じています/.test(b.error ?? ''), false,
+            '起動途中を「既に閉じています」と言った（送り直せば通るのに諦めさせる）: '
+            + JSON.stringify(b));
+        assert.match(b.error ?? '', /まだ起動中/, `理由が違う: ${JSON.stringify(b)}`);
+        // 応答の本文は閉じておく（開いたままだと node --test が終わらない）
+        const res = await posting;
+        await res.body.cancel().catch(() => {});
+    } finally {
+        child.kill();
+    }
+});

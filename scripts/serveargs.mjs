@@ -564,3 +564,41 @@ export function shouldWriteReadSecret(tokenFile, readFile) {
         .replace(/\/+$/, '').toLowerCase();
     return norm(tokenFile) !== norm(readFile);
 }
+
+/**
+ * 🚨 **`--port` / `--repo` の「値が無い」を黙って既定に落とさない（#2/#3 の MINOR）。**
+ *
+ * `timeoutFrom()` と `collectRepos()` は値の欠落を error にしているのに、
+ * `--port` は `val('--port', undefined)` で読んでいたので
+ * **`serve.mjs --port`（値を忘れた）が黙って 7749 で起動**していた。
+ * `--stop --repo`（値なし）はもっと悪く、**カレントのリポジトリに落ちて
+ * 意図と違うデーモンを `taskkill /T /F`** する（`/T` なので走っている exec の子ごと）。
+ * 「打ったフラグを黙って捨てない」（#30）を値の側でも守る。
+ *
+ * @returns {{port: number} | {error: string}} 指定が無ければ既定
+ */
+export function portFrom(argv, def) {
+    const a = Array.isArray(argv) ? argv : [];
+    const i = a.indexOf('--port');
+    if (i === -1) return checkPort(undefined, def);
+    const raw = a[i + 1];
+    // ⚠️ 次がフラグなら値ではない（`--port --exec` を既定と読まない）
+    if (raw === undefined || String(raw).startsWith('-')) return { error: raw ?? '(無し)' };
+    return checkPort(raw, def);
+}
+
+/**
+ * `--stop` の対象リポジトリ。値が無ければ error（既定に落とさない）。
+ *
+ * @returns {{repo: string|null} | {error: string}} 指定が無ければ repo: null（= カレント）
+ */
+export function stopRepoFrom(argv) {
+    const a = Array.isArray(argv) ? argv : [];
+    const i = a.indexOf('--repo');
+    if (i === -1) return { repo: null };
+    const raw = a[i + 1];
+    if (raw === undefined || String(raw).startsWith('-') || /["\r\n\0]/.test(String(raw))) {
+        return { error: raw ?? '(無し)' };
+    }
+    return { repo: String(raw) };
+}

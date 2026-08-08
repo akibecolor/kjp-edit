@@ -103,7 +103,9 @@ export class RingLog {
      * `missing` は「from の直後から連続していない」= 取りこぼした件数。
      */
     since(from) {
-        const n = Number.isFinite(from) ? from : 0;
+        // ⚠️ 負の値は 0 と同じ扱い（MINOR）。そうしないと `firstKept - n - 1` が
+        //    正になり、**1件も捨てていないのに「N 件を省略しました」と告知**する。
+        const n = Number.isFinite(from) && from > 0 ? from : 0;
         const out = this.records.filter(r => r.n > n);
         const firstKept = this.records.length ? this.records[0].n : this.seq + 1;
         const missing = Math.max(0, firstKept - 1 - n);
@@ -164,16 +166,27 @@ class Session {
      */
     lastOutput(max = 8000) {
         let acc = '';
+        // 🚨 **「切ったか」を長さ比較で決めない（MINOR。10回目のレビュー）。**
+        //    上限ちょうど（`acc.length === max`）で break したとき、
+        //    その前のレコードは**捨てているのに** `text.length > max` が偽になり、
+        //    `…` が付かずに**告知なしで古い出力が消えて**いた。
+        //    ループを抜けた理由をフラグで持つ（省略したかどうかは長さではなく事実）。
+        let cut = false;
         for (let i = this.log.records.length - 1; i >= 0; i--) {
             const r = this.log.records[i];
             if (r.t !== 'out' && r.t !== 'err') continue;
             acc = String(r.d ?? '') + acc;
-            if (acc.length >= max) break;
+            if (acc.length >= max) {
+                // まだ前に out/err が残っているなら、確かに切っている
+                cut = this.log.records.slice(0, i)
+                    .some(x => x.t === 'out' || x.t === 'err') || acc.length > max;
+                break;
+            }
         }
         const text = acc.trim();
         if (!text) return null;
         // 末尾を返す（進行中の出力は最後が最新）。切ったことは告げる
-        return text.length > max ? `…${text.slice(-max)}` : text;
+        return (cut || text.length > max) ? `…${text.slice(-max)}` : text;
     }
     describe(now) {
         return {
