@@ -20,7 +20,7 @@ import {
     collectHosts, collectRepos, serverArgs, autostartServeArgs, checkTimeout, timeoutFrom,
     runningCaps, requestedCaps, describeCaps,
     runningConfig, requestedConfig, configDiff, stopTargets, stopOutcome,
-    otherDaemonsNote, portShiftNote, shouldWriteReadSecret,
+    otherDaemonsNote, portShiftNote, shouldWriteReadSecret, servesRepo,
 } from './serveargs.mjs';
 
 const SERVER = '/x/v0/server.mjs';
@@ -1015,3 +1015,45 @@ test('shouldWriteReadSecret: --token-file が token-read 自身なら書かな�
     assert.equal(shouldWriteReadSecret('C:/Users/me/.kjp-edit/token-write', read), true);
     assert.equal(shouldWriteReadSecret(null, read), false);
 });
+
+/**
+ * 🚨 **`--repo` を複数見ているデーモンを「別のリポジトリ」と言わない（#61。BLOCKING）。**
+ *
+ * 対象の判定が全部 `repoOf()`（**1本目だけ**）だったので、
+ * `--repo A --repo B` のデーモンに対して repo B で `--stop` を打つと
+ * 「動いていません」＋「← 別のリポジトリなので止めません」と**断言**していた。
+ * 実際にはそのデーモンが B を配信していて、`--exec` の子ごと生き残る
+ * （CLAUDE.md が「観測ツールとして最悪の誤り」と呼ぶ**止めたつもりで走り続けている**）。
+ * 二重起動の門も同じ式なので、B を見る2本目が黙って立ち上がっていた。
+ */
+{
+    const multi = 'node C:/k/v0/server.mjs --repo C:/repos/A --repo C:/repos/B'
+        + ' --port 7749 --allow-exec';
+    const one = [{ pid: 4242, port: 7749, cmd: multi }];
+
+    test('🚨 servesRepo: 1本目以外でも「自分のデーモン」と判定する', () => {
+        assert.equal(servesRepo(multi, 'C:/repos/A'), true);
+        assert.equal(servesRepo(multi, 'C:/repos/B'), true, '2本目を別物と判定している');
+        assert.equal(servesRepo(multi, 'C:/repos/C'), false);
+        // ⚠️ 「読めなかった」は false ではなく null（#54 で分けた区別）
+        assert.equal(servesRepo('node server.mjs --port 7749', 'C:/repos/A'), null);
+    });
+
+    test('🚨 stopTargets: 2本目のリポジトリからでも止める対象になる', () => {
+        const r = stopTargets(one, 'C:/repos/B');
+        assert.equal(r.targets.length, 1,
+            `2本目のリポジトリで対象にならない: ${JSON.stringify(r)}`);
+        assert.equal(r.others.length, 0, '「別のリポジトリ」と断言している');
+        assert.equal(r.unknown.length, 0);
+    });
+
+    test('🚨 otherDaemonsNote: 自分を配信しているデーモンを「他のリポジトリ」と数えない', () => {
+        const note = otherDaemonsNote({ supported: true, list: one }, 'C:/repos/B');
+        assert.equal(note, null, `自分のデーモンを他所として数えた: ${JSON.stringify(note)}`);
+        // 無関係なリポジトリからは「他所」に見える（数え漏らしにしない）
+        const other = otherDaemonsNote({ supported: true, list: one }, 'C:/repos/C');
+        assert.equal(other?.count, 1);
+        assert.match(other.lines[0], /A/, `登録の一覧が出ていない: ${other.lines[0]}`);
+        assert.match(other.lines[0], /B/, `2本目が出ていない: ${other.lines[0]}`);
+    });
+}

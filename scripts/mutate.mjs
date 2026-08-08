@@ -33,6 +33,28 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #61: 対象の判定を1本目だけに戻す（複数 repo のデーモンに嘘をつく）
+        name: 'stop-first-repo-only',
+        why: '--repo の1本目だけで自分のデーモンか判定する（2本目のリポジトリで「動いていません」と断言する）',
+        file: 'scripts/serveargs.mjs',
+        from: '    const list = reposOf(cmd);',
+        to: '    const list = [repoOf(cmd)].filter(Boolean);   /* 変異: 1本目だけ */',
+        gone: 'const list = reposOf(cmd);',
+        pattern: '1本目以外でも「自分のデーモン」と判定する',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
+        // 🚨 #61: 「読めなかった」を「別のリポジトリ」に潰す（#54 の再発）
+        name: 'stop-unknown-as-other',
+        why: 'コマンド行を読めなかったデーモンを「別のリポジトリ」と断言する（止め残しに気付けない）',
+        file: 'scripts/serveargs.mjs',
+        from: '    if (!list || !list.length) return null;',
+        to: '    if (!list || !list.length) return false;   /* 変異: 分からないを別物と言う */',
+        gone: 'if (!list || !list.length) return null;',
+        pattern: '1本目以外でも「自分のデーモン」と判定する',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
         // 🚨 #65: merge のシーケンサ門（外しても smoke が全部緑だった）
         name: 'merge-sequencer-gate',
         why: 'rebase 停止中でも取り込む（git は exit 0 で通し、--continue が別ブランチに残す）',
@@ -1619,10 +1641,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（repo B で 8 分走っている会話セッションが無言で消える。taskkill /T なので子孫も）',
         file: 'scripts/serveargs.mjs',
         // #54 で「分からない」を別枠にしたので、判定の行はこの形になった
-        from: `        else if (samePathish(found, repo)) targets.push(r);
-        else others.push(r);`,
+        from: '        else if (serves) targets.push(r);\n        else others.push(r);',
         to: '        else targets.push(r);   /* 変異: repo で絞らない */',
-        gone: 'else if (samePathish(found, repo)) targets.push(r);',
+        gone: 'else if (serves) targets.push(r);',
         pattern: '--stop の既定はカレントのリポジトリだけ',
         testFile: 'scripts/serveargs.test.mjs',
     },
@@ -2384,9 +2405,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'repo を判定できない相手を「別のリポジトリ」と断言する'
             + '（止め残しに気付けない。「分からない」と「無い」を混ぜる型）',
         file: 'scripts/serveargs.mjs',
-        from: "        if (found === null || found === undefined || found === '') unknown.push(r);",
-        to: '        /* 変異: 分からないものを別枠にしない */',
-        gone: "if (found === null || found === undefined || found === '') unknown.push(r);",
+        from: '        if (serves === null) unknown.push(r);',
+        to: '        if (false) unknown.push(r);   /* 変異: 分からないものを別枠にしない */',
+        gone: 'if (serves === null) unknown.push(r);',
         pattern: '「別のリポジトリ」と断言しない',
         testFile: 'scripts/serveargs.test.mjs',
     },

@@ -35,7 +35,7 @@ import { readSecretOf } from '../v0/readsecret.mjs';
 import {
     SERVE_FLAGS, unknownFlag, checkPort, timeoutFrom, collectHosts, collectRepos, serverArgs,
     configDiff, describeCaps, stopTargets, stopOutcome,
-    otherDaemonsNote, portShiftNote, shouldWriteReadSecret,
+    otherDaemonsNote, portShiftNote, shouldWriteReadSecret, servesRepo,
 } from './serveargs.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -385,7 +385,9 @@ if (!probe.supported) {
     console.log('  二重起動の門が効きません。同じリポジトリを2本見ると'
         + 'watcher・キャッシュ・実行枠・監査が二重になります。');
 }
-const already = probe.list.find(r => samePathish(repoOf(r.cmd), repo));
+// 🚨 **1本目だけで判定しない（#61）。** 複数 repo のデーモンが既に
+//    このリポジトリを配信していても「動いていない」と読み、2本目が立ち上がっていた。
+const already = probe.list.find(r => servesRepo(r.cmd, repo) === true);
 // 🚨 **他に動いているデーモンを黙らせない（#55）。** 別リポジトリの2本目は
 //    正しく立ち上がるが、今まで一言も言わなかったので「今マシン上で何本
 //    動いているか」を --status を打つまで知る手段が無かった

@@ -413,6 +413,29 @@ export function configDiff(argv, cmd, { repos = null } = {}) {
  *   others = 別のリポジトリだと**分かっている**もの / unknown = 判定できなかったもの。
  *   どちらも止めないが、**言い方を変える**（必ず両方見せる）
  */
+/**
+ * 🚨 **そのデーモンが「このリポジトリ」を配信しているか（#61。10回目のレビュー / BLOCKING）。**
+ *
+ * `--repo` は複数指定できるのに、対象の判定が全部 `repoOf()`（**1本目だけ**）だった。
+ * その結果、`--repo A --repo B` で動いているデーモンに対して repo B で:
+ *
+ * - `--stop` が「このリポジトリの kjp-edit は動いていません: B」と言い、
+ *   続けて「← 別のリポジトリなので止めません」と**断言**した。
+ *   実際にはそのデーモンが B を配信していて、`--exec` の子ごと生き残る
+ *   （CLAUDE.md が「観測ツールとして最悪の誤り」と呼ぶ**止めたつもりで走り続けている**）
+ * - 二重起動の門が外れ、B を見る2本目が黙って立ち上がる
+ *   （watcher・TTL キャッシュ・実行枠・監査ログが二重になる）
+ *
+ * ⚠️ **「読めなかった」と「別のリポジトリ」を混ぜない。** 一覧が空なら null を返し、
+ *    呼ぶ側が `unknown` として扱う（#54 で分けたのと同じ理由）。
+ * @returns {boolean|null} 一致すれば true / しなければ false / 判定できなければ null
+ */
+export function servesRepo(cmd, repo) {
+    const list = reposOf(cmd);
+    if (!list || !list.length) return null;
+    return list.some(r => samePathish(r, repo));
+}
+
 export function stopTargets(list, repo, all = false) {
     const items = Array.isArray(list) ? list : [];
     if (all) return { targets: items, others: [], unknown: [] };
@@ -420,12 +443,13 @@ export function stopTargets(list, repo, all = false) {
     const others = [];
     const unknown = [];
     for (const r of items) {
-        const found = repoOf(r?.cmd);
+        // 🚨 **1本目だけで判定しない（#61）。** `--repo` は複数指定できるので、
+        //    「登録済みのどれか1本でも一致したら自分のデーモン」。
+        const serves = servesRepo(r?.cmd, repo);
         // ⚠️ 順序が意味を持つ: 「読めなかった」を先に分ける。
-        //    後ろに回すと `samePathish(null, repo)` が false になって
-        //    「別のリポジトリ」に混ざる（それが #54 の形）。
-        if (found === null || found === undefined || found === '') unknown.push(r);
-        else if (samePathish(found, repo)) targets.push(r);
+        //    後ろに回すと false と同じ扱いになって「別のリポジトリ」に混ざる（#54 の形）。
+        if (serves === null) unknown.push(r);
+        else if (serves) targets.push(r);
         else others.push(r);
     }
     return { targets, others, unknown };
@@ -482,12 +506,13 @@ export function describeCaps(cmd) {
  */
 export function otherDaemonsNote(probe, repo) {
     if (!probe?.supported) return null;
-    const others = (probe.list ?? []).filter(r => !samePathish(repoOf(r?.cmd), repo));
+    // 🚨 複数 repo のデーモンを「他のリポジトリ」と数えない（#61）
+    const others = (probe.list ?? []).filter(r => servesRepo(r?.cmd, repo) !== true);
     if (!others.length) return null;
     return {
         count: others.length,
         lines: others.map(r => `PID ${r.pid}  port ${r.port ?? '?'}  `
-            + `${describeCaps(r.cmd)}  ${repoOf(r.cmd) ?? '(repo 不明)'}`),
+            + `${describeCaps(r.cmd)}  ${(reposOf(r.cmd) ?? []).join(' , ') || '(repo 不明)'}`),
     };
 }
 
