@@ -145,6 +145,35 @@ if (repoCheck.error !== undefined) {
     process.exit(1);
 }
 const repos = (repoCheck.repos.length ? repoCheck.repos : [ROOT]).map(trimTrailingSep);
+// 🚨 **登録するパスは「解決した絶対パス」にする（#74。10回目のレビュー / SERIOUS）。**
+//
+// `serve.mjs` は `topLevel()` で1本ずつ解決し、開けなければ起動を止める。
+// install には同じ門が無く、`--repo .` や実在しないパスをそのまま REG_SZ に書いて
+// 「自動起動を登録しました」と表示していた。Run キーから起動されるプロセスの
+// 作業ディレクトリは %USERPROFILE% 等で git リポジトリではないので、
+// **ログオン時にだけ exit 1** する（コンソール窓が一瞬出て消えるだけ）。
+// `--allow-host` の引き継ぎ漏れ（#29）とまったく同じ壊れ方で、
+// しかも同じファイルが「`--allow-host` は検証しているのに `--repo` が無検証、
+// という非対称が #29 の原因だった」と書いている**その非対称が残っていた**。
+{
+    const resolved = [];
+    for (const r of repos) {
+        const t = await run('git', ['-C', r, 'rev-parse', '--show-toplevel']);
+        const top = (t.out ?? '').trim();
+        if (t.code !== 0 || !top) {
+            console.error(`\n✖ git のリポジトリとして開けません: ${r}`);
+            console.error('  登録すると**ログオン時にだけ**起動に失敗します'
+                + '（手元では気付けない形で壊れます）。');
+            console.error('  存在する worktree かリポジトリのパスを渡してください\n');
+            process.exit(1);
+        }
+        // ⚠️ **解決した絶対パスを書く**（相対パスは Run キーの作業ディレクトリで別物になる）
+        resolved.push(trimTrailingSep(top));
+    }
+    repos.length = 0;
+    repos.push(...resolved);
+}
+
 const portCheck = checkPort(val('--port', undefined), '7749');
 if (portCheck.error !== undefined) {
     console.error(`\n✖ --port には 1〜65535 を指定してください（受け取った値: ${portCheck.error}）\n`);
@@ -165,6 +194,16 @@ const serveArgs = built.args;
 // Run キーの値は1つの文字列。**CRT の規則に合わせて引用する**（scripts/winargs.mjs）。
 const value = [process.execPath, SERVE, ...serveArgs].map(winQuote).join(' ');
 
+// 🚨 **検査用: 登録の手前で止める（--dry-run）。**
+//    #74 の門（開けないパスを拒否する）を変異で測るには install を実際に走らせる必要が
+//    あるが、門を外した変異は**利用者の Run キーに嘘の登録を書いてしまう**。
+//    そこで「レジストリに触る手前で止める」経路を用意する。
+//    ⚠️ 既定では存在しない挙動で、書き込みだけを飛ばす（検証と組み立ては全部通る）。
+if (has('--dry-run')) {
+    console.log('（--dry-run なので登録していません）');
+    console.log(value);
+    process.exit(0);
+}
 const r = await run('reg', ['add', RUN_KEY, '/v', NAME, '/t', 'REG_SZ', '/d', value, '/f']);
 if (r.code !== 0) {
     console.error(`✖ 登録できませんでした: ${(r.err || r.out).trim()}`);

@@ -20,7 +20,9 @@ export const SERVE_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--
 
 /** 自動起動の登録が受け付けるフラグ（`--status` 等はサブコマンドなので入らない） */
 export const AUTOSTART_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text', '--timeout']);
+    '--watch', '--agents-text', '--timeout',
+    // 🚨 検査専用: レジストリに触る手前で止める（#74 の門を変異で測るため）
+    '--dry-run']);
 
 /**
  * サーバ側の名前 → この層での名前。

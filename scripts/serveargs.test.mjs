@@ -1057,3 +1057,38 @@ test('shouldWriteReadSecret: --token-file が token-read 自身なら書かな�
         assert.match(other.lines[0], /B/, `2本目が出ていない: ${other.lines[0]}`);
     });
 }
+
+/**
+ * 🚨 **autostart install は解決できないパスを登録しない（#74。10回目のレビュー）。**
+ *
+ * `serve.mjs` は `topLevel()` で1本ずつ解決して開けなければ起動を止めるのに、
+ * install には同じ門が無く、`--repo .` や実在しないパスをそのまま REG_SZ に書いて
+ * 「自動起動を登録しました」と表示していた。Run キーから起動されるプロセスの
+ * 作業ディレクトリは %USERPROFILE% 等なので、**ログオン時にだけ exit 1** する
+ * （コンソール窓が一瞬出て消えるだけで、手元では気付けない）。
+ *
+ * ⚠️ **成功する install は絶対に走らせない**（利用者の Run キーを書き換えるため）。
+ *    ここで測るのは「拒否したこと」だけ。
+ */
+test('🚨 autostart install: 開けないパスは登録を拒否する（#74）', async () => {
+    const AUTOSTART = fileURLToPath(new URL('./autostart.mjs', import.meta.url));
+    const missing = join(tmpdir(), `kjp-not-a-repo-${Date.now()}`);
+    // 🚨 **--dry-run を必ず付ける。** 門を外した変異は install を最後まで走らせるので、
+    //    付けないと**利用者の Run キーに嘘の登録が書かれる**（検査が事故を起こす）。
+    const child = spawn(process.execPath, [AUTOSTART, 'install', '--repo', missing, '--dry-run'],
+        { shell: false, windowsHide: true });
+    let out = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { out += d; });
+    // 🚨 待ち続ける形にしない（守りを外すと登録して終わるので、上限で観測する）
+    const code = await Promise.race([
+        new Promise(res => child.on('exit', c => res(c))),
+        new Promise(res => setTimeout(() => res('(20秒たっても終わらない)'), 20000)),
+    ]).finally(() => child.kill());
+    assert.equal(code, 1, `開けないパスで登録できてしまった（exit=${code}）: ${out.slice(0, 300)}`);
+    assert.match(out, /リポジトリとして開けません/, `理由が出ていない: ${out.slice(0, 300)}`);
+    // 「登録しました」と言っていないこと（嘘の成功を出さない）
+    assert.equal(out.includes('登録しました'), false, `拒否したのに成功と言った: ${out}`);
+});

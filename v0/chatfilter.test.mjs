@@ -396,3 +396,25 @@ test('result: 成功は終端の1行のまま（本文は assistant 側で出て
     assert.match(text, /応答おわり/);
     assert.equal(text.includes('出来ました'), false, `成功で本文を二重に出している: ${text}`);
 });
+
+/**
+ * 🚨 **飛ばした断片を「最後の出力」にしない（#73。10回目のレビュー / SERIOUS）。**
+ *
+ * 断片を飛ばした後に残る完全な行が `lines[0]` のときだけ `break` で抜け、
+ * 末尾の fallback が**さっき飛ばした断片**を返していた。
+ * 結果、監視盤には生の JSON 断片が並び、**直前に出た
+ * `⚠ 停止を要求されました` や claude の stderr が画面から消える**。
+ */
+test('🚨 chatGlance: 断片の直前が JSON でない完全な行でも、それを返す', () => {
+    const raw = '⚠ 停止を要求されました\n{"type":"assistant","message":{"content":[{"type":"te';
+    const g = chatGlance(raw);
+    assert.equal(g.text, '⚠ 停止を要求されました',
+        `飛ばした断片を返している: ${JSON.stringify(g.text)}`);
+    assert.equal(g.writing, true, '書きかけであることを告げていない');
+    assert.equal(g.interpreted, false);
+});
+
+test('🚨 chatGlance: 断片しか無いときは断片を出す（黙って空にしない）', () => {
+    const g = chatGlance('{"type":"assis');
+    assert.equal(g.text, '{"type":"assis', `1行しか無いのに消した: ${JSON.stringify(g.text)}`);
+});

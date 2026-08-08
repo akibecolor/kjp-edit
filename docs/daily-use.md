@@ -106,6 +106,13 @@ node scripts/autostart.mjs install --repo C:/Users/akico/Documents/kjp-editor \
 node scripts/autostart.mjs uninstall
 ```
 
+🚨 **登録するパスは git で解決してから書く**（#74。10回目のレビュー）。
+以前は `--repo .` や実在しないパスをそのまま Run キーに書いて「登録しました」と
+表示していた。Run キーから起動されるプロセスの作業ディレクトリは %USERPROFILE% 等で
+リポジトリではないので、**ログオン時にだけ起動に失敗する**（窓が一瞬出て消えるだけ）。
+今は開けなければ登録を拒否し、解決した絶対パスを書く。
+⚠️ `--dry-run` を付けると**レジストリに触らずに**登録内容だけ出す（検査用）。
+
 **既定は読み取り専用で登録する。** `--write` / `--exec` を明示しない限り
 capability は付けない（ログオンのたびに立ち上がるものに黙って権限を持たせない）。
 

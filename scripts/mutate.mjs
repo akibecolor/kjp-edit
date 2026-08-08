@@ -33,6 +33,17 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #74: 解決できないパスをそのまま Run キーに書く（ログオン時だけ壊れる）
+        name: 'autostart-repo-unchecked',
+        why: 'install が --repo を解決せずに登録する（ログオン時にだけ起動に失敗する = 手元では気付けない）',
+        file: 'scripts/autostart.mjs',
+        from: '        if (t.code !== 0 || !top) {',
+        to: '        if (false) {   /* 変異: 開けなくても登録する */',
+        gone: 'if (t.code !== 0 || !top) {',
+        pattern: 'autostart install: 開けないパスは登録を拒否する',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
         // 🚨 #69: 失敗の理由と subtype を捨てる（別の失敗が同じ表示になる）
         name: 'chat-result-reason',
         why: 'result の理由と subtype を落とす（「Credit balance is too low」も error_max_turns も同じ1行になる）',
@@ -3258,20 +3269,25 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'monitor-glance-tail-skipped',
         why: '末尾の解釈できない行を飛ばす（終わった理由が消え、古い応答が最後の出力になる）',
         file: 'v0/chatfilter.mjs',
-        from: '            if (i > 0) return { text: lines[i], interpreted: false, writing };\n            break;',
-        to: '            continue;   /* 変異: 末尾の生テキストも飛ばす */',
-        gone: 'if (i > 0) return { text: lines[i], interpreted: false, writing };',
-        pattern: 'chatGlance',
+        // ⚠️ #73 で `break` が消えたので、行の形が変わった。
+        //    「見た行を返す」を `continue` にすると**全部飛ばして空になる**
+        from: '            return { text: lines[i], interpreted: false, writing };\n        }',
+        to: '            continue;   /* 変異: 末尾の生テキストも飛ばす */\n        }',
+        gone: 'return { text: lines[i], interpreted: false, writing };\n        }',
+        pattern: '断片しか無いときは断片を出す',
         testFile: 'v0/chatfilter.test.mjs',
     },
     {
         name: 'monitor-glance-keeps-raw',
-        why: '解釈できない行を空にする（「応答が来ていない」ように見える）',
+        // 🚨 #73 で守りの本体が変わった。以前は「fallback が末尾の行を返す」ことを
+        //    固定していたが、その fallback が**飛ばした断片**を返す誤りだった。
+        //    今は「見た行をその場で返す」のが守りなので、そこに当てる。
+        why: '解釈できない完全な行を返さず、飛ばした断片を最後の出力にする（停止の告知や stderr が画面から消える）',
         file: 'v0/chatfilter.mjs',
-        from: "    return { text: lines[lines.length - 1] ?? '', interpreted: false, writing };",
-        to: "    return { text: '', interpreted: false, writing };",
-        gone: "text: lines[lines.length - 1]",
-        pattern: 'chatGlance',
+        from: '            return { text: lines[i], interpreted: false, writing };',
+        to: '            break;   /* 変異: 見た行を返さず fallback に落とす */',
+        gone: 'return { text: lines[i], interpreted: false, writing };',
+        pattern: '断片の直前が JSON でない完全な行でも',
         testFile: 'v0/chatfilter.test.mjs',
     },
     {

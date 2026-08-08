@@ -149,8 +149,14 @@ export function chatGlance(raw) {
             }
             // 飛ばす理由は「サーバが末尾を返すので**先頭の行**が途中から始まる」
             // ことだけ。末尾側の解釈できない行は**そのまま出す**（捨てない）。
-            if (i > 0) return { text: lines[i], interpreted: false, writing };
-            break;
+            // 🚨 **i === 0 でも「見た行」を返す（#73。10回目のレビュー / SERIOUS）。**
+            //    以前はここで break していたので、末尾の fallback が
+            //    **さっき飛ばした断片**（`lines[lines.length - 1]`）を返していた。
+            //    結果、監視盤には生の JSON 断片が並び、**直前に出た
+            //    `⚠ 停止を要求されました` や claude の stderr が画面から消えた**
+            //    （8回目が SERIOUS とした「止まったのに応答しているように見える」と同じ型。
+            //     README の「断片は出さず直前の完全な応答を出す」とも食い違っていた）。
+            return { text: lines[i], interpreted: false, writing };
         }
         const got = chatRecordLines(r);
         // 🚨 **本文とツール名の両方を出す。** 最後の1行だけにすると、
@@ -159,7 +165,9 @@ export function chatGlance(raw) {
         const text = got.map(o => o.text.trim()).filter(Boolean).join(' ');
         if (text) return { text, interpreted: true, writing };
     }
-    return { text: lines[lines.length - 1] ?? '', interpreted: false, writing };
+    // ⚠️ ここに来るのは**1行も無いとき**だけ（上のループは必ず何かを返す）。
+    //    以前はここが「飛ばした断片を返す」経路になっていた（#73）。
+    return { text: '', interpreted: false, writing };
 }
 
 /**
