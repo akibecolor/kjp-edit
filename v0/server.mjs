@@ -34,7 +34,7 @@ import {
 } from './writefile.mjs';
 import { computeSwimlanes } from './swimlanes.mjs';
 import { planMerge } from './mergeplan.mjs';
-import { collectAgents, transcriptRoot, maskSecrets } from './transcript.mjs';
+import { collectAgents, transcriptRoot, maskSecrets, stripFreeText } from './transcript.mjs';
 import { ExecRegistry, isSessionId } from './execsession.mjs';
 import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
 import { makeFailTracker, makeInflightGate, makeGoodSet, failDelay } from './failtracker.mjs';
@@ -2398,14 +2398,32 @@ async function handleRequest(req, res) {
             //    記録も遅延も無い当たり判定になり、実行トークンの総当たり口になる。
             const shown = await presentedTokenAudited(req, res, url);
             if (shown.handled) return;
-            const body = JSON.stringify(
-                // ⚠️ 隠すのは **`--require-auth` のときだけ**。認証が要らない構成は
-                //    ループバック限定で Cookie の脅威（他ポートのページ）が無く、
-                //    ここで隠すと素の利用を壊すだけで守りにならない。
-                (state.execSessions && opts.requireAuth && !shown.ok)
-                    ? { ...state, execSessions: null, execSessionsHidden: true }
-                    : state,
-            );
+            // ⚠️ 隠すのは **`--require-auth` のときだけ**。認証が要らない構成は
+            //    ループバック限定で Cookie の脅威（他ポートのページ）が無く、
+            //    ここで隠すと素の利用を壊すだけで守りにならない。
+            const hideForRead = opts.requireAuth && !shown.ok;
+            let out = state;
+            if (state.execSessions && hideForRead) {
+                out = { ...out, execSessions: null, execSessionsHidden: true };
+            }
+            // 🔒 **記録の自由文も execSessions と同じ資格情報にする（B4。10回目のレビュー）。**
+            //    コマンド行は走っている実行の argv と**同じ種類のデータ**なのに、
+            //    片方（argv）だけ生の実行トークンに限定していた。
+            //    根拠（Cookie は他ポートに渡るが、渡っても読み取りまで）は
+            //    記録側にも等しく当てはまる。マスキングはベストエフォートなので
+            //    守りとして数えない（#66 で「落とした」と言いながら残る形が5つ出た）。
+            //    ⚠️ 要約（件数・パス・状態）は落とさない。観測の本体はそこ。
+            if (out.agents && opts.allowTranscriptText && hideForRead) {
+                const r = stripFreeText(out.agents);
+                out = {
+                    ...out, agents: r.agents,
+                    // ⚠️ 黙って空にしない（「発話が無い」と読めてしまう）
+                    transcriptTextHidden: true,
+                    // 何も落としていないなら告知だけ出して UI が困らないようにする
+                    transcriptTextStripped: r.stripped,
+                };
+            }
+            const body = JSON.stringify(out);
             res.writeHead(200, {
                 'content-type': 'application/json; charset=utf-8',
                 'cache-control': 'no-store',

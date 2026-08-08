@@ -2450,6 +2450,13 @@ function renderAgents(s) {
   if (!p) return;   // 閉じている（#57）
   const box = el('div');
   box.style.padding = '.4rem';
+  // 🔒 **自由文を出せないことを告げる（B4）。** 黙って空にすると
+  //    「発話もコマンドも無かった」と読める（execSessionsHidden と同じ扱い）。
+  if (s.transcriptTextHidden) {
+    box.append(el('div', 'note warn',
+      '⚠ 発話とコマンド行は出せません（読み取り用の鍵では返しません）。'
+      + ' 実行の鍵を貼ると出ます。件数とパスはこのまま見えます'));
+  }
   const wtByPath = new Map(s.worktrees.map(w => [w.path, w]));
   for (const a of s.agents) {
     // ⚠️ 差分として開けるのは base との差分にあるファイルだけ。

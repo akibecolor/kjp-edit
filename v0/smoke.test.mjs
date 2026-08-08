@@ -21,6 +21,7 @@ import { join, dirname, sep, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { mergeTargets } from './mergeplan.mjs';
+import { readSecretOf } from './readsecret.mjs';
 
 const SERVER = fileURLToPath(new URL('./server.mjs', import.meta.url));
 
@@ -7319,5 +7320,64 @@ test('⚠ exec: 起動途中への入力は「まだ起動中」と言う（MINO
         await res.body.cancel().catch(() => {});
     } finally {
         child.kill();
+    }
+});
+
+/**
+ * 🔒 **記録の自由文も実行の鍵に揃える（B4。10回目のレビュー）。**
+ *
+ * `--allow-transcript-text` が出すコマンド行は、走っている実行の argv
+ * （`execSessions`）と**同じ種類のデータ**。argv だけ生の実行トークンに限定して
+ * いたが、根拠（Cookie はポートで分離されないので他のローカルサービスに渡る。
+ * 渡っても読み取りまでに留める）は記録側にも等しく当てはまる。
+ * マスキングはベストエフォート（#66 で5形出た）なので守りとして数えない。
+ */
+test('🔒 読み取りの鍵では記録の発話とコマンド行を返さない（B4）', async () => {
+    const home = await fakeHome(repo);
+    const token = 'b4-exec-token-0123456789abcdef';
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--allow-transcript-text',
+            '--require-auth', '--token', token],
+        { shell: false, windowsHide: true,
+            env: { ...process.env, ...isolatedConfig(), HOME: home, USERPROFILE: home } });
+    child.stdout.setEncoding('utf8');
+    let banner = '';
+    try {
+        const url = await Promise.race([
+            new Promise((res, rej) => {
+                child.stdout.on('data', d => {
+                    banner += d;
+                    const m = banner.match(/http:\/\/127\.0\.0\.1:\d+/);
+                    if (m) res(m[0]);
+                });
+                child.on('error', rej);
+            }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error(`起動しなかった: ${banner}`)), 20000)),
+        ]);
+        // ⚠️ 案内の行は URL より後に出るので banner から拾うと競争になる
+        //    （最初そう書いて落ちた）。派生の式は共有モジュールにあるのでそこから作る（#59）
+        const readSecret = readSecretOf(token);
+
+        // 🔒 読み取りの鍵だけ → 自由文は出ない。ただし**黙って空にしない**
+        const ro = await (await fetch(`${url}/api/v0/state?fresh=1`,
+            { headers: { cookie: `kjp_auth=${readSecret}` } })).text();
+        assert.equal(ro.includes(AGENT_SECRET), false,
+            `読み取りの鍵で自由文が出ている: ${ro.slice(0, 400)}`);
+        const roJson = JSON.parse(ro);
+        assert.equal(roJson.transcriptTextHidden, true,
+            '出せないことを告げていない（「発話が無い」と読める）');
+        // ⚠️ 要約は落とさない（観測の本体）
+        const a = (roJson.agents ?? []).find(x => x.toolCounts && Object.keys(x.toolCounts).length);
+        assert.ok(a, `要約まで消している: ${JSON.stringify(roJson.agents)}`);
+
+        // 生の実行トークンなら今まで通り出る（縛った代わりに使えなくしていない）
+        const rw = await (await fetch(`${url}/api/v0/state?fresh=1`,
+            { headers: { 'x-kjp-token': token } })).text();
+        assert.ok(rw.includes('echo '), `実行の鍵でもコマンド行が出ない: ${rw.slice(0, 400)}`);
+        assert.equal(JSON.parse(rw).transcriptTextHidden, undefined,
+            '実行の鍵なのに「出せません」と言っている');
+    } finally {
+        child.kill();
+        await rm(home, { recursive: true, force: true }).catch(() => {});
     }
 });

@@ -12,7 +12,7 @@ import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-    summarize, repoRelative, readTail, collectAgents, LIMITS, maskSecrets,
+    summarize, repoRelative, readTail, collectAgents, LIMITS, maskSecrets, stripFreeText,
 } from './transcript.mjs';
 import { relativeInside } from './git.mjs';
 // UI が実際に出す文字。app.html の中に置いていたので検査が掛からなかった（8回目のレビュー）
@@ -1090,4 +1090,37 @@ test('🚨 summarize: 記録の時刻が未来なら「稼働中」と断言し�
     assert.equal(s.ageMs, null, `経過を数字で断言している: ${s.ageMs}`);
     assert.equal(s.clockSkew, true);
     assert.match(s.why ?? '', /時計|未来/, `理由が無い: ${s.why}`);
+});
+
+/**
+ * 🔒 **自由文（発話とコマンド行）だけを落とせる（B4。10回目のレビュー）。**
+ *
+ * 走っている実行の argv（`execSessions`）と**同じ種類のデータ**なのに、
+ * 記録側だけ読み取りの鍵で出ていた。同じ資格情報に揃える。
+ */
+test('🔒 stripFreeText: 発話とコマンド行だけを落とし、要約は残す', () => {
+    const agents = [{
+        path: '/w', state: 'active', toolCounts: { Bash: 2 }, talk: 3,
+        text: [{ at: 't', role: 'user', text: '秘密の相談' }],
+        recent: [
+            { tool: 'Bash', path: null, command: 'echo secret', commandMasked: false },
+            { tool: 'Read', path: 'v0/git.mjs' },
+        ],
+    }];
+    const r = stripFreeText(agents);
+    const json = JSON.stringify(r.agents);
+    assert.equal(json.includes('秘密の相談'), false, `発話が残っている: ${json}`);
+    assert.equal(json.includes('echo secret'), false, `コマンド行が残っている: ${json}`);
+    assert.equal(r.stripped, true, '落としたことを返していない');
+    // ⚠️ 観測の本体（件数・パス・状態）は残す。全部隠すと使えなくなる
+    assert.deepEqual(r.agents[0].toolCounts, { Bash: 2 });
+    assert.equal(r.agents[0].state, 'active');
+    assert.equal(r.agents[0].recent[1].path, 'v0/git.mjs');
+    assert.equal(r.agents[0].recent.length, 2, '行そのものを消してはいけない');
+});
+
+test('stripFreeText: 落とすものが無ければ stripped は false（嘘の告知を出さない）', () => {
+    const r = stripFreeText([{ path: '/w', state: 'idle', text: [], recent: [{ tool: 'Read' }] }]);
+    assert.equal(r.stripped, false);
+    assert.equal(stripFreeText(null).agents, null);
 });

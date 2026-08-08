@@ -871,3 +871,42 @@ export async function collectAgents(worktrees, {
     }));
     return { agents, errors };
 }
+
+/**
+ * 🔒 **自由文（発話とコマンド行）を落とす（B4。10回目のレビュー）。**
+ *
+ * `--allow-transcript-text` は記録の `Bash` / `PowerShell` の**コマンド行**と
+ * **発話**を出す。これは `/api/v0/state` の `execSessions`（走っている実行の argv）と
+ * **同じ種類のデータ**なのに、片方だけ「生の実行トークンを提示した相手」に限定して
+ * いた（Cookie はポートで分離されないので、他のローカルサービスに渡っても
+ * 読み取りまでに留める、というのが execSessions を隠した根拠）。
+ * **同じ根拠は記録側にも当てはまる**ので、同じ資格情報に揃える。
+ *
+ * ⚠️ **マスキングを守りとして数えない。** `maskSecrets` はベストエフォートで、
+ *    実際に「落としました」と言いながら残る形が5つ見つかっている（#66）。
+ *    構造（資格情報の分界）の方に賭ける。
+ * ⚠️ **要約は落とさない。** ツール件数・パス・状態は読み取りの鍵で出す
+ *    （観測ツールとしての本体はそこ。全部隠すと使えなくなる）。
+ * ⚠️ **黙って空にしない。** 落としたら呼び出し側が `transcriptTextHidden` を返し、
+ *    UI が「出せません」と描く（`execSessionsHidden` と同じ扱い。
+ *    黙って空にすると「発話が無い」と読める）。
+ *
+ * @param {object[]|null} agents payload の agents
+ * @returns {{agents: object[]|null, stripped: boolean}}
+ */
+export function stripFreeText(agents) {
+    if (!Array.isArray(agents)) return { agents, stripped: false };
+    let stripped = false;
+    const out = agents.map(a => {
+        const recent = (a.recent ?? []).map(r => {
+            if (r.command === undefined || r.command === null) return r;
+            stripped = true;
+            const { command, commandMasked, ...rest } = r;
+            void command; void commandMasked;
+            return rest;
+        });
+        if ((a.text ?? []).length) stripped = true;
+        return { ...a, text: [], recent };
+    });
+    return { agents: out, stripped };
+}

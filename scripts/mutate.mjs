@@ -33,6 +33,37 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🔒 B4: 記録の自由文を読み取りの鍵で返す（argv だけ隠しても意味が無い）
+        name: 'transcript-text-to-read-key',
+        why: '記録の発話とコマンド行を読み取りの鍵で返す（execSessions を隠した根拠が成立しなくなる）',
+        file: 'v0/server.mjs',
+        from: '            if (out.agents && opts.allowTranscriptText && hideForRead) {',
+        to: '            if (false) {   /* 変異: 読み取りの鍵でも自由文を返す */',
+        gone: 'out.agents && opts.allowTranscriptText && hideForRead',
+        pattern: '読み取りの鍵では記録の発話とコマンド行を返さない',
+    },
+    {
+        // 🔒 B4: 落としたのに黙る（「発話が無い」と読める）
+        name: 'transcript-hidden-silent',
+        why: '自由文を落としたことを告げない（黙って空にすると「発話が無かった」と読める）',
+        file: 'v0/server.mjs',
+        from: '                    transcriptTextHidden: true,',
+        to: '                    /* 変異: 落としたことを黙る */',
+        gone: 'transcriptTextHidden: true,',
+        pattern: '読み取りの鍵では記録の発話とコマンド行を返さない',
+    },
+    {
+        // 🔒 B4: 要約まで消す（観測ツールとして使えなくなる）
+        name: 'strip-eats-summary',
+        why: '自由文を落とすときに要約（件数・パス・状態）まで消す（観測の本体が消える）',
+        file: 'v0/transcript.mjs',
+        from: '        return { ...a, text: [], recent };',
+        to: '        return { path: a.path, text: [], recent: [] };   /* 変異: 要約も消す */',
+        gone: 'return { ...a, text: [], recent };',
+        pattern: 'stripFreeText: 発話とコマンド行だけを落とし',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
         name: 'input-eats-ring',
         why: '長い入力の本文をリングに積む（自分の貼り付けで子の出力が全部押し出され、最後の出力が消える）',
         file: 'v0/execsession.mjs',
@@ -385,9 +416,15 @@ const MUTANTS = [
         name: 'state-token-oracle-unwalled',
         why: '実行トークンの当たり判定を門・記録・遅延の外に出す（read から exec への昇格）',
         file: 'v0/server.mjs',
-        from: '            const shown = await presentedTokenAudited(req, res, url);\n            if (shown.handled) return;\n            const body = JSON.stringify(',
-        to: '            const shown = { ok: presentedToken(req, url), handled: false };   /* 変異 */\n            const body = JSON.stringify(',
-        gone: 'const shown = await presentedTokenAudited(req, res, url);\n            if (shown.handled) return;\n            const body',
+        // ⚠️ `/session` 側にも同じ2行があるので、**後ろの行まで含めて一意にする**
+        from: '            const shown = await presentedTokenAudited(req, res, url);\n'
+            + '            if (shown.handled) return;\n'
+            + '            // ⚠️ 隠すのは **`--require-auth` のときだけ**',
+        to: '            const shown = { ok: presentedToken(req, url), handled: false };   /* 変異 */\n'
+            + '            // ⚠️ 隠すのは **`--require-auth` のときだけ**',
+        gone: 'const shown = await presentedTokenAudited(req, res, url);\n'
+            + '            if (shown.handled) return;\n'
+            + '            // ⚠️ 隠すのは',
         pattern: 'state/session の実行トークン当て判定',
     },
     {
@@ -3093,9 +3130,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'Cookie だけの相手に exec の argv を出す'
             + '（コマンド行に秘密が載りうるので「read は読み取りまで」が崩れる）',
         file: 'v0/server.mjs',
-        from: '                (state.execSessions && opts.requireAuth && !shown.ok)',
-        to: '                (false)',
-        gone: 'state.execSessions && opts.requireAuth && !shown.ok',
+        from: '            if (state.execSessions && hideForRead) {',
+        to: '            if (false) {   /* 変異: Cookie だけでも argv を出す */',
+        gone: 'if (state.execSessions && hideForRead) {',
         pattern: 'argv は Cookie だけでは読めず',
     },
     {
@@ -3573,8 +3610,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '一覧を落としたことをサーバが伝えない'
             + '（UI からは「1本も走っていない」と区別できない）',
         file: 'v0/server.mjs',
-        from: '                    ? { ...state, execSessions: null, execSessionsHidden: true }',
-        to: '                    ? { ...state, execSessions: null }',
+        from: '                out = { ...out, execSessions: null, execSessionsHidden: true };',
+        to: '                out = { ...out, execSessions: null };   /* 変異: 隠したことを黙る */',
         gone: 'execSessionsHidden: true',
         pattern: '読み取り用の鍵では走っているセッションを出さない',
     },
