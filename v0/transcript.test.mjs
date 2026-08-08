@@ -1015,3 +1015,45 @@ test('🔒 発話からも資格情報を落とし、落としたことを言う
     assert.equal(clean.text[0].masked, undefined,
         '落としていないのに告知している（告知が信用できなくなる）');
 });
+
+/**
+ * 🚨 **「秘密を落としました」と告知したなら、本当に落ちていること（#66）。**
+ *
+ * `masked = true` は「正規表現が当たった」だけで立っていた。区切りが `\s` なので、
+ * 鍵の直後にある**記号1つ**（cmd.exe の行継続 `^`、YAML のブロック `|` / `>`、`$`、`-`）を
+ * 値として食い、**本物の値は次の行に残る**。そのあと `clip()` が `\s+` を
+ * 空白1つに畳むので、画面には `--token (マスクしました) kjp0000SUPER…` という
+ * 綺麗な1行が出て、横に「← 秘密を落としました」と描かれる = **告知が嘘**。
+ * コマンド行は読み取りの鍵で読めるので、read → 実行トークン回収の経路が開く。
+ */
+test('🚨 maskSecrets: 記号1つを値として食って本物を残さない', () => {
+    const S = 'kjp0000SUPERSECRETTOKENVALUE';
+    const nl = String.fromCharCode(10);
+    const shapes = [
+        ['cmd の行継続 ^', `node server.mjs --allow-exec --token ^${nl}  ${S}`],
+        ['YAML のブロック |', `cat > c.yml <<EOF${nl}token: |${nl}  ${S}${nl}EOF`],
+        ['YAML の折り畳み >', `printf "authorization: >${nl}  Bearer ${S}"`],
+        ['シェル変数の $', `--token $${nl}${S}`],
+        ['ハイフン単体', `--token -${nl}${S}`],
+    ];
+    for (const [name, text] of shapes) {
+        const r = maskSecrets(text, []);
+        assert.equal(r.masked, true, `${name}: 告知が立っていない`);
+        assert.equal(r.text.includes(S), false,
+            `${name}: 「落としました」と言いながら秘密が残っている: `
+            + JSON.stringify(r.text.replace(/\s+/g, ' ')));
+    }
+});
+
+test('maskSecrets: 記号を飛ばす対応で普通の形を壊していない', () => {
+    const S = 'kjp0000SUPERSECRETTOKENVALUE';
+    for (const text of [`--token ${S}`, `--token=${S}`, `x-kjp-token: ${S}`,
+        `authorization: Bearer ${S}`]) {
+        const r = maskSecrets(text, []);
+        assert.equal(r.masked, true, `告知が立っていない: ${text}`);
+        assert.equal(r.text.includes(S), false, `秘密が残っている: ${r.text}`);
+    }
+    // 引用された値は1つとして食う（途中で切って残さない）
+    const q = maskSecrets('--password "pass phrase X"', []);
+    assert.equal(q.text.includes('phrase'), false, `引用の途中で切れている: ${q.text}`);
+});

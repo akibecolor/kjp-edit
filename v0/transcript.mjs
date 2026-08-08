@@ -260,6 +260,19 @@ const CONTINUATION_RE = /[\\\x60]\r?\n/g;
 // 値。クォートで囲まれた値を1つとして食う（`[^ ]+` だと
 // `--password "pass phrase X"` の `"pass` だけ落として ` phrase X"` を残す）
 const SECRET_VALUE = "(?:\"[^\"]*\"?|'[^']*'?|[^" + SECRET_WS + "'\"]+)";
+// 🚨 **記号1つを「値」として食って本物を残さない（#66。10回目のレビュー / SERIOUS）。**
+//
+// 区切りが `\s` なので、鍵の直後にある**記号1つ**（cmd.exe の行継続 `^`、
+// YAML のブロック `|` / `>`、`$`、`-`）が値として食われ、**本物の値は次の行に残る**。
+// そのあと `clip()` が `\s+` を空白1つに畳むので、画面には
+// `--token (マスクしました) kjp0000SUPER…` という綺麗な1行が出て、
+// 横に「← 秘密を落としました」と描かれる = **告知が嘘になる**。
+// （実測で5形が決定的に再現。実データの 6347 件では未発火だったが、形として成立する）
+//
+// ⚠️ **英数字を1文字も含まない語は「値」と見なさない。** それを飛ばして次の語まで食う。
+//    多めに消す方向に倒す（消しすぎは読みにくいだけだが、残すと秘密が漏れる）。
+const PUNCT_ONLY = "[^" + SECRET_WS + "A-Za-z0-9]+";
+const SECRET_VALUE_SMART = "(?:" + PUNCT_ONLY + SECRET_WS + "+)?" + SECRET_VALUE;
 // 🚨 `authorization: Bearer <値>` は「Bearer」を値と見なして落とし、**トークンを残す**
 //    （告知だけ立つので「落とした」と嘘をつく）。スキーム語ごと食う
 const AUTH_SCHEME = "(?:(?:bearer|basic|token)" + SECRET_WS + "+)?";
@@ -279,10 +292,13 @@ export function maskSecrets(text, secrets = []) {
     // (b) 秘密を渡す形の**直後の語**を落とす（`--token=X` と `--token X` の両方、
     //     `x-kjp-token: X` のようなヘッダ形も）
     const forms = [
-        new RegExp("(--?(?:" + SECRET_KEYS + ")=" + SECRET_WS + "*)" + SECRET_VALUE, "gi"),
-        new RegExp("(--?(?:" + SECRET_KEYS + ")" + SECRET_WS + "+)" + SECRET_VALUE, "gi"),
+        new RegExp("(--?(?:" + SECRET_KEYS + ")=" + SECRET_WS + "*)" + SECRET_VALUE_SMART, "gi"),
+        new RegExp("(--?(?:" + SECRET_KEYS + ")" + SECRET_WS + "+)" + SECRET_VALUE_SMART, "gi"),
         new RegExp("((?:" + SECRET_KEYS + ")['\"]?[:=]" + SECRET_WS + "*)"
-            + AUTH_SCHEME + "([^" + SECRET_WS + "'\"]+)", "gi"),
+            // ⚠️ スキーム語（Bearer 等）の判定は**記号を飛ばした後**に置く。
+            //    前に置くと `authorization: >\n  Bearer <値>` で `> Bearer` までを
+            //    値として食い、**本物のトークンが残る**（#66 で実測）。
+            + "((?:" + PUNCT_ONLY + SECRET_WS + "+)?" + AUTH_SCHEME + SECRET_VALUE + ")", "gi"),
     ];
     for (const re of forms) {
         out = out.replace(re, (m, head) => { masked = true; return head + "(マスクしました)"; });

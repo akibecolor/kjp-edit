@@ -33,6 +33,17 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #66: 記号1つを値として食い、本物の秘密を次の行に残す（告知が嘘になる）
+        name: 'mask-punct-eats-value',
+        why: '鍵の直後の記号1つを値として食う（「秘密を落としました」と言いながら本物が残る）',
+        file: 'v0/transcript.mjs',
+        from: 'const SECRET_VALUE_SMART = "(?:" + PUNCT_ONLY + SECRET_WS + "+)?" + SECRET_VALUE;',
+        to: 'const SECRET_VALUE_SMART = SECRET_VALUE;   /* 変異: 記号を飛ばさない */',
+        gone: 'const SECRET_VALUE_SMART = "(?:" + PUNCT_ONLY',
+        pattern: '記号1つを値として食って本物を残さない',
+        testFile: 'v0/transcript.test.mjs',
+    },
+    {
         // 🚨 #61: 対象の判定を1本目だけに戻す（複数 repo のデーモンに嘘をつく）
         name: 'stop-first-repo-only',
         why: '--repo の1本目だけで自分のデーモンか判定する（2本目のリポジトリで「動いていません」と断言する）',
