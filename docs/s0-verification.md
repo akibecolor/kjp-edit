@@ -177,7 +177,7 @@ git 状態の read→decide→write を守るものではありません。
 
 | # | v0 での状態 |
 |---|---|
-| **1** | 🟢 **実装した**（#59）。`POST /api/v0/clash` が**自分の worktree のシーケンサ状態**（`self`）を返し、`scripts/clash.mjs`（`PreToolUse` フック）が rebase 停止中の編集を `deny` する。checkout / merge 側の 409 は以前から。**未検証だったのは「フックから機械が聞けること」**で、そこが埋まった |
+| **1** | 🟢 **実装した**（#59）。`POST /api/v0/precheck` が**自分の worktree のシーケンサ状態**（`self`）を返し、`scripts/precheck.mjs`（`PreToolUse` フック）が rebase 停止中の編集を `deny` する。checkout / merge 側の 409 は以前から。**未検証だったのは「フックから機械が聞けること」**で、そこが埋まった |
 | **2** | ⬜ 未着手（共有 `refs/stash`） |
 | **3** | 🟢 実装済み（`swimlanes.mjs`。全 worktree の HEAD を1枚に） |
 | **4** | 🟢 実装済み（`mergeplan.mjs`。payload の `mergePlan`） |
@@ -185,7 +185,7 @@ git 状態の read→decide→write を守るものではありません。
 | **6** | 🟡 統合は進行中（グラフ + 差分 + 最小エディタ + コンソール + 活動観測 + グリッド配置） |
 
 ⚠️ **名前が既存ツール `clash`（MIT）と重なっている。**
-`POST /api/v0/clash` と `scripts/clash.mjs` は**この文書が指す `clash` とは別物**で、
+`POST /api/v0/precheck` と `scripts/precheck.mjs` は**この文書が指す `clash` とは別物**で、
 コードも借りていない（`v0/git.mjs` の `mergePreview` を再利用している）。
 紛らわしいので、外に出すなら改名する（`preflight` など）。
 ⚠️ 上の「clash を依存として取り込む」という提案は**採っていない**。

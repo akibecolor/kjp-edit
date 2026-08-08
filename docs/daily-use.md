@@ -295,7 +295,7 @@ node scripts/serve.mjs --exec    # 🚨 監視盤は --exec が要る（--write 
 ## 編集を始める前に衝突を止める（`PreToolUse` フック、#59）
 
 画面で見えるだけでは、**エージェントは見ない**。
-`scripts/clash.mjs` は Claude Code のフックとして動き、`Edit` / `Write` の**前に**
+`scripts/precheck.mjs` は Claude Code のフックとして動き、`Edit` / `Write` の**前に**
 動いているデーモンへ問い合わせて、次のときに止める:
 
 | 状態 | 判定 | 理由 |
@@ -309,14 +309,14 @@ node scripts/serve.mjs --exec    # 🚨 監視盤は --exec が要る（--write 
 
 ```json
 {"hooks": {"PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
-  "hooks": [{"type": "command", "command": "node scripts/clash.mjs"}]}]}}
+  "hooks": [{"type": "command", "command": "node scripts/precheck.mjs"}]}]}}
 ```
 
 ⚠️ **既定では入れていない。** デーモンを止めている間は毎回 `ask` になるので、
 「常用のデーモンを上げっぱなしにする」運用（上の自動起動）が前提。
 それが嫌なら入れない — **黙って `allow` に倒す実装にはしない**
-（判定の本体は `v0/clashguard.mjs` の純関数で、
-`clash-daemon-down-allows` などの変異が「倒れていないこと」を測っている）。
+（判定の本体は `v0/precheck.mjs` の純関数で、
+`precheck-daemon-down-allows` などの変異が「倒れていないこと」を測っている）。
 
 🔒 使うのは `~/.kjp-edit/token-read` だけで、**読み取り経路しか叩かない**
 （`merge-tree --write-tree` が loose object を書くだけで、ref / index /

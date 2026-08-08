@@ -90,7 +90,7 @@ node scripts/verify.mjs               # 構文 + unit + smoke + レイアウト
 | **取り込み順序の提案** | 衝突グラフの独立集合を貪欲に取る。**追加の git 呼び出しは0、AI も使わない**。仮説であって保証ではない |
 | **差分 / 全文** | ファイラかタブから開く。**差分**は `base...HEAD`、**全文**はファイルの中身（行番号付き。ref を選べる）。上限 4000 行で切り、切ったら必ず告知する |
 | **🚨 警告** | シーケンサ乗っ取りと `MERGE_HEAD` の消失リスク |
-| **書く前のガード**（#59） | `POST /api/v0/clash` と `scripts/clash.mjs`（`PreToolUse` フック）。**画面を見ないエージェントを止める**唯一の経路。既定では `.claude/settings.json` に入れていない |
+| **書く前のガード**（#59） | `POST /api/v0/precheck` と `scripts/precheck.mjs`（`PreToolUse` フック）。**画面を見ないエージェントを止める**唯一の経路。既定では `.claude/settings.json` に入れていない |
 | **エージェントの活動**（`--watch-agents`） | 稼働中 / 待機 / 記録なし、直近のツールと触ったパス、件数。**既定オフ**（リポジトリ外の記録を読むため） |
 
 **ペインは自由に動かせます。** ヘッダを掴んで並べ替え、列（左 / 差分 / コンソール / 右）を
@@ -129,7 +129,7 @@ HEAD は今: hijacked
 
 ### 見せるだけでなく、書く前に止める（#59）
 
-`POST /api/v0/clash`（**読み取り専用**）が、編集を始める前の問い合わせ口です。
+`POST /api/v0/precheck`（**読み取り専用**）が、編集を始める前の問い合わせ口です。
 
 ```
 {"worktree": "<絶対パス>", "paths": ["src/a.ts"]}
@@ -138,7 +138,7 @@ HEAD は今: hijacked
 ```
 
 `decided` が `false` のときは**一部を判定できていない**ので、`conflicts` が空でも
-「衝突なし」とは読めません。Claude Code から使うフックは `scripts/clash.mjs`
+「衝突なし」とは読めません。Claude Code から使うフックは `scripts/precheck.mjs`
 （手順は `docs/daily-use.md`）。
 
 ## 別端末（スマホ）から見る
@@ -230,7 +230,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `proctree.mjs` / `.test.mjs` | プロセスの親子関係（`killTree` が孫を取り残さないため。純関数） |
 | `failtracker.mjs` / `.test.mjs` | 認証失敗の記録・遅延・同時実行の門（総当たりへの壁） |
 | `readsecret.mjs` | 🔒 **読み取り専用の派生秘密**。案内 URL・Cookie・フックに配る値の式を1本化 |
-| `clashguard.mjs` / `.test.mjs` | 🔒 編集前の衝突ガードの判定（純関数）。**「調べられない」を allow に倒さない**（#59） |
+| `precheck.mjs` / `.test.mjs` | 🔒 編集前の衝突ガードの判定（純関数）。**「調べられない」を allow に倒さない**（#59） |
 | `transcript.mjs` / `.test.mjs` | エージェントの活動記録の読み取りとマスキング（`--watch-agents`） |
 | `input-check.mjs` | CDP の入力層で**実際のマウス入力**を流して測る（合成イベントでは測れない。#58） |
 
@@ -255,7 +255,7 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `POST /api/v0/merge` | 取り込み（merge）。**`--allow-write` が必要**。**衝突しないと予測できたものだけ**実行する |
 | `POST /api/v0/file` | 編集のために作業ツリーの中身を読む。**`--allow-write` が必要**。`{worktree, path}` → `{text, oid, eol, bom, bytes}` |
 | `POST /api/v0/write` | 作業ツリーに書く。**`--allow-write` が必要**。`{worktree, path, text, baseOid}`。`baseOid` が今の中身と違えば **409** |
-| `POST /api/v0/clash` | 🔒 **編集前の衝突の問い合わせ（読み取り専用）**。`{worktree, paths[]}` → `{self, conflicts, busy, unknown, decided}`。**`decided:false` のときは「衝突なし」と読めない**（#59） |
+| `POST /api/v0/precheck` | 🔒 **編集前の衝突の問い合わせ（読み取り専用）**。`{worktree, paths[]}` → `{self, conflicts, busy, unknown, decided}`。**`decided:false` のときは「衝突なし」と読めない**（#59） |
 | `POST /api/v0/exec` | 任意コマンドの実行。出力を行区切り JSON で流す。**`--allow-exec` が必要** |
 | `/api/v0/exec/list` | 走っている（と、終わって保持中の）実行セッションの一覧。**`--allow-exec` が必要** |
 | `POST /api/v0/exec/<id>/kill` | 実行を**本当に止める**（木ごと落として数え直す）。切断（`abort`）は購読解除でしかない |

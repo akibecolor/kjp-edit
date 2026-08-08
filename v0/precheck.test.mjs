@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: MIT
-// node --test v0/clashguard.test.mjs
+// node --test v0/precheck.test.mjs
 //
 // 「調べられなかった」を「衝突なし」と言わないことを固定する（#59）。
 // ここが緑でも `allow` に倒れていたら、フックは**黙って通す**ので意味が無い。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decide, touchedPaths, ALLOW, DENY, ASK } from './clashguard.mjs';
+import { decide, touchedPaths, ALLOW, DENY, ASK } from './precheck.mjs';
 
 const clean = { decided: true, self: null, conflicts: [], busy: [], unknown: [] };
 
-test('clashguard: 衝突が無ければ通す', () => {
+test('precheck: 衝突が無ければ通す', () => {
     const r = decide({ answer: clean, paths: ['a.txt'] });
     assert.equal(r.decision, ALLOW);
 });
 
-test('🚨 clashguard: デーモンに繋がらないとき allow にしない', () => {
+test('🚨 precheck: デーモンに繋がらないとき allow にしない', () => {
     const r = decide({ answer: null, error: 'ECONNREFUSED', paths: ['a.txt'] });
     assert.equal(r.decision, ASK, '応答が無いのに通している');
     assert.match(r.reason, /確認できません|できませんでした/);
@@ -23,7 +23,7 @@ test('🚨 clashguard: デーモンに繋がらないとき allow にしない',
     assert.doesNotMatch(r.reason, /衝突はありません|衝突なしです/);
 });
 
-test('🚨 clashguard: 一部でも判定できなければ allow にしない', () => {
+test('🚨 precheck: 一部でも判定できなければ allow にしない', () => {
     const r = decide({
         answer: {
             ...clean, decided: false,
@@ -35,7 +35,7 @@ test('🚨 clashguard: 一部でも判定できなければ allow にしない',
     assert.match(r.reason, /ref を解決できません/);
 });
 
-test('🚨 clashguard: 自分がシーケンサ停止中なら拒否する', () => {
+test('🚨 precheck: 自分がシーケンサ停止中なら拒否する', () => {
     const r = decide({
         answer: { ...clean, self: { rebasing: true } },
         paths: ['a.txt'],
@@ -44,7 +44,7 @@ test('🚨 clashguard: 自分がシーケンサ停止中なら拒否する', () 
     assert.match(r.reason, /rebase/);
 });
 
-test('clashguard: 触るパスが衝突していれば拒否、していなければ通す', () => {
+test('precheck: 触るパスが衝突していれば拒否、していなければ通す', () => {
     const answer = {
         ...clean,
         conflicts: [{ path: 'shared.txt', worktree: '/w/b', branch: 'agent-b' }],
@@ -55,7 +55,7 @@ test('clashguard: 触るパスが衝突していれば拒否、していなけ�
     assert.equal(decide({ answer, paths: [] }).decision, DENY);
 });
 
-test('clashguard: 拒否の理由に相手の枝が入る', () => {
+test('precheck: 拒否の理由に相手の枝が入る', () => {
     const r = decide({
         answer: { ...clean, conflicts: [{ path: 'x', worktree: '/w/b', branch: 'agent-b' }] },
         paths: ['x'],

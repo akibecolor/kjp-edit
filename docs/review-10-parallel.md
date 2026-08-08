@@ -32,11 +32,11 @@
 
 ## SERIOUS（15件・要約）
 
-- **検査に載っていないテスト**: `clashguard.test.mjs` / `dirlabel.test.mjs` の 15 テストが
+- **検査に載っていないテスト**: `precheck.test.mjs` / `dirlabel.test.mjs` の 15 テストが
   verify にも CI にも載っていなかった（手書きの一覧） → ✅ **本コミットで修正**（自動探索。326 → 342 pass）
 - **`serve.mjs` が `--token-file` に渡したファイルを自分で上書き**するので、
   読み取り専用構成では**起動のたびに鍵が回る** → ✅ **本コミットで修正**（`shouldWriteReadSecret`、変異つき）
-- **`POST /api/v0/clash` が読み取りの鍵だけで worktree 数に比例した git を起動できる**
+- **`POST /api/v0/precheck` が読み取りの鍵だけで worktree 数に比例した git を起動できる**
   （キャッシュ・同時実行の門・`Sec-Fetch-Site` 要求が無い） → issue
 - **`/api/v0/state?token=` が実行トークンの当たり判定を無記録・無遅延で返す**（実測 2632 req/s、監査 0 行）
 - **`--layout-probe` の `/__shutdown` と `/__throw` が Host 検証・認証より前**にあり、
@@ -81,7 +81,7 @@ docs 側はこの要約だけを持ち、**中身は issue で管理する**（�
 |---|---|
 | #60 | 🚨 取り込みボタンがディレクトリ名を branch として送る |
 | #61 | 🚨 `--repo` 複数のデーモンに `--stop` が嘘をつく |
-| #62 | `POST /api/v0/clash` に門も上限も無い |
+| #62 | `POST /api/v0/precheck` に門も上限も無い |
 | #63 | `?token=` の当たり判定が無記録・無遅延 |
 | #64 | `/__shutdown` `/__throw` が門の手前 |
 | #65 | merge のシーケンサ門が未検証 |
@@ -104,10 +104,21 @@ MINOR の14件は issue にしていない（この文書の要約が記録）�
 
 ---
 
+## ⚠️ 改名について
+
+このレビューの後（同日）、`clash` を **`precheck` に改名**した
+（既存ツール `clash`（MIT、`docs/s0-verification.md` が調査したもの）と
+名前が衝突していて、文書の中で同じ語が2つの意味になっていたため）。
+この文書に出てくる `precheck.*` は、レビュー時点では
+`v0/clashguard.mjs` / `v0/clashguard.test.mjs` / `scripts/clash.mjs`、
+経路は `POST /api/v0/clash` だった。
+
+---
+
 ## この回で分かったこと（体制の話）
 
 🚨 **「検査を足した」と「検査が走っている」は別。**
-`clashguard.test.mjs` は**変異のときだけ、しかも落ちる前提で**走っていた。
+`precheck.test.mjs` は**変異のときだけ、しかも落ちる前提で**走っていた。
 一覧が手書きだったのが原因なので、**探して並べる**形にした。
 
 🚨 **「検査を足した」と「検査が落ちられる」も別。**

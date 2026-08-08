@@ -2257,7 +2257,7 @@ async function handleRequest(req, res) {
         //    エージェントを遠隔から動かすのに PTY は要らない。
         //    対話 TUI をそのまま覗きたくなった時点で PTY を検討する。
         /**
-         * 🔒 **衝突の事前問い合わせ（#59）。読み取り専用。**
+         * 🔒 **衝突の事前問い合わせ（#59。`precheck`）。読み取り専用。**
          *
          * 設計当初（`docs/s0-verification.md`）に「他所に無い」と判定した中核が
          * これ。今までは**画面で見えるだけ**で、エージェントが編集を始める前に
@@ -2270,7 +2270,7 @@ async function handleRequest(req, res) {
          *    merge-tree が落ちた等は `unknown` に積み、`decided:false` を返す。
          *    呼ぶ側が「衝突ゼロ = 安全」と読める形にしない。
          */
-        if (url.pathname === '/api/v0/clash') {
+        if (url.pathname === '/api/v0/precheck') {
             if (req.method !== 'POST') { denyJson(res, 405, 'POST のみ受け付けます'); return; }
             let body;
             try { body = await readJson(req); } catch (err) {

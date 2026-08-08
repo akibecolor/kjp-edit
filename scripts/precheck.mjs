@@ -7,13 +7,13 @@
 // 使い方（`.claude/settings.json`）:
 //   {"hooks": {"PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit",
 //     "hooks": [{"type": "command",
-//       "command": "node scripts/clash.mjs"}]}]}}
+//       "command": "node scripts/precheck.mjs"}]}]}}
 //
 // 🔒 **読み取りだけ。** 使うのは `~/.kjp-edit/token-read` で、
 //    `token-exec` / `token-write` には触らない（capability の分界を跨がない）。
 // 🚨 **デーモンが動いていないときに「衝突なし」と答えない。**
 //    判定できない場合は `ask`（人間に聞く）。判定の本体は
-//    `v0/clashguard.mjs` の純関数で、`v0/clashguard.test.mjs` が固定している。
+//    `v0/precheck.mjs` の純関数で、`v0/precheck.test.mjs` が固定している。
 //
 // 終了コードは常に 0（フック自身の失敗で編集を止めない）。判定は stdout の JSON で返す。
 
@@ -21,7 +21,7 @@ import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join, relative, dirname, isAbsolute } from 'node:path';
-import { decide, touchedPaths, ALLOW } from '../v0/clashguard.mjs';
+import { decide, touchedPaths, ALLOW } from '../v0/precheck.mjs';
 
 const STATE = join(homedir(), '.kjp-edit');
 const TIMEOUT_MS = 5000;
@@ -97,7 +97,7 @@ const rel = (paths ?? []).map(p => relative(root, p).split('\\').join('/'))
 
 let answer = null, error = null;
 try {
-    const res = await fetch(`${base}/api/v0/clash?repo=${encodeURIComponent(repoRoot)}`, {
+    const res = await fetch(`${base}/api/v0/precheck?repo=${encodeURIComponent(repoRoot)}`, {
         method: 'POST',
         headers: {
             'content-type': 'application/json',

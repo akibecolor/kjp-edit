@@ -2,9 +2,9 @@
 //
 // 編集を始める前の「触ってよいか」の判定（#59）。
 //
-// `POST /api/v0/clash` の応答を、`PreToolUse` フックの許可判定に翻訳する。
+// `POST /api/v0/precheck` の応答を、`PreToolUse` フックの許可判定に翻訳する。
 // **純関数**にしてあるのは、ここが「安全側に倒れているか」を
-// ネットワークもデーモンも無しに固定するため（`clashguard.test.mjs`）。
+// ネットワークもデーモンも無しに固定するため（`precheck.test.mjs`）。
 //
 // 🚨 **「調べられなかった」を「衝突なし」と言わない。**
 //    デーモンが落ちている / ref が解決できない / merge-tree が落ちた、は
@@ -21,14 +21,14 @@ export const ASK = 'ask';
  *
  * ここを `ALLOW` にすると、デーモンが落ちているだけで**黙って全部通る**。
  * 判定の分岐に埋め込むと「安全側に倒れているか」がコードから読めなくなるので、
- * 定数にして突然変異の的にしてある（`clash-daemon-down-allows` / `clash-undecided-allows`）。
+ * 定数にして突然変異の的にしてある（`precheck-daemon-down-allows` / `precheck-undecided-allows`）。
  */
 const UNREACHABLE = ASK;   // 問い合わせられなかった
 const UNDECIDED = ASK;     // 問い合わせたが、一部を判定できなかった
 
 /**
  * @param {object} input
- * @param {null|object} input.answer  `/api/v0/clash` の応答（取れなければ null）
+ * @param {null|object} input.answer  `/api/v0/precheck` の応答（取れなければ null）
  * @param {null|string} input.error   問い合わせ自体が失敗した理由
  * @param {string[]} input.paths      これから触るリポジトリ相対パス
  * @returns {{decision: 'allow'|'deny'|'ask', reason: string}}

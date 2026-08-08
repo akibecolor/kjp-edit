@@ -6693,19 +6693,19 @@ test('🔒 checkout: リポジトリ設定の filter があるときは切り替
  * 検査で固定するのは「衝突を見つけること」より
  * **「調べられなかったときに『衝突なし』と答えないこと」**（そこが唯一の壁）。
  */
-const clash = (worktree, paths, method = 'POST') =>
-    fetch(`${baseUrl}/api/v0/clash`, {
+const precheck = (worktree, paths, method = 'POST') =>
+    fetch(`${baseUrl}/api/v0/precheck`, {
         method,
         headers: { 'content-type': 'application/json' },
         body: method === 'POST' ? JSON.stringify({ worktree, paths }) : undefined,
     });
 
-test('clash: 触るパスが他の worktree と衝突することを事前に答える', async () => {
+test('precheck: 触るパスが他の worktree と衝突することを事前に答える', async () => {
     const s = await state();
     const a = s.worktrees.find(w => w.branch === 'agent-a');
     const b = s.worktrees.find(w => w.branch === 'agent-b');
     assert.ok(a && b, 'fixture の worktree が無い');
-    const r = await clash(a.path, ['shared.txt']);
+    const r = await precheck(a.path, ['shared.txt']);
     assert.equal(r.status, 200);
     const j = await r.json();
     assert.equal(j.decided, true, `判定できていない: ${JSON.stringify(j.unknown)}`);
@@ -6716,24 +6716,24 @@ test('clash: 触るパスが他の worktree と衝突することを事前に答
         `衝突相手の worktree が違う: ${hit.worktree}`);
 
     // paths で絞れる（触らないパスを聞いたら空）
-    const other = await (await clash(a.path, ['only-a.txt'])).json();
+    const other = await (await precheck(a.path, ['only-a.txt'])).json();
     assert.equal(other.conflicts.length, 0,
         `絞り込みが効いていない: ${JSON.stringify(other.conflicts)}`);
 });
 
-test('🚨 clash: 知らない worktree に「衝突なし」と答えない', async () => {
-    const r = await clash(join(repo, '..', 'not-a-worktree'), ['x.txt']);
+test('🚨 precheck: 知らない worktree に「衝突なし」と答えない', async () => {
+    const r = await precheck(join(repo, '..', 'not-a-worktree'), ['x.txt']);
     assert.equal(r.status, 400, '知らない worktree を 200 で通している');
     const j = await r.json();
     assert.ok(!('conflicts' in j), `拒否のはずが結果を返している: ${JSON.stringify(j)}`);
 });
 
-test('🚨 clash: GET では答えない（読み取り専用でも副作用のある形にしない）', async () => {
-    const r = await clash(repo, [], 'GET');
+test('🚨 precheck: GET では答えない（読み取り専用でも副作用のある形にしない）', async () => {
+    const r = await precheck(repo, [], 'GET');
     assert.equal(r.status, 405);
 });
 
-test('🚨 clash: 作業ツリーと ref に触らない', async () => {
+test('🚨 precheck: 作業ツリーと ref に触らない', async () => {
     const s = await state();
     const a = s.worktrees.find(w => w.branch === 'agent-a');
     const before = await Promise.all([
@@ -6741,7 +6741,7 @@ test('🚨 clash: 作業ツリーと ref に触らない', async () => {
         g(['status', '--porcelain'], a.path),
         g(['for-each-ref', '--format=%(refname) %(objectname)'], repo),
     ]);
-    await (await clash(a.path, ['shared.txt'])).json();
+    await (await precheck(a.path, ['shared.txt'])).json();
     const after = await Promise.all([
         g(['rev-parse', 'HEAD'], a.path),
         g(['status', '--porcelain'], a.path),
@@ -6752,7 +6752,7 @@ test('🚨 clash: 作業ツリーと ref に触らない', async () => {
     assert.equal(after[2].stdout, before[2].stdout, 'ref が変わった');
 });
 
-test('🚨 clash: 自分がシーケンサ停止中なら self に出す（乗っ取りの本体）', async () => {
+test('🚨 precheck: 自分がシーケンサ停止中なら self に出す（乗っ取りの本体）', async () => {
     const wt = join(repo, '..', `${basename(repo)}-clash-seq`);
     try {
         await g(['worktree', 'add', '-q', '-b', 'clash-seq', wt, 'main'], repo);
@@ -6781,7 +6781,7 @@ test('🚨 clash: 自分がシーケンサ停止中なら self に出す（乗�
             child.on('error', reject);
             child.on('close', () => resolve());
         });
-        const j = await (await clash(wt, ['seq.txt'])).json();
+        const j = await (await precheck(wt, ['seq.txt'])).json();
         assert.ok(j.self, `self が無い: ${JSON.stringify(j)}`);
         assert.equal(j.self.rebasing, true,
             `rebase 停止中を見落としている: ${JSON.stringify(j.self)}`);
