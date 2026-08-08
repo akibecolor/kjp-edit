@@ -33,6 +33,39 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #69: 失敗の理由と subtype を捨てる（別の失敗が同じ表示になる）
+        name: 'chat-result-reason',
+        why: 'result の理由と subtype を落とす（「Credit balance is too low」も error_max_turns も同じ1行になる）',
+        file: 'v0/chatfilter.mjs',
+        from: '            text: `── ${head}${sub} ──${why}`,',
+        to: '            text: `── ${head} ──`,   /* 変異: 理由を捨てる */',
+        gone: 'text: `── ${head}${sub} ──${why}`,',
+        pattern: 'エラーの理由と subtype を出す',
+        testFile: 'v0/chatfilter.test.mjs',
+    },
+    {
+        // 🚨 #67: 滞留を黙って「送った」と言う
+        name: 'input-pending-silent',
+        why: '相手が読んでいないのに「送った」と言う（会話が返ってこない理由が画面から分からない）',
+        file: 'v0/inputnote.mjs',
+        from: '    if (pending > 0) {',
+        to: '    if (false) {   /* 変異: 滞留を黙る */',
+        gone: 'if (pending > 0) {',
+        pattern: '未読が残っていたら',
+        testFile: 'v0/inputnote.test.mjs',
+    },
+    {
+        // 🚨 #67: 分からないのに「届いた」と断言する
+        name: 'input-unknown-as-delivered',
+        why: 'pending が無い応答を「届いた」と断言する（分からないを無いと言う型）',
+        file: 'v0/inputnote.mjs',
+        from: '    if (!Number.isFinite(pending)) {',
+        to: '    if (false) {   /* 変異: 分からないを届いたと言う */',
+        gone: 'if (!Number.isFinite(pending)) {',
+        pattern: 'pending が無い応答を「届いた」と断言しない',
+        testFile: 'v0/inputnote.test.mjs',
+    },
+    {
         // 🚨 #68: 停止処理中の入力を「送った」と言う
         name: 'input-ignores-kill-requested',
         why: '停止処理中の入力を 200 ok:true で受ける（読まれない1行が「送った」として記録に残る）',
@@ -2097,6 +2130,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'\n"
             + "            || url.pathname === '/dirlabel.mjs'\n"
             + "            || url.pathname === '/mergeplan.mjs'\n"
+            + "            || url.pathname === '/inputnote.mjs'\n"
             + "            || url.pathname === '/panegrid.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",

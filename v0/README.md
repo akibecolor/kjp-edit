@@ -216,7 +216,8 @@ URL を知っている誰でも無認証でリポジトリの中身が読めま�
 | `ndjson.mjs` | 行区切り JSON のストリーム読み。**ブラウザと unit テストで共有** |
 | `ndjson.test.mjs` | 行割れ・マルチバイト割れの回帰テスト |
 | `argv.mjs` | コマンド行の分割と会話モードの判定（`isChatArgv`）。同じ理由で共有 |
-| `chatfilter.mjs` / `.test.mjs` | 会話モード（stream-json）の出力の解釈。**同じ理由で共有** |
+| `chatfilter.mjs` / `.test.mjs` | 会話モード（stream-json）の出力の解釈。**同じ理由で共有**。失敗の `result` は理由と `subtype` まで出す（#69） |
+| `inputnote.mjs` / `.test.mjs` | 標準入力を送ったときの「送った」と「届いた」の区別（#67）。**同じ理由で共有** |
 | `mergeplan.mjs` / `.test.mjs` | 取り込み順序の提案（純関数）と、提案のラベルを **git に渡す ref に解決する** `mergeTargets()`（#60）。**同じ理由で共有** |
 | `panelayout.mjs` / `.test.mjs` | ペインの配置（ドラッグで決めた並び）の表現と永続化の形。**同じ理由で共有** |
 | `panegrid.mjs` / `.test.mjs` | グリッド配置（`?grid=1`）のパターン・結合・移動・閉じる（純関数。#57） |

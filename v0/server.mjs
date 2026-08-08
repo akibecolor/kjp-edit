@@ -3517,6 +3517,7 @@ async function handleRequest(req, res) {
             || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'
             || url.pathname === '/dirlabel.mjs'
             || url.pathname === '/mergeplan.mjs'
+            || url.pathname === '/inputnote.mjs'
             || url.pathname === '/panegrid.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {

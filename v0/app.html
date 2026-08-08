@@ -413,6 +413,7 @@ import { uniqueLabels } from './dirlabel.mjs';
 // 再描画で消さない」は、壊れても静かなので字面ではなく挙動で固定する。8回目のレビュー）
 import { mergeOutcome } from './mergeresult.mjs';
 import { mergeTargets } from './mergeplan.mjs';
+import { inputNote } from './inputnote.mjs';
 // 保存前に見せる差分。編集中の内容はまだどこにも無いので `git diff` に渡せない
 // （渡すには「先に書く」しかなく、「書く前に見せる」と矛盾する）
 import { diffLines } from './linediff.mjs';
@@ -1518,7 +1519,20 @@ async function runExec(termEl, scrollEl, wt, argv, onState,
         line('e', `✖ ${msg}\n`);
         return { ok: false, error: msg };
       }
-      return { ok: true };
+      // 🚨 **「送った」と「届いた」を分ける（#67。10回目のレビュー / SERIOUS）。**
+      //    子が stdin を読んでいないと、データは親のバッファに積まれるだけで
+      //    誰も読まない。それでも 200 が返り `▸ 打った文章` が出るので、
+      //    利用者から見ると「送ったのに返事が来ない」だけになり、
+      //    **送れていないことが画面のどこからも分からない**（#18 の本命である
+      //    claude との会話で一番起きる形）。サーバは応答に `pending` を返しているのに、
+      //    ここが `r.ok` しか見ずに本文を捨てていた（README の約束が
+      //    コンソール経路では成立していなかった）。
+      let body = null;
+      try { body = await r.json(); } catch { /* JSON でない応答は無視 */ }
+      // 判定は共有モジュール（`inputnote.mjs`）。ここに書くとテストできない
+      const note = inputNote(body);
+      if (note.note) line('e', note.note);
+      return { ok: true, pending: note.pending, delivered: note.delivered };
     } catch (e) {
       line('e', `✖ ${e.message}\n`);
       return { ok: false, error: e.message };

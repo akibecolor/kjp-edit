@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeChatFilter, chatGlance, chatInputText } from './chatfilter.mjs';
+import { makeChatFilter, chatGlance, chatInputText, chatRecordLines } from './chatfilter.mjs';
 
 /** 出力を集める。`[cls, text]` の配列で返す */
 function collect() {
@@ -360,4 +360,39 @@ test('chatInputText: content が文字列の形も読む', () => {
     assert.equal(
         chatInputText(JSON.stringify({ type: 'user', message: { content: 'そのまま' } })),
         'そのまま');
+});
+
+/**
+ * 🚨 **失敗の理由を捨てない（#69。10回目のレビュー / SERIOUS）。**
+ *
+ * 以前は `── ✖ エラー ──` の1行だけだったので、
+ * 「Credit balance is too low」も `error_max_turns` も **同じ表示**になり、
+ * 次に何をすればよいか判断できなかった。しかも `chatGlance` は
+ * `interpreted: true` を返すので「解釈できない行」の印すら付かない。
+ */
+test('🚨 result: エラーの理由と subtype を出す', () => {
+    const lines = chatRecordLines({
+        type: 'result', is_error: true, subtype: 'error_during_execution',
+        result: 'Credit balance is too low',
+    });
+    const text = lines.map(l => l.text).join('\n');
+    assert.match(text, /error_during_execution/, `subtype が出ていない: ${text}`);
+    assert.match(text, /Credit balance is too low/, `理由が出ていない: ${text}`);
+});
+
+test('🚨 result: 長い理由は切って、切ったことと全体の文字数を言う', () => {
+    const long = 'x'.repeat(900);
+    const lines = chatRecordLines({ type: 'result', is_error: true, result: long });
+    const text = lines.map(l => l.text).join('\n');
+    assert.ok(text.length < 500, `切っていない: ${text.length} 文字`);
+    assert.match(text, /…/, `省略の印が無い: ${text.slice(0, 120)}`);
+    assert.match(text, /900 文字/, `全体の文字数を言っていない: ${text.slice(-60)}`);
+});
+
+test('result: 成功は終端の1行のまま（本文は assistant 側で出ている）', () => {
+    const lines = chatRecordLines({ type: 'result', is_error: false, subtype: 'success',
+        result: '出来ました' });
+    const text = lines.map(l => l.text).join('\n');
+    assert.match(text, /応答おわり/);
+    assert.equal(text.includes('出来ました'), false, `成功で本文を二重に出している: ${text}`);
 });

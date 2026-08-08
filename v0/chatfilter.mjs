@@ -58,9 +58,32 @@ export function chatRecordLines(r) {
         return out;
     }
     if (r?.type === 'result') {
+        // 🚨 **理由と subtype を捨てない（#69。10回目のレビュー / SERIOUS）。**
+        //    以前は `── ✖ エラー ──` の1行だけだったので、
+        //    「Credit balance is too low」も `error_max_turns` も
+        //    `error_during_execution` も**まったく同じ表示**になり、
+        //    次に何をすればよいか判断できなかった。しかも `chatGlance` は
+        //    `interpreted: true` を返すので「解釈できない行」の印も付かず、
+        //    **解釈できていると積極的に主張**していた
+        //    （このファイル冒頭が警戒している当のことを result の経路でやっていた）。
+        // ⚠️ 成功時は本文が assistant 側で既に出ているので終端の1行だけでよい。
+        const head = r.is_error ? '✖ エラー' : '✔ 応答おわり';
+        const sub = typeof r.subtype === 'string' && r.subtype && r.subtype !== 'success'
+            ? `（${r.subtype}）` : '';
+        let why = '';
+        if (r.is_error) {
+            const body = typeof r.result === 'string' ? r.result
+                : (typeof r.error === 'string' ? r.error : '');
+            const flat = body.replace(/\s+/g, ' ').trim();
+            // ⚠️ 切ったら必ず「…」と文字数を添える（黙って省略しない）
+            if (flat) {
+                why = flat.length > 300
+                    ? ` ${flat.slice(0, 300)}…（全 ${flat.length} 文字）` : ` ${flat}`;
+            }
+        }
         return [{
             cls: r.is_error ? 'e' : 'p',
-            text: `── ${r.is_error ? '✖ エラー' : '✔ 応答おわり'} ──`,
+            text: `── ${head}${sub} ──${why}`,
         }];
     }
     if (r?.type === 'system' && r.subtype === 'init') {
