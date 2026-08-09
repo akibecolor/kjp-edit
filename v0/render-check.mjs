@@ -1019,7 +1019,10 @@ try {
         // ⚠️ **トークン付きの URL で開く。** 実行を有効にしているので、
         //    トークンが無いとコンソールが描かれず（= 計測対象が無い）、
         //    30秒空回りする（先の UI 修正の副作用で実際に踏んだ）。
-        `${base}/?token=${TOKEN}&probe=1`,
+        // ⚠️ **旧レイアウトを明示する（#75）。** 既定はグリッドになったが、
+        //    ここの検査は**入れ物をまたぐドラッグ**（movedTo / resetHost）を見ているので、
+        //    既定に流すと測る対象が消える。グリッドのドラッグは input-check が測る。
+        `${base}/?token=${TOKEN}&probe=1&grid=0`,
     ], { shell: false, windowsHide: true });
     chrome.stderr.setEncoding('utf8');
     let cerr = '';

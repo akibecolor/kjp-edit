@@ -534,13 +534,18 @@ function readStoredLayout() {
 let paneLayout = parseLayout(readStoredLayout());
 
 /**
- * 🚨 **グリッド配置（#57）は `?grid=1` のときだけ。**
+ * 🚨 **グリッド配置が既定（2026-08-09 に切り替えた。#75）。**
  *
- *    既定を切り替えるのは、実ブラウザ検査（入れ物 id で並びを測っている）の
- *    書き換えと**同じコミット**で行う。先に切り替えると「測る対象が消えた」を
- *    別の失敗として報告するか、最悪「測っていないのに緑」になる。
+ *    旧レイアウト（固定4カラム）は `?grid=0` で残してある。消していないのは、
+ *    **ドラッグで入れ物をまたぐ挙動の検査が旧レイアウトを見ている**ため
+ *    （消すとその検査も消えるので、まず既定だけを移す）。
+ * ⚠️ 検査は両方を測る:
+ *      - 既定（グリッド）… 幅ごとの溢れ・隠れ・潰れ・配置ボタン（layout-check）と
+ *        セル移動・文字選択・× の実クリック（input-check）
+ *      - 旧レイアウト（`?grid=0`）… 入れ物をまたぐ並べ替えと復元（layout-check / render-check）
+ *    **どちらかを測らないまま既定を変えない**（「測っていないのに緑」を作らない）。
  */
-const gridMode = new URLSearchParams(location.search).get('grid') === '1';
+const gridMode = new URLSearchParams(location.search).get('grid') !== '0';
 
 /**
  * 🚨 **スマホ横で PC レイアウトを見る（`body.wide`）。**

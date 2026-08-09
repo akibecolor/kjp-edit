@@ -124,7 +124,7 @@ try {
 }
 
 /** ハーネスを開いて JSON を取り出す */
-async function measure(width, from = null, grid = false) {
+async function measure(width, from = null, grid = null) {
     const at = from ?? baseUrl;
     const profile = await mkdtemp(join(tmpdir(), 'kjp-layout-'));
     const child = spawn(browser, [
@@ -143,7 +143,9 @@ async function measure(width, from = null, grid = false) {
         '--virtual-time-budget=30000', '--dump-dom',
         // ⚠️ `at` は測る対象のサーバ（1本構成の2台目も測るため）
         // ⚠️ 配置バーはグリッドのときだけ描かれる（渡さないと測っていないのに緑）
-        `${at}/__probe?w=${width}&token=${TOKEN}${grid ? '&grid=1' : ''}`,
+        // ⚠️ grid は 3 状態（'1' = グリッド / '0' = 旧レイアウト / null = 既定）
+        `${at}/__probe?w=${width}&token=${TOKEN}`
+            + (grid === null ? '' : `&grid=${grid ? 1 : 0}`),
     ], { shell: false, windowsHide: true });
     let out = '';
     let err = '';
@@ -311,6 +313,17 @@ try {
     if (probeSession === null) {
         problems.push('監視盤用のセッションが起動できなかった（行を測れない）');
     }
+    // 🚨 **既定がグリッドであること（#75）。**
+    //    パラメータを渡さずに開いて確かめる。grid=1 を明示した検査だけだと、
+    //    既定を切り戻しても全部緑のまま通る。
+    {
+        const d = await measure(1280, null, null);
+        if (d.gridbarDrawn !== true) {
+            problems.push('既定がグリッドになっていない（配置バーが描かれない）');
+        }
+        lines.push('既定: ' + (d.gridbarDrawn ? 'グリッド' : '旧レイアウト'));
+    }
+
     // 🚨 **配置ボタンの大きさが揃っていること**（利用者の指摘。2026-08-09）。
     //    ラベルの字種が混在（`1枚` / `2×2`）していたので**幅が揃わず、
     //    漢字の行だけ縦位置もずれて**いた。字種を `行×列` に統一し、
@@ -344,10 +357,37 @@ try {
         }
     }
     for (const width of [390, 768, 1280]) {
-        const r = await measure(width);
+        // ⚠️ **旧レイアウトを明示して測る（#75）。** 既定はグリッドになったが、
+        //    ここの並べ替え・復元の assert は**入れ物 id** を見ているので、
+        //    黙って既定に追随させると「測る対象が消えた」を別の失敗として報告する。
+        //    グリッド側は下の別ブロックで測る。
+        const r = await measure(width, null, false);
         // iframe の幅が指定通りでないと、測っている対象が違う
         if (r.innerWidth !== width) {
             problems.push(`幅 ${width}: iframe の innerWidth が ${r.innerWidth} になっている`);
+        }
+        // 🚨 **既定（グリッド）も幅ごとに測る（#75）。**
+        //    旧レイアウトだけ測って既定を測らない状態を作らない。
+        //    並べ替え・復元は入れ物 id を見るので旧レイアウト側に残し、
+        //    ここでは**配置に関係なく成立すべき性質**（溢れ・隠れ・潰れ）を見る。
+        {
+            const gr = await measure(width, null, true);
+            if (gr.bodyScrollWidth > gr.bodyClientWidth + 1) {
+                problems.push(`幅 ${width}（既定=グリッド）: body が横に溢れている `
+                    + `(${gr.bodyScrollWidth} > ${gr.bodyClientWidth}) — ${(gr.overflowing ?? []).join(', ')}`);
+            }
+            if ((gr.hiddenButDrawnCount ?? 0) > 0) {
+                problems.push(`幅 ${width}（既定=グリッド）: hidden なのに描かれている `
+                    + `(${(gr.hiddenButDrawn ?? []).join(', ')})`);
+            }
+            // ⚠️ 測っている対象が実在すること（0枚で緑にしない）
+            if ((gr.drawnCmdbars ?? 0) < 1) {
+                problems.push(`幅 ${width}（既定=グリッド）: コマンドバーが1つも描かれていない`
+                    + '（測れていない）');
+            }
+            lines.push(`${String(width).padStart(4)}px グリッド: 溢れ `
+                + `${gr.bodyScrollWidth > gr.bodyClientWidth + 1 ? 'あり' : 'なし'}`
+                + ` / hidden描画 ${gr.hiddenButDrawnCount ?? 0} / コマンドバー ${gr.drawnCmdbars ?? 0}`);
         }
         const overflows = r.bodyScrollWidth > r.bodyClientWidth + 1;
         if (overflows) {

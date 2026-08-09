@@ -33,6 +33,27 @@ process.chdir(ROOT);
  */
 const MUTANTS = [
     {
+        // 🚨 #75: 既定をグリッドから切り戻す（グリッド側の検査は grid=1 を明示しているので
+        //    これを測る assert が無いと全部緑のまま通る）
+        name: 'grid-not-default',
+        why: '既定をグリッドから旧レイアウトに戻す（切り戻しに気付けない）',
+        file: 'v0/app.html',
+        from: "const gridMode = new URLSearchParams(location.search).get('grid') !== '0';",
+        to: "const gridMode = new URLSearchParams(location.search).get('grid') === '1';   /* 変異 */",
+        gone: "get('grid') !== '0'",
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        // 🚨 #75: 旧レイアウトを測る経路（grid=0）を潰す = 並べ替えの検査が既定に流れる
+        name: 'probe-grid-zero-ignored',
+        why: 'ハーネスが grid=0 を無視する（旧レイアウトを測っているつもりで既定を測る）',
+        file: 'v0/server.mjs',
+        from: "        + (grid === '1' ? '&grid=1' : grid === '0' ? '&grid=0' : '');",
+        to: "        + (grid === '1' ? '&grid=1' : '');   /* 変異: grid=0 を落とす */",
+        gone: "grid === '0' ? '&grid=0'",
+        script: 'v0/layout-check.mjs',
+    },
+    {
         // 配置ボタンの大きさ（利用者の指摘。字種が混ざると幅も縦位置もずれる）
         name: 'gridbtn-size-not-fixed',
         // 🚨 **守りが2枚あるので、1枚ずつ外しても差が出ない**（実測で両方 SURVIVED）。

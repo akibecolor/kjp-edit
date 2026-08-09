@@ -221,7 +221,7 @@ document.getElementById('out').textContent = JSON.stringify(out);
 </script>`;
 }
 
-function probeHarness(width, mode, token, grid = false) {
+function probeHarness(width, mode, token, grid = null) {
     const w = Number.isFinite(width) && width >= 200 && width <= 4000 ? Math.floor(width) : 390;
     // 🚨 描画の予算を測るモード（#3）。**仮想時間では測れない**ので
     //    v0/render-check.mjs が実時間で開く（layout-check とは別の検査）。
@@ -234,7 +234,9 @@ function probeHarness(width, mode, token, grid = false) {
     const q = (token ? `&token=${encodeURIComponent(token)}` : '')
         // ⚠️ 配置バーはグリッドのときしか描かれない。渡さないと
         //    「測っていないのに緑」になる（capability を切ると描かれない UI と同じ）
-        + (grid ? '&grid=1' : '');
+        // ⚠️ 3状態にする。既定がグリッドになったので、**旧レイアウトを測るには
+        //    `grid=0` を明示して渡す**必要がある（渡さないと既定に流れる）。
+        + (grid === '1' ? '&grid=1' : grid === '0' ? '&grid=0' : '');
     if (mode === 'render') return renderHarness(w, q);
     return `<!doctype html><meta charset="utf-8"><title>layout probe</title>
 <body style="margin:0">
@@ -300,6 +302,10 @@ const wtBadges = [...doc.querySelectorAll('.ref.wt')].filter(drawn).length;
 //    検査は**2本登録して起動する**（描かれていないまま「測った」にしない）。
 // 🚨 **配置ボタンの大きさが揃っていること**（利用者の指摘。2026-08-09）。
 //    ラベルの字種が混ざると幅も縦位置もずれる。**揃えたと主張するなら測る。**
+// 🚨 **既定がグリッドであること自体を測る（#75）。** 既定を切り戻しても
+//    配置ボタンの検査は grid=1 を明示しているので気付けない。
+const gridbar = doc.getElementById('gridbar');
+const gridbarDrawn = !!(gridbar && drawn(gridbar));
 const gridBtns = [...doc.querySelectorAll('#gridbar button')].filter(drawn).map(e => {
   const r = rect(e);
   return { t: e.textContent.trim(), w: Math.round(r.width),
@@ -417,6 +423,7 @@ document.getElementById('out').textContent = JSON.stringify({
   bodyScrollWidthAfterDrag: scrollDrag,
   bodyClientWidthAfterDrag: clientDrag,
   gridBtns,
+  gridbarDrawn,
   drawnCmdbars: cmdbars,
   drawnMonitorRows: monitorRows,
   bodyScrollWidth: bodyScroll,
@@ -2451,7 +2458,7 @@ async function handleRequest(req, res) {
             res.end(probeHarness(Number(url.searchParams.get('w')),
                 url.searchParams.get('mode'),
                 presentedToken(req, url) ? opts.token : null,
-                url.searchParams.get('grid') === '1'));
+                url.searchParams.get('grid')));
             return;
         }
         // クライアントが書き込み可否とトークンを知るための経路。
