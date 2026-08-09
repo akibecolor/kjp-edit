@@ -4,19 +4,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    THEMES, nextTheme, resolveTheme, parseColor, contrastRatio, MIN_CONTRAST,
+    THEMES, DEFAULT_THEME, nextTheme, resolveTheme, parseColor, contrastRatio, MIN_CONTRAST,
 } from './theme.mjs';
 
-test('nextTheme: 自動 → ライト → ダーク → 自動 と巡る', () => {
+test('nextTheme: 巡回する（既定のダークから dark → auto → light）', () => {
     assert.equal(nextTheme('auto'), 'light');
     assert.equal(nextTheme('light'), 'dark');
     assert.equal(nextTheme('dark'), 'auto');
 });
 
-test('🚨 nextTheme: 知らない値は auto に戻す（localStorage は書き換えられる）', () => {
+test('🚨 nextTheme: 知らない値は既定（ダーク）に戻す（localStorage は書き換えられる）', () => {
     for (const bad of ['', null, undefined, 'ネオン', '__proto__']) {
         assert.equal(THEMES.includes(nextTheme(bad)), true, `巡回から外れた: ${bad}`);
-        assert.equal(nextTheme(bad), 'auto');
+        assert.equal(nextTheme(bad), DEFAULT_THEME);
     }
 });
 
@@ -28,9 +28,13 @@ test('resolveTheme: auto は OS に従い、固定したらそれを使う', () 
     assert.deepEqual(resolveTheme('dark', false), { choice: 'dark', applied: 'dark' });
 });
 
-test('resolveTheme: 壊れた保存値は auto として扱う', () => {
-    assert.equal(resolveTheme('ネオン', false).choice, 'auto');
-    assert.equal(resolveTheme(null, true).applied, 'dark');
+test('🚨 resolveTheme: 選んでいない／壊れているときは既定のダーク', () => {
+    // 既定を auto にしていると、OS がライトの人には**選んでいないのにライト**が出る
+    assert.equal(resolveTheme(null, false).choice, DEFAULT_THEME);
+    assert.equal(resolveTheme(null, false).applied, 'dark');
+    assert.equal(resolveTheme('ネオン', false).choice, DEFAULT_THEME);
+    // auto を**明示的に選んだ**ときだけ OS に従う
+    assert.equal(resolveTheme('auto', false).applied, 'light');
 });
 
 test('parseColor: ブラウザが返す形を解釈し、読めないものは null', () => {

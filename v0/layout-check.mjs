@@ -124,7 +124,7 @@ try {
 }
 
 /** ハーネスを開いて JSON を取り出す */
-async function measure(width, from = null) {
+async function measure(width, from = null, grid = false) {
     const at = from ?? baseUrl;
     const profile = await mkdtemp(join(tmpdir(), 'kjp-layout-'));
     const child = spawn(browser, [
@@ -142,7 +142,8 @@ async function measure(width, from = null) {
         // ⚠️ 予算は main 側の 30000（ドラッグ検査は reload を含むので 8000 では足りない）
         '--virtual-time-budget=30000', '--dump-dom',
         // ⚠️ `at` は測る対象のサーバ（1本構成の2台目も測るため）
-        `${at}/__probe?w=${width}&token=${TOKEN}`,
+        // ⚠️ 配置バーはグリッドのときだけ描かれる（渡さないと測っていないのに緑）
+        `${at}/__probe?w=${width}&token=${TOKEN}${grid ? '&grid=1' : ''}`,
     ], { shell: false, windowsHide: true });
     let out = '';
     let err = '';
@@ -309,6 +310,38 @@ try {
     probeSession = await startProbeSession();
     if (probeSession === null) {
         problems.push('監視盤用のセッションが起動できなかった（行を測れない）');
+    }
+    // 🚨 **配置ボタンの大きさが揃っていること**（利用者の指摘。2026-08-09）。
+    //    ラベルの字種が混在（`1枚` / `2×2`）していたので**幅が揃わず、
+    //    漢字の行だけ縦位置もずれて**いた。字種を `行×列` に統一し、
+    //    CSS でも大きさを固定したので、**揃っていることを実測で固定する**。
+    {
+        const g = await measure(1280, null, true);
+        const btns = g.gridBtns ?? [];
+        // ⚠️ 検査が対象を描けていることを検査自身が確かめる（0個で緑にしない）
+        if (btns.length < 7) {
+            problems.push(`配置ボタンが ${btns.length} 個しか描かれていない`
+                + '（グリッドのバーを測れていない）');
+        } else {
+            const w = new Set(btns.map(b => b.w));
+            const h = new Set(btns.map(b => b.h));
+            const top = new Set(btns.map(b => b.top));
+            if (w.size !== 1) {
+                problems.push(`配置ボタンの幅が揃っていない: `
+                    + btns.map(b => `${b.t}=${b.w}`).join(' '));
+            }
+            if (h.size !== 1) {
+                problems.push(`配置ボタンの高さが揃っていない: `
+                    + btns.map(b => `${b.t}=${b.h}`).join(' '));
+            }
+            // 🚨 縦のずれ（漢字混在で起きていた形）は上端で見る
+            if (top.size !== 1) {
+                problems.push(`配置ボタンの縦位置が揃っていない: `
+                    + btns.map(b => `${b.t}@${b.top}`).join(' '));
+            }
+            lines.push(`配置ボタン ${btns.length} 個 / 幅 ${[...w].join(',')} `
+                + `/ 高さ ${[...h].join(',')} / 上端 ${[...top].join(',')}`);
+        }
     }
     for (const width of [390, 768, 1280]) {
         const r = await measure(width);

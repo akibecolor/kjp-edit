@@ -32,6 +32,28 @@ process.chdir(ROOT);
  *      そうしないと「置換が効いていない」と誤判定する（実際に踏んだ）。
  */
 const MUTANTS = [
+    {
+        // 配置ボタンの大きさ（利用者の指摘。字種が混ざると幅も縦位置もずれる）
+        name: 'gridbtn-size-not-fixed',
+        // 🚨 **守りが2枚あるので、1枚ずつ外しても差が出ない**（実測で両方 SURVIVED）。
+        //    (a) CSS の min-width / height / 中央揃え、(b) ラベルの字種の統一。
+        //    どちらか片方でも揃うので、 で**2枚とも外して**
+        //    利用者が見た形（幅も縦もばらつく）を再現する。
+        //    「検査が弱い」と読み違えて検査を強くしに行かないこと。
+        why: '配置ボタンの大きさを固定せず、ラベルの字種も混ぜ戻す（利用者が見た形）',
+        file: 'v0/app.html',
+        from: '  #gridbar button { min-width: 3.2rem; height: 1.6rem; padding: 0 .4rem;',
+        to: '  #gridbar button { padding: 0 .4rem;   /* 変異: 大きさを固定しない */',
+        gone: 'min-width: 3.2rem; height: 1.6rem;',
+        // ⚠️ **今は外しても差が出ない（実測で SURVIVED）。**
+        //    ラベルを `行×列` に統一したので、自然幅が既に等しい。
+        //    `also` で両方外したいところだが、mutate.mjs の `also` は**同じファイル内**
+        //    しか書き換えられない（別ファイルを足すと復元の経路が増えて、
+        //    復元し損ねる事故の面が広がる）。なので理由を書いて2枚目として残す。
+        //    ラベルが1つでも変わった瞬間に効く（そのとき layout-check が落ちる）。
+        defensive: 'ラベルの字種を統一しているので、今は CSS を外しても幅・高さ・上端が揃う（実測）。ラベルが変わった瞬間に効く2枚目として残す。揃っていること自体はlayout-check が測っているので、守りが消えても property は守られる',
+        script: 'v0/layout-check.mjs',
+    },
     // -----------------------------------------------------------------
     // 配色（ダーク / ライト）。守りは「実際に当たっている」「読める」「覚える」。
     // -----------------------------------------------------------------
@@ -3320,9 +3342,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（実行系の UI が「使えません」の一文になり、'
             + 'コマンドバーも監視盤も描かれないまま「測った」ことになる）',
         file: 'v0/server.mjs',
-        from: '                presentedToken(req, url) ? opts.token : null));',
-        to: '                null));',
-        gone: 'presentedToken(req, url) ? opts.token : null));',
+        from: '                presentedToken(req, url) ? opts.token : null,',
+        to: '                null,',
+        gone: 'presentedToken(req, url) ? opts.token : null,',
         script: 'v0/layout-check.mjs',
     },
     {

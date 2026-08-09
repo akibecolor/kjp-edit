@@ -10,20 +10,31 @@
 //    だから比（WCAG のコントラスト比）を計算できる形にして、
 //    実ブラウザの検査が**実際に描かれている色**で測る。
 
-/** 選べる値。`auto` は OS の設定に従う（既定） */
+/** 選べる値。`auto` は OS の設定に従う */
 export const THEMES = ['auto', 'light', 'dark'];
+
+/**
+ * 🚨 **既定はダーク**（利用者の判断。2026-08-09）。
+ *
+ * 以前は `auto`（OS 追従）だったが、この道具は暗い画面で長時間見るものなので
+ * **選んでいないときはダーク**にする。`auto` は「OS に合わせたい」ときに
+ * 明示的に選ぶ値になった（ボタンは dark → auto → light → dark と巡る）。
+ * ⚠️ 保存値が壊れているときもここに落とす（読めない値を `auto` と解釈しない）。
+ */
+export const DEFAULT_THEME = 'dark';
 
 /** 表示名（UI のボタンに出す） */
 export const THEME_LABEL = { auto: '自動', light: 'ライト', dark: 'ダーク' };
 
 /**
- * 次の値（ボタンを押したときの遷移）。auto → light → dark → auto。
+ * 次の値（ボタンを押したときの遷移）。既定のダークから始まるので
+ * 実際には dark → auto → light → dark と巡る。
  *
- * ⚠️ 知らない値は `auto` に戻す（localStorage は書き換えられうる）。
+ * ⚠️ 知らない値は既定（ダーク）に戻す（localStorage は書き換えられうる）。
  */
 export function nextTheme(cur) {
     const i = THEMES.indexOf(cur);
-    return i === -1 ? 'auto' : THEMES[(i + 1) % THEMES.length];
+    return i === -1 ? DEFAULT_THEME : THEMES[(i + 1) % THEMES.length];
 }
 
 /**
@@ -35,7 +46,7 @@ export function nextTheme(cur) {
  *   choice = 利用者が選んだ値（ボタンの表示用）/ applied = 実際に当てる配色
  */
 export function resolveTheme(saved, prefersDark) {
-    const choice = THEMES.includes(saved) ? saved : 'auto';
+    const choice = THEMES.includes(saved) ? saved : DEFAULT_THEME;
     if (choice === 'auto') return { choice, applied: prefersDark ? 'dark' : 'light' };
     return { choice, applied: choice };
 }

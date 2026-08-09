@@ -133,6 +133,19 @@
     padding: .25rem .5rem; background: var(--head); border-bottom: 1px solid var(--line);
     font-size: 12px; }
   .bar:empty { display: none; }
+  /* 🚨 **配置のボタンは大きさを揃える（利用者の指摘。2026-08-09）。**
+     以前はラベルの字種が混在（`1枚` / `2×2`）していたので**幅が揃わず**、
+     漢字の行だけ**縦位置もずれて**いた。ラベルは `行×列` に統一したうえで、
+     ここで大きさも固定する:
+       - `inline-flex` + 中央揃えで、字種が変わっても**縦位置が動かない**
+         （line-height の解釈は字種で変わるので、行の高さに頼らない）
+       - `tabular-nums` で数字の幅を揃える
+       - `min-width` で最も広いラベルに合わせる
+     ⚠️ 揃えたと主張するなら測る: layout-check が**全ボタンの幅・高さ・上端**が
+        同じであることを実ブラウザで見る。 */
+  #gridbar button { min-width: 3.2rem; height: 1.6rem; padding: 0 .4rem;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-variant-numeric: tabular-nums; line-height: 1; }
   .split { flex: 0 0 var(--split); position: relative; }
   .split::after { content: ''; position: absolute; inset: 0; background: var(--line); }
   .split:hover::after, .split.dragging::after { background: var(--accent); }

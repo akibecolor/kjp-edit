@@ -333,11 +333,20 @@ export function migrateV1(layout) {
  *    ここを取り違えると、選んだ形と出る形が食い違う。
  */
 export const GRID_PRESETS = [
-    { name: '1x1', label: '1枚', cols: 1, rows: 1 },
-    { name: '1x2', label: '1行2列', cols: 2, rows: 1 },
-    { name: '1x3', label: '1行3列', cols: 3, rows: 1 },
+    // 🚨 **字種を混ぜない（利用者の指摘。2026-08-09）。**
+    //    以前は `1枚` / `1行2列` / `2×2` と漢字と数字が混在していたので、
+    //    ボタンの**幅が揃わず、漢字の行だけ縦位置もずれて**いた。
+    //    ラベルは `行×列` の同じ形（全部が数字と × だけ）にし、
+    //    日本語の説明は title に置く（意味は失わない）。
+    // ⚠️ **揃えの本体は CSS 側**（`#gridbar button` の min-width / height /
+    //    inline-flex 中央揃え）。実測すると、CSS を入れた後は
+    //    ラベルを漢字に戻しても幅・高さ・上端が変わらない（変異が SURVIVED した）。
+    //    つまりこの統一は**読みやすさのため**で、守りではない。守りは layout-check が測る。
+    { name: '1x1', label: '1×1', cols: 1, rows: 1 },
+    { name: '1x2', label: '1×2', cols: 2, rows: 1 },
+    { name: '1x3', label: '1×3', cols: 3, rows: 1 },
     { name: '2x2', label: '2×2', cols: 2, rows: 2 },
-    { name: '2x3', label: '2行3列', cols: 3, rows: 2 },
+    { name: '2x3', label: '2×3', cols: 3, rows: 2 },
     { name: '3x3', label: '3×3', cols: 3, rows: 3 },
     { name: '4x4', label: '4×4', cols: 4, rows: 4 },
 ];

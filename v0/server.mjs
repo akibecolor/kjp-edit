@@ -221,7 +221,7 @@ document.getElementById('out').textContent = JSON.stringify(out);
 </script>`;
 }
 
-function probeHarness(width, mode, token) {
+function probeHarness(width, mode, token, grid = false) {
     const w = Number.isFinite(width) && width >= 200 && width <= 4000 ? Math.floor(width) : 390;
     // 🚨 描画の予算を測るモード（#3）。**仮想時間では測れない**ので
     //    v0/render-check.mjs が実時間で開く（layout-check とは別の検査）。
@@ -231,7 +231,10 @@ function probeHarness(width, mode, token) {
     //    （「capability を切ると描かれない UI は、検査でも描かれない」の再発）。
     // 🔒 見せてよいのは **既にトークンを持っている要求だけ**（/api/v0/session と同じ規則）。
     //    呼び出し側が presentedToken を通ったときだけ token を渡してくる。
-    const q = token ? `&token=${encodeURIComponent(token)}` : '';
+    const q = (token ? `&token=${encodeURIComponent(token)}` : '')
+        // ⚠️ 配置バーはグリッドのときしか描かれない。渡さないと
+        //    「測っていないのに緑」になる（capability を切ると描かれない UI と同じ）
+        + (grid ? '&grid=1' : '');
     if (mode === 'render') return renderHarness(w, q);
     return `<!doctype html><meta charset="utf-8"><title>layout probe</title>
 <body style="margin:0">
@@ -295,6 +298,13 @@ const wtBadges = [...doc.querySelectorAll('.ref.wt')].filter(drawn).length;
 
 // 🚨 リポジトリのセレクトも同じ扱い。1本しか登録していないと描かれないので、
 //    検査は**2本登録して起動する**（描かれていないまま「測った」にしない）。
+// 🚨 **配置ボタンの大きさが揃っていること**（利用者の指摘。2026-08-09）。
+//    ラベルの字種が混ざると幅も縦位置もずれる。**揃えたと主張するなら測る。**
+const gridBtns = [...doc.querySelectorAll('#gridbar button')].filter(drawn).map(e => {
+  const r = rect(e);
+  return { t: e.textContent.trim(), w: Math.round(r.width),
+    h: Math.round(r.height), top: Math.round(r.top) };
+});
 const repoSel = doc.getElementById('reposel');
 const repoSels = repoSel && drawn(repoSel) ? repoSel.options.length : 0;
 // 🚨 **CSS が読めているかを「効果」で確かめる。** 規則の書き間違い
@@ -406,6 +416,7 @@ document.getElementById('out').textContent = JSON.stringify({
   overflowingAfterDragCount: overDrag.length,
   bodyScrollWidthAfterDrag: scrollDrag,
   bodyClientWidthAfterDrag: clientDrag,
+  gridBtns,
   drawnCmdbars: cmdbars,
   drawnMonitorRows: monitorRows,
   bodyScrollWidth: bodyScroll,
@@ -2439,7 +2450,8 @@ async function handleRequest(req, res) {
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
             res.end(probeHarness(Number(url.searchParams.get('w')),
                 url.searchParams.get('mode'),
-                presentedToken(req, url) ? opts.token : null));
+                presentedToken(req, url) ? opts.token : null,
+                url.searchParams.get('grid') === '1'));
             return;
         }
         // クライアントが書き込み可否とトークンを知るための経路。
