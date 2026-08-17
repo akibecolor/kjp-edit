@@ -18,7 +18,7 @@
 
 import { createServer } from 'node:http';
 import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
-import { readFile, open, lstat } from 'node:fs/promises';
+import { readFile, writeFile, rm, open, lstat } from 'node:fs/promises';
 import { constants as FS } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve, relative } from 'node:path';
@@ -40,6 +40,7 @@ import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
 import { makeFailTracker, makeInflightGate, makeGoodSet, failDelay } from './failtracker.mjs';
 import { collisionFullLabels } from './dirlabel.mjs';
 import { readSecretOf } from './readsecret.mjs';
+import { DeviceBook, formatCode, PAIR_TTL_MS } from './devices.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -54,6 +55,8 @@ function parseArgs(argv) {
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
+        // 端末の承認（`docs/device-approval.md`）。渡さないと**経路そのものが無い**
+        devicesFile: null,
         // 🔒 監査ログの上限（超えたら1世代だけ残して回転する）。認証前の 401 も
         //    同じファイルに追記されるので、上限が無いと外から容量を食える。
         auditMaxBytes: 4 * 1024 * 1024,
@@ -129,6 +132,7 @@ function parseArgs(argv) {
         //    自動生成（32バイト = 43文字）が条件を満たしてしまう（6回目のレビュー）
         else if (a === '--token') { opts.token = argv[++i]; opts.tokenExplicit = true; }
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
+        else if (a === '--devices-file') opts.devicesFile = resolve(argv[++i]);
         else if (a === '--audit-max-bytes') opts.auditMaxBytes = num('--audit-max-bytes', 512, 2 ** 40);
         else if (a === '--token-file') { opts.tokenFile = resolve(argv[++i]); opts.tokenExplicit = true; }
         else if (a === '--require-auth') opts.requireAuth = true;
@@ -147,6 +151,7 @@ function parseArgs(argv) {
             console.log('       --exec-timeout <秒>  実行の上限時間（既定 600）');
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
+            console.log('       --devices-file <path> 承認した端末の台帳（渡さないと端末の登録は無効）');
             console.log('       --audit-max-bytes <n> 監査ログの上限（既定 4194304。超えたら .1 に回す）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
             console.log('       --require-auth       読み取りにもトークンを要求する（--allow-host のとき既定オン）');
@@ -1299,13 +1304,119 @@ function knownGoodSecret(vals) {
  */
 async function presentedTokenAudited(req, res, url) {
     const vals = presentedSecrets(req, url);
-    if (!vals.length) return { ok: false, handled: false };
+    if (!vals.length) return { ok: false, raw: false, handled: false };
+    // 🔒 **生トークンと端末の鍵を分けて返す。** `raw` は「生トークンそのもの」で、
+    //    `/api/v0/session` の払い出しはこれだけを見る（承認の連鎖を作らない）。
+    const shown = () => {
+        const raw = presentedToken(req, url);
+        const dev = raw ? null : vals.map(v => deviceMatches(v)).find(Boolean) ?? null;
+        return { raw, device: dev };
+    };
     // 既に実行トークンとして通った値は、門を素通りさせる（比較は必ず通る）
-    if (goodTokens.has(vals)) return { ok: presentedToken(req, url), handled: false };
+    if (goodTokens.has(vals)) {
+        const v = shown();
+        return { ok: Boolean(v.raw || v.device), raw: v.raw, device: v.device, handled: false };
+    }
     // 読み取り用の秘密しか提示していないなら「実行トークンの試行」ではない
     const secret = cookieSecret();
-    if (!vals.some(v => !secretMatches(v, secret))) return { ok: false, handled: false };
-    return tokenWall(req, res, vals, () => presentedToken(req, url));
+    if (!vals.some(v => !secretMatches(v, secret))) return { ok: false, raw: false, handled: false };
+    let seen = { raw: false, device: null };
+    const r = await tokenWall(req, res, vals, () => {
+        seen = shown();
+        return Boolean(seen.raw || seen.device);
+    });
+    return { ...r, raw: seen.raw, device: seen.device };
+}
+
+/* =========================================================================
+ * 端末の承認（`docs/device-approval.md`）
+ *
+ * 🚨 **承認の根拠は「母艦でしか読めない合言葉を読めたこと」。**
+ *    peer も Host も母艦を証明しない（実測して撤回した。設計文書の3-2）。
+ *    だから合言葉は **stdout と 0600 のファイルにだけ**書き、応答には載せない。
+ * ========================================================================= */
+
+/** 台帳（`--devices-file` が無ければ端末の登録は無効） */
+let deviceBook = new DeviceBook();
+
+/** 合言葉を置くファイル（台帳と同じディレクトリ） */
+function pairCodePath() {
+    return opts.devicesFile ? join(dirname(opts.devicesFile), 'pair-code') : null;
+}
+
+/** 端末の登録が使える構成か。**理由も返す**（黙って無効にしない） */
+function pairingWhy() {
+    if (!opts.devicesFile) return '端末の登録は無効です（--devices-file を渡して起動してください）';
+    if (!opts.requireAuth) {
+        return '端末の登録は認証を有効にしたときだけ使えます（--allow-host か --require-auth）';
+    }
+    return null;
+}
+
+async function loadDevices() {
+    if (!opts.devicesFile) return;
+    let raw = null;
+    try { raw = await readFile(opts.devicesFile, 'utf8'); } catch { /* 初回は無い */ }
+    deviceBook = DeviceBook.from(raw ?? { devices: [] });
+    // ⚠️ **黙って捨てない。** 読めなかった件数を必ず告げる
+    if (deviceBook.broken) {
+        console.error(`⚠ 端末の台帳を一部読めませんでした: ${deviceBook.broken}`);
+    }
+    const n = deviceBook.list().filter(d => !d.revokedAt).length;
+    if (n) console.log(`🔑 承認済みの端末 ${n} 台（一覧は serve.mjs --pair）`);
+}
+
+async function saveDevices() {
+    if (!opts.devicesFile) return;
+    // 🔒 0600（所有者だけ）。hash しか入っていないが、台帳自体も見せない
+    await writeFile(opts.devicesFile, `${JSON.stringify(deviceBook.toJSON(), null, 1)}\n`,
+        { encoding: 'utf8', mode: 0o600 }).catch(err => {
+        console.error(`⚠ 端末の台帳を保存できませんでした: ${err.message}`);
+    });
+}
+
+/**
+ * 🔒 **合言葉を母艦にだけ出す。** stdout と 0600 のファイル。
+ *    ⚠️ **応答に載せない**（載せた瞬間に設計が崩れる）。
+ */
+async function announceCode(req, code, label) {
+    const shown = formatCode(code);
+    console.log('');
+    console.log('🔑 端末の登録を要求されました');
+    console.log(`   名前: ${label}`);
+    console.log(`   合言葉: ${shown}   ← この端末に入力してください（5分で切れます）`);
+    console.log(`   要求元: ${originHint(req).peer ?? '(不明)'}`);
+    console.log('');
+    const path = pairCodePath();
+    if (path) {
+        await writeFile(path, `${shown}\n`, { encoding: 'utf8', mode: 0o600 })
+            .catch(err => console.error(`⚠ 合言葉をファイルに書けませんでした: ${err.message}`));
+    }
+}
+
+/** 合言葉のファイルを消す（渡し終わり／取り消し／期限切れのあと） */
+async function clearCodeFile() {
+    const path = pairCodePath();
+    if (path) await rm(path, { force: true }).catch(() => {});
+}
+
+/**
+ * 🔒 **端末の鍵が提示されたか。**
+ *
+ * ⚠️ **生トークンとは別に扱う。** 端末の鍵は実行を通すが、
+ *    `/api/v0/session` の生トークンの払い出しと `/pair/list` `/pair/revoke` は通さない
+ *    （通すと承認した端末が**別の端末を承認できる** = 承認の連鎖）。
+ */
+function deviceMatches(value) {
+    if (!opts.devicesFile) return null;
+    const hit = deviceBook.match(value);
+    if (!hit) return null;
+    if (hit.firstUse) {
+        auditExec({ event: 'pair-first-use', device: hit.id, label: hit.label }, null)
+            .catch(() => {});
+        saveDevices().catch(() => {});
+    }
+    return hit;
 }
 
 /**
@@ -1409,7 +1520,13 @@ function authed(req, url) {
         //    （exec / checkout / トークン払い出しは presentedToken = 生トークンのみ）
         || presentedReadSecret(req, url)
         || tokenMatches(req.headers[TOKEN_HEADER])
-        || tokenMatches(url.searchParams.get('token'));
+        || tokenMatches(url.searchParams.get('token'))
+        // 🔒 **承認済みの端末の鍵でも読める**（）。
+        //    ⚠️ ここを足し忘れると、承認しても**入口で 401** になり
+        //    「登録できたのに何も見えない」になる（実装中に実際に踏んだ）。
+        //    端末の鍵は読み取り用の秘密より強い（実行も通す）ので、読み取りは当然通す。
+        || Boolean(deviceMatches(req.headers[TOKEN_HEADER]))
+        || Boolean(deviceMatches(url.searchParams.get('token')));
 }
 
 /**
@@ -1443,7 +1560,12 @@ async function gateMutation(req, res) {
     const given = req.headers[TOKEN_HEADER];
     const vals = typeof given === 'string' ? [given] : [];
     // 壁の中身は `tokenWall()` に1本化してある（写すと変異が効かなくなる。#63）
-    const r = await tokenWall(req, res, vals, () => tokenMatches(given));
+    // 🔒 **端末の鍵でも実行を通す（`docs/device-approval.md`）。**
+    //    ⚠️ ただし生トークンとは別扱い。`/api/v0/session` の払い出しと
+    //    `/pair/list` `/pair/revoke` は `tokenMatches()` だけを見る
+    //    （通すと承認した端末が別の端末を承認できる = 承認の連鎖）。
+    const r = await tokenWall(req, res, vals,
+        () => tokenMatches(given) || Boolean(deviceMatches(given)));
     if (r.handled) return false;
     if (!r.ok) {
         denyJson(res, 403, `${TOKEN_HEADER} が一致しません`);
@@ -2498,14 +2620,16 @@ async function handleRequest(req, res) {
                 //    ブラウザは `?token=` で1回渡され、sessionStorage に持つ
                 //    （sessionStorage は**ポートを含むオリジン単位**なので
                 //     他のポートからは読めない。Cookie との決定的な違い）。
-                token: opts.allowWrite && sameOrigin && shown.ok
+                // 🔒 **端末の鍵には生トークンを渡さない**（承認の連鎖を作らない。
+                //    `docs/device-approval.md` の4章）。見るのは `raw` だけ。
+                token: opts.allowWrite && sameOrigin && shown.raw
                     ? opts.token : null,
                 // 🔒 **どちらの秘密で来たかを伝える。**
                 //    案内の URL には読み取り専用の派生秘密しか載せないので、
                 //    ページはそれを「読める鍵」として保持するが、
                 //    **書き込み・実行の鍵と混同してはいけない**
                 //    （混同すると「有効に見えて必ず 403」の状態を作る）。
-                presented: shown.ok ? 'token'
+                presented: shown.raw ? 'token' : shown.device ? 'device'
                     : (presentedReadSecret(req, url) ? 'read' : 'none'),
             }));
             return;
@@ -2530,6 +2654,140 @@ async function handleRequest(req, res) {
          *    merge-tree が落ちた等は `unknown` に積み、`decided:false` を返す。
          *    呼ぶ側が「衝突ゼロ = 安全」と読める形にしない。
          */
+        /**
+         * 🔒 **端末の承認（`docs/device-approval.md`）。**
+         *
+         * 門の順序（順序そのものが守り）:
+         *   request … 読み取りの認証（入口）だけ。合言葉は**応答に載せない**
+         *   claim   … id + 合言葉。**tokenWall**（記録と遅延）＋**試行5回**
+         *   list / revoke / cancel … **生の実行トークンだけ**（端末の鍵では通さない）
+         */
+        if (url.pathname.startsWith('/api/v0/pair/')) {
+            const action = url.pathname.slice('/api/v0/pair/'.length);
+            if (req.method !== 'POST') { denyJson(res, 405, 'POST のみ受け付けます'); return; }
+            // ⚠️ 使えない構成なら**理由を返す**（黙って 404 にしない）
+            const why = pairingWhy();
+            if (why) { denyJson(res, 403, why); return; }
+            // 🔒 別オリジン起点は拒否（precheck と同じ基準）
+            {
+                const site = req.headers['sec-fetch-site'];
+                if (site && site !== 'same-origin') {
+                    denyJson(res, 403, `別オリジン起点の要求は拒否します (Sec-Fetch-Site: ${site})`);
+                    return;
+                }
+            }
+            let body = {};
+            try { body = await readJson(req); } catch (err) {
+                denyJson(res, err.tooLarge ? 413 : 400, err.message); return;
+            }
+            const ok = payload => {
+                res.writeHead(200, {
+                    'content-type': 'application/json; charset=utf-8',
+                    'cache-control': 'no-store',
+                });
+                res.end(JSON.stringify(payload));
+            };
+
+            if (action === 'request') {
+                const r = deviceBook.request(body.label);
+                await auditExec({
+                    event: 'pair-request', label: r.label,
+                    replaced: r.replaced?.label ?? null, ...originHint(req),
+                }, null);
+                // 🔒 **合言葉は母艦にだけ**（stdout と 0600 のファイル）
+                await announceCode(req, r.code, r.label);
+                // ⚠️ 応答には id と期限だけ。**code を入れない**
+                ok({
+                    id: r.id, label: r.label, expiresInMs: PAIR_TTL_MS,
+                    // 上書きしたことは要求した側にも伝える（黙って捨てない）
+                    replaced: r.replaced?.label ?? null,
+                    how: '母艦で「node scripts/serve.mjs --pair」を実行して合言葉を見て、'
+                        + 'この端末に入力してください',
+                });
+                return;
+            }
+
+            if (action === 'status') {
+                const cur = deviceBook.current();
+                // ⚠️ 自分の要求かどうかだけ答える。**合言葉も鍵も返さない**
+                ok(cur && cur.id === String(body.id ?? '')
+                    ? { state: 'pending', triesLeft: cur.triesLeft, expiresInMs: cur.expiresInMs }
+                    : { state: 'unknown' });
+                return;
+            }
+
+            if (action === 'claim') {
+                // 🚨 **合言葉の照合は壁を通す**（記録と遅延）。試行の上限は台帳側。
+                const peer = peerKey(req);
+                let out = { state: 'unknown' };
+                const wall = await tokenWall(req, res, [String(body.code ?? '')], () => {
+                    out = deviceBook.claim(body.id, body.code);
+                    return out.state === 'approved';
+                });
+                if (wall.handled) return;
+                if (out.state === 'approved') {
+                    await saveDevices();
+                    await clearCodeFile();
+                    await auditExec({
+                        event: 'pair-claimed', device: out.device.id, label: out.device.label,
+                        ...originHint(req),
+                    }, null);
+                    console.log(`🔑 端末を登録しました: ${out.device.label}`);
+                    // 🔒 鍵は**この1回だけ**。Cookie には入れない（呼ぶ側が localStorage に置く）
+                    ok({ state: 'approved', secret: out.secret, device: out.device });
+                    return;
+                }
+                if (out.state === 'too-many') {
+                    await clearCodeFile();
+                    await auditExec({ event: 'pair-too-many', ...originHint(req) }, null);
+                    denyJson(res, 429,
+                        '合言葉を外しすぎたので要求を無効にしました（もう一度「この端末を登録」から）');
+                    return;
+                }
+                if (out.state === 'bad-code') {
+                    await auditExec({
+                        event: 'pair-bad-code', triesLeft: out.triesLeft, ...originHint(req),
+                    }, null);
+                    denyJson(res, 403, `合言葉が違います（あと ${out.triesLeft} 回）`);
+                    return;
+                }
+                void peer;
+                denyJson(res, 409, '承認待ちの要求がありません（期限切れかもしれません）');
+                return;
+            }
+
+            // ここから下は**生の実行トークンだけ**（端末の鍵では通さない）
+            if (action === 'list' || action === 'revoke' || action === 'cancel') {
+                if (!await gateExec(req, res)) return;
+                // 🔒 gateExec は端末の鍵でも通るので、**ここで生トークンを要求し直す**
+                if (!tokenMatches(req.headers[TOKEN_HEADER])) {
+                    denyJson(res, 403,
+                        '端末の一覧と失効は生の実行トークンが必要です'
+                        + '（承認した端末が別の端末を承認できないようにするため）');
+                    return;
+                }
+                if (action === 'list') {
+                    ok({ devices: deviceBook.list(), pending: deviceBook.current() });
+                    return;
+                }
+                if (action === 'cancel') {
+                    const had = deviceBook.cancel();
+                    await clearCodeFile();
+                    ok({ ok: Boolean(had), cancelled: had?.label ?? null });
+                    return;
+                }
+                const r = deviceBook.revoke(String(body.id ?? ''));
+                if (!r.ok) { denyJson(res, 409, r.why); return; }
+                await saveDevices();
+                await auditExec({
+                    event: 'pair-revoke', device: r.device.id, label: r.device.label,
+                }, null);
+                ok({ ok: true, device: r.device });
+                return;
+            }
+            denyJson(res, 404, `知らない操作です: ${action}`);
+            return;
+        }
         if (url.pathname === '/api/v0/precheck') {
             if (req.method !== 'POST') { denyJson(res, 405, 'POST のみ受け付けます'); return; }
             // 🔒 **同一オリジンだけ（#62）。** 入口の `siteAllowed()` は `same-site` と
@@ -3576,6 +3834,7 @@ async function handleRequest(req, res) {
             || url.pathname === '/mergeplan.mjs'
             || url.pathname === '/inputnote.mjs'
             || url.pathname === '/theme.mjs'
+            || url.pathname === '/devicekey.mjs'
             || url.pathname === '/panegrid.mjs') {
             const js = await readFile(join(HERE, url.pathname.slice(1)));
             res.writeHead(200, {
@@ -3895,6 +4154,10 @@ if (opts.requireAuth && !opts.token) {
 if (opts.allowWrite && !opts.token) {
     opts.token = randomBytes(32).toString('base64url');
 }
+
+// 🔑 端末の台帳を読む（--devices-file が無ければ何もしない）。
+//    ⚠️ listen より前に読む（承認済みの端末が最初の要求で通らない窓を作らない）。
+await loadDevices();
 
 server.listen(opts.port, '127.0.0.1', () => {
     const { port } = server.address();

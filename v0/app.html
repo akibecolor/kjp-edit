@@ -451,6 +451,9 @@ import { mergeOutcome } from './mergeresult.mjs';
 import { mergeTargets } from './mergeplan.mjs';
 import { inputNote } from './inputnote.mjs';
 import { nextTheme, resolveTheme, THEME_LABEL } from './theme.mjs';
+import {
+  pickCredential, canMutateWith, deviceLabel, DEVICE_KEY, URL_KEY,
+} from './devicekey.mjs';
 // 保存前に見せる差分。編集中の内容はまだどこにも無いので `git diff` に渡せない
 // （渡すには「先に書く」しかなく、「書く前に見せる」と矛盾する）
 import { diffLines } from './linediff.mjs';
@@ -1775,6 +1778,101 @@ function keyPasteBox() {
   bar.append(inp, btn);
   const box = el('div');
   box.append(bar, msg);
+
+  /* 🔑 **この端末を登録する（`docs/device-approval.md`）。**
+   *
+   * 押すと母艦に合言葉が出る（**この画面には出ない**）。
+   * 合言葉を入れると、この端末専用の鍵が `localStorage` に入り、
+   * 以後は**貼り直さなくても**実行できる。
+   * ⚠️ 鍵は Cookie に入れない（ポートで分離されないので他のローカルページに渡る）。
+   */
+  const pairBar = el('div', 'cmdbar');
+  const pairBtn = el('button', null, 'この端末を登録');
+  pairBar.append(pairBtn);
+  const pairMsg = el('div', 'wrmsg');
+  const codeBar = el('div', 'cmdbar');
+  const codeInp = el('input');
+  codeInp.placeholder = '母艦に出た合言葉（ABCD-EFGH）';
+  codeInp.spellcheck = false;
+  codeInp.autocapitalize = 'characters';
+  const codeBtn = el('button', null, '登録する');
+  codeBar.append(codeInp, codeBtn);
+  codeBar.hidden = true;
+  let pairId = null;
+
+  const pairPost = async (action, body) => {
+    const r = await fetch(`/api/v0/pair/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(session.token ? { [session.tokenHeader]: session.token } : {}),
+      },
+      body: JSON.stringify(body ?? {}),
+    });
+    let out = null;
+    try { out = await r.json(); } catch { /* 本文が JSON でない */ }
+    return { code: r.status, body: out };
+  };
+
+  pairBtn.addEventListener('click', async () => {
+    pairBtn.disabled = true;
+    pairMsg.className = 'wrmsg';
+    pairMsg.textContent = '登録を要求しています…';
+    const r = await pairPost('request', {
+      label: deviceLabel(navigator.userAgent, navigator.platform),
+    });
+    pairBtn.disabled = false;
+    if (r.code !== 200) {
+      pairMsg.className = 'wrmsg bad';
+      pairMsg.textContent = `✖ ${r.body?.error ?? `HTTP ${r.code}`}`;
+      return;
+    }
+    pairId = r.body.id;
+    codeBar.hidden = false;
+    codeInp.focus();
+    // ⚠️ **どこで合言葉を見るかを書く**（窓なしで起動していると stdout が見えない）
+    pairMsg.className = 'wrmsg';
+    pairMsg.textContent = '母艦で「node scripts/serve.mjs --pair」を実行して'
+      + '合言葉を見て、下に入れてください（5分で切れます）'
+      + (r.body.replaced ? `。⚠ 先に待っていた「${r.body.replaced}」の要求は取り消されました` : '');
+  });
+
+  const sendCode = async () => {
+    if (!pairId) return;
+    const code = codeInp.value.trim();
+    if (!code) return;
+    codeBtn.disabled = true;
+    const r = await pairPost('claim', { id: pairId, code });
+    codeBtn.disabled = false;
+    if (r.code === 200 && r.body?.secret) {
+      // ⚠️ **貼った鍵の枠は消さない。** 一度ここで消していたが、それは
+      //    「URL の値を貼った鍵と同じ枠に入れていた」時代の後始末で、
+      //    枠を分けた今は**その後始末が不具合を隠す**（枠の混同を戻す変異が
+      //    SURVIVED した = 守りが検証されない状態になっていた）。
+      //    貼った鍵は利用者が明示的に渡したものなので、勝手に捨てない。
+      try { localStorage.setItem(DEVICE_KEY, r.body.secret); } catch {
+        pairMsg.className = 'wrmsg bad';
+        pairMsg.textContent = 'このブラウザでは保存できません（プライベートモード？）';
+        return;
+      }
+      codeInp.value = '';
+      pairMsg.className = 'wrmsg';
+      pairMsg.textContent = '✔ 登録しました。次からは鍵を貼らなくても使えます';
+      location.reload();
+      return;
+    }
+    // ⚠️ **理由をそのまま出す**（残り回数・無効化を隠さない）
+    pairMsg.className = 'wrmsg bad';
+    pairMsg.textContent = `✖ ${r.body?.error ?? `HTTP ${r.code}`}`;
+    if (r.code === 429) { codeBar.hidden = true; pairId = null; }
+  };
+  codeBtn.addEventListener('click', sendCode);
+  // ⚠️ IME の変換確定 Enter で送らない（半端な値が入る）
+  codeInp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) sendCode();
+  });
+
+  box.append(pairBar, codeBar, pairMsg);
   return box;
 }
 
@@ -3258,13 +3356,26 @@ const TOKEN_KEY = 'kjp_token';
   const u = new URL(location.href);
   const t = u.searchParams.get('token');
   if (t) {
-    try { sessionStorage.setItem(TOKEN_KEY, t); } catch { /* 使えない環境 */ }
+    // 🚨 **URL で来た鍵は貼った鍵とは別の枠に入れる（実測で踏んだ）。**
+    //    同じ枠に入れると `pickCredential` が「貼った鍵」として扱い、
+    //    **端末の鍵より優先**してしまう（承認済みなのに「トークン未取得」になる）。
+    try { sessionStorage.setItem(URL_KEY, t); } catch { /* 使えない環境 */ }
     u.searchParams.delete('token');
     history.replaceState(null, '', `${u.pathname}${u.search}${u.hash}`);
   }
+  // 🔑 **承認済みの端末の鍵も候補にする**（`docs/device-approval.md`）。
+  //    ⚠️ 強い順の判定は devicekey.mjs（テスト済み）。ここでは集めるだけ。
   let held = null;
   try { held = sessionStorage.getItem(TOKEN_KEY); } catch { /* noop */ }
-  if (held) session.token = held;
+  let deviceKey = null;
+  try { deviceKey = localStorage.getItem(DEVICE_KEY); } catch { /* noop */ }
+  let storedUrlToken = null;
+  try { storedUrlToken = sessionStorage.getItem(URL_KEY); } catch { /* noop */ }
+  const picked = pickCredential({
+    urlToken: t, sessionToken: held, deviceKey, storedUrlToken,
+  });
+  if (picked.value) session.token = picked.value;
+  session.credentialKind = picked.kind;
 }
 
 try {
@@ -3278,6 +3389,9 @@ try {
     // サーバが null を返しても、手元に持っているトークンは捨てない
     session = { ...session, ...got, token: got.token ?? session.token };
   }
+  // ⚠️ **失効した端末の鍵をここで捨てる処理は置かない。** 実測で「握り続けると
+  //    読み取りまで塞ぐ」は起きず（読み取りは Cookie で続く）、実行も
+  //    鍵つき URL を開き直せば戻る（`urlToken` が最優先）。理由は devicekey.mjs。
 } catch { /* 観測のみで動く */ }
 /**
  * 🔒 **読み取り用の鍵と、書き込み・実行の鍵を混同しない。**
@@ -3289,7 +3403,9 @@ try {
  * なる（このリポジトリが BLOCKING として扱ってきた形）。
  * サーバが `presented` でどちらか教えるので、書き込み系の UI はこれで判定する。
  */
-session.canMutate = session.presented === 'token';
+// 🔑 端末の鍵でも書き込み・実行に使える（判定は devicekey.mjs）。
+//    ⚠️ 読み取り用の派生秘密は使えない（混ぜると「有効に見えて必ず 403」）。
+session.canMutate = canMutateWith(session.presented);
 const cap = $('#cap');
 // ⚠️ **「有効」と「使える」を分ける。** 鍵が無い / 読み取り用しか無いと
 //    有効でも必ず 403 になるので、バッジで区別する

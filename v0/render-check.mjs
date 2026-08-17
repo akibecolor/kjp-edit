@@ -97,7 +97,9 @@ const MEASURE = `(async () => {
     // 🚨 トークンの扱いを**実際の挙動として**測る（#41）。
     //    smoke 側は JS の字面しか見ていなかったので、行を残したまま
     //    到達不能にする変更（早期 return / 条件で囲む）が完全に見えなかった。
-    heldToken: (() => { try { return sessionStorage.getItem('kjp_token'); } catch { return null; } })(),
+    // ⚠️ 案内 URL で来た鍵は貼った鍵とは別の枠（kjp_url）。同じ枠に入れると
+    //    端末の鍵より優先されて、承認済みなのに使えなくなる（実測で踏んだ）
+    heldToken: (() => { try { return sessionStorage.getItem('kjp_url'); } catch { return null; } })(),
     search: location.search,
     href: location.href,
     // ⚠️ dataset のフラグではなく**実際に見える文字**を返す。
@@ -705,7 +707,9 @@ const READKEY_CHECK = `(async () => {
     await wait(200);
   }
   return {
-    heldToken: (() => { try { return sessionStorage.getItem('kjp_token'); } catch { return null; } })(),
+    // ⚠️ 案内 URL で来た鍵は貼った鍵とは別の枠（kjp_url）。同じ枠に入れると
+    //    端末の鍵より優先されて、承認済みなのに使えなくなる（実測で踏んだ）
+    heldToken: (() => { try { return sessionStorage.getItem('kjp_url'); } catch { return null; } })(),
     canRun: [...pane.querySelectorAll('button')].some(b => b.textContent === '実行'),
     said: /出せません/.test(text),
     sample: text.replace(/\\s+/g, ' ').slice(0, 300),
@@ -813,7 +817,9 @@ const EDITOR_READKEY_CHECK = `(async () => {
   return {
     // 🚨 前提の確認: このタブが**鍵を持っている**こと（持っていないなら
     //    「token の有無で判定する」退行を再現できない = 何も測れていない）
-    heldToken: (() => { try { return sessionStorage.getItem('kjp_token'); } catch { return null; } })(),
+    // ⚠️ 案内 URL で来た鍵は貼った鍵とは別の枠（kjp_url）。同じ枠に入れると
+    //    端末の鍵より優先されて、承認済みなのに使えなくなる（実測で踏んだ）
+    heldToken: (() => { try { return sessionStorage.getItem('kjp_url'); } catch { return null; } })(),
     // 🚨 測る対象が描かれていること自体を確かめる（差分ペインとタブが無いなら空振り）
     panes: panesOf().length,
     tabs,
@@ -1252,8 +1258,11 @@ try {
     //    ⚠️ 他の検査の前提（鍵を持っている）を壊すので、必ずこの位置。
     //    ⚠️ この前段（鍵を捨てて読み込み直す）を接ぎ忘れて、統合直後に
     //       「鍵を捨てられていない = 何も測っていない」で落ちた。**手順ごと接ぐ。**
+    // ⚠️ **枠が2つある**（貼った鍵 `kjp_token` と URL で来た鍵 `kjp_url`）。
+    //    片方だけ消すと鍵が残り、「読み取り用の鍵だけ」の状態を作れない = 何も測れない。
     await evaluate(`(() => {
       try { sessionStorage.removeItem('kjp_token'); } catch (e) { /* 使えない環境 */ }
+      try { sessionStorage.removeItem('kjp_url'); } catch (e) { /* 使えない環境 */ }
       location.reload();
       return true;
     })()`).catch(() => { /* reload で実行コンテキストが消えるのは正常 */ });
@@ -1285,7 +1294,7 @@ try {
         editorReadKey = { error: '案内の URL に生の鍵が載っているので、読み取り鍵の状態を作れない' };
     } else if (readSecret !== null) {
         await evaluate(`(() => {
-          try { sessionStorage.setItem('kjp_token', ${JSON.stringify(readSecret)}); }
+          try { sessionStorage.setItem('kjp_url', ${JSON.stringify(readSecret)}); }
           catch (e) { /* 使えない環境 */ }
           location.reload();
           return true;

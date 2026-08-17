@@ -16,7 +16,9 @@ import { repoOf, reposOf, samePathish } from './winargs.mjs';
 
 /** 起動口が受け付けるフラグ。ここに無いものは黙って捨てずに止める */
 export const SERVE_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
-    '--watch', '--agents-text', '--timeout', '--status', '--stop', '--all', '--help', '-h']);
+    '--watch', '--agents-text', '--timeout', '--status', '--stop', '--all', '--help', '-h',
+    // 🔑 端末の承認（`docs/device-approval.md`）。母艦で合言葉を読む／失効させる
+    '--pair', '--revoke']);
 
 /** 自動起動の登録が受け付けるフラグ（`--status` 等はサブコマンドなので入らない） */
 export const AUTOSTART_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
@@ -37,7 +39,9 @@ export const FLAG_ALIAS = {
 };
 
 /** 値を取るフラグ。次のトークンは値なので、フラグとして検査してはいけない */
-export const VALUE_FLAGS = new Set(['--repo', '--port', '--allow-host', '--timeout']);
+export const VALUE_FLAGS = new Set(['--repo', '--port', '--allow-host', '--timeout',
+    // 🔑 `--pair --revoke <id>` の id を「知らないフラグ」と誤報しない
+    '--revoke']);
 
 /**
  * 未知のフラグを探す。見つからなければ null。
@@ -159,6 +163,7 @@ export function collectRepos(argv) {
  */
 export function serverArgs({
     argv, server, repos, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
+    devicesFile,
     execTimeout = null,
 }) {
     const has = f => argv.includes(f);
@@ -203,6 +208,10 @@ export function serverArgs({
     //    401 を記録するのは `--require-auth` を付けた瞬間からなので、
     //    「実行を許したときだけ記録が出る」という前提が既に成り立っていない。
     if (auditLog) args.push('--audit-log', auditLog);
+    // 🔑 **端末の台帳も capability に関係なく渡す**（監査ログと同じ理由）。
+    //    ⚠️ ただし経路が有効になるのは `--require-auth` のときだけ（サーバ側で判定）。
+    //    渡さないと「登録しようとしたら 403」になり、理由が分かりにくい。
+    if (devicesFile) args.push('--devices-file', devicesFile);
     if (wantExec) {
         args.push('--allow-exec');
         // 🚨 **絶対上限を起動口から延ばせるようにする。**

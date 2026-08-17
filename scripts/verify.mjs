@@ -269,6 +269,23 @@ if (!quick && !failed) {
     steps.push({ name: 'theme', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
+// 8. 端末の承認を UI から通す検査。**「どの枠から鍵を読むか」の配線は app.html の中**
+//    なので、unit では字面しか見られない（行を残して到達不能にする変更が見えない）。
+//    実際にこの配線で壊れた（承認済みなのに「実行有効（トークン未取得）」）。
+if (!quick && !failed) {
+    const r = await run(['v0/pair-check.mjs'], { timeout: 240_000 });
+    const skipped = /skipped/.test(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `pair ${(r.ms / 1000).toFixed(1)}s`,
+        ok, skipped,
+        detail: ok ? [] : detailLines(r.output, r.timedOut ? 10 : 6, r.timedOut),
+    });
+    if (!ok) failed = true;
+} else {
+    steps.push({ name: 'pair', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
+}
+
 // ---- 出力: 20行以内 ----
 // 🚨 **飛ばした検査は緑のときも名前を出す（#52）。**
 //    「このプラットフォームでは測っていない」を毎回目に入れる。
@@ -294,5 +311,6 @@ if (failed) {
     console.log('    node --test v0/swimlanes.test.mjs v0/paths.test.mjs v0/ndjson.test.mjs v0/mergeplan.test.mjs v0/argv.test.mjs');
     console.log('    node --test v0/smoke.test.mjs');
     console.log('    node v0/layout-check.mjs');
+    console.log('    node v0/pair-check.mjs        # 端末の承認を UI から通す');
 }
 process.exit(failed ? 1 : 0);

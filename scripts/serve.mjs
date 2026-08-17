@@ -226,6 +226,128 @@ async function running() {
     });
 }
 
+/* ---------------------------------------------------------------------------
+ * 🔑 端末の承認（`docs/device-approval.md`）
+ *
+ * 🚨 **ここが「母艦にいること」の証明。** 合言葉はデーモンの stdout と
+ *    `~/.kjp-edit/pair-code`（0600）にだけ出る。読めるのはこのマシンの所有者だけ。
+ *    ⚠️ 窓なしで起動していると stdout が見えないので、**このコマンドが実質の入口**。
+ * --------------------------------------------------------------------------- */
+if (has('--pair')) {
+    const codePath = join(STATE_DIR, 'pair-code');
+    const target = has('--revoke') ? val('--revoke', null) : null;
+    if (has('--revoke') && !target) {
+        console.error('\n✖ --revoke には端末の id を指定してください');
+        console.error('      node scripts/serve.mjs --pair            # 一覧と id を見る');
+        console.error('      node scripts/serve.mjs --pair --revoke <id>\n');
+        process.exit(1);
+    }
+
+    // 動いているデーモンに聞く（在庫の値は古いことがあるので、動いていれば HTTP を優先）
+    const probe = await running();
+    const scope = await topLevel(process.cwd());
+    const mine = probe.supported
+        ? probe.list.find(r => servesRepo(r.cmd, scope) === true) : null;
+    let token = null;
+    try { token = (await readFile(join(STATE_DIR, 'token-exec'), 'utf8')).trim(); } catch { /* 無い */ }
+
+    const askDaemon = async (path, body) => {
+        if (!mine?.port || !token) return null;
+        try {
+            const r = await fetch(`http://127.0.0.1:${mine.port}/api/v0/pair/${path}`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-kjp-token': token,
+                    'sec-fetch-site': 'same-origin',
+                },
+                body: JSON.stringify(body ?? {}),
+            });
+            const text = await r.text();
+            try { return { code: r.status, body: JSON.parse(text) }; }
+            catch { return { code: r.status, body: text.slice(0, 200) }; }
+        } catch (e) { return { code: 0, body: e.message }; }
+    };
+
+    if (target) {
+        const r = await askDaemon('revoke', { id: target });
+        if (r === null) {
+            console.error('\n✖ 失効はデーモンが動いているときだけできます'
+                + '（台帳を直接書き換えると、動いているデーモンの記憶と食い違います）\n');
+            process.exit(1);
+        }
+        if (r.code !== 200) {
+            console.error(`\n✖ 失効できませんでした: ${r.body?.error ?? r.body}\n`);
+            process.exit(1);
+        }
+        console.log(`失効しました: ${r.body.device?.label ?? target}`);
+        process.exit(0);
+    }
+
+    // 合言葉（承認待ちがあるときだけ存在する）
+    let code = null;
+    try { code = (await readFile(codePath, 'utf8')).trim(); } catch { /* 無い */ }
+
+    const listed = await askDaemon('list', {});
+    console.log('');
+    if (code) {
+        console.log(`🔑 合言葉: ${code}`);
+        console.log('   この値を**登録したい端末**に入力してください（5分で切れます）。');
+        const pend = listed?.code === 200 ? listed.body.pending : null;
+        if (pend) {
+            console.log(`   要求している端末: ${pend.label}`
+                + `（あと ${Math.round((pend.expiresInMs ?? 0) / 1000)} 秒 / `
+                + `残り試行 ${pend.triesLeft}）`);
+        }
+    } else {
+        console.log('承認待ちの要求はありません。');
+        console.log('   端末側で「この端末を登録」を押すと、ここに合言葉が出ます。');
+    }
+
+    console.log('');
+    if (listed === null) {
+        // ⚠️ **「調べられない」を「無い」と言わない。** 台帳のファイルを読んで代わりに出すが、
+        //    最終使用時刻は初回しか保存していないので**古いことがある**と告げる。
+        console.log('⚠ デーモンが動いていないので、台帳のファイルから読みます');
+        console.log('  （最終使用は初回のぶんだけなので古いことがあります）');
+        try {
+            const raw = JSON.parse(await readFile(join(STATE_DIR, 'devices.json'), 'utf8'));
+            const list = (raw.devices ?? []).map(d => ({
+                id: d.id, label: d.label, createdAt: d.createdAt,
+                lastUsedAt: d.lastUsedAt, revokedAt: d.revokedAt,
+            }));
+            printDevices(list);
+        } catch { console.log('  台帳はまだありません（承認した端末が0台）'); }
+    } else if (listed.code !== 200) {
+        console.log(`⚠ 一覧を取れませんでした: ${listed.body?.error ?? listed.body}`);
+    } else {
+        printDevices(listed.body.devices ?? []);
+    }
+    console.log('');
+    console.log('  失効: node scripts/serve.mjs --pair --revoke <id>');
+    console.log('');
+    process.exit(0);
+}
+
+function printDevices(list) {
+    const live = list.filter(d => !d.revokedAt);
+    const dead = list.filter(d => d.revokedAt);
+    if (!live.length) console.log('承認した端末: 0 台');
+    else {
+        console.log(`承認した端末: ${live.length} 台`);
+        for (const d of live) {
+            console.log(`  ${d.id.slice(0, 8)}  ${d.label}`
+                + `  登録 ${String(d.createdAt).slice(0, 16).replace('T', ' ')}`
+                + `  最終使用 ${d.lastUsedAt ? String(d.lastUsedAt).slice(0, 16).replace('T', ' ') : '(まだ)'}`);
+        }
+    }
+    // ⚠️ 失効したものも出す（消したつもりが残っていないかを確かめられるように）
+    if (dead.length) {
+        console.log(`失効済み: ${dead.length} 台`);
+        for (const d of dead) console.log(`  ${d.id.slice(0, 8)}  ${d.label}  失効 ${String(d.revokedAt).slice(0, 16).replace('T', ' ')}`);
+    }
+}
+
 if (has('--status')) {
     const { supported, list, why } = await running();
     if (!supported) {
@@ -519,6 +641,7 @@ const args = serverArgs({
     writeTokenFile: join(STATE_DIR, 'token-write'),
     execTokenFile: join(STATE_DIR, 'token-exec'),
     auditLog: join(STATE_DIR, 'exec-audit.jsonl'),
+    devicesFile: join(STATE_DIR, 'devices.json'),
     execTimeout: timeoutCheck.seconds,
 });
 const wantExec = has('--exec');

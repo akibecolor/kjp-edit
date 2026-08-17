@@ -165,6 +165,32 @@ node scripts/serve.mjs --allow-host fractal2.tail73c198.ts.net
 
 4. スマホのブラウザでそのアドレスを開く
 
+### 🔑 実行の鍵を毎回貼らないようにする（端末の登録）
+
+スマホから実行を使うなら、**その端末を1回だけ承認**しておく
+（設計は [device-approval.md](device-approval.md)、使い方は `../v0/README.md`）。
+
+1. スマホの画面のコンソールで「**この端末を登録**」を押す
+2. 母艦で合言葉を見る:
+
+```bash
+node scripts/serve.mjs --pair
+#   🔑 合言葉: ABCD-EFGH
+```
+
+3. スマホに入れて「登録する」。以後は**鍵を貼らずに**実行できる
+
+⚠️ **合言葉はスマホの画面には出ません**（出たら「母艦にいること」の証明にならない）。
+⚠️ 5分で切れます。5回外すと要求ごと無効になるので、もう一度1から。
+
+```bash
+node scripts/serve.mjs --pair                    # 一覧と id を見る
+node scripts/serve.mjs --pair --revoke 3f9a12b8  # 端末を失効させる
+```
+
+失効させると**実行だけ**が止まります（読み取りは Cookie で続く）。
+実行を戻すには `?token=` 付きの URL を開き直します。
+
 ### つまずいた点（実際に踏んだ）
 
 - **`tailscale serve` は tailnet 側で機能を有効化しないと動かない。**

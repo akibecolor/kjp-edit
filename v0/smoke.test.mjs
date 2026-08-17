@@ -7381,3 +7381,298 @@ test('🔒 読み取りの鍵では記録の発話とコマンド行を返さな
         await rm(home, { recursive: true, force: true }).catch(() => {});
     }
 });
+
+/* ===========================================================================
+ * 🔑 端末の承認（`docs/device-approval.md` §6 の一覧をここで測る）
+ *
+ * 🚨 **「応答に合言葉が載らない」を字面で測らない。** 実際の本文を読む。
+ *    JS の字面を assert する検査は「行を残して到達不能にする」変更が見えない
+ *    （CLAUDE.md / `docs/review-5-6-parallel.md`）。
+ * =========================================================================== */
+
+const READ_OF_EXEC = readSecretOf(EXEC_TOKEN);
+
+async function startPair(extra = []) {
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-pair-'));
+    // ⚠️ **`--require-auth` が要る。** 入口に壁が無い構成では登録の経路そのものを
+    //    閉じてある（壁が無いなら鍵を配る意味も無い）。実測で 403 になって気付いた。
+    const s = await startExec(['--require-auth',
+        '--devices-file', join(dir, 'devices.json'),
+        '--audit-log', join(dir, 'audit.jsonl'), ...extra]);
+    return { ...s, dir, devices: join(dir, 'devices.json'), audit: join(dir, 'audit.jsonl') };
+}
+
+/** 合言葉は**母艦のファイル**からしか読めない（応答には無い）ことを前提にした読み方 */
+async function codeFromHost(dir) {
+    return (await readFile(join(dir, 'pair-code'), 'utf8')).trim();
+}
+
+function pairPost(url, action, body, headers = {}) {
+    return fetch(`${url}/api/v0/pair/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body ?? {}),
+    });
+}
+
+/** 端末側のふり（読み取りの鍵しか持っていない状態で登録を要求する） */
+const asPhone = { 'x-kjp-token': READ_OF_EXEC };
+/** 母艦のふり（生の実行トークン） */
+const asHost = { 'x-kjp-token': EXEC_TOKEN };
+
+test('🔒 合言葉は応答に載らず、母艦のファイル（0600）にだけ出る', async () => {
+    const s = await startPair();
+    try {
+        const r = await pairPost(s.url, 'request', { label: 'スモークの端末' }, asPhone);
+        assert.equal(r.status, 200);
+        const raw = await r.text();
+        const body = JSON.parse(raw);
+        const code = await codeFromHost(s.dir);
+        // 🚨 **表記を揃えてから探す。** 母艦に出るのは `ABCD-EFGH`、内部の値は
+        //    ハイフン無しなので、そのまま `includes` すると**載っていても見つからない**
+        //    （実測: 応答に生の合言葉を載せる変異が SURVIVED した）。
+        const bare = code.replace(/[^0-9A-Z]/g, '');
+        const hasCode = t => t.includes(code) || (bare.length >= 8 && t.includes(bare));
+        // 🔒 本文のどこにも合言葉が無い（id や label に紛れ込ませていない）
+        assert.equal(hasCode(raw), false, `応答に合言葉が載っている: ${raw}`);
+        // 🔒 Cookie にも載せない（ポートで分離されないので他のローカルページに渡る）
+        assert.equal(hasCode(r.headers.get('set-cookie') ?? ''), false,
+            '合言葉が Cookie に出ている');
+        // ⚠️ 合言葉が「そもそも出ていない」を緑と読まないため、形も測る
+        assert.match(code, /^[23456789A-HJ-NP-TV-Z]{4}-[23456789A-HJ-NP-TV-Z]{4}$/,
+            `母艦に合言葉が出ていない: ${JSON.stringify(code)}`);
+
+        // 🔒 status も合言葉を返さない（自分の要求かどうかだけ）
+        const st = await (await pairPost(s.url, 'status', { id: body.id }, asPhone)).text();
+        assert.equal(hasCode(st), false, `status に合言葉が載っている: ${st}`);
+        assert.equal(JSON.parse(st).state, 'pending');
+        // 他人の id には「知らない」としか答えない（存在も漏らさない）
+        const other = await (await pairPost(s.url, 'status', { id: 'よその id' }, asPhone)).json();
+        assert.deepEqual(other, { state: 'unknown' });
+
+        // ファイルの権限（POSIX だけ。Windows は ACL なので測れない → 測れないと言う）
+        if (process.platform !== 'win32') {
+            const { stat } = await import('node:fs/promises');
+            const mode = (await stat(join(s.dir, 'pair-code'))).mode & 0o777;
+            assert.equal(mode, 0o600, `合言葉のファイルが他人に読める: ${mode.toString(8)}`);
+        }
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔑 承認した端末は鍵を貼らずに実行でき、承認前は 403 のまま', async () => {
+    const s = await startPair();
+    try {
+        // 承認前: 読み取りの鍵では実行できない（今までの守り）
+        const before = await fetch(`${s.url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...asPhone },
+            body: JSON.stringify({ worktree: repo, argv: ['git', '--version'] }),
+        });
+        assert.equal(before.status, 403, '承認前に実行が通っている');
+        void await before.text();
+
+        const req = await (await pairPost(s.url, 'request', { label: 'スモークの端末' }, asPhone)).json();
+        const code = await codeFromHost(s.dir);
+        const got = await pairPost(s.url, 'claim', { id: req.id, code }, asPhone);
+        assert.equal(got.status, 200);
+        // 🔒 鍵は本文で1回だけ。**Set-Cookie に出さない**（応答で測る。字面ではなく）
+        const cookieOnClaim = got.headers.get('set-cookie') ?? '';
+        const secret = (await got.json()).secret;
+        assert.ok(secret && secret.length >= 32, `鍵が短い: ${JSON.stringify(secret)}`);
+        assert.equal(cookieOnClaim.includes(secret), false,
+            '🚨 端末の鍵が Cookie に出ている（ポートで分離されないので他のローカルページに渡る）');
+        // 合言葉のファイルは使い終わったら消える（残すと再利用できる）
+        const left = await codeFromHost(s.dir).then(v => v, () => null);
+        assert.equal(left, null, `合言葉のファイルが残っている: ${left}`);
+
+        // 🔑 端末の鍵だけで実行できる（＝貼らなくていい）
+        const after = await fetch(`${s.url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': secret },
+            body: JSON.stringify({ worktree: repo, argv: ['git', '--version'] }),
+        });
+        // ⚠️ **assert のメッセージで `await r.text()` を呼ばない。** 本文は1度しか読めず
+        //    「Body has already been read」で**別の原因に見える失敗**になる（CLAUDE.md）
+        const afterBody = await after.text();
+        assert.equal(after.status, 200, `端末の鍵で実行できない: ${afterBody}`);
+
+        // 再読込しても続く（毎回台帳で照合する。1回限りにしていない）
+        const sess = await (await fetch(`${s.url}/api/v0/session`,
+            { headers: { 'x-kjp-token': secret } })).json();
+        assert.equal(sess.presented, 'device', `端末として認識されない: ${JSON.stringify(sess)}`);
+        assert.equal(sess.allowExec, true);
+        // 🔒 **承認の連鎖を作らない。** 端末の鍵では生トークンを受け取れない
+        assert.equal(sess.token ?? null, null,
+            '🚨 端末の鍵に生の実行トークンを渡している（他の端末を承認できてしまう）');
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 合言葉を5回外すと要求が無効になり、正しい合言葉でも通らない', async () => {
+    const s = await startPair();
+    try {
+        const req = await (await pairPost(s.url, 'request', { label: '総当たりする端末' }, asPhone)).json();
+        const code = await codeFromHost(s.dir);
+        const wrong = code === 'AAAA-AAAA' ? 'BBBB-BBBB' : 'AAAA-AAAA';
+        const codes = [];
+        for (let i = 0; i < 5; i += 1) {
+            const r = await pairPost(s.url, 'claim', { id: req.id, code: wrong }, asPhone);
+            codes.push(r.status);
+            void await r.text();
+        }
+        // 5回目で無効化（429）。403 が5つ並ぶなら上限が効いていない
+        assert.equal(codes.filter(c => c === 429).length, 1,
+            `試行の上限が効いていない: ${codes.join(',')}`);
+        // 🔒 無効化後は**正しい合言葉でも通らない**（ここが本体）
+        const after = await pairPost(s.url, 'claim', { id: req.id, code }, asPhone);
+        assert.notEqual(after.status, 200,
+            '🚨 無効化した後に正しい合言葉で通った（総当たりの上限が意味を失う）');
+        void await after.text();
+        // 記録が残る（痕跡ゼロで総当たりされない）
+        const log = await readFile(s.audit, 'utf8').catch(() => '');
+        assert.match(log, /pair-bad-code/, `外した記録が無い: ${log.slice(0, 300)}`);
+        assert.match(log, /pair-too-many/, '無効化した記録が無い');
+        // 🚨 **壁を通っていること自体を測る。** 上の2つは経路側が書く記録なので、
+        //    `tokenWall()` を外しても残る（実測でその変異が SURVIVED した）。
+        //    壁が書くのは `mutation-token-failed` — これが記録と遅延と混雑の門の本体。
+        assert.match(log, /mutation-token-failed/,
+            '🚨 合言葉の照合が tokenWall を通っていない（記録も遅延も混雑の門も付かない）');
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 他人の id では受け取れない（承認に相乗りできない）', async () => {
+    const s = await startPair();
+    try {
+        const req = await (await pairPost(s.url, 'request', { label: '正しい端末' }, asPhone)).json();
+        const code = await codeFromHost(s.dir);
+        // 合言葉は合っているが id が違う → 通らない
+        const r = await pairPost(s.url, 'claim', { id: `${req.id}x`, code }, asPhone);
+        assert.notEqual(r.status, 200, '🚨 他人の id で承認を受け取れた');
+        void await r.text();
+        // 正しい id なら通る（「常に落ちる」を緑と読まないため）
+        const good = await pairPost(s.url, 'claim', { id: req.id, code }, asPhone);
+        assert.equal(good.status, 200, `正しい id でも通らない: ${await good.text()}`);
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 一覧と失効は生の実行トークンだけ（読み取りの鍵も端末の鍵も通さない）', async () => {
+    const s = await startPair();
+    try {
+        const req = await (await pairPost(s.url, 'request', { label: '承認された端末' }, asPhone)).json();
+        const code = await codeFromHost(s.dir);
+        const secret = (await (await pairPost(s.url, 'claim', { id: req.id, code }, asPhone)).json()).secret;
+
+        for (const [who, headers] of [['読み取りの鍵', asPhone], ['端末の鍵', { 'x-kjp-token': secret }]]) {
+            for (const action of ['list', 'revoke', 'cancel']) {
+                const r = await pairPost(s.url, action, { id: req.id }, headers);
+                assert.notEqual(r.status, 200,
+                    `🚨 ${who}で ${action} が通った（承認した端末が別の端末を承認できてしまう）`);
+                void await r.text();
+            }
+        }
+        // 母艦（生トークン）なら通る
+        const l = await pairPost(s.url, 'list', {}, asHost);
+        const lBody = await l.text();
+        assert.equal(l.status, 200, `生トークンで一覧が取れない: ${lBody}`);
+        const listed = JSON.parse(lBody);
+        assert.equal(listed.devices.length, 1);
+        // 🔒 一覧に鍵そのもの（や hash）を出さない
+        const raw = JSON.stringify(listed);
+        assert.equal(raw.includes(secret), false, '一覧に端末の鍵が出ている');
+        assert.equal(/hash/.test(raw), false, `一覧に hash が出ている: ${raw}`);
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔑 失効させるとその端末だけが通らなくなる', async () => {
+    const s = await startPair();
+    try {
+        const devices = [];
+        for (const label of ['1台目', '2台目']) {
+            const req = await (await pairPost(s.url, 'request', { label }, asPhone)).json();
+            const code = await codeFromHost(s.dir);
+            const got = await (await pairPost(s.url, 'claim', { id: req.id, code }, asPhone)).json();
+            devices.push({ id: got.device.id, secret: got.secret, label });
+        }
+        // ⚠️ 失効した鍵は**入口で 401（平文）**になるので JSON.parse できない。
+        //    「壊れた」と「弾かれた」を取り違えないよう、本文は生で持つ。
+        const asks = async secret => {
+            const r = await fetch(`${s.url}/api/v0/session`, { headers: { 'x-kjp-token': secret } });
+            const body = await r.text();
+            let json = null;
+            try { json = JSON.parse(body); } catch { /* 401 は平文 */ }
+            return { code: r.status, presented: json?.presented ?? null, body };
+        };
+        assert.equal((await asks(devices[0].secret)).presented, 'device');
+        assert.equal((await asks(devices[1].secret)).presented, 'device');
+
+        const rv = await pairPost(s.url, 'revoke', { id: devices[0].id }, asHost);
+        const rvBody = await rv.text();
+        assert.equal(rv.status, 200, `失効できない: ${rvBody}`);
+
+        const dead = await asks(devices[0].secret);
+        assert.notEqual(dead.presented, 'device',
+            `🚨 失効させた端末がまだ通る: ${dead.body.slice(0, 200)}`);
+        const live = await asks(devices[1].secret);
+        assert.equal(live.presented, 'device',
+            `失効させていない端末まで止まった: ${live.code} ${live.body.slice(0, 200)}`);
+        // 失効は台帳に残る（消したつもりが残っていないかを人が確かめられるように）
+        const book = JSON.parse(await readFile(s.devices, 'utf8'));
+        const saved = book.devices.find(d => d.id === devices[0].id);
+        assert.ok(saved?.revokedAt, `失効が保存されていない: ${JSON.stringify(book)}`);
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 使えない構成では理由を返す（黙って 404 にしない）', async () => {
+    // --devices-file 無し
+    const a = await startExec(['--require-auth']);
+    try {
+        const r = await pairPost(a.url, 'request', { label: 'x' }, asPhone);
+        assert.equal(r.status, 403);
+        assert.match((await r.json()).error, /--devices-file/, '使えない理由を告げていない');
+    } finally { a.child.kill(); }
+    // 入口に壁が無い構成（--require-auth 無し）
+    const b = await startExec(['--devices-file', join(tmpdir(), 'kjp-never-written.json')]);
+    try {
+        const r = await pairPost(b.url, 'request', { label: 'x' }, asHost);
+        assert.equal(r.status, 403);
+        assert.match((await r.json()).error, /--require-auth|--allow-host/,
+            '壁が無いのに理由を告げていない');
+    } finally { b.child.kill(); }
+});
+
+test('🔒 同じマシンの別ポートのページからは登録できない（#62 と同型）', async () => {
+    // 🚨 **`cross-site` で測ってはいけない。** それは入口（siteAllowed）が
+    //    平文の forbidden で落とすので、**この経路の守りを外しても緑になる**。
+    //    入口が通してしまうのは `same-site`（= 同じマシンの別ポート）なので、
+    //    測るのはこっち（実測して差し替えた）。
+    const s = await startPair();
+    try {
+        const r = await pairPost(s.url, 'request', { label: 'x' },
+            { ...asPhone, 'sec-fetch-site': 'same-site' });
+        assert.equal(r.status, 403, '別ポートのページから登録を要求できた');
+        assert.match((await r.json()).error, /別オリジン/);
+        // 素の要求（ヘッダ無し）は通る（守りが全部を塞いでいないことも測る）
+        const ok = await pairPost(s.url, 'request', { label: 'x' }, asPhone);
+        assert.equal(ok.status, 200, `素の要求まで塞いでいる: ${await ok.text()}`);
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});

@@ -469,7 +469,12 @@ const MUTANTS = [
         file: 'v0/server.mjs',
         from: '                if (site && site !== \'same-origin\') {\n                    denyJson(res, 403,\n                        `別オリジン起点の問い合わせは拒否します (Sec-Fetch-Site: ${site})`);',
         to: '                if (false) {\n                    denyJson(res, 403,\n                        `別オリジン起点の問い合わせは拒否します (Sec-Fetch-Site: ${site})`);',
-        gone: 'if (site && site !== \'same-origin\') {\n                    denyJson(res, 403,',
+        // 🚨 **同じ式が他所にできた瞬間に `gone` は無効化される**（CLAUDE.md）。
+        //    端末の承認（`/pair/*`）に同じ形の門を置いたら、ここの `gone` が
+        //    あちらの行に一致して「書き換えが効いていない」で SKIP に落ちた
+        //    = **守りが未検証のまま静かに続く**。文言まで含めて一意にする。
+        gone: 'if (site && site !== \'same-origin\') {\n                    denyJson(res, 403,\n'
+            + '                        `別オリジン起点の問い合わせは拒否します',
         pattern: '連投は畳まれ、同時実行に上限がある',
     },
     {
@@ -1434,10 +1439,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'Cookie 認証の要求に実行トークンを返す。Cookie はポートで分離されないので、'
             + '他ポートを開いた相手がリクエスト1本多いだけで任意コード実行に到達する（実測）',
         file: 'v0/server.mjs',
-        from: '                token: opts.allowWrite && sameOrigin && shown.ok\n                    ? opts.token : null,',
+        from: '                token: opts.allowWrite && sameOrigin && shown.raw\n                    ? opts.token : null,',
         to: '                token: opts.allowWrite && sameOrigin ? opts.token : null,',
         // ⚠️ `presentedToken(` は関数定義側にも出るので、呼び出しの形で一意にする
-        gone: 'sameOrigin && shown.ok',
+        gone: 'sameOrigin && shown.raw',
         pattern: 'Cookie の値は実行トークンと別で',
     },
     // spawn 失敗（'exit' が来ない）と孫が stdio を握る場合（'close' が来ない）を
@@ -1668,9 +1673,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'トークンを sessionStorage に持たない。'
             + 'Cookie 経由でしか取り戻せなくなり、他ポートの相手が実行に到達する',
         file: 'v0/app.html',
-        from: '    try { sessionStorage.setItem(TOKEN_KEY, t); } catch { /* 使えない環境 */ }',
+        // ⚠️ 案内 URL の値は**読み取り専用の派生秘密**なので、枠を
+        //    `URL_KEY` に分けた（端末の鍵より弱いことを型で示すため）。
+        //    測っている中身は同じ: **Cookie 経由でしか取り戻せない状態にしない**
+        from: '    try { sessionStorage.setItem(URL_KEY, t); } catch { /* 使えない環境 */ }',
         to: '    /* 変異: トークンを保持しない */',
-        gone: 'sessionStorage.setItem(TOKEN_KEY, t)',
+        gone: 'sessionStorage.setItem(URL_KEY, t)',
         script: 'v0/render-check.mjs',
     },
     {
@@ -2367,6 +2375,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + "            || url.pathname === '/mergeplan.mjs'\n"
             + "            || url.pathname === '/inputnote.mjs'\n"
             + "            || url.pathname === '/theme.mjs'\n"
+            + "            || url.pathname === '/devicekey.mjs'\n"
             + "            || url.pathname === '/panegrid.mjs') {",
         to: '            || false) {',
         gone: "url.pathname === '/chatfilter.mjs'",
@@ -2830,8 +2839,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（読み取り専用 + --allow-host の常用構成では 401 の記録を .git の外に'
             + '出せず、トンネルの向こうから容量を食える）',
         file: 'scripts/serveargs.mjs',
-        from: "    if (auditLog) args.push('--audit-log', auditLog);\n    if (wantExec) {",
-        to: '    if (wantExec) {',
+        from: "    if (auditLog) args.push('--audit-log', auditLog);\n"
+            + '    // 🔑 **端末の台帳も capability に関係なく渡す**（監査ログと同じ理由）。',
+        to: '    // 🔑 **端末の台帳も capability に関係なく渡す**（監査ログと同じ理由）。',
         gone: "if (auditLog) args.push('--audit-log', auditLog)",
         pattern: '監査ログの置き場所はどの capability でも渡す',
         testFile: 'scripts/serveargs.test.mjs',
@@ -4391,6 +4401,167 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         //    UI を1度も描いていない）。**1本構成を実ブラウザで描いて数える**
         //    パスを layout-check に足して、そこで測る。
         script: 'v0/layout-check.mjs',
+    },
+    /* -----------------------------------------------------------------
+     * 🔑 端末の承認（`docs/device-approval.md` §6 の表）
+     *
+     * 🚨 **順序そのものが守りなので、順序を動かす変異も入れる**
+     *    （`--allow-exec` の門が自動生成より後ろにあった事故と同型）。
+     * 🚨 **「行を足す」だけの変異は `gone` が消えないので SKIP に落ちる。**
+     *    足すのではなく**並びも変える**ことで、元の字面が消えるようにしてある。
+     * ----------------------------------------------------------------- */
+    {
+        name: 'pair-code-in-response',
+        why: '合言葉を応答に載せる（母艦を読めない相手が承認できる = 承認の根拠が消える）',
+        file: 'v0/server.mjs',
+        from: '                    id: r.id, label: r.label, expiresInMs: PAIR_TTL_MS,',
+        to: '                    id: r.id, code: r.code, label: r.label,'
+            + ' expiresInMs: PAIR_TTL_MS,   /* 変異: 合言葉を載せる */',
+        gone: 'id: r.id, label: r.label, expiresInMs: PAIR_TTL_MS,',
+        pattern: '合言葉は応答に載らず',
+    },
+    {
+        name: 'pair-no-try-limit',
+        why: '合言葉の試行の上限（5回）を外す（並列に叩けば 30^8 でも削れる。'
+            + '読み取りの鍵は実測 8,955 req/s で総当たりされた実績がある）',
+        file: 'v0/devices.mjs',
+        from: '            if (this.pending.tries >= MAX_TRIES) {',
+        to: '            if (false) {   /* 変異: 上限を見ない */',
+        gone: 'if (this.pending.tries >= MAX_TRIES) {',
+        pattern: '合言葉を5回外すと要求が無効になり',
+    },
+    {
+        name: 'pair-id-not-checked',
+        why: 'id の照合を外す（合言葉だけで誰でも受け取れる = 承認に相乗りできる）',
+        file: 'v0/devices.mjs',
+        from: "        if (!p || !sameString(String(p.id), String(id ?? ''))) return { state: 'unknown' };",
+        to: '        if (!p) return { state: "unknown" };   /* 変異: id を見ない */',
+        gone: "!sameString(String(p.id), String(id ?? ''))",
+        pattern: '他人の id では受け取れない',
+    },
+    {
+        name: 'pair-list-accepts-device',
+        why: '端末の鍵で一覧と失効を通す（承認した端末が別の端末を承認できる = 承認の連鎖）',
+        file: 'v0/server.mjs',
+        from: '                if (!tokenMatches(req.headers[TOKEN_HEADER])) {',
+        to: '                if (false) {   /* 変異: 端末の鍵でも通す */',
+        gone: 'if (!tokenMatches(req.headers[TOKEN_HEADER])) {',
+        pattern: '一覧と失効は生の実行トークンだけ',
+    },
+    {
+        name: 'pair-session-token-to-device',
+        why: '端末の鍵に生の実行トークンを渡す（1台承認すると、その端末が母艦と同じ権限を持つ）',
+        file: 'v0/server.mjs',
+        from: '                token: opts.allowWrite && sameOrigin && shown.raw\n'
+            + '                    ? opts.token : null,',
+        to: '                token: opts.allowWrite && sameOrigin && (shown.raw || shown.device)\n'
+            + '                    ? opts.token : null,   /* 変異: 端末の鍵にも渡す */',
+        gone: 'sameOrigin && shown.raw\n                    ? opts.token : null,',
+        pattern: '承認した端末は鍵を貼らずに実行でき',
+    },
+    {
+        name: 'pair-secret-in-cookie',
+        why: '端末の鍵を Cookie に入れる（Cookie はポートで分離されないので'
+            + '他のローカルサービスに実行の鍵が渡る。#43 と同型の事故）',
+        file: 'v0/server.mjs',
+        from: "                    ok({ state: 'approved', secret: out.secret, device: out.device });",
+        to: "                    res.setHeader('set-cookie',\n"
+            + "                        'kjp_dev=' + out.secret + '; Path=/; HttpOnly; SameSite=Lax');\n"
+            + "                    ok({ state: 'approved', device: out.device, secret: out.secret });",
+        gone: "ok({ state: 'approved', secret: out.secret, device: out.device });",
+        pattern: '承認した端末は鍵を貼らずに実行でき',
+    },
+    {
+        name: 'pair-wall-bypass',
+        why: '合言葉の照合を tokenWall の外でやる（記録も遅延も混雑の門も付かない。'
+            + '痕跡ゼロで総当たりできた形に戻る）',
+        file: 'v0/server.mjs',
+        from: "                const wall = await tokenWall(req, res, [String(body.code ?? '')], () => {\n"
+            + '                    out = deviceBook.claim(body.id, body.code);\n'
+            + "                    return out.state === 'approved';\n"
+            + '                });',
+        to: '                out = deviceBook.claim(body.id, body.code);   /* 変異: 壁を通さない */\n'
+            + "                const wall = { ok: out.state === 'approved', handled: false };",
+        gone: 'const wall = await tokenWall(req, res,',
+        pattern: '合言葉を5回外すと要求が無効になり',
+    },
+    {
+        name: 'pair-require-auth-not-checked',
+        why: '入口に壁が無い構成でも登録を許す（誰でも /pair/request を叩けるので、'
+            + '合言葉を5回ずつ何度でも引き直せる = 上限が意味を失う）',
+        file: 'v0/server.mjs',
+        from: '            if (why) { denyJson(res, 403, why); return; }',
+        to: '            /* 変異: 使える構成かを見ない */',
+        gone: 'if (why) { denyJson(res, 403, why); return; }',
+        pattern: '使えない構成では理由を返す',
+    },
+    {
+        name: 'pair-same-site-allowed',
+        why: '同じマシンの別ポートのページから登録を要求できる（#62 と同型。'
+            + '入口の siteAllowed は same-site を通すので、ここで塞がないと素通り）',
+        file: 'v0/server.mjs',
+        // ⚠️ precheck に**同じ形の門**があるので、文言まで含めて一意にする
+        from: "                if (site && site !== 'same-origin') {\n"
+            + "                    denyJson(res, 403, `別オリジン起点の要求は拒否します (Sec-Fetch-Site: ${site})`);",
+        to: '                if (false) {   /* 変異: 別オリジン起点でも通す */\n'
+            + "                    denyJson(res, 403, '通らない');",
+        gone: "                if (site && site !== 'same-origin') {\n"
+            + '                    denyJson(res, 403, `別オリジン起点の要求は拒否します',
+        pattern: '同じマシンの別ポートのページからは登録できない',
+    },
+    {
+        name: 'pair-revoke-not-enforced',
+        why: '失効した端末をまだ通す（「切ったつもりで通っている」= 観測ツールとして最悪の誤り）',
+        file: 'v0/devices.mjs',
+        from: '            if (d.revokedAt) continue;',
+        to: '            /* 変異: 失効を見ない */',
+        gone: 'if (d.revokedAt) continue;',
+        pattern: '失効させるとその端末だけが通らなくなる',
+    },
+    {
+        name: 'pair-list-leaks-hash',
+        why: '一覧に鍵の hash を出す（オフラインで照合できる材料を配ることになる）',
+        file: 'v0/devices.mjs',
+        from: '            id: d.id, label: d.label, createdAt: d.createdAt,',
+        to: '            id: d.id, hash: d.hash, label: d.label, createdAt: d.createdAt,',
+        gone: 'id: d.id, label: d.label, createdAt: d.createdAt,',
+        pattern: '一覧と失効は生の実行トークンだけ',
+    },
+    {
+        name: 'pair-code-file-kept',
+        why: '使い終わった合言葉のファイルを消さない（次に読めた人が'
+            + '「まだ有効な合言葉」だと思って使えるが要求は無いので、'
+            + '**何が起きているか分からない失敗**になる）',
+        file: 'v0/server.mjs',
+        from: '                    await saveDevices();\n'
+            + '                    await clearCodeFile();',
+        to: '                    await saveDevices();\n'
+            + '                    /* 変異: 合言葉のファイルを残す */',
+        gone: '                    await saveDevices();\n                    await clearCodeFile();',
+        pattern: '承認した端末は鍵を貼らずに実行でき',
+    },
+    {
+        /* 🚨 **ここは実ブラウザで測る。**
+         * 「どの枠から鍵を読むか」の配線は `app.html` の中なので、
+         * 字面を assert する検査では**行を残して到達不能にする**変更が見えない。
+         * この変異は**実際にあった壊れ方そのもの**（読み取り秘密を貼った鍵の枠に入れ、
+         * 承認済みの端末で「実行有効（トークン未取得）」になった）。 */
+        name: 'pair-read-secret-beats-device',
+        why: '読み取り秘密を貼った鍵と同じ枠に戻す（承認しても capability が使えないまま）',
+        file: 'v0/app.html',
+        from: '    try { sessionStorage.setItem(URL_KEY, t); } catch { /* 使えない環境 */ }',
+        to: '    try { sessionStorage.setItem(TOKEN_KEY, t); } catch { /* 変異: 同じ枠 */ }',
+        gone: 'sessionStorage.setItem(URL_KEY, t)',
+        script: 'v0/pair-check.mjs',
+    },
+    {
+        name: 'pair-ui-device-cannot-mutate',
+        why: '端末の鍵を「書き込み・実行に使える鍵」から外す（登録できるのに押せない）',
+        file: 'v0/devicekey.mjs',
+        from: "    return presented === 'token' || presented === 'device';",
+        to: "    return presented === 'token';   /* 変異: device を落とす */",
+        gone: "presented === 'token' || presented === 'device'",
+        script: 'v0/pair-check.mjs',
     },
 ];
 

@@ -107,6 +107,33 @@
   `pair-too-many` / `pair-revoke` / `pair-first-use` を残す。**合言葉も鍵も書かない**
 - `label` は端末が名乗る自由文なので**長さと文字種を縛る**（記録に自由文を入れない原則）
 
+## 5.5 画面側の枠は3つに分ける（実装して実測で1件踏んだ）
+
+鍵の置き場所は**3つ**あり、**強い順に選ぶ**（判定は `v0/devicekey.mjs`、テスト済み）:
+
+| 枠 | 何が入るか | 寿命 | 他ポートから読めるか |
+|---|---|---|---|
+| `sessionStorage.kjp_token` | 手で貼った実行の鍵 | タブを閉じるまで | **読めない**（ポート込みオリジン単位） |
+| `localStorage['kjp.device']` | 承認された端末の鍵 | 消すまで | **読めない**（同上） |
+| `sessionStorage.kjp_url` | 案内 URL の `?token=` で来た値 | タブを閉じるまで | **読めない**（同上） |
+
+強い順: **今 URL で来た鍵 > 貼った鍵 > 端末の鍵 > 前に URL で来た鍵**。
+
+🚨 **実測で踏んだ:** 最初は `?token=` の値を**貼った鍵と同じ枠**に入れていた。
+トンネル越しの URL に載るのは**読み取り専用の派生秘密**なので、それが
+「貼った鍵」として端末の鍵より優先され、**承認済みの端末で
+capability が「実行有効（トークン未取得）」のまま**になった。
+サーバは `presented: 'device'` を返せていたので、**画面側だけの取り違え**だった。
+
+⚠️ **「今来た」と「前に来た」を分ける理由:** URL 由来を一律で端末の鍵より下に置くと、
+失効した端末の鍵を握った画面が**鍵つき URL を開き直しても死んだ鍵を送り続ける**。
+今来た鍵を最優先にすることが「実行を取り戻す道」になっている。
+
+⚠️ **書いたが削除した守り:** 「401 を受けたら端末の鍵を捨てる」。
+防ぐつもりだった「死んだ鍵を握ると読み取りまで塞ぐ」は**実測で起きなかった**
+（読み取りは Cookie の派生秘密で続く）。守る対象が無く、配線を測る手段も無かったので
+**守りごと消した**（CLAUDE.md「測っても差が出ない守りは置かない」。`defensive` で誤魔化さない）。
+
 ## 6. 測ること（実装と同じコミットで）
 
 - 承認前は端末の鍵が存在しないので実行は 403 のまま
@@ -120,17 +147,34 @@
 - 端末の鍵が **`Set-Cookie` に出てこない**（字面ではなく応答で測る）
 - 合言葉の照合が `tokenWall()` を通っている（記録と遅延が付く）
 
-変異（守りを外すと落ちること）:
+変異（守りを外すと落ちること）— **14件すべて KILLED を実測**
+（`node scripts/mutate.mjs pair-code-in-response …`）:
 
-| 名前 | 何を外すか |
-|---|---|
-| `pair-code-in-response` | 応答に合言葉を載せる |
-| `pair-no-try-limit` | 試行の上限（5回）を外す |
-| `pair-id-not-checked` | id の照合を外す（相乗りできる） |
-| `pair-list-accepts-device` | 端末の鍵で一覧・失効を通す |
-| `pair-session-token-to-device` | 端末の鍵に生トークンを渡す（承認の連鎖） |
-| `pair-secret-in-cookie` | 端末の鍵を Cookie に入れる |
-| `pair-wall-bypass` | `tokenWall()` を通さない |
+| 名前 | 何を外すか | 測る検査 |
+|---|---|---|
+| `pair-code-in-response` | 応答に合言葉を載せる | smoke |
+| `pair-no-try-limit` | 試行の上限（5回）を外す | smoke |
+| `pair-id-not-checked` | id の照合を外す（相乗りできる） | smoke |
+| `pair-list-accepts-device` | 端末の鍵で一覧・失効を通す | smoke |
+| `pair-session-token-to-device` | 端末の鍵に生トークンを渡す（承認の連鎖） | smoke |
+| `pair-secret-in-cookie` | 端末の鍵を Cookie に入れる | smoke |
+| `pair-wall-bypass` | `tokenWall()` を通さない | smoke |
+| `pair-require-auth-not-checked` | 壁が無い構成でも登録を許す | smoke |
+| `pair-same-site-allowed` | 別ポートのページから登録できる | smoke |
+| `pair-revoke-not-enforced` | 失効した端末を通す | smoke |
+| `pair-list-leaks-hash` | 一覧に鍵の hash を出す | smoke |
+| `pair-code-file-kept` | 使い終わった合言葉のファイルを残す | smoke |
+| `pair-read-secret-beats-device` | URL の鍵を貼った鍵と同じ枠に戻す | **pair-check（実ブラウザ）** |
+| `pair-ui-device-cannot-mutate` | `canMutateWith` から `device` を落とす | **pair-check（実ブラウザ）** |
+
+🚨 **最初 3件が SURVIVED した。原因は3つとも検査側で、内容が示唆的だったので残す:**
+
+1. `pair-code-in-response` — 母艦に出る合言葉は `ABCD-EFGH`、内部の値は**ハイフン無し**。
+   そのまま `includes` していたので、**載っていても見つからなかった**
+2. `pair-wall-bypass` — 「記録が残る」を経路側が書く `pair-bad-code` で見ていた。
+   これは壁を外しても残るので、**壁が書く `mutation-token-failed` を見る**必要があった
+3. `pair-read-secret-beats-device` — 登録成功時に古い枠を消す**後始末が不具合を隠していた**
+   （枠を分ける前の移行処理。分けた後は害しかないので削除した）
 
 ## 7. これができると「プロジェクトを開く」が同じ土台に乗る
 

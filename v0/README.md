@@ -597,6 +597,45 @@ node v0/server.mjs --require-auth                   # ループバックでも�
 ここが払い出している限り読み取りにトークンを要求しても意味がなく
 （届く相手が誰でも取れる）、トークンは CSRF 対策にしかなりません。
 
+### 🔑 端末を承認して登録する（実行の鍵を毎回貼らないために）
+
+スマホから実行を使うたびに鍵を貼るのが面倒だったので、**母艦で承認した端末にだけ
+その端末専用の鍵を発行**します。設計と順序は [../docs/device-approval.md](../docs/device-approval.md)。
+
+```bash
+# 台帳を渡して起動する（scripts/serve.mjs は自動で渡します）
+node v0/server.mjs --require-auth --allow-exec --token-file ~/.kjp-edit/token-exec \
+                   --devices-file ~/.kjp-edit/devices.json
+
+# 端末側で「この端末を登録」を押したら、母艦で合言葉を見る
+node scripts/serve.mjs --pair
+#   🔑 合言葉: ABCD-EFGH
+#   承認した端末: 1 台
+#     3f9a12b8  Android / Chrome  登録 2026-08-18 09:12  最終使用 2026-08-18 09:13
+
+node scripts/serve.mjs --pair --revoke 3f9a12b8   # 失効させる
+```
+
+**承認の根拠は「母艦でしか読めない合言葉を読めたこと」です。**
+合言葉はデーモンの stdout と `~/.kjp-edit/pair-code`（0600）にだけ出て、
+**要求した端末には返しません**。
+
+⚠️ **peer アドレスも `Host` も「母艦にいること」を証明しません**（実測して撤回した前提）。
+`tailscale serve` はループバックに繋ぎ直すので、トンネル越しの要求も
+`remoteAddress === '127.0.0.1'` になり、`Host` は要求側が自由に決められます。
+
+| | |
+|---|---|
+| 端末の鍵の置き場所 | `localStorage`（**ポートを含むオリジン単位**）。🔒 **Cookie には入れません**（Cookie はポートで分離されないので他のローカルページに渡る） |
+| 合言葉 | 30種8文字（39.3 ビット）。`tokenWall()`（記録 + 遅延 + 混雑の門）＋**試行5回**で無効化 |
+| できること | 実行・書き込み（貼った鍵と同じ） |
+| **できないこと** | 🔒 `/api/v0/session` の**生トークンの受け取り**、`--pair` の**一覧と失効**（= 承認した端末が別の端末を承認できない） |
+| 有効な構成 | `--require-auth`（または `--allow-host`）**かつ** `--devices-file`。壁が無い構成では経路ごと閉じます |
+| 失効したら | 実行だけが止まります（読み取りは Cookie で続く）。実行を戻すには `?token=` 付きの URL を開き直す |
+
+鍵の枠は3つあり**強い順に選びます**（今 URL で来た鍵 > 貼った鍵 > 端末の鍵 > 前に URL で来た鍵）。
+判定は `v0/devicekey.mjs`（unit）、配線は `node v0/pair-check.mjs`（**実ブラウザで UI から通す**）。
+
 ### エージェントの活動観測（既定オフ、書き込み・実行とも別の capability）
 
 ```bash
