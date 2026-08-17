@@ -11,8 +11,8 @@ IDE（Eclipse Theia）に進むかは v0 を使ってから判断する。設計
 **変更したら必ずこれを走らせる。合否が出るまで「できた」と言わない。**
 
 ```bash
-node scripts/verify.mjs          # 構文 + ユニット + スモーク + レイアウト
-node scripts/verify.mjs --quick  # スモークとレイアウトを飛ばす（速い）
+node scripts/verify.mjs          # 9段: 構文 + ユニット + スモーク + 実ブラウザ5種
+node scripts/verify.mjs --quick  # スモークと実ブラウザを飛ばす（速い）
 ```
 
 出力は20行以内に収めてある。失敗したら個別に再現する:
@@ -20,6 +20,11 @@ node scripts/verify.mjs --quick  # スモークとレイアウトを飛ばす（
 node --test v0/swimlanes.test.mjs
 node --test v0/smoke.test.mjs
 node v0/layout-check.mjs         # 実ブラウザでレイアウトを測る（無ければスキップ）
+node v0/render-check.mjs         # 描画の速さ・編集器・IME・監視盤
+node v0/input-check.mjs          # 実際のマウスでグリッドを掴む
+node v0/theme-check.mjs          # 配色が実際に当たっていること
+node v0/pair-check.mjs           # 端末の承認を UI から通す
+node v0/open-check.mjs           # 「開く」で足して切り替えられること
 ```
 
 **成功を主張するのではなく証拠を示すこと。** テストを通したなら、その出力を貼る。

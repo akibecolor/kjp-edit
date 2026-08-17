@@ -286,6 +286,22 @@ if (!quick && !failed) {
     steps.push({ name: 'pair', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
 }
 
+// 9. 「開く」（プロジェクトの追加）を UI から通す検査。**足せても切り替えられなければ
+//    開いた意味が無い**ので、打つ → 足す → セレクトに出る → 切り替わる まで実ブラウザで測る。
+if (!quick && !failed) {
+    const r = await run(['v0/open-check.mjs'], { timeout: 240_000 });
+    const skipped = /skipped/.test(r.output);
+    const ok = r.code === 0;
+    steps.push({
+        name: `open ${(r.ms / 1000).toFixed(1)}s`,
+        ok, skipped,
+        detail: ok ? [] : detailLines(r.output, r.timedOut ? 10 : 6, r.timedOut),
+    });
+    if (!ok) failed = true;
+} else {
+    steps.push({ name: 'open', ok: true, skipped: true, why: quick ? '--quick' : '先行ステップが失敗' });
+}
+
 // ---- 出力: 20行以内 ----
 // 🚨 **飛ばした検査は緑のときも名前を出す（#52）。**
 //    「このプラットフォームでは測っていない」を毎回目に入れる。

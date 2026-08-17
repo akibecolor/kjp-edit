@@ -7812,3 +7812,270 @@ test('🔒 checkout はリポジトリの post-checkout フックを起動しな
         await rm(marker, { force: true }).catch(() => {});
     }
 });
+
+/* ===========================================================================
+ * 📁 プロジェクトを開く（`docs/open-project.md` §6）
+ *
+ * 🔒 門は `gateExec`。読み取り／書き込みの鍵で足せると**読める／書ける範囲を
+ *    HTTP から広げられる**（昇格）。exec 級には新しい権限を与えない（cat で読めるので）。
+ * =========================================================================== */
+
+/** 使い捨ての別リポジトリを1本作る（「開く」対象） */
+async function makeOtherRepo(name) {
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), `kjp-other-${name}-`));
+    const r = join(dir, 'proj');
+    await mkdir(r, { recursive: true });
+    const gg = a => g(a, r);
+    await gg(['init', '-q', '-b', 'main']);
+    await writeFile(join(r, 'ヨソ.txt'), 'よそのリポジトリ\n', 'utf8');
+    await gg(['add', '-A']);
+    await gg(['-c', 'user.email=t@e', '-c', 'user.name=t', 'commit', '-q', '-m', 'よそ']);
+    return { dir, path: r };
+}
+
+/**
+ * 🚨 **パスの一致を `===` で見ない**（このリポジトリの規則。テスト側で破って踏んだ）。
+ *    `git rev-parse --show-toplevel` は **Windows でも `/`** を返すので、
+ *    `join()` で作ったバックスラッシュの表記とは字面が一致しない。
+ *    大文字小文字も Windows/macOS では区別しない。
+ */
+function sameRepoPath(a, b) {
+    const norm = v => String(v ?? '').split(sep).join('/').split('\\').join('/');
+    const x = norm(a);
+    const y = norm(b);
+    return process.platform === 'win32' || process.platform === 'darwin'
+        ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
+function reposPost(url, action, body, headers = {}) {
+    return fetch(`${url}/api/v0/repos/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body ?? {}),
+    });
+}
+
+test('📁 実行の鍵でリポジトリを足せる（足した直後に ?repo= が通る）', async () => {
+    const s = await startExec();
+    const other = await makeOtherRepo('add');
+    try {
+        // 足す前は登録されていないので読めない
+        const before = await fetch(`${s.url}/api/v0/state?fresh=1&repo=${encodeURIComponent(other.path)}`);
+        assert.equal(before.status, 400, '登録前に読めた（範囲が固定されていない）');
+        void await before.text();
+
+        const r = await reposPost(s.url, 'add', { path: other.path }, { 'x-kjp-token': EXEC_TOKEN });
+        const body = await r.text();
+        assert.equal(r.status, 200, `足せない: ${body}`);
+        assert.ok(sameRepoPath(JSON.parse(body).added, other.path), `足したパスが違う: ${body}`);
+
+        // 🔑 足した意味がある（?repo= が通り、そのリポジトリの中身が見える）
+        const after = await fetch(`${s.url}/api/v0/state?fresh=1&repo=${encodeURIComponent(other.path)}`);
+        const afterBody = await after.text();
+        assert.equal(after.status, 200, `足したのに読めない: ${afterBody}`);
+        assert.match(afterBody, /よそ/, '足したリポジトリの中身が見えない');
+
+        // 一覧にも出る。⚠️ 起動時の分は fixed=true、足した分は false
+        const list = await (await fetch(`${s.url}/api/v0/repos`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } })).json();
+        const added = list.repos.find(x => sameRepoPath(x.path, other.path));
+        assert.ok(added, `一覧に出ていない: ${JSON.stringify(list.repos)}`);
+        assert.equal(added.fixed, false, '足した分が「起動時に固定」と誤表示されている');
+        const base = list.repos.find(x => !sameRepoPath(x.path, other.path));
+        assert.equal(base.fixed, true, '起動時の分が fixed になっていない（外せてしまう）');
+    } finally {
+        s.child.kill();
+        await rm(other.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 読み取り・書き込みの鍵ではリポジトリを足せない（範囲の昇格を作らない）', async () => {
+    const other = await makeOtherRepo('deny');
+    // 読み取りの鍵（派生秘密）
+    const s = await startExec(['--require-auth']);
+    try {
+        const r = await reposPost(s.url, 'add', { path: other.path },
+            { 'x-kjp-token': readSecretOf(EXEC_TOKEN) });
+        assert.equal(r.status, 403, '🚨 読み取りの鍵で読める範囲を広げられた');
+        void await r.text();
+    } finally { s.child.kill(); }
+    // 書き込みだけの構成（--allow-exec 無し）は経路ごと閉じている
+    const w = await startAuthServer(['--allow-write', '--token', EXEC_TOKEN]);
+    try {
+        const r = await reposPost(`http://127.0.0.1:${w.port}`, 'add', { path: other.path },
+            { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(r.status, 403, '🚨 書き込みの鍵で書ける範囲を広げられた');
+        assert.match((await r.json()).error, /--allow-exec/, '理由を告げていない');
+    } finally {
+        w.child.kill();
+        await rm(other.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 別オリジン起点ではリポジトリを足せない（#62 と同型）', async () => {
+    const s = await startExec();
+    const other = await makeOtherRepo('site');
+    try {
+        const r = await reposPost(s.url, 'add', { path: other.path },
+            { 'x-kjp-token': EXEC_TOKEN, 'sec-fetch-site': 'same-site' });
+        assert.equal(r.status, 403, '別ポートのページから足せた');
+        // ⚠️ 文言は `gateMutation` のもの（別オリジンの門はそこが持っている）
+        assert.match((await r.json()).error, /別サイト起点/);
+    } finally {
+        s.child.kill();
+        await rm(other.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('📁 開くときのパスの検証（理由を返す / worktree はリポジトリ側に解決 / 重複は1本）', async () => {
+    const s = await startExec();
+    const other = await makeOtherRepo('valid');
+    try {
+        const add = path => reposPost(s.url, 'add', { path }, { 'x-kjp-token': EXEC_TOKEN });
+        // git リポジトリでない場所
+        const notGit = await add(other.dir);
+        assert.equal(notGit.status, 400, 'git でない場所を登録できた');
+        assert.match((await notGit.json()).error, /git リポジトリとして開けません/);
+        // 存在しないパス
+        const missing = await add(join(other.dir, 'ない'));
+        assert.equal(missing.status, 400, '存在しないパスを登録できた');
+        void await missing.text();
+        // NUL / 空
+        const nul = await add('a\x00b');
+        assert.equal(nul.status, 400);
+        void await nul.text();
+        const blank = await add('   ');
+        assert.equal(blank.status, 400);
+        void await blank.text();
+
+        // 🚨 linked worktree のパスを渡すと**リポジトリ側**に解決される
+        //    （そのまま登録すると `?repo=` の照合に通らない = 本命の構成だけ失敗する）
+        const wtDir = join(other.dir, 'wt-1');
+        await g(['worktree', 'add', '-q', '-b', 'えだ', wtDir], other.path);
+        const viaWt = await add(wtDir);
+        const viaWtBody = await viaWt.json();
+        assert.equal(viaWt.status, 200, `worktree から足せない: ${JSON.stringify(viaWtBody)}`);
+        assert.ok(sameRepoPath(viaWtBody.added, other.path),
+            `worktree のまま登録された（?repo= の照合に通らない）: ${viaWtBody.added}`);
+
+        // 重複は1本（別表記でも samePath で潰す）
+        const again = await add(other.path.split(sep).join('/'));
+        const againBody = await again.json();
+        assert.equal(again.status, 200);
+        assert.equal(againBody.added, null, '同じ場所が2本になった');
+        assert.ok(againBody.already, '重複だと言っていない');
+        const list = await (await fetch(`${s.url}/api/v0/repos`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } })).json();
+        const hits = list.repos.filter(x => sameRepoPath(x.path, other.path));
+        assert.equal(hits.length, 1, `一覧に重複が出ている: ${JSON.stringify(list.repos)}`);
+    } finally {
+        s.child.kill();
+        await rm(other.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 足したものは外せるが、起動時の --repo は外せない（足せるなら外せること）', async () => {
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-reposfile-'));
+    const reposFile = join(dir, 'repos.json');
+    const audit = join(dir, 'audit.jsonl');
+    const s = await startExec(['--repos-file', reposFile, '--audit-log', audit]);
+    const other = await makeOtherRepo('rm');
+    try {
+        await reposPost(s.url, 'add', { path: other.path }, { 'x-kjp-token': EXEC_TOKEN })
+            .then(r => r.text());
+        // 🔒 起動時の分は外せない
+        const fixed = await reposPost(s.url, 'remove', { path: repo },
+            { 'x-kjp-token': EXEC_TOKEN });
+        assert.equal(fixed.status, 409, '🚨 起動時に固定したリポジトリを HTTP から外せた');
+        assert.match((await fixed.json()).error, /起動時/);
+        // 足した分は外せる
+        const rm1 = await reposPost(s.url, 'remove', { path: other.path },
+            { 'x-kjp-token': EXEC_TOKEN });
+        const rm1Body = await rm1.text();
+        assert.equal(rm1.status, 200, `外せない: ${rm1Body}`);
+        // 外したら読めなくなる
+        const gone = await fetch(`${s.url}/api/v0/state?fresh=1&repo=${encodeURIComponent(other.path)}`);
+        assert.equal(gone.status, 400, '外したのに読める');
+        void await gone.text();
+        // 監査に残る
+        const log = await readFile(audit, 'utf8').catch(() => '');
+        assert.match(log, /repo-add/, '追加が監査に残っていない');
+        assert.match(log, /repo-remove/, '削除が監査に残っていない');
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await rm(other.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('📁 --repos-file を渡すと再起動後も残る（渡さなければ残らない）', async () => {
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-persist-'));
+    const reposFile = join(dir, 'repos.json');
+    const other = await makeOtherRepo('persist');
+    try {
+        const a = await startExec(['--repos-file', reposFile]);
+        try {
+            await reposPost(a.url, 'add', { path: other.path }, { 'x-kjp-token': EXEC_TOKEN })
+                .then(r => r.text());
+        } finally { a.child.kill(); }
+        // 保存されている（⚠️ 起動時の分は保存しない = 起動フラグと食い違わせない）
+        const saved = JSON.parse(await readFile(reposFile, 'utf8'));
+        assert.equal(saved.repos.length, 1, `保存の中身が違う: ${JSON.stringify(saved)}`);
+        assert.ok(sameRepoPath(saved.repos[0], other.path), `保存されたパスが違う: ${saved.repos[0]}`);
+
+        // 同じ控えで起動し直すと復元される
+        const b = await startExec(['--repos-file', reposFile]);
+        try {
+            const r = await fetch(`${b.url}/api/v0/state?fresh=1&repo=${encodeURIComponent(other.path)}`);
+            assert.equal(r.status, 200, '再起動後に復元されていない');
+            void await r.text();
+        } finally { b.child.kill(); }
+
+        // 控えを渡さなければ残らない（そのプロセスだけ）
+        const c = await startExec();
+        try {
+            const r = await fetch(`${c.url}/api/v0/state?fresh=1&repo=${encodeURIComponent(other.path)}`);
+            assert.equal(r.status, 400, '控えを渡していないのに残っている');
+            void await r.text();
+        } finally { c.child.kill(); }
+    } finally {
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await rm(other.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 bare リポジトリを別表記で足しても一覧は1本（samePath。字面比較では潰せない）', async () => {
+    // 🚨 **なぜ bare で測るのか（実測して選んだ）。**
+    //    非 bare は `git rev-parse --show-toplevel` が**大文字小文字・区切り・末尾の `.` を
+    //    すべて正規化**して返すので、どんな表記で渡しても登録名の字面が一致してしまう
+    //    （= `===` でも重複が潰せるので、`samePath` の守りを外しても差が出ない）。
+    //    bare は git を通さず渡された表記のまま登録するので、**ここが samePath が
+    //    本当に効いている場所**。実測でそう分かったので、この形で固定する。
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-bare-'));
+    const bare = join(dir, 'かばん.git');
+    await g(['init', '-q', '--bare', bare], dir);
+    // 起動時は Node の resolve が返す表記（Windows なら区切りが \）で登録される
+    const s = await startExec(['--repo', bare]);
+    try {
+        const list0 = await (await fetch(`${s.url}/api/v0/repos`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } })).json();
+        assert.equal(list0.repos.length, 2, `bare が登録されていない: ${JSON.stringify(list0.repos)}`);
+
+        // 同じ場所を**別表記**（区切りを / に）で足す
+        const other = bare.split(sep).join('/');
+        assert.notEqual(other, bare === other ? null : bare, '表記が変わっていない（測れていない）');
+        const r = await reposPost(s.url, 'add', { path: other }, { 'x-kjp-token': EXEC_TOKEN });
+        const body = await r.json();
+        assert.equal(r.status, 200, `足せない: ${JSON.stringify(body)}`);
+        assert.equal(body.added, null, '🚨 同じ bare が2本になった（samePath で潰せていない）');
+        assert.ok(body.already, '重複だと言っていない');
+
+        const list = await (await fetch(`${s.url}/api/v0/repos`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } })).json();
+        assert.equal(list.repos.length, 2,
+            `一覧に重複が出ている（キャッシュも2重になる）: ${JSON.stringify(list.repos.map(x => x.path))}`);
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+});

@@ -1118,3 +1118,26 @@ test('🚨 stopRepoFrom: --repo の値が無ければ error（カレントに落
     assert.equal(stopRepoFrom(['--stop']).repo, null);
     assert.equal(stopRepoFrom(['--stop', '--repo', 'C:/x']).repo, 'C:/x');
 });
+
+/**
+ * 📁 **「開く」で足した分の控えも capability に関係なく渡す**（`docs/open-project.md`）。
+ *
+ * 監査ログと同じ理由。渡さないと「開いたのに再起動で消えた」になり、
+ * 原因が分かりにくい（経路が有効になるのは `--allow-exec` のときだけで、それはサーバ側の判定）。
+ */
+test('開いたリポジトリの控えはどの capability でも渡す', () => {
+    const withRepos = extra => serverArgs({
+        argv: extra, server: SERVER, repos: ['/r'], port: 7749,
+        tokenFile: '/s/token-read', writeTokenFile: '/s/token-write',
+        execTokenFile: '/s/token-exec', auditLog: '/s/audit.jsonl',
+        reposFile: '/s/repos.json',
+    });
+    for (const argv of [[], ['--write'], ['--allow-host', 'box.ts.net'], ['--exec']]) {
+        const a = withRepos(argv);
+        assert.ok(a.includes('--repos-file'),
+            `${argv.join(' ') || '(既定)'} で開いたリポジトリの控えを渡していない`);
+        assert.equal(a[a.indexOf('--repos-file') + 1], '/s/repos.json');
+    }
+    // 渡さなければ付けない（要らない構成にファイルを作らせない）
+    assert.ok(!base(['--exec']).includes('--repos-file'));
+});

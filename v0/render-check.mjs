@@ -123,11 +123,23 @@ const MEASURE = `(async () => {
  */
 const IME_CHECK = `(async () => {
   const wait = ms => new Promise(r => setTimeout(r, ms));
+  /* 🚨 **コンソールの入力欄を厳密に掴む（実測で踏んだ）。**
+     以前は最初の \`.cmdbar input\` を掴んでいたが、\`.cmdbar\` は**コンソール以外**でも
+     使う（監視盤の行、「開く」のパス入力）。「開く」を足した瞬間に
+     \`#openbar\` の入力欄が**DOM 上で先**に来たので、
+       1. 「\`.cmdbar input\` が現れるまで待つ」が**コンソール描画前に成立**し、
+          \`.term\` が無い状態で「コマンドバーが無い」と誤報した
+       2. さらに IME の検査が**コンソールではなく「開く」の入力欄**を測ることになり、
+          コンソール側の守りが壊れていても緑になる（静かな誤測定）
+     なので「ペインの中 / 監視盤ではない / placeholder が無い」で絞る（下の検査と同じ条件）。 */
+  const findConsole = () => [...document.querySelectorAll('.cmdbar input')].find(e =>
+    e.closest('[data-pane-id]') && e.closest('[data-pane-id]').dataset.paneId !== 'monitor'
+    && !e.placeholder);
   for (let i = 0; i < 200; i++) {
-    if (document.querySelector(".cmdbar input")) break;
+    if (findConsole() && document.querySelector(".term")) break;
     await wait(100);
   }
-  const input = document.querySelector(".cmdbar input");
+  const input = findConsole();
   const term = document.querySelector(".term");
   if (!input || !term) return { error: "コマンドバーが無い（--allow-exec とトークンを確認）" };
   const fire = composing => {

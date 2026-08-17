@@ -423,6 +423,8 @@
           「見ているつもりのリポジトリ」と実際の対象がずれる
           （checkout の <select> と同じ理由。CLAUDE.md の UI の規則）。 -->
   <select id="reposel" hidden></select>
+  <!-- 📁 プロジェクトを開く（`docs/open-project.md`）。門はサーバの gateExec -->
+  <button id="openproj" hidden title="ローカルのリポジトリを登録一覧に足す">開く</button>
   <span class="path" id="repo"></span>
   <span class="cap" id="cap" hidden></span>
   <button id="refresh">再読込</button>
@@ -440,6 +442,8 @@
 <div class="bar" id="closed" hidden></div>
 <!-- グリッド（#57）: パターンの切り替えと、入り切らないペインの告知 -->
 <div class="bar" id="gridbar" hidden></div>
+<!-- 📁 プロジェクトを開く（`docs/open-project.md`）。「開く」を押したときだけ出す -->
+<div class="bar" id="openbar" hidden></div>
 
 <div class="shell" id="shell">
   <div class="col" id="left"></div>
@@ -1013,6 +1017,92 @@ function gridNote(text) {
   if (old) old.remove();
   const n = el('span', 'note warn gridnote', `  ${text}`);
   box.append(n);
+}
+
+/**
+ * 📁 **プロジェクトを開く（`docs/open-project.md`）。**
+ *
+ * 「開く」を押すとパスの入力欄が出て、足すと登録一覧に入る（以後セレクトで選べる）。
+ *
+ * 🔒 **門はサーバの `gateExec`。** ここで出す・出さないは見た目の話で守りではない
+ *    （押せば必ずサーバの判定を通る。画面側の判定を守りだと思うと、
+ *     「UI を消したから安全」という誤解になる）。
+ * ⚠️ **ファイルの一覧・参照は作らない**（設計文書 §5）。作ると「HTTP から
+ *    ファイルシステムを歩ける」経路になり、exec とは別クラスの攻撃面が増える。
+ *    パスは打つ（母艦の CLI で足すこともできる）。
+ * ⚠️ 使えない構成なら**理由をそのまま出す**（押しても何も起きないのが一番分からない）。
+ */
+function buildOpenBox(info) {
+  const btn = $('#openproj');
+  const bar = $('#openbar');
+  if (!btn || !bar) return;
+  // 実行の鍵が無い／--allow-exec が無い構成では出さない（押せない操作を並べない）
+  if (!session.canMutate || !info?.canAdd) { btn.hidden = true; bar.hidden = true; return; }
+  btn.hidden = false;
+
+  const inp = el('input');
+  inp.placeholder = 'リポジトリのパス（例: C:/work/myproj）';
+  inp.spellcheck = false;
+  inp.className = 'grow';
+  const go = el('button', null, '足す');
+  const msg = el('div', 'wrmsg');
+  const row = el('div', 'cmdbar');
+  row.append(inp, go);
+  bar.replaceChildren(el('b', null, '開く'), row, msg);
+
+  const send = async () => {
+    const path = inp.value.trim();
+    if (!path) return;
+    go.disabled = true;
+    inp.disabled = true;
+    msg.className = 'wrmsg';
+    msg.textContent = '開いています…';
+    let r = { code: 0, body: null };
+    try {
+      const res = await fetch('/api/v0/repos/add', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(session.token ? { [session.tokenHeader]: session.token } : {}),
+        },
+        body: JSON.stringify({ path }),
+      });
+      let out = null;
+      try { out = await res.json(); } catch { /* 本文が JSON でない */ }
+      r = { code: res.status, body: out };
+    } catch (e) {
+      r = { code: 0, body: { error: e.message } };
+    }
+    go.disabled = false;
+    inp.disabled = false;
+    if (r.code !== 200) {
+      // ⚠️ 理由をそのまま出す（git リポジトリでない／認可が無い／構成が違う を区別できる）
+      msg.className = 'wrmsg bad';
+      msg.textContent = `✖ ${r.body?.error ?? `HTTP ${r.code}`}`;
+      return;
+    }
+    msg.className = 'wrmsg';
+    if (r.body.added) {
+      // 🚨 **足したことを画面に出す**（黙って読める範囲を増やさない）。
+      //    ⚠️ セレクトは作り直さない（選択が先頭に戻る。CLAUDE.md の UI の規則）ので、
+      //    切り替えられるようにするには読み込み直すのが正しい。
+      msg.textContent = `✔ 足しました: ${r.body.added}`;
+      for (const n of r.body.notes ?? []) msg.textContent += `（${n}）`;
+      inp.value = '';
+      location.reload();
+      return;
+    }
+    msg.textContent = `⚠ すでに登録されています: ${r.body.already}`;
+  };
+  go.addEventListener('click', send);
+  // ⚠️ IME の変換確定 Enter で送らない（半端なパスが飛ぶ）
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) send();
+  });
+  btn.addEventListener('click', () => {
+    bar.hidden = !bar.hidden;
+    if (!bar.hidden) inp.focus();
+  });
 }
 
 function renderGridBar(overflow) {
@@ -3481,6 +3571,10 @@ if (session.allowExec) {
     if (r.ok) {
       const d = await r.json();
       const repos = Array.isArray(d.repos) ? d.repos : [];
+      // 📁 **プロジェクトを開く（`docs/open-project.md`）。**
+      //    ⚠️ 門はサーバ側の `gateExec`。ここで出す・出さないは**見た目の話**で、
+      //    守りではない（`canMutate` を見て出すが、押せば必ずサーバの門を通る）。
+      buildOpenBox(d);
       if (repos.length > 1) {
         for (const it of repos) {
           const o = document.createElement('option');

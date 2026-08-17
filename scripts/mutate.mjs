@@ -118,6 +118,67 @@ const MUTANTS = [
         script: 'v0/theme-check.mjs',
     },
     {
+        // 📁 足した後に読み込み直さないと、セレクトが古いままで**切り替えられない**
+        //    （「足せたのに使えない」= 開いた意味が無い状態）。
+        name: 'open-ui-no-reload',
+        why: '足した後に読み込み直さない（セレクトが古いままで、足したリポジトリに切り替えられない）',
+        file: 'v0/app.html',
+        from: "      inp.value = '';\n      location.reload();",
+        to: "      inp.value = '';   /* 変異: 読み込み直さない */",
+        gone: "      inp.value = '';\n      location.reload();",
+        script: 'v0/open-check.mjs',
+    },
+    {
+        // 📁 打った値ではなく空を送る（入力を読めていないと「開く」が成立しない）
+        name: 'open-ui-ignores-input',
+        why: '入力欄の値を読まずに送る（何を打っても開けない）',
+        file: 'v0/app.html',
+        from: '    const path = inp.value.trim();',
+        to: "    const path = '';   /* 変異: 入力を読まない */",
+        gone: 'const path = inp.value.trim();',
+        script: 'v0/open-check.mjs',
+    },
+    /* -----------------------------------------------------------------
+     * 📁 プロジェクトを開く（`docs/open-project.md`）
+     * ----------------------------------------------------------------- */
+    {
+        name: 'repo-add-without-exec',
+        why: '開く経路の認可を外す（読み取りの鍵で読める範囲を HTTP から広げられる = 昇格）',
+        file: 'v0/server.mjs',
+        from: "            const removing = url.pathname.endsWith('/remove');\n            // 1. 認可（**最初**。git を起動する前）\n            if (!await gateExec(req, res)) return;",
+        to: "            const removing = url.pathname.endsWith('/remove');   /* 変異: 認可を外す */",
+        gone: "if (!await gateExec(req, res)) return;\n            // ⚠️ 使えない構成なら理由を返す",
+        pattern: 'リポジトリを足せない',
+    },
+    {
+        name: 'repo-add-any-path',
+        why: 'git ルートの検証を外す（任意のディレクトリを登録一覧に足せる）',
+        file: 'v0/server.mjs',
+        from: "                const r = await normalizeRepoPath(raw);\n                resolved = r.resolved;",
+        to: "                resolved = raw;   /* 変異: 検証しない */",
+        gone: "                const r = await normalizeRepoPath(raw);\n                resolved = r.resolved;",
+        pattern: '開くときのパスの検証',
+    },
+    {
+        name: 'repo-add-no-dedup',
+        why: '同じ場所の重複を潰さない（一覧に2行出てキャッシュも2重になる）',
+        file: 'v0/server.mjs',
+        from: "            const dup = opts.repos.find(r => samePath(r, resolved));",
+        to: "            const dup = opts.repos.find(r => r === resolved);   /* 変異: 字面だけ見る */",
+        gone: "const dup = opts.repos.find(r => samePath(r, resolved));",
+        pattern: 'bare リポジトリを別表記で足しても一覧は1本',
+    },
+    {
+        name: 'repo-remove-startup',
+        why: '起動時に --repo で渡したリポジトリも HTTP から外せるようにする'
+            + '（起動の意図を HTTP から覆せる）',
+        file: 'v0/server.mjs',
+        from: "                if (startupRepos.some(r => samePath(r, hit))) {",
+        to: "                if (false) {   /* 変異: 起動時の分も外せる */",
+        gone: "if (startupRepos.some(r => samePath(r, hit))) {",
+        pattern: '起動時の --repo は外せない',
+    },
+    {
         // 🎨 #76: 配置ボタンを文字からミニグリッドにした。**形を当てているか**を測る
         //    （大きさの揃いだけでは、アイコンが潰れていても緑になる）。
         name: 'grid-icon-shape-missing',
@@ -1379,9 +1440,11 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'bare リポジトリを開けなくする（bare を親に worktree を並べる構成が使えない。'
             + 'かつ bare の門が到達不能になって検証できなくなる）',
         file: 'v0/server.mjs',
-        // ⚠️ `--repo` を複数受けるようにしてループの中に入ったのでインデントが増えた
-        from: "            try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim(); }\n            catch { /* bare。下で判定する */ }",
-        to: "            top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim();",
+        // ⚠️ `--repo` を複数受けるようにしてループの中に入ったのでインデントが増えたが、
+        //    **`normalizeRepoPath()` に切り出した**（起動時と `/api/v0/repos/add` で
+        //    同じ検証を通すため）ので、また関数直下のインデントに戻った
+        from: "    try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim(); }\n    catch { /* bare。下で判定する */ }",
+        to: "    top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim();",
         gone: 'catch { /* bare。下で判定する */ }',
         pattern: 'bare と prunable の門が実際に効く',
     },
@@ -2908,6 +2971,17 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: '監査ログは上限で回転',
     },
     {
+        // 📁 開いた分の控えを渡さないと「開いたのに再起動で消えた」になる（原因が分かりにくい）
+        name: 'serveargs-repos-any-cap',
+        why: '開いたリポジトリの控えを --exec のときだけ渡す（他の構成では再起動で黙って消える）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (reposFile) args.push('--repos-file', reposFile);",
+        to: '    /* 変異: 控えを渡さない */',
+        gone: "if (reposFile) args.push('--repos-file', reposFile)",
+        pattern: '開いたリポジトリの控えはどの capability でも渡す',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    {
         name: 'serveargs-audit-any-cap',
         why: '監査ログの置き場所を --exec のときだけ渡す'
             + '（読み取り専用 + --allow-host の常用構成では 401 の記録を .git の外に'
@@ -4291,7 +4365,10 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
     if (!hit) return { error: \`登録されていないリポジトリです: \${want}\` };
     return { repo: hit };`,
         to: '    return { repo: want };   /* 変異: 登録済みかを見ない */',
-        gone: '登録されていないリポジトリです',
+        // ⚠️ 「登録されていないリポジトリです」は `/api/v0/repos/remove` にもできたので、
+        //    文言だけでは一意にならない（`gone` が他所に一致して SKIP に落ちる型）。
+        //    `pickRepo()` 固有の**返し方**まで含めて一意にする。
+        gone: '    const hit = opts.repos.find(r => samePath(r, want));',
         pattern: '未登録のパスは 400',
     },
     {
@@ -4362,9 +4439,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '同じ場所を2回渡したときに重複を潰さない'
             + '（セレクトに2行出て、キャッシュも2重になる）',
         file: 'v0/server.mjs',
-        from: '            if (normalized.some(r => samePath(r, resolved))) {',
+        from: '            if (normalized.some(x => samePath(x, r.resolved))) {',
         to: '            if (false) {',
-        gone: 'normalized.some(r => samePath(r, resolved))',
+        gone: 'normalized.some(x => samePath(x, r.resolved))',
         pattern: '同じ場所を2回渡したら1本にまとめる',
     },
     {
@@ -4579,9 +4656,13 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: '入口に壁が無い構成でも登録を許す（誰でも /pair/request を叩けるので、'
             + '合言葉を5回ずつ何度でも引き直せる = 上限が意味を失う）',
         file: 'v0/server.mjs',
-        from: '            if (why) { denyJson(res, 403, why); return; }',
-        to: '            /* 変異: 使える構成かを見ない */',
-        gone: 'if (why) { denyJson(res, 403, why); return; }',
+        // ⚠️ 同じ形の門が「プロジェクトを開く」にもできたので、直前の行まで含めて一意にする
+        //    （`from` が2箇所に一致すると、どこを書き換えたか分からない = 測る対象が不定）
+        from: '            const why = pairingWhy();\n'
+            + '            if (why) { denyJson(res, 403, why); return; }',
+        to: '            const why = pairingWhy();   /* 変異: 使える構成かを見ない */',
+        gone: '            const why = pairingWhy();\n'
+            + '            if (why) { denyJson(res, 403, why); return; }',
         pattern: '使えない構成では理由を返す',
     },
     {

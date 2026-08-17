@@ -164,6 +164,7 @@ export function collectRepos(argv) {
 export function serverArgs({
     argv, server, repos, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
     devicesFile,
+    reposFile,
     execTimeout = null,
 }) {
     const has = f => argv.includes(f);
@@ -212,6 +213,10 @@ export function serverArgs({
     //    ⚠️ ただし経路が有効になるのは `--require-auth` のときだけ（サーバ側で判定）。
     //    渡さないと「登録しようとしたら 403」になり、理由が分かりにくい。
     if (devicesFile) args.push('--devices-file', devicesFile);
+    // 📁 **「開く」で足した分の控えも capability に関係なく渡す**（監査ログと同じ理由）。
+    //    ⚠️ 経路が有効になるのは --allow-exec のときだけ（サーバ側で判定）。
+    //    渡さないと「開いたのに再起動で消えた」になり、理由が分かりにくい。
+    if (reposFile) args.push('--repos-file', reposFile);
     if (wantExec) {
         args.push('--allow-exec');
         // 🚨 **絶対上限を起動口から延ばせるようにする。**

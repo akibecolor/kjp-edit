@@ -57,6 +57,9 @@ function parseArgs(argv) {
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
         // 端末の承認（`docs/device-approval.md`）。渡さないと**経路そのものが無い**
         devicesFile: null,
+        // プロジェクトを開く（`docs/open-project.md`）。渡さなければ
+        // **そのプロセスだけ**（再起動で消える）。渡せば残るので一覧で見えて消せる
+        reposFile: null,
         // 🔒 監査ログの上限（超えたら1世代だけ残して回転する）。認証前の 401 も
         //    同じファイルに追記されるので、上限が無いと外から容量を食える。
         auditMaxBytes: 4 * 1024 * 1024,
@@ -133,6 +136,7 @@ function parseArgs(argv) {
         else if (a === '--token') { opts.token = argv[++i]; opts.tokenExplicit = true; }
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
         else if (a === '--devices-file') opts.devicesFile = resolve(argv[++i]);
+        else if (a === '--repos-file') opts.reposFile = resolve(argv[++i]);
         else if (a === '--audit-max-bytes') opts.auditMaxBytes = num('--audit-max-bytes', 512, 2 ** 40);
         else if (a === '--token-file') { opts.tokenFile = resolve(argv[++i]); opts.tokenExplicit = true; }
         else if (a === '--require-auth') opts.requireAuth = true;
@@ -152,6 +156,7 @@ function parseArgs(argv) {
             console.log('       --token <s>          書き込み/実行用トークン（既定は起動時にランダム生成）');
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
             console.log('       --devices-file <path> 承認した端末の台帳（渡さないと端末の登録は無効）');
+            console.log('       --repos-file <path>  「開く」で足したリポジトリの控え（渡さないとそのプロセスだけ）');
             console.log('       --audit-max-bytes <n> 監査ログの上限（既定 4194304。超えたら .1 に回す）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
             console.log('       --require-auth       読み取りにもトークンを要求する（--allow-host のとき既定オン）');
@@ -545,6 +550,60 @@ function repoLabels(paths) {
  * ⚠️ 指定が無ければ既定（1本目）。後方互換のため必須にしない。
  * @returns {{repo: string} | {error: string}}
  */
+/**
+ * 🔒 **リポジトリのパスを「登録名」に正規化する（起動時と実行時で同じ関数を通す）。**
+ *
+ * 🚨 **写して2箇所に持たない。** 起動時の検証と `/api/v0/repos/add` の検証が別実装だと、
+ *    片方だけ緩む／片方の変異が効かなくなる（#63 で `tokenWall` を写して踏んだ形）。
+ * ⚠️ **登録名はリポジトリ側**（`--git-common-dir` の親）。`--show-toplevel` は
+ *    linked worktree ではその worktree を返すので、そのまま登録すると
+ *    `?repo=` の照合に通らない（**エージェントが worktree で働くのが本命**なので、
+ *    ここを取り違えると本命の場合だけ毎回失敗する）。
+ * @returns {Promise<{resolved: string, notes: string[]}>} 開けなければ throw する
+ */
+async function normalizeRepoPath(given) {
+    // 🚨 **bare では `--show-toplevel` が exit 128 で落ちる**
+    //    （`fatal: this operation must be run in a work tree`）。空文字を返すのではない。
+    //    そのため以前は bare リポジトリを「git リポジトリとして開けません」と
+    //    誤って拒否していた。**bare を親にして linked worktree を並べる構成**は
+    //    エージェントを並列に走らせる普通のやり方なので、受け付ける。
+    //    （これが `wt.bare` の門が到達不能だった原因でもある。#33）
+    const notes = [];
+    let top = '';
+    try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim(); }
+    catch { /* bare。下で判定する */ }
+    let resolved = given;
+    if (top) {
+        resolved = top;
+        // 🚨 **linked worktree を渡されたらリポジトリ側に解決する（実測で踏んだ）。**
+        //    `--show-toplevel` は linked worktree では**その worktree** を返すので、
+        //    そのまま登録すると「開いたのは同じリポジトリなのに別の登録が増える」
+        //    （しかも `?repo=` に渡す表記が worktree になり、`--git-common-dir` の親と
+        //    食い違う）。**エージェントが worktree で働くのが本命**なので、
+        //    ここを取り違えると本命の場合だけ毎回おかしくなる（CLAUDE.md のパスの規則）。
+        //    リポジトリ側 = `--git-common-dir`（絶対）の親。
+        try {
+            const common = await commonDir(given);
+            const root = /(^|[\\/])\.git$/.test(common) ? dirname(common) : common;
+            if (root && !samePath(root, top)) {
+                notes.push(`worktree なのでリポジトリ側に解決しました: ${top} → ${root}`);
+                resolved = root;
+            }
+        } catch { /* 解決できなければ toplevel のまま（黙って落とさない） */ }
+        if (!samePath(resolved, given)) {
+            notes.push(`repo をリポジトリのルートに解決しました: ${given} → ${resolved}`);
+        }
+    } else {
+        const bare = (await git(['rev-parse', '--is-bare-repository'], { cwd: given })).trim();
+        if (bare !== 'true') {
+            throw new Error('作業ツリーが無く、bare でもありません（.git の中を指していませんか）');
+        }
+        notes.push(`bare リポジトリを見ています: ${given}`
+            + '（作業ツリーは linked worktree 側にあります）');
+    }
+    return { resolved, notes };
+}
+
 function pickRepo(url) {
     const raw = url.searchParams.get('repo');
     if (raw === null || raw === '') return { repo: opts.repos[0] };
@@ -1367,6 +1426,43 @@ async function presentedTokenAudited(req, res, url) {
  *    peer も Host も母艦を証明しない（実測して撤回した。設計文書の3-2）。
  *    だから合言葉は **stdout と 0600 のファイルにだけ**書き、応答には載せない。
  * ========================================================================= */
+
+/* =========================================================================
+ * プロジェクトを開く（`docs/open-project.md`）
+ *
+ * 🚨 **門は `gateExec`。合言葉は要らない。** exec 級の資格情報を持つ相手は
+ *    `argv=['cat','<任意のパス>']` で**すでに任意のファイルを読める**ので、
+ *    「登録一覧に足す」は新しい権限を与えない（単なる利便性）。
+ *    逆に読み取り／書き込みの鍵に許すと**新しい範囲**を与える昇格になる。
+ * ========================================================================= */
+
+/** 起動時に `--repo` で渡された分（**HTTP から外せない**。起動の意図を覆させない） */
+let startupRepos = [];
+
+/** プロジェクトを開く経路が使える構成か。**理由も返す**（黙って無効にしない） */
+function openProjectWhy() {
+    if (!opts.allowExec) {
+        return 'プロジェクトを開くには --allow-exec が必要です'
+            + '（読み取り・書き込みの鍵で許すと、読める／書ける範囲を HTTP から'
+            + '広げられてしまうため）';
+    }
+    return null;
+}
+
+/**
+ * 足した一覧を保存する（`--repos-file` を渡したときだけ）。
+ *
+ * ⚠️ **起動時に渡した分は保存しない。** 保存すると、次の起動で `--repo` を外しても
+ *    残り続けて「起動フラグと実際に読める範囲が食い違う」状態になる。
+ */
+async function saveRepos() {
+    if (!opts.reposFile) return;
+    const added = opts.repos.filter(r => !startupRepos.some(s => samePath(s, r)));
+    const body = { version: 1, repos: added };
+    await writeFile(opts.reposFile, `${JSON.stringify(body, null, 1)}\n`,
+        { encoding: 'utf8', mode: 0o600 })
+        .catch(err => console.error(`⚠ リポジトリ一覧を保存できませんでした: ${err.message}`));
+}
 
 /** 台帳（`--devices-file` が無ければ端末の登録は無効） */
 let deviceBook = new DeviceBook();
@@ -2577,10 +2673,110 @@ async function handleRequest(req, res) {
             res.end(JSON.stringify({
                 repos: opts.repos.map((p, i) => ({
                     path: p, label: labels[i], current: p === repo,
+                    // ⚠️ 起動時に渡した分は HTTP から外せない（起動の意図を覆させない）
+                    fixed: startupRepos.some(r => samePath(r, p)),
                 })),
                 current: repo,
                 default: opts.repos[0],
+                canAdd: Boolean(opts.allowExec),
+                addWhy: openProjectWhy(),
             }));
+            return;
+        }
+        /**
+         * 🔒 **プロジェクトを開く / 閉じる（`docs/open-project.md`）。**
+         *
+         * 門の順序（順序そのものが守り。認可より前に副作用を起こさない）:
+         *   1. `gateExec` … `--allow-exec` + 生トークン or 端末の鍵
+         *   2. 別オリジン起点を拒否（入口は `same-site` を通すので、ここで塞ぐ）
+         *   3. パスの形 → 4. **起動時と同じ正規化** → 5. `samePath` の重複潰し
+         *   6. 監査 → 7. 一覧に反映（+ `--repos-file` に保存）
+         *
+         * 🚨 **なぜ合言葉が要らないか。** exec 級の資格情報を持つ相手は
+         *    `POST /api/v0/exec argv=['cat','<任意のパス>']` で**すでに任意のファイルを
+         *    読める**（レビュー11 で確定した分界の但し書き）。だから「登録一覧に足す」は
+         *    新しい権限を1つも与えない = 単なる利便性。逆に読み取り／書き込みの鍵に許すと
+         *    **新しい範囲の読み取り／書き込み**を与える昇格になるので、`gateExec` で閉じる。
+         */
+        if (url.pathname === '/api/v0/repos/add' || url.pathname === '/api/v0/repos/remove') {
+            const removing = url.pathname.endsWith('/remove');
+            // 1. 認可（**最初**。git を起動する前）
+            if (!await gateExec(req, res)) return;
+            // ⚠️ 使えない構成なら理由を返す（黙って 404 にしない）
+            const why = openProjectWhy();
+            if (why) { denyJson(res, 403, why); return; }
+            // 2. 🔒 別オリジン起点の拒否は **`gateMutation` が既にやっている**
+            //    （`site && site !== 'same-origin'` → 403「別サイト起点の書き込みは拒否します」）。
+            //    ⚠️ 最初はここに同じ判定を書いたが、**到達不能な死んだ守り**だった（実測）。
+            //    `/pair/*` は入口の認証だけで通る（gateMutation を通らない）ので自前の判定が
+            //    必要だが、こちらは exec の門を通るので不要。**冗長な守りは置かない**
+            //    （置くと「守っているつもりの未検証コード」が増え、変異も KILLED にできない）。
+            let body = {};
+            try { body = await readJson(req); } catch (err) {
+                denyJson(res, err.tooLarge ? 413 : 400, err.message); return;
+            }
+            // 3. パスの形（NUL / 空 / 長すぎ を弾く。git に渡す前）
+            const raw = typeof body.path === 'string' ? toNFC(body.path.trim()) : '';
+            if (!raw) { denyJson(res, 400, 'path を指定してください'); return; }
+            if (raw.includes('\x00')) { denyJson(res, 400, 'path に NUL は使えません'); return; }
+            if (raw.length > 4096) { denyJson(res, 400, 'path が長すぎます'); return; }
+
+            const ok = payload => {
+                res.writeHead(200, {
+                    'content-type': 'application/json; charset=utf-8',
+                    'cache-control': 'no-store',
+                });
+                res.end(JSON.stringify(payload));
+            };
+
+            if (removing) {
+                const hit = opts.repos.find(r => samePath(r, raw));
+                if (!hit) { denyJson(res, 404, `登録されていないリポジトリです: ${raw}`); return; }
+                // 🔒 **起動時に渡した分は外せない。** HTTP から起動の意図を覆させない
+                //    （`--repo` で固定した範囲は「人がそのプロセスに与えた前提」）。
+                if (startupRepos.some(r => samePath(r, hit))) {
+                    denyJson(res, 409,
+                        '起動時に --repo で渡したリポジトリは外せません'
+                        + '（起動の意図を HTTP から覆さないため。デーモンを起動し直してください）');
+                    return;
+                }
+                if (opts.repos.length <= 1) {
+                    denyJson(res, 409, '最後のリポジトリは外せません（見るものが無くなります）');
+                    return;
+                }
+                await auditExec({ event: 'repo-remove', repo: hit, ...originHint(req) }, null);
+                opts.repos = opts.repos.filter(r => !samePath(r, hit));
+                cachedByRepo.delete(hit);
+                await saveRepos();
+                console.log(`📁 リポジトリを一覧から外しました: ${hit}`);
+                ok({ removed: hit, repos: opts.repos });
+                return;
+            }
+
+            // 4. 起動時と**同じ関数**で正規化する（分岐させない）
+            let resolved;
+            let notes = [];
+            try {
+                const r = await normalizeRepoPath(raw);
+                resolved = r.resolved;
+                notes = r.notes;
+            } catch (err) {
+                denyJson(res, 400, `git リポジトリとして開けません: ${err.message}`);
+                return;
+            }
+            // 5. samePath で重複を潰す（2行出るとキャッシュも2重になる）
+            const dup = opts.repos.find(r => samePath(r, resolved));
+            if (dup) { ok({ added: null, already: dup, repos: opts.repos, notes }); return; }
+            // 6. 監査（**足す前**に書く。失敗しても「足そうとした」が残る）
+            await auditExec({
+                event: 'repo-add', repo: resolved, given: raw, ...originHint(req),
+            }, null);
+            // 7. 反映
+            opts.repos.push(resolved);
+            await saveRepos();
+            console.log(`📁 リポジトリを一覧に足しました: ${resolved}`);
+            for (const n of notes) console.log(`   ${n}`);
+            ok({ added: resolved, repos: opts.repos, notes });
             return;
         }
         if (url.pathname === '/api/v0/state') {
@@ -3993,37 +4189,16 @@ server.on('error', err => {
     const normalized = [];
     for (const given of opts.repos) {
         try {
-            // 🚨 **bare では `--show-toplevel` が exit 128 で落ちる**
-            //    （`fatal: this operation must be run in a work tree`）。空文字を返すのではない。
-            //    そのため以前は bare リポジトリを「git リポジトリとして開けません」と
-            //    誤って拒否していた。**bare を親にして linked worktree を並べる構成**は
-            //    エージェントを並列に走らせる普通のやり方なので、受け付ける。
-            //    （これが `wt.bare` の門が到達不能だった原因でもある。#33）
-            let top = '';
-            try { top = (await git(['rev-parse', '--show-toplevel'], { cwd: given })).trim(); }
-            catch { /* bare。下で判定する */ }
-            let resolved = given;
-            if (top) {
-                if (!samePath(top, given)) {
-                    console.log(`repo をリポジトリのルートに解決しました: ${given} → ${top}`);
-                }
-                resolved = top;
-            } else {
-                const bare = (await git(['rev-parse', '--is-bare-repository'], { cwd: given })).trim();
-                if (bare !== 'true') {
-                    throw new Error('作業ツリーが無く、bare でもありません（.git の中を指していませんか）');
-                }
-                console.log(`bare リポジトリを見ています: ${given}`
-                    + '（作業ツリーは linked worktree 側にあります）');
-            }
+            const r = await normalizeRepoPath(given);
+            for (const note of r.notes) console.log(note);
             // ⚠️ 重複は `===` ではなく `samePath()` で潰す。同じ場所を別表記で
             //    2回渡されると、セレクトに2行出て**キャッシュも2重**になる
             //    （TTL の無効化が片方にしか効かない）。
-            if (normalized.some(r => samePath(r, resolved))) {
+            if (normalized.some(x => samePath(x, r.resolved))) {
                 console.log(`repo が重複しているので1本にまとめました: ${given}`);
                 continue;
             }
-            normalized.push(resolved);
+            normalized.push(r.resolved);
         } catch (err) {
             console.error(`\n✖ git リポジトリとして開けません: ${given}`);
             console.error(`  ${err.message}\n`);
@@ -4033,6 +4208,37 @@ server.on('error', err => {
         }
     }
     opts.repos = normalized;
+    // 🔒 **起動時の分を覚える**（HTTP から外せない集合。`docs/open-project.md` 不変条件）
+    startupRepos = [...normalized];
+}
+
+// 📁 前に「開く」で足した分を復元する（`--repos-file` を渡したときだけ）。
+//    ⚠️ **保存されていたパスも起動時と同じ関数で検証する。** ファイルは人が編集できるし、
+//    リポジトリは消えている／移動していることがある。**黙って捨てず、理由を出して飛ばす**
+//    （「足したはずのものが無い」を起動ログで気付けるようにする）。
+if (opts.reposFile) {
+    let saved = null;
+    try { saved = JSON.parse(await readFile(opts.reposFile, 'utf8')); } catch { /* 初回は無い */ }
+    let restored = 0;
+    let dropped = 0;
+    for (const given of saved?.repos ?? []) {
+        if (typeof given !== 'string' || !given.trim()) { dropped++; continue; }
+        try {
+            const r = await normalizeRepoPath(given);
+            if (opts.repos.some(x => samePath(x, r.resolved))) continue;
+            opts.repos.push(r.resolved);
+            restored++;
+        } catch (err) {
+            dropped++;
+            console.error(`⚠ 前に開いたリポジトリを復元できませんでした: ${given}`);
+            console.error(`   ${err.message}`);
+        }
+    }
+    if (restored) console.log(`📁 前に開いたリポジトリを ${restored} 本復元しました`);
+    // 🚨 落としたなら**必ず告知する**（黙って減らすと「開いたはずが無い」になる）
+    if (dropped) console.error(`⚠ 復元できなかったリポジトリが ${dropped} 本あります`);
+    // 落とした分をファイルから消す（次の起動で同じ警告を出し続けない）
+    if (dropped) await saveRepos();
 }
 
 // 🔒 ループバックのみ。--port 0 で OS に空きポートを選ばせる（テスト用）

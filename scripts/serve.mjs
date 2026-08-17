@@ -670,6 +670,7 @@ const args = serverArgs({
     execTokenFile: join(STATE_DIR, 'token-exec'),
     auditLog: join(STATE_DIR, 'exec-audit.jsonl'),
     devicesFile: join(STATE_DIR, 'devices.json'),
+    reposFile: join(STATE_DIR, 'repos.json'),
     execTimeout: timeoutCheck.seconds,
 });
 const wantExec = has('--exec');
