@@ -313,8 +313,32 @@ const gridbar = doc.getElementById('gridbar');
 const gridbarDrawn = !!(gridbar && drawn(gridbar));
 const gridBtns = [...doc.querySelectorAll('#gridbar button')].filter(drawn).map(e => {
   const r = rect(e);
-  return { t: e.textContent.trim(), w: Math.round(r.width),
-    h: Math.round(r.height), top: Math.round(r.top) };
+  const ic = e.querySelector('.gicon');
+  const cs = ic ? win.getComputedStyle(ic) : null;
+  // 🚨 #76: 面が文字からアイコンになったので textContent は空。診断用の名前は
+  //    data-preset を使う（無いと「=48」の羅列になって、どのボタンか言えない）。
+  //    アイコンが行×列を実際に描けているかも一緒に返す（描けているのに嘘を防ぐ）。
+  // 🚨 **セル数と行列数だけでは足りない（実測）。** 行を当てない変異は、セル数から
+  //    暗黙の行が同数できるので**数では差が出なかった**（SURVIVED）。
+  //    実際に変わるのは**セルが箱を満たすか**（暗黙の行は内容で潰れる）。面積で測る。
+  let fill = 0;
+  if (ic) {
+    const ir = rect(ic);
+    const cells = [...ic.querySelectorAll('i')].map(rect);
+    if (cells.length && ir.height > 0 && ir.width > 0) {
+      const bottom = Math.max(...cells.map(c => c.bottom));
+      const topmost = Math.min(...cells.map(c => c.top));
+      const right = Math.max(...cells.map(c => c.right));
+      const left = Math.min(...cells.map(c => c.left));
+      fill = Math.round((((bottom - topmost) * (right - left)) / (ir.height * ir.width)) * 100);
+    }
+  }
+  return { t: e.dataset.preset || e.textContent.trim(), w: Math.round(r.width),
+    h: Math.round(r.height), top: Math.round(r.top),
+    cells: ic ? ic.querySelectorAll('i').length : 0,
+    cols: cs ? cs.gridTemplateColumns.split(' ').length : 0,
+    rows: cs ? cs.gridTemplateRows.split(' ').length : 0,
+    fill };
 });
 const repoSel = doc.getElementById('reposel');
 const repoSels = repoSel && drawn(repoSel) ? repoSel.options.length : 0;

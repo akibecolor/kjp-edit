@@ -352,8 +352,31 @@ try {
                 problems.push(`配置ボタンの縦位置が揃っていない: `
                     + btns.map(b => `${b.t}@${b.top}`).join(' '));
             }
+            // 🚨 **アイコンが「分割の形」を実際に描けていること（#76）。**
+            //    面が文字からミニグリッドになったので、`大きさが揃っている`だけでは
+            //    **アイコンが空でも／行と列が入れ違っていても緑**になる（描けているのに嘘）。
+            //    data-preset の `<行>x<列>` と、実際のセル数・CSS の行列数を突き合わせる。
+            // 🚨 **セルが箱を満たしていることも見る（実測して足した）。**
+            //    数だけ見ると、行を当てない変異は**暗黙の行が同数できる**ので
+            //    差が出ず SURVIVED した。実際に変わるのは高さの分配（暗黙の行は
+            //    内容で潰れる）なので、セルの占める面積を見る。
+            const wrong = btns.filter(b => {
+                const m = /^(\d+)x(\d+)$/.exec(b.t || '');
+                if (!m) return true;
+                const rows = Number(m[1]);
+                const cols = Number(m[2]);
+                return b.cells !== rows * cols || b.rows !== rows || b.cols !== cols
+                    || b.fill < 80;
+            });
+            if (wrong.length) {
+                problems.push('配置ボタンのアイコンが分割の形を描けていない: '
+                    + wrong.map(b => `${b.t}(セル${b.cells}/${b.rows}行${b.cols}列/占有${b.fill}%)`)
+                        .join(' '));
+            }
             lines.push(`配置ボタン ${btns.length} 個 / 幅 ${[...w].join(',')} `
-                + `/ 高さ ${[...h].join(',')} / 上端 ${[...top].join(',')}`);
+                + `/ 高さ ${[...h].join(',')} / 上端 ${[...top].join(',')}`
+                + ` / アイコン ${btns.map(b => b.cells).join(',')} セル`
+                + ` / 占有 ${[...new Set(btns.map(b => b.fill))].join(',')}%`);
         }
     }
     for (const width of [390, 768, 1280]) {

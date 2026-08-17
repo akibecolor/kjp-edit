@@ -63,16 +63,18 @@ const MUTANTS = [
         //    「検査が弱い」と読み違えて検査を強くしに行かないこと。
         why: '配置ボタンの大きさを固定せず、ラベルの字種も混ぜ戻す（利用者が見た形）',
         file: 'v0/app.html',
-        from: '  #gridbar button { min-width: 3.2rem; height: 1.6rem; padding: 0 .4rem;',
-        to: '  #gridbar button { padding: 0 .4rem;   /* 変異: 大きさを固定しない */',
-        gone: 'min-width: 3.2rem; height: 1.6rem;',
-        // ⚠️ **今は外しても差が出ない（実測で SURVIVED）。**
-        //    ラベルを `行×列` に統一したので、自然幅が既に等しい。
-        //    `also` で両方外したいところだが、mutate.mjs の `also` は**同じファイル内**
-        //    しか書き換えられない（別ファイルを足すと復元の経路が増えて、
-        //    復元し損ねる事故の面が広がる）。なので理由を書いて2枚目として残す。
-        //    ラベルが1つでも変わった瞬間に効く（そのとき layout-check が落ちる）。
-        defensive: 'ラベルの字種を統一しているので、今は CSS を外しても幅・高さ・上端が揃う（実測）。ラベルが変わった瞬間に効く2枚目として残す。揃っていること自体はlayout-check が測っているので、守りが消えても property は守られる',
+        from: '  #gridbar button { min-width: 2.2rem; height: 1.6rem; padding: 0 .35rem;',
+        to: '  #gridbar button { padding: 0 .35rem;   /* 変異: 大きさを固定しない */',
+        gone: 'min-width: 2.2rem; height: 1.6rem;',
+        // ⚠️ **今は外しても差が出ない（実測で SURVIVED）。ただし理由が #76 で変わった。**
+        //    以前の理由は「ラベルを `行×列` に統一したので自然幅が等しい」だったが、
+        //    #76 で面を**固定サイズのミニグリッド**（`.gicon` の width/height）にしたので、
+        //    今の揃いの根拠は**アイコンの箱が固定であること**。文字が無いので字種の話は
+        //    もう関係ない。**理由が変わったのに古い理由を残すと、その記述が嘘になる。**
+        //    `also` で `.gicon` の寸法も一緒に外したいが、mutate.mjs の `also` は
+        //    同じファイル内しか書き換えられず（ここは同じ app.html なので可能だが）、
+        //    アイコン側は `grid-icon-shape-missing` / `grid-icon-no-cells` で別に測っている。
+        defensive: '面が固定サイズのミニグリッド（.gicon の width/height）になったので、CSS の min-width/height を外しても幅・高さ・上端は揃う（実測で SURVIVED）。アイコンの箱が可変になった瞬間に効く2枚目として残す。揃っていること自体は layout-check が実測している',
         script: 'v0/layout-check.mjs',
     },
     // -----------------------------------------------------------------
@@ -114,6 +116,30 @@ const MUTANTS = [
         to: "    /* 変異: 覚えない */",
         gone: "localStorage.setItem(THEME_KEY, nxt)",
         script: 'v0/theme-check.mjs',
+    },
+    {
+        // 🎨 #76: 配置ボタンを文字からミニグリッドにした。**形を当てているか**を測る
+        //    （大きさの揃いだけでは、アイコンが潰れていても緑になる）。
+        name: 'grid-icon-shape-missing',
+        why: '配置アイコンに列を当てない（全部1列に潰れて、押す前に分割が読み取れない）',
+        file: 'v0/app.html',
+        // ⚠️ 最初は行（--gr）を外す変異にしていたが、**暗黙の行が同数できて伸びる**ので
+        //    セル数・行数・占有面積のどれも変わらず SURVIVED した（実測）。
+        //    形を決めているのは列なので、守り（--gr の宣言）を消して変異を列に向けた。
+        from: "    icon.style.setProperty('--gc', String(pre.cols));",
+        to: '    /* 変異: 列を当てない */',
+        gone: "icon.style.setProperty('--gc', String(pre.cols));",
+        script: 'v0/layout-check.mjs',
+    },
+    {
+        // 🎨 #76: セルを1枚も作らない（アイコンが空でも大きさは揃う = 緑に見える）
+        name: 'grid-icon-no-cells',
+        why: '配置アイコンのセルを作らない（空の箱が並ぶだけで分割が分からない）',
+        file: 'v0/app.html',
+        from: '    for (let i = 0; i < pre.rows * pre.cols; i += 1) icon.append(el(\'i\'));',
+        to: '    /* 変異: セルを作らない */',
+        gone: "for (let i = 0; i < pre.rows * pre.cols; i += 1) icon.append(el('i'));",
+        script: 'v0/layout-check.mjs',
     },
     {
         // 🔒 レビュー11・指摘E: /pair/request を絞らず1件1行で監査に書くと、

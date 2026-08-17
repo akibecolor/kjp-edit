@@ -143,9 +143,39 @@
        - `min-width` で最も広いラベルに合わせる
      ⚠️ 揃えたと主張するなら測る: layout-check が**全ボタンの幅・高さ・上端**が
         同じであることを実ブラウザで見る。 */
-  #gridbar button { min-width: 3.2rem; height: 1.6rem; padding: 0 .4rem;
+  /* 🚨 **配色に追従させる（#76 で気付いた。撮って初めて見えた）。**
+     ここには背景色の指定が無く、**UA 既定のボタン（明るい面 + 黒文字）のまま**だった。
+     ダークにしても配置バーだけ白いボタンが並ぶ状態で、これも「野暮ったい」の一部。
+     ⚠️ 直値ではなくトークン（`--card` / `--fg` / `--line`）を使う。
+        直値だと配色の切り替えから漏れる（差分の色で実際に踏んだ形）。
+     アイコンのセルは `currentColor` なので、この `color` に自動で追従する。 */
+  #gridbar button { min-width: 2.2rem; height: 1.6rem; padding: 0 .35rem;
     display: inline-flex; align-items: center; justify-content: center;
-    font-variant-numeric: tabular-nums; line-height: 1; }
+    font-variant-numeric: tabular-nums; line-height: 1;
+    background: var(--card); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 3px; cursor: pointer; }
+  /* 選択中は枠と色で示す（アイコンの濃さだけだと、隣と見比べないと分からない） */
+  #gridbar button.on { border-color: var(--accent); color: var(--accent); }
+  /* 🚨 **配置ボタンは「分割の形」を描く（#76）。**
+     以前は `1×1 1×2 … 4×4` という**文字の羅列**で、何がどうなるか読み取りづらかった
+     （利用者の言葉で「野暮ったい」）。実際の行×列をミニグリッドで描く。
+       - セルは `currentColor` なので**配色（自動/ライト/ダーク）に自動で追従**する
+         （色を直値で置くと切り替えから漏れる。theme-check が落とす形）
+       - 箱の大きさは**固定**（行数・列数が変わってもボタンの外形が動かない）。
+         揃いは `#gridbar button` の min-width/height と合わせて layout-check が実測する
+       - 文字を消した代わりに `aria-label` と `title` に意味を残す（読み上げでも分かる）
+     ⚠️ セル数が行×列と一致していることも layout-check が数える
+        （アイコンが空・行数だけ違う、という「描けているのに嘘」を防ぐ）。 */
+  /* ⚠️ **行は宣言しない（実測して守りごと消した）。** `grid-template-rows:
+     repeat(var(--gr),1fr)` を持っていたが、セル数が行×列なので**暗黙の行が同数でき、
+     しかも align-content の既定（stretch）で箱いっぱいに伸びる** — 外しても
+     セル数・行数・占有面積（100%）が1つも変わらず、変異が SURVIVED した。
+     「測っても差が出ない守りは置かない」（CLAUDE.md）に従って削除。
+     形を決めているのは**列（--gc）とセル数**で、そこは変異で固定してある。 */
+  .gicon { display: grid; gap: 1px; width: 1.05rem; height: .85rem;
+    grid-template-columns: repeat(var(--gc), 1fr); }
+  .gicon i { background: currentColor; opacity: .5; border-radius: 1px; }
+  #gridbar button.on .gicon i { opacity: 1; }
   .split { flex: 0 0 var(--split); position: relative; }
   .split::after { content: ''; position: absolute; inset: 0; background: var(--line); }
   .split:hover::after, .split.dragging::after { background: var(--accent); }
@@ -996,8 +1026,22 @@ function renderGridBar(overflow) {
   box.append(el('b', null, '配置'));
   const cur = presetOf(paneGrid);
   for (const pre of GRID_PRESETS) {
-    const b = el('button', pre.name === cur ? 'on' : null, pre.label);
-    b.title = `${pre.rows} 行 × ${pre.cols} 列にする`;
+    // 🚨 **文字ではなく分割の形を描く（#76）。** 意味は title と aria-label に残す
+    //    （文字を消しただけだと読み上げから消える）。
+    const b = el('button', pre.name === cur ? 'on' : null);
+    const why = `${pre.rows} 行 × ${pre.cols} 列にする`;
+    b.title = why;
+    b.setAttribute('aria-label', why);
+    // ⚠️ 検査（layout-check）が「どのボタンか」を言えるように名前を持たせる。
+    //    textContent が空になったので、これが無いと診断が `=48` の羅列になる。
+    b.dataset.preset = pre.name;
+    if (pre.name === cur) b.setAttribute('aria-pressed', 'true');
+    const icon = el('span', 'gicon');
+    // ⚠️ 行は当てない（暗黙の行がセル数から同数でき、伸びて同じ形になる。CSS 側の注記）
+    icon.style.setProperty('--gc', String(pre.cols));
+    // セル数は行×列（layout-check が数えて、形と一致していることを確かめる）
+    for (let i = 0; i < pre.rows * pre.cols; i += 1) icon.append(el('i'));
+    b.append(icon);
     b.addEventListener('click', () => setPreset(pre.name));
     box.append(b);
   }
