@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     DeviceBook, safeLabel, PAIR_TTL_MS, LABEL_MAX, MAX_TRIES,
+    PAIR_ALPHABET, PAIR_LEN, pairCode, formatCode, normalizeCode,
 } from './devices.mjs';
 
 /** 時刻を手で進められる台帳 */
@@ -48,7 +49,7 @@ test('🚨 合言葉が合えば鍵を1回だけ渡す', () => {
     assert.equal(b.claim(r.id, r.code).state, 'unknown', '2回目も鍵を返している');
 });
 
-test('🚨 合言葉を外したら数え、上限で要求そのものを無効にする（6桁を当てさせない）', () => {
+test('🚨 合言葉を外したら数え、上限で要求そのものを無効にする（当てさせない）', () => {
     const { b } = book();
     const r = b.request('スマホ');
     for (let i = 1; i < MAX_TRIES; i++) {
@@ -149,4 +150,51 @@ test('🚨 保存が壊れていても起動できる。ただし黙って捨て
 
     // 正常な保存は broken にしない（嘘の告知を出さない）
     assert.equal(DeviceBook.from(JSON.stringify({ version: 1, devices: [] })).broken, null);
+});
+
+/**
+ * 🚨 **合言葉は日本語にしない**（利用者と検討して却下。2026-08-09）。
+ *
+ * エントロピーは桁で上げる方が効く（ひらがな5文字 27.6 ビット < 30種8文字 39.3 ビット）。
+ * さらに日本語は **IME の切り替え / 読み間違い / 正規化（macOS の NFD）** を持ち込む。
+ * ここでは「紛らわしい字が入らない」「打ちやすさを許しても強度が落ちない」を固定する。
+ */
+test('🚨 合言葉に紛らわしい文字が入らない（30種8文字）', () => {
+    assert.equal(PAIR_ALPHABET.length, 30);
+    for (const ch of '01ILOU') {
+        assert.equal(PAIR_ALPHABET.includes(ch), false, `紛らわしい字が入っている: ${ch}`);
+    }
+    for (let i = 0; i < 200; i++) {
+        const c = pairCode();
+        assert.equal(c.length, PAIR_LEN);
+        for (const ch of c) {
+            assert.ok(PAIR_ALPHABET.includes(ch), `想定外の文字: ${ch}`);
+        }
+    }
+});
+
+test('合言葉は小文字・ハイフン・空白で打っても通る（強度は落ちない）', () => {
+    const { b } = book();
+    const r = b.request('スマホ');
+    // 表示は ABCD-EFGH。打つ側は形を崩してよい
+    assert.match(formatCode(r.code), /^[0-9A-Z]{4}-[0-9A-Z]{4}$/);
+    const typed = formatCode(r.code).toLowerCase().replace('-', ' ');
+    assert.equal(b.claim(r.id, typed).state, 'approved');
+    // 英数字以外を落とすだけなので、別の合言葉が通るようにはならない
+    assert.equal(normalizeCode('abcd-efgh'), 'ABCDEFGH');
+});
+
+test('🚨 合言葉の分布が偏らない（剰余の偏りを作らない）', () => {
+    const seen = new Map();
+    const rounds = 4000;
+    for (let i = 0; i < rounds; i++) {
+        for (const ch of pairCode()) seen.set(ch, (seen.get(ch) ?? 0) + 1);
+    }
+    assert.equal(seen.size, PAIR_ALPHABET.length, '出ていない文字がある（探索空間が狭い）');
+    const want = (rounds * PAIR_LEN) / PAIR_ALPHABET.length;
+    for (const [ch, n] of seen) {
+        // 偏りの検出。剰余をそのまま使うと最初の16文字が約1.5倍になる
+        assert.ok(n > want * 0.8 && n < want * 1.2,
+            `${ch} の出現が ${n}（期待 ${Math.round(want)} 前後）= 偏っている`);
+    }
 });
