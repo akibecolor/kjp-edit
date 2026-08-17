@@ -151,6 +151,11 @@ exec だけ開けていたので「**封じ込めが最も効かない構成で�
 
 - `~/.kjp-edit/devices.json`（0600）。`{ id, label, secretHash, createdAt, lastUsedAt, revokedAt }`
   - 🔒 **平文の鍵を保存しない**（`sha256` を保存し、提示された値を照合する）
+  - ⚠️ **Windows では `mode: 0600` はノーオペ**（Node が mode を無視する。fable の挙動検証が確認）。
+    `pair-code` / `devices.json` / `token-*` が他ユーザから読めないのは、置き場所
+    （`~/.kjp-edit/` = ユーザプロファイル配下）の**継承 ACL** によるものであって、
+    `0600` 指定の効果ではない。**`--devices-file` を全ユーザ可読のディレクトリに置くと保護が消える**。
+    「0600」という表記は POSIX での話で、Windows では**置き場所の ACL に依存する**（プラットフォームの限界）。
 - 監査（`exec-audit.jsonl`）に `pair-request` / `pair-claimed` / `pair-bad-code` /
   `pair-too-many` / `pair-revoke` / `pair-first-use` を残す。**合言葉も鍵も書かない**
 - `label` は端末が名乗る自由文なので**長さと文字種を縛る**（記録に自由文を入れない原則）

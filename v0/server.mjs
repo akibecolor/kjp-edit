@@ -2810,11 +2810,13 @@ async function handleRequest(req, res) {
          */
         if (url.pathname === '/api/v0/repos/add' || url.pathname === '/api/v0/repos/remove') {
             const removing = url.pathname.endsWith('/remove');
-            // 1. 認可（**最初**。git を起動する前）
+            // 1. 認可（**最初**。git を起動する前）。`gateExec` が `--allow-exec` を要求する。
             if (!await gateExec(req, res)) return;
-            // ⚠️ 使えない構成なら理由を返す（黙って 404 にしない）
-            const why = openProjectWhy();
-            if (why) { denyJson(res, 403, why); return; }
+            // ⚠️ **`openProjectWhy()` の再チェックは置かない（fable の挙動検証が拾った死んだ守り）。**
+            //    `openProjectWhy()` が非 null を返すのは `!allowExec` のときだけだが、
+            //    そこは上の `gateExec` が既に 403 で閉じている（到達不能）。same-site の
+            //    死んだ守りと同型。**使えない理由**は GET `/api/v0/repos` の `addWhy` が返し、
+            //    UI はそれで「開く」ボタンを説明つきで隠すので、詳しい文面はそちらで生きている。
             // 2. 🔒 別オリジン起点の拒否は **`gateMutation` が既にやっている**
             //    （`site && site !== 'same-origin'` → 403「別サイト起点の書き込みは拒否します」）。
             //    ⚠️ 最初はここに同じ判定を書いたが、**到達不能な死んだ守り**だった（実測）。

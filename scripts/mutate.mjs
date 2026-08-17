@@ -145,9 +145,14 @@ const MUTANTS = [
         name: 'repo-add-without-exec',
         why: '開く経路の認可を外す（読み取りの鍵で読める範囲を HTTP から広げられる = 昇格）',
         file: 'v0/server.mjs',
-        from: "            const removing = url.pathname.endsWith('/remove');\n            // 1. 認可（**最初**。git を起動する前）\n            if (!await gateExec(req, res)) return;",
+        from: "            const removing = url.pathname.endsWith('/remove');\n"
+            + '            // 1. 認可（**最初**。git を起動する前）。'
+            + '`gateExec` が `--allow-exec` を要求する。\n'
+            + '            if (!await gateExec(req, res)) return;',
         to: "            const removing = url.pathname.endsWith('/remove');   /* 変異: 認可を外す */",
-        gone: "if (!await gateExec(req, res)) return;\n            // ⚠️ 使えない構成なら理由を返す",
+        // ⚠️ `if (!await gateExec…` は5箇所にあるので、直後のコメントまで含めて一意にする
+        gone: 'if (!await gateExec(req, res)) return;\n'
+            + '            // ⚠️ **`openProjectWhy()` の再チェックは置かない',
         pattern: 'リポジトリを足せない',
     },
     {
