@@ -293,6 +293,18 @@ if (has('--pair')) {
             process.exit(1);
         }
         console.log(`失効しました: ${r.body.device?.label ?? target}`);
+        // 🔒 **回転したことを必ず告げる。** 生トークンを貼ったタブと読み取り Cookie が
+        //    無効になるので、黙っていると「急に入れなくなった」になる（原因が分からない失敗）。
+        if (r.body.tokenRotated) {
+            console.log('');
+            console.log('🔑 実行トークンを回転しました（失効を本物にするため）。');
+            console.log('   理由: 承認した端末は実行を通す = `cat token-exec` で生トークンを'
+                + '写せるので、台帳から外すだけでは写しが生き続けます。');
+            console.log('   ⚠️ 生トークンを貼っていたタブと読み取り Cookie は無効になりました'
+                + '（?token= 付き URL を開き直してください）。');
+            console.log('   ✅ 他の承認済み端末はそのまま使えます（端末の鍵は生トークンと独立）。');
+            console.log(`   新しい値: ${join(STATE_DIR, 'token-exec')}`);
+        }
         process.exit(0);
     }
 

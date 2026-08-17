@@ -8079,3 +8079,81 @@ test('🔒 bare リポジトリを別表記で足しても一覧は1本（samePa
         await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
 });
+
+test('🔒 端末を失効させたら実行トークンを回転する（写された生トークンが死ぬ = 失効が本物になる）', async () => {
+    // 🚨 **これが無いと「失効」が嘘になる。** 承認した端末は実行を通す = 実質 RCE なので
+    //    `cat ~/.kjp-edit/token-exec` で生トークンを写せる。台帳から外すだけでは
+    //    写しが生き続けるので「あの端末は切った」が成立しない（止めたつもりで動いている型）。
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-rot-'));
+    const tokenFile = join(dir, 'token-exec');
+    const audit = join(dir, 'audit.jsonl');
+    await writeFile(tokenFile, `${EXEC_TOKEN}\n`, 'utf8');
+    // ⚠️ `--token-file` で渡す（回転の保存先。リテラルの `--token` では保存先が無い）
+    const dir2 = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-rotdev-'));
+    const s = await startAuthServer(['--allow-exec', '--token-file', tokenFile,
+        '--require-auth', '--devices-file', join(dir2, 'devices.json'),
+        '--audit-log', audit]);
+    const url = `http://127.0.0.1:${s.port}`;
+    const post = (action, body, tok) => fetch(`${url}/api/v0/pair/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-kjp-token': tok },
+        body: JSON.stringify(body ?? {}),
+    });
+    try {
+        // 2台承認する（1台目を失効させ、2台目が生き残ることを見る）
+        const secrets = [];
+        for (const label of ['消す端末', '残す端末'] ) {
+            const req = await (await post('request', { label }, EXEC_TOKEN)).json();
+            const code = (await readFile(join(dir2, 'pair-code'), 'utf8')).trim();
+            const got = await (await post('claim', { id: req.id, code }, EXEC_TOKEN)).json();
+            secrets.push({ id: got.device.id, secret: got.secret, label });
+        }
+        // 生トークンは今は通る
+        const beforeSession = await fetch(`${url}/api/v0/session`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } });
+        assert.equal((await beforeSession.json()).presented, 'token', '生トークンが通らない');
+
+        // 失効させる
+        const rv = await post('revoke', { id: secrets[0].id }, EXEC_TOKEN);
+        const rvBody = await rv.json();
+        assert.equal(rv.status, 200, `失効できない: ${JSON.stringify(rvBody)}`);
+        assert.equal(rvBody.tokenRotated, true, '回転したと言っていない');
+
+        // 🔒 **写された生トークンは死ぬ**（これが目的。ここが通ると失効が嘘になる）
+        const after = await fetch(`${url}/api/v0/session`,
+            { headers: { 'x-kjp-token': EXEC_TOKEN } });
+        const afterBody = await after.text();
+        let presented = null;
+        try { presented = JSON.parse(afterBody).presented; } catch { /* 401 は平文 */ }
+        assert.notEqual(presented, 'token',
+            `🚨 失効の後も古い生トークンが通る（写しが生き続ける = 封じ込めになっていない）: ${afterBody.slice(0, 150)}`);
+        // 古い生トークンで実行もできない
+        const oldExec = await fetch(`${url}/api/v0/exec`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': EXEC_TOKEN },
+            body: JSON.stringify({ worktree: repo, argv: ['git', '--version'] }),
+        });
+        assert.notEqual(oldExec.status, 200, '🚨 古い生トークンで実行できた');
+        void await oldExec.text();
+
+        // 🔑 **他の承認済み端末は生き続ける**（端末の鍵は台帳のハッシュ照合で生トークンとは独立）
+        const live = await fetch(`${url}/api/v0/session`,
+            { headers: { 'x-kjp-token': secrets[1].secret } });
+        assert.equal((await live.json()).presented, 'device',
+            '失効させていない端末まで止まった（回転の影響範囲が広すぎる）');
+
+        // 新しい値がファイルに保存され、それで通る（回している意味がある）
+        const next = (await readFile(tokenFile, 'utf8')).trim();
+        assert.notEqual(next, EXEC_TOKEN, 'ファイルの値が変わっていない');
+        assert.ok(next.length >= 24, `新しいトークンが短い: ${next.length}`);
+        const withNew = await fetch(`${url}/api/v0/session`, { headers: { 'x-kjp-token': next } });
+        assert.equal((await withNew.json()).presented, 'token', '新しいトークンで通らない');
+        // 記録に残る（何が起きたか後から追える）
+        const log = await readFile(audit, 'utf8').catch(() => '');
+        assert.match(log, /exec-token-rotated/, '回転が監査に残っていない');
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await rm(dir2, { recursive: true, force: true }).catch(() => {});
+    }
+});

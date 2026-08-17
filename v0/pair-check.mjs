@@ -169,15 +169,18 @@ try {
         problems.push(`承認した端末で実行が通らない: ${ran.code} ${ran.out}`);
     }
 
-    // ---- 4. 失効させたら実行できなくなるが、読み取りは続き、嘘を言わない ----
-    // 🔒 **測って前提を1つ捨てた（2026-08-18）。** 「死んだ鍵を握ると読み取りまで塞ぐ」と
-    //    考えて `shouldForgetDevice` を書いたが、実測では**読み取りは Cookie で続く**
-    //    （案内 URL を開いた時点で読み取り専用の派生秘密が Cookie に入っている）。
-    //    なので塞がるのは実行だけ。ここで測るのは「**実行できないことを画面が言う**」で、
-    //    それが**この repo が最悪とする誤り**（止めたつもりで動いている／
-    //    使えるつもりで必ず 403）の反対側にあたる。
-    //    ⚠️ 実行を取り戻す道も塞いでいない: 鍵つき URL を開き直せば
-    //    `urlToken` が最優先なので通る（判定は devicekey.mjs のテスト）。
+    // ---- 4. 失効させたら、その端末は実行も読み取りも通らない（封じ込め）＋理由を言う ----
+    // 🔒 **ここは2回書き換えている。実測で結論が2回動いた場所なので経過を残す。**
+    //    (1) 最初は「死んだ鍵を握ると読み取りまで塞ぐ」と考えて `shouldForgetDevice` を
+    //        書いたが、実測では**読み取りは Cookie（派生秘密）で続いた**ので守りごと削除した。
+    //    (2) その後、失効時に**実行トークンを回転する**ようにした（利用者の判断。2026-08-18）。
+    //        派生秘密は生トークン由来なので、回転すると**読み取り Cookie も死ぬ** —
+    //        つまり (1) の「読み取りは続く」は**もう成り立たない**。
+    //        失効した端末は実行も読み取りも通らない = **これが本物の封じ込め**で、狙った形。
+    // 🚨 ただし**無言で白画面にしない**こと。実測では
+    //    「unauthorized: トークンが必要です。…?token=... 付きの URL を開いてください」と
+    //    理由が出る。**そこまで測る**（黙って何も出ないのは、この repo が最も嫌う失敗）。
+    // ⚠️ 他の承認済み端末が生き続けること（回転の影響範囲）は smoke 側で HTTP で固定してある。
     const listed = await (await fetch(`${base}/api/v0/pair/list`, {
         method: 'POST',
         headers: {
@@ -210,16 +213,24 @@ try {
         panes: document.querySelectorAll('[data-pane-id]').length,
         cap: document.getElementById('cap')?.textContent ?? '',
         execCode: r.status,
+        seen: (document.body.innerText || '').slice(0, 300),
       };
-    })()`, v => v.reloaded && v.panes >= 1);
+    // ⚠️ 待つ条件は「再読込を跨いだこと」だけ（ペインは**描けなくなるのが正しい**）
+    })()`, v => v.reloaded && (v.panes >= 1 || (v.seen ?? '').length > 0));
     console.log('失効のあと:', JSON.stringify(revoked));
-    if (!revoked?.panes) {
-        problems.push('失効の後に画面が描けていない（実行を切ったら読み取りまで切れている）');
-    }
     if (revoked?.execCode === 200) {
         problems.push('🚨 失効させた端末でまだ実行できる');
     }
-    // 🚨 **「使えるつもりで必ず 403」を作らない。** 実行できないなら画面がそう言う
+    // 🔒 **封じ込め: 失効した端末は読み取りも通らない**（回転で派生秘密も死ぬ）
+    if (revoked?.panes) {
+        problems.push(`🚨 失効させた端末がまだ読めている（回転が効いていない）: ${revoked.panes} ペイン`);
+    }
+    // 🚨 **無言で白画面にしない。** 何が起きたか画面が言うこと
+    if (!/unauthorized|トークン/.test(revoked?.seen ?? '')) {
+        problems.push('失効の後、画面が理由を何も言っていない（無言の白画面）: '
+            + `${JSON.stringify((revoked?.seen ?? '').slice(0, 80))}`);
+    }
+    // 🚨 **「使えるつもりで必ず 403」を作らない。** 実行できないなら「実行有効」と言わない
     if (revoked?.cap?.includes('実行有効') && !revoked.cap.includes('未取得')) {
         problems.push(`実行できないのに「実行有効」と表示している: ${revoked.cap}`);
     }

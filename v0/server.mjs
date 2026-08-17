@@ -1464,6 +1464,65 @@ async function saveRepos() {
         .catch(err => console.error(`⚠ リポジトリ一覧を保存できませんでした: ${err.message}`));
 }
 
+/**
+ * 🔒 **失効させたら実行トークンを回転する（利用者の判断。2026-08-18）。**
+ *
+ * 🚨 **これが無いと「失効」が嘘になる。** 承認した端末は実行を通す = 実質 RCE なので、
+ *    `cat ~/.kjp-edit/token-exec` で**生トークンを写せる**。台帳から外すだけでは
+ *    写された生トークンが生き続けるので、「あの端末は切った」は封じ込めにならない
+ *    （観測ツールとして最悪の誤り = 止めたつもりで動いている、と同じ型）。
+ *
+ * 影響範囲（意図した形）:
+ *   - 写された生トークン … **死ぬ**（目的）
+ *   - 他の承認済み端末 … **生き続ける**（端末の鍵は台帳のハッシュ照合で生トークンとは独立）
+ *   - 生トークンを貼ったタブ / 読み取り Cookie … 死ぬ（派生秘密が生トークン由来。
+ *     `?token=` 付き URL を開き直す）
+ *   - CLI / フック … 影響なし（毎回ファイルを読むので回転後の値が入る）
+ *
+ * ⚠️ **`--token-file` が無い構成（`--token` をリテラルで渡した）では保存先が無い。**
+ *    黙って in-memory だけ変えると**新しい値を誰も知らない**ので、stdout に出す
+ *    （「分からない」と「無い」を分ける。捨てない）。
+ * @returns {Promise<{rotated: boolean, why?: string}>}
+ */
+async function rotateExecToken(reason) {
+    if (!opts.token) return { rotated: false, why: 'トークンを使っていない構成です' };
+    const next = randomBytes(32).toString('base64url');
+    const prev = opts.token;
+    opts.token = next;
+    // 🚨 **古い値の控えを捨てる。** `goodTokens` / `goodSecrets` は「一度通った値」を
+    //    覚えて混雑の門を素通りさせる集合なので、古いトークンと古い派生秘密の
+    //    ハッシュが残っていると**回転後も門だけは素通りできる**（比較は必ず走るので
+    //    認可は破れないが、総当たりの絞りが緩む状態を残さない）。
+    goodTokens.forget();
+    goodSecrets.forget();
+    let saved = null;
+    if (opts.tokenFile) {
+        try {
+            await writeFile(opts.tokenFile, `${next}\n`, { encoding: 'utf8', mode: 0o600 });
+            saved = opts.tokenFile;
+        } catch (err) {
+            // ⚠️ 保存に失敗しても in-memory は既に変わっている（写しを殺すのが優先）。
+            //    **黙らない**: 新しい値を知る手段が stdout だけになったことを告げる。
+            console.error(`⚠ 実行トークンを回転しましたが保存できませんでした: ${err.message}`);
+        }
+    }
+    await auditExec({
+        event: 'exec-token-rotated', reason,
+        savedTo: saved, prevLength: prev.length,
+    }, null);
+    console.log(`🔑 実行トークンを回転しました（${reason}）`);
+    if (saved) {
+        console.log(`   新しい値: ${saved}`);
+        console.log('   ⚠️ 生トークンを貼っていたタブと読み取り Cookie は無効になりました'
+            + '（?token= 付き URL を開き直してください）。承認済みの端末はそのまま使えます。');
+    } else {
+        // 保存先が無い構成。**値そのものを出す**（他に知る手段が無い）
+        console.log(`   新しい実行トークン: ${next}`);
+        console.log('   ⚠️ --token-file が無い構成なので保存していません（この行が唯一の控えです）');
+    }
+    return { rotated: true, savedTo: saved };
+}
+
 /** 台帳（`--devices-file` が無ければ端末の登録は無効） */
 let deviceBook = new DeviceBook();
 
@@ -3052,7 +3111,12 @@ async function handleRequest(req, res) {
                 await auditExec({
                     event: 'pair-revoke', device: r.device.id, label: r.device.label,
                 }, null);
-                ok({ ok: true, device: r.device });
+                // 🚨 **失効させたら実行トークンを回転する（これが無いと「失効」が嘘になる）。**
+                //    端末の鍵は実行を通す = 実質 RCE なので、`cat token-exec` で生トークンを
+                //    写せる。台帳から外すだけでは写しが生き続けるので封じ込めにならない。
+                //    ⚠️ 他の承認済み端末は生き続ける（端末の鍵は台帳のハッシュ照合で独立）。
+                const rot = await rotateExecToken(`端末を失効させた（${r.device.label}）`);
+                ok({ ok: true, device: r.device, tokenRotated: rot.rotated });
                 return;
             }
             denyJson(res, 404, `知らない操作です: ${action}`);

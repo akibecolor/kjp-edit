@@ -216,6 +216,17 @@ const MUTANTS = [
         pattern: '連打は監査を集約する',
     },
     {
+        // 🔒 失効させても生トークンを回転しないと、写された生トークンが生き続けて
+        //    「あの端末は切った」が嘘になる（止めたつもりで動いている型）。
+        name: 'pair-revoke-no-rotate',
+        why: '端末を失効させても実行トークンを回転しない（cat で写された生トークンが生き続ける = 失効が封じ込めにならない）',
+        file: 'v0/server.mjs',
+        from: '                const rot = await rotateExecToken(',
+        to: '                const rot = { rotated: true }; if (false) await rotateExecToken(',
+        gone: 'const rot = await rotateExecToken(',
+        pattern: '実行トークンを回転する',
+    },
+    {
         // 🔒 レビュー11・指摘D: 期限切れ/承認待ち無しでも合言葉ファイルを掃かないと、
         //    serve.mjs --pair が死んだ合言葉を「まだ使える（5分で切れます）」と嘘表示する。
         name: 'pair-code-not-swept-on-expiry',
