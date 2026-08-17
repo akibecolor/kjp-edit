@@ -57,6 +57,9 @@ function parseArgs(argv) {
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
         // 端末の承認（`docs/device-approval.md`）。渡さないと**経路そのものが無い**
         devicesFile: null,
+        // 🔒 読み取り用の派生秘密の配布先（`token-read`）。**回転のときに一緒に配り直す**
+        //    （渡さないと、回転後にフックと案内 URL が古い値を持ち続けて 401 になる）
+        readSecretFile: null,
         // プロジェクトを開く（`docs/open-project.md`）。渡さなければ
         // **そのプロセスだけ**（再起動で消える）。渡せば残るので一覧で見えて消せる
         reposFile: null,
@@ -137,6 +140,7 @@ function parseArgs(argv) {
         else if (a === '--audit-log') opts.auditLog = resolve(argv[++i]);
         else if (a === '--devices-file') opts.devicesFile = resolve(argv[++i]);
         else if (a === '--repos-file') opts.reposFile = resolve(argv[++i]);
+        else if (a === '--read-secret-file') opts.readSecretFile = resolve(argv[++i]);
         else if (a === '--audit-max-bytes') opts.auditMaxBytes = num('--audit-max-bytes', 512, 2 ** 40);
         else if (a === '--token-file') { opts.tokenFile = resolve(argv[++i]); opts.tokenExplicit = true; }
         else if (a === '--require-auth') opts.requireAuth = true;
@@ -157,6 +161,7 @@ function parseArgs(argv) {
             console.log('       --audit-log <path>   実行の監査ログの置き場所（既定は <GIT_DIR> 内。実行した相手が消せる）');
             console.log('       --devices-file <path> 承認した端末の台帳（渡さないと端末の登録は無効）');
             console.log('       --repos-file <path>  「開く」で足したリポジトリの控え（渡さないとそのプロセスだけ）');
+            console.log('       --read-secret-file <path> 読み取り用の派生秘密の配布先（回転時に一緒に配り直す）');
             console.log('       --audit-max-bytes <n> 監査ログの上限（既定 4194304。超えたら .1 に回す）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
             console.log('       --require-auth       読み取りにもトークンを要求する（--allow-host のとき既定オン）');
@@ -1475,9 +1480,19 @@ async function saveRepos() {
  * 影響範囲（意図した形）:
  *   - 写された生トークン … **死ぬ**（目的）
  *   - 他の承認済み端末 … **生き続ける**（端末の鍵は台帳のハッシュ照合で生トークンとは独立）
- *   - 生トークンを貼ったタブ / 読み取り Cookie … 死ぬ（派生秘密が生トークン由来。
- *     `?token=` 付き URL を開き直す）
- *   - CLI / フック … 影響なし（毎回ファイルを読むので回転後の値が入る）
+ *   - 生トークンを貼ったタブ / 読み取り Cookie … 死ぬ（派生秘密が生トークン由来）
+ *   - CLI / フック … **配布先を配り直せば影響なし**（下の `--read-secret-file`）
+ *
+ * 🚨 **ここで `token-read` も配り直さないと、読み取りフックが黙って壊れる（レビュー12）。**
+ *    派生秘密は生トークン由来なので回転で変わるが、その配布先（`~/.kjp-edit/token-read`）を
+ *    書くのは `scripts/serve.mjs` の**起動時1回だけ**。回転で更新しないと、
+ *    `scripts/precheck.mjs`（PreToolUse フック = エージェントの安全装置）が
+ *    毎回そのファイルを読んで**死んだ値**を提示し、401 → `ask` に落ちて
+ *    **衝突の事前チェックがデーモンを再起動するまで沈黙する**。
+ *    ⚠️ `serve.mjs:705` に「実測: フックが毎回 401 を受け `ask` に倒れて初めて気付いた」と
+ *    **同じ事故が別経路で記録されている**。回転でそれを再発させていた。
+ *    ⚠️ さらに「`?token=` 付き URL を開き直せ」も、その URL に載る値が
+ *    古い派生秘密なので**復旧手段にならない**（新しい値を出す必要がある）。
  *
  * ⚠️ **`--token-file` が無い構成（`--token` をリテラルで渡した）では保存先が無い。**
  *    黙って in-memory だけ変えると**新しい値を誰も知らない**ので、stdout に出す
@@ -1506,21 +1521,57 @@ async function rotateExecToken(reason) {
             console.error(`⚠ 実行トークンを回転しましたが保存できませんでした: ${err.message}`);
         }
     }
+    // 🚨 **読み取り用の派生秘密も配り直す（レビュー12）。** ここを飛ばすと
+    //    フック（`precheck.mjs`）が古い値を提示して 401 → `ask` に落ち、
+    //    衝突の事前チェックが再起動まで黙って止まる。
+    //    ⚠️ 派生の式は `v0/readsecret.mjs` の1本を通す（配る側とずれると
+    //    「読み取り用と名乗るファイルで読み取りができない」に戻る）。
+    let readSaved = null;
+    if (opts.readSecretFile) {
+        // ⚠️ 読み取り専用構成では `--token-file` が `token-read` 自身なので、
+        //    そこに派生値を書くと**トークンそのものを壊す**（起動時と同じ判断）。
+        if (opts.tokenFile && samePath(opts.readSecretFile, opts.tokenFile)) {
+            console.error('⚠ 読み取り秘密の配布先が --token-file と同じなので書きません'
+                + `（トークンを壊すため）: ${opts.readSecretFile}`);
+        } else {
+            try {
+                await writeFile(opts.readSecretFile, `${readSecretOf(next)}\n`,
+                    { encoding: 'utf8', mode: 0o600 });
+                readSaved = opts.readSecretFile;
+            } catch (err) {
+                console.error('⚠ 読み取り秘密を配り直せませんでした'
+                    + `（フックが 401 になります）: ${err.message}`);
+            }
+        }
+    }
     await auditExec({
         event: 'exec-token-rotated', reason,
-        savedTo: saved, prevLength: prev.length,
+        savedTo: saved, readSavedTo: readSaved, prevLength: prev.length,
     }, null);
     console.log(`🔑 実行トークンを回転しました（${reason}）`);
     if (saved) {
         console.log(`   新しい値: ${saved}`);
-        console.log('   ⚠️ 生トークンを貼っていたタブと読み取り Cookie は無効になりました'
-            + '（?token= 付き URL を開き直してください）。承認済みの端末はそのまま使えます。');
     } else {
         // 保存先が無い構成。**値そのものを出す**（他に知る手段が無い）
         console.log(`   新しい実行トークン: ${next}`);
         console.log('   ⚠️ --token-file が無い構成なので保存していません（この行が唯一の控えです）');
     }
-    return { rotated: true, savedTo: saved };
+    if (readSaved) {
+        console.log(`   読み取り用の派生秘密も配り直しました: ${readSaved}`);
+    } else if (!opts.readSecretFile) {
+        // 🚨 **配布先を知らないことを黙らない。** フックと案内 URL が壊れたままになる
+        console.log('   ⚠️ 読み取り用の配布先（--read-secret-file）を渡されていないので'
+            + '配り直せていません。フック（precheck）と古い ?token= 付き URL は'
+            + '401 になります（デーモンを起動し直すと直ります）。');
+    }
+    // 🔒 **新しい読み取り用 URL をここで出す。** 古い `?token=` を開き直しても
+    //    載っている派生秘密は死んでいるので、復旧手段として案内にならない。
+    // ⚠️ `opts.port` ではなく**実際に listen したポート**を使う（`--port 0` だと 0 になる）
+    const shownPort = server.address()?.port ?? opts.port;
+    console.log(`   新しい読み取り用 URL: http://127.0.0.1:${shownPort}/?token=${readSecretOf(next)}`);
+    console.log('   ⚠️ 生トークンを貼っていたタブと古い読み取り Cookie は無効です。'
+        + '承認済みの端末（localStorage の鍵）はそのまま使えます。');
+    return { rotated: true, savedTo: saved, readSavedTo: readSaved };
 }
 
 /** 台帳（`--devices-file` が無ければ端末の登録は無効） */
@@ -3111,10 +3162,13 @@ async function handleRequest(req, res) {
                 await auditExec({
                     event: 'pair-revoke', device: r.device.id, label: r.device.label,
                 }, null);
-                // 🚨 **失効させたら実行トークンを回転する（これが無いと「失効」が嘘になる）。**
-                //    端末の鍵は実行を通す = 実質 RCE なので、`cat token-exec` で生トークンを
-                //    写せる。台帳から外すだけでは写しが生き続けるので封じ込めにならない。
+                // 🚨 **失効させたら実行トークンを回転する。** 端末の鍵は実行を通す = 実質 RCE なので
+                //    `cat token-exec` で生トークンを写せる。台帳から外すだけでは写しが生き続ける。
                 //    ⚠️ 他の承認済み端末は生き続ける（端末の鍵は台帳のハッシュ照合で独立）。
+                // ⚠️ **これを「完全な封じ込め」と読まない（レビュー12 で過大主張を訂正）。**
+                //    相手は既に任意コード実行を得ているので、回転より前に cron / 自動起動 /
+                //    worktree 内のスクリプト / 常駐プロセス / 追加した鍵を仕込める。
+                //    **回転が取り消せるのは「写された生トークンで HTTP を叩く」経路だけ。**
                 const rot = await rotateExecToken(`端末を失効させた（${r.device.label}）`);
                 ok({ ok: true, device: r.device, tokenRotated: rot.rotated });
                 return;

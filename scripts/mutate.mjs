@@ -216,6 +216,17 @@ const MUTANTS = [
         pattern: '連打は監査を集約する',
     },
     {
+        // 🔒 レビュー12: 回転で読み取り用の派生秘密を配り直さないと、フック（precheck）が
+        //    毎回死んだ値を提示して 401 → ask に落ち、衝突の事前チェックが黙って止まる。
+        name: 'rotate-skips-read-secret',
+        why: '回転しても読み取り用の派生秘密を配り直さない（フックが 401 になり衝突の事前チェックが黙って止まる）',
+        file: 'v0/server.mjs',
+        from: '    let readSaved = null;\n    if (opts.readSecretFile) {',
+        to: '    let readSaved = null;\n    if (false) {   /* 変異: 配り直さない */',
+        gone: 'let readSaved = null;\n    if (opts.readSecretFile) {',
+        pattern: '読み取り用の派生秘密も配り直す',
+    },
+    {
         // 🔒 失効させても生トークンを回転しないと、写された生トークンが生き続けて
         //    「あの端末は切った」が嘘になる（止めたつもりで動いている型）。
         name: 'pair-revoke-no-rotate',

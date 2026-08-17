@@ -165,6 +165,7 @@ export function serverArgs({
     argv, server, repos, port, tokenFile, writeTokenFile, execTokenFile, auditLog,
     devicesFile,
     reposFile,
+    readSecretFile,
     execTimeout = null,
 }) {
     const has = f => argv.includes(f);
@@ -217,6 +218,10 @@ export function serverArgs({
     //    ⚠️ 経路が有効になるのは --allow-exec のときだけ（サーバ側で判定）。
     //    渡さないと「開いたのに再起動で消えた」になり、理由が分かりにくい。
     if (reposFile) args.push('--repos-file', reposFile);
+    // 🔒 **読み取り用の派生秘密の配布先も渡す（レビュー12）。** 渡さないと、失効で
+    //    実行トークンが回転したときにこのファイルが古いまま残り、
+    //    フック（precheck）と古い ?token= 付き URL が 401 になる（安全装置が黙って止まる）。
+    if (readSecretFile) args.push('--read-secret-file', readSecretFile);
     if (wantExec) {
         args.push('--allow-exec');
         // 🚨 **絶対上限を起動口から延ばせるようにする。**

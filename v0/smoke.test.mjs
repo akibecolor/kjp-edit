@@ -8157,3 +8157,68 @@ test('🔒 端末を失効させたら実行トークンを回転する（写さ
         await rm(dir2, { recursive: true, force: true }).catch(() => {});
     }
 });
+
+test('🔒 回転したら読み取り用の派生秘密も配り直す（フックが黙って壊れない。レビュー12）', async () => {
+    // 🚨 **レビュー12 が見つけた嘘。** 回転は `token-exec` だけ書き換えていたが、
+    //    読み取り用の派生秘密の配布先（`~/.kjp-edit/token-read`）を書くのは
+    //    `serve.mjs` の**起動時1回だけ**。回転で更新しないと、
+    //    `scripts/precheck.mjs`（PreToolUse フック = エージェントの安全装置）が
+    //    毎回そのファイルを読んで**死んだ値**を提示し、401 → `ask` に落ちて
+    //    **衝突の事前チェックが再起動まで沈黙する**。
+    //    それなのにコメントは「CLI/フック … 影響なし」と書いてあった（事実に反する記述）。
+    //    ⚠️ `serve.mjs:705` に「実測: フックが毎回 401 を受け ask に倒れて初めて気付いた」と
+    //    **同じ事故が別経路で記録されている**。回転でそれを再発させていた。
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-rot2-'));
+    const tokenFile = join(dir, 'token-exec');
+    const readFilePath = join(dir, 'token-read');
+    await writeFile(tokenFile, `${EXEC_TOKEN}\n`, 'utf8');
+    // 起動口と同じように、派生秘密を配布先に書いておく（フックが読む値）
+    await writeFile(readFilePath, `${readSecretOf(EXEC_TOKEN)}\n`, 'utf8');
+    const dir2 = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-rot2dev-'));
+    const s = await startAuthServer(['--allow-exec', '--token-file', tokenFile,
+        '--require-auth', '--devices-file', join(dir2, 'devices.json'),
+        '--read-secret-file', readFilePath]);
+    const url = `http://127.0.0.1:${s.port}`;
+    const post = (action, body, tok) => fetch(`${url}/api/v0/pair/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-kjp-token': tok },
+        body: JSON.stringify(body ?? {}),
+    });
+    /** フックと同じ読み方（毎回ファイルを読んでヘッダに載せる） */
+    const asHook = async () => {
+        const tok = (await readFile(readFilePath, 'utf8')).trim();
+        const r = await fetch(`${url}/api/v0/state?fresh=1`, { headers: { 'x-kjp-token': tok } });
+        void await r.text();
+        return r.status;
+    };
+    try {
+        assert.equal(await asHook(), 200, 'フックの読み方で最初から通らない（検査が測れていない）');
+        const before = (await readFile(readFilePath, 'utf8')).trim();
+
+        // 端末を1台承認して失効させる（回転が起きる）
+        const req = await (await post('request', { label: '回転の検査' }, EXEC_TOKEN)).json();
+        const code = (await readFile(join(dir2, 'pair-code'), 'utf8')).trim();
+        const got = await (await post('claim', { id: req.id, code }, EXEC_TOKEN)).json();
+        assert.ok(got.secret, `承認できない: ${JSON.stringify(got)}`);
+        const rv = await (await post('revoke', { id: got.device.id }, EXEC_TOKEN)).json();
+        assert.equal(rv.tokenRotated, true, '回転していない');
+
+        // 🔒 **配布先が新しい値に更新されている**（= フックが通る）
+        const after = (await readFile(readFilePath, 'utf8')).trim();
+        assert.notEqual(after, before, '🚨 読み取り用の配布先が古いまま（フックが 401 になる）');
+        assert.equal(await asHook(), 200,
+            '🚨 回転の後、フックの読み方で 401 になる（衝突の事前チェックが黙って止まる）');
+        // 派生の式は1本（配る側とずれると「読み取り用と名乗る値で読めない」に戻る）
+        const nextToken = (await readFile(tokenFile, 'utf8')).trim();
+        assert.equal(after, readSecretOf(nextToken), '配った値が派生の式と合っていない');
+
+        // 🔒 古い派生秘密は死んでいる（封じ込めは効いたまま）
+        const old = await fetch(`${url}/api/v0/state?fresh=1`, { headers: { 'x-kjp-token': before } });
+        assert.equal(old.status, 401, '古い派生秘密がまだ通る（回転の意味が無い）');
+        void await old.text();
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        await rm(dir2, { recursive: true, force: true }).catch(() => {});
+    }
+});
