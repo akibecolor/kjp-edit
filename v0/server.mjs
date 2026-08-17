@@ -40,7 +40,7 @@ import { parseProcPairs, descendantsOf, stillAlive } from './proctree.mjs';
 import { makeFailTracker, makeInflightGate, makeGoodSet, failDelay } from './failtracker.mjs';
 import { collisionFullLabels } from './dirlabel.mjs';
 import { readSecretOf } from './readsecret.mjs';
-import { DeviceBook, formatCode, PAIR_TTL_MS } from './devices.mjs';
+import { DeviceBook, formatCode, PAIR_TTL_MS, LABEL_MAX } from './devices.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -636,23 +636,22 @@ async function collectFresh(repo) {
         });
     }));
 
-    // 🚨 checkout は git のフック（post-checkout）を起動する。つまりフックのある
-    //    リポジトリでは `--allow-write` は実質コード実行と同じ。capability を
-    //    分けている以上、この事実を payload に出して見えるようにする（レビューで実証）。
-    //    既定でフックを止めるとワークフローを壊すので、止めずに知らせる方を選んだ。
+    // 🚨 **checkout の残余リスクを正直に告げる（レビュー11・指摘F で書き換え）。**
+    //    以前は「checkout はフックを起動するので実質コード実行」と警告していたが、
+    //    (1) その検査は既定 hooks ディレクトリしか見ず `core.hooksPath` を見落として
+    //        いたので、custom hooksPath のリポジトリで**警告が沈黙**していた、
+    //    (2) いまは checkout でフックを無効化した（`-c core.hooksPath=<空>`）ので
+    //        「フックが実質コード実行」はもう当てはまらない。
+    //    しかし **gitattributes の smudge/clean フィルタは checkout で走りうる**ので、
+    //    信頼できない ref を checkout する行為は依然として実質コード実行になりえる。
+    //    hooks を止めたことで「安全になった」と誤解させない — 残るリスクを明示する。
     if (opts.allowWrite) {
-        try {
-            const { existsSync } = await import('node:fs');
-            const hooks = ['post-checkout', 'post-index-change']
-                .filter(h => existsSync(join(common, 'hooks', h)));
-            if (hooks.length) {
-                errors.push({
-                    scope: 'security',
-                    message: `フックが存在します（${hooks.join(', ')}）。checkout はこれを起動するので、`
-                        + '--allow-write はこのリポジトリでは実質コード実行と同じです。',
-                });
-            }
-        } catch { /* 判定できなければ黙る */ }
+        errors.push({
+            scope: 'security',
+            message: 'checkout はこのリポジトリのフック（post-checkout 等）を抑止して実行しますが、'
+                + 'gitattributes の smudge/clean フィルタは checkout で走りえます。'
+                + '信頼できない ref の checkout は実質コード実行になりえます。',
+        });
     }
 
     // 全 worktree の HEAD + base を含む1枚のグラフ。
@@ -1238,6 +1237,15 @@ const mutationFails = makeFailTracker({
     event: 'mutation-token-failed', summaryEvent: 'mutation-token-failed-summary',
     windowMs: AUTH_FAIL_WINDOW_MS,
 });
+// 🔒 **端末登録の連打を絞る（レビュー11・指摘E）。** read 認証だけで無制限に叩ける穴を塞ぐ。
+//    ⚠️ 失敗の追跡ではなく**成功する要求の流量制限**に流用している。`free` を広めに取り、
+//    複数端末を続けて登録する正規の使い方（数台）は即時、洪水だけを遅延・集約する。
+const pairFails = makeFailTracker({
+    audit: rec => auditExec(rec),
+    event: 'pair-request', summaryEvent: 'pair-request-summary',
+    windowMs: AUTH_FAIL_WINDOW_MS,
+    delayOpts: { free: 5 },
+});
 /**
  * 🔒 **実行トークンを1度でも通した値の控え。**
  *
@@ -1350,6 +1358,18 @@ function pairingWhy() {
     if (!opts.requireAuth) {
         return '端末の登録は認証を有効にしたときだけ使えます（--allow-host か --require-auth）';
     }
+    // 🔒 **端末の登録は --allow-exec のときだけ許す（11回目のレビュー / 不変条件5）。**
+    //    理由: 端末の鍵は実行を通す = 実質 RCE なので、`cat ~/.kjp-edit/token-exec` で
+    //    生の実行トークンを回収できる。つまり「端末の鍵 < 生トークン」「失効で封じ込め」は
+    //    exec が有効な限り**成立しない**（`docs/device-approval.md` の分界の但し書き）。
+    //    さらに一覧・失効は gateExec を通すので、exec 無しの構成では
+    //    **checkout 権を持つ長寿命の鍵を発行できるのに二度と失効できない**という
+    //    不変条件5の破れが起きる。両方まとめて閉じるため、登録自体を exec に揃える。
+    if (!opts.allowExec) {
+        return '端末の登録は --allow-exec のときだけ使えます'
+            + '（端末の鍵は実行を通す＝生トークンと同等になるため、'
+            + '失効で封じ込められる --allow-write だけの構成では登録させません）';
+    }
     return null;
 }
 
@@ -1454,7 +1474,16 @@ async function tokenWall(req, res, vals, compare) {
     }
     try {
         const ok = compare();
-        if (ok) goodTokens.remember(vals);
+        // 🚨 **通った値だけを覚える。提示値を丸ごと覚えてはいけない（11回目のレビュー）。**
+        //    実行トークンと読み取り用 Cookie を一緒に送る正規の要求（/state のポール等）は
+        //    `vals=[execToken, readSecret]` で compare=true になる。ここで vals を丸ごと
+        //    覚えると **readSecret が goodTokens に昇格**し、以後 readSecret を提示した要求が
+        //    `goodTokens.has` で混雑の門・記録・遅延を素通りする = #63 で塞いだ
+        //    「痕跡ゼロ・無遅延の総当たり」が正規運用で復活する（readSecret は Cookie で
+        //    他ポートに漏れ、案内 URL にも載る = 広く出回る値）。読み取り側の
+        //    `rememberGoodSecret` は同じ理由で filter しているのに、ここに絞りが無かった。
+        //    ⚠️ 覚えてよいのは**この壁（実行）を実際に通せる値だけ** = 生トークン or 端末の鍵。
+        if (ok) goodTokens.remember(vals.filter(v => tokenMatches(v) || Boolean(deviceMatches(v))));
         // 🚨 **外したら記録して遅延する。** ここが無いと痕跡ゼロで総当たりできた
         //    （実測 8,955 req/s。読み取り側だけ塞いで実行側が取り残しだった）。
         //    ⚠️ 遅延の間も枠を握る。これが「並列でも縛れる」の本体。
@@ -1561,9 +1590,16 @@ async function gateMutation(req, res) {
     const vals = typeof given === 'string' ? [given] : [];
     // 壁の中身は `tokenWall()` に1本化してある（写すと変異が効かなくなる。#63）
     // 🔒 **端末の鍵でも実行を通す（`docs/device-approval.md`）。**
-    //    ⚠️ ただし生トークンとは別扱い。`/api/v0/session` の払い出しと
-    //    `/pair/list` `/pair/revoke` は `tokenMatches()` だけを見る
-    //    （通すと承認した端末が別の端末を承認できる = 承認の連鎖）。
+    //    `/api/v0/session` の払い出しと `/pair/list` `/pair/revoke` は `tokenMatches()`
+    //    だけを見て端末の鍵では通さない（HTTP 層での分界）。
+    // 🚨 **ただしこの分界は「多層防御の1枚目」であって封じ込めではない（11回目のレビュー）。**
+    //    端末の鍵は実行を通す = 実質 RCE なので、承認された端末は
+    //    `POST /api/v0/exec argv=['cat','~/.kjp-edit/token-exec']` で**生トークンを
+    //    ディスクから回収できる**。回収すれば一覧・失効・別端末の発行も全部通る。
+    //    つまり exec が有効な限り端末の鍵と生トークンは実質同等で、失効も
+    //    「exec を一度使った端末」には封じ込めにならない。だから端末の登録自体を
+    //    `--allow-exec` のときだけに限っている（`pairingWhy()`）。分界を残すのは、
+    //    HTTP だけを叩く経路（トークン回収の exec を実際に撃つ前）を一段狭めるため。
     const r = await tokenWall(req, res, vals,
         () => tokenMatches(given) || Boolean(deviceMatches(given)));
     if (r.handled) return false;
@@ -2668,6 +2704,13 @@ async function handleRequest(req, res) {
             // ⚠️ 使えない構成なら**理由を返す**（黙って 404 にしない）
             const why = pairingWhy();
             if (why) { denyJson(res, 403, why); return; }
+            // 🚨 **期限切れの合言葉ファイルを掃く（レビュー11・指摘D）。**
+            //    `current()` は期限切れの pending を null にするが**ファイルは消さない**ので、
+            //    5分放置後に `serve.mjs --pair` が死んだ合言葉を「まだ使える（5分で切れます）」と
+            //    嘘表示していた（clearCodeFile の呼び出しは approved/too-many/cancel だけだった）。
+            //    live な pending が無いのに合言葉ファイルが在るなら、それは死んだ値なので消す。
+            //    ⚠️ `current()` は期限切れを検出すると pending を null にする副作用を持つ。
+            if (!deviceBook.current()) await clearCodeFile();
             // 🔒 別オリジン起点は拒否（precheck と同じ基準）
             {
                 const site = req.headers['sec-fetch-site'];
@@ -2689,11 +2732,18 @@ async function handleRequest(req, res) {
             };
 
             if (action === 'request') {
+                // 🚨 **レート制限（レビュー11・指摘E）。** read 認証だけで無制限に叩けると、
+                //    (a) 承認待ちを上書きし続けて**登録を恒久的に妨害**、(b) stdout と
+                //    合言葉ファイルを洪水、(c) **監査ログを回転させて exec/kill の記録を消せる**
+                //    （read 鍵は Cookie で他ポートに漏れ、案内 URL にも載る = 広く出回る値）。
+                //    failtracker で「先頭は即時（複数端末の連続登録に十分）、以降は指数遅延、
+                //    監査は集約」にする。**上書き（request）より前に絞る**ので churn も抑える。
+                //    ⚠️ read 鍵を持つ相手は登録を「遅延」できるが「乗っ取り」はできない
+                //    （合言葉は母艦にしか出ないので、上書きしても攻撃者は claim を完了できない）。
+                await pairFails.note(peerKey(req), {
+                    label: String(body.label ?? '').slice(0, LABEL_MAX), ...originHint(req),
+                });
                 const r = deviceBook.request(body.label);
-                await auditExec({
-                    event: 'pair-request', label: r.label,
-                    replaced: r.replaced?.label ?? null, ...originHint(req),
-                }, null);
                 // 🔒 **合言葉は母艦にだけ**（stdout と 0600 のファイル）
                 await announceCode(req, r.code, r.label);
                 // ⚠️ 応答には id と期限だけ。**code を入れない**
@@ -3639,15 +3689,31 @@ async function handleRequest(req, res) {
                 return;
             }
 
+            // 🔒 **フックを通さない（レビュー11・指摘F。merge と対称に）。**
+            //    checkout は post-checkout フックを起動するので、`--allow-write` は
+            //    「リポジトリ設定のコードを HTTP から起動できる」に等しかった。唯一の防御が
+            //    payload の警告だったが、その警告は既定 hooks ディレクトリしか見ておらず、
+            //    悪意あるリポジトリが `core.hooksPath` をツリー内の追跡ファイルに向けると
+            //    **警告が沈黙したままフックが走った**。merge と同じく空のディレクトリに
+            //    向けて無効化する（`-c` はコマンド行なのでリポジトリ設定の hooksPath に勝つ）。
+            //    ⚠️ **これで checkout が安全になったとは言わない。** gitattributes の
+            //    smudge/clean フィルタは checkout で走りうるので、信頼できない ref の
+            //    checkout は依然として実質コード実行になりえる（下の警告で正直に告げる）。
+            const { mkdtemp } = await import('node:fs/promises');
+            const { tmpdir } = await import('node:os');
+            const emptyHooks = await mkdtemp(join(tmpdir(), 'kjp-nohooks-'));
             try {
                 // optionalLocks: index の stat-cache 更新を許す（書き込み操作なので）
                 // --end-of-options: ref がオプションとして解釈される余地を潰す（多層防御）
-                await git(['checkout', '--end-of-options', ref, '--'],
-                    { cwd: wt.path, optionalLocks: true });
+                await git(['-c', `core.hooksPath=${emptyHooks}`,
+                    'checkout', '--end-of-options', ref, '--'],
+                { cwd: wt.path, optionalLocks: true });
             } catch (err) {
                 // git 自身が拒否した場合（未コミットの変更が消える等）もここに来る
                 denyJson(res, 409, `git が checkout を拒否しました: ${err.message}`);
                 return;
+            } finally {
+                await rm(emptyHooks, { recursive: true, force: true }).catch(() => {});
             }
             cachedByRepo.delete(repo);   // 状態が変わったのでキャッシュを捨てる
             const after = (await listWorktrees(repo)).find(w => samePath(w.path, wantPath));

@@ -7655,6 +7655,18 @@ test('🔒 使えない構成では理由を返す（黙って 404 にしない�
         assert.match((await r.json()).error, /--require-auth|--allow-host/,
             '壁が無いのに理由を告げていない');
     } finally { b.child.kill(); }
+    // 🔒 **実行が無い構成（--allow-write だけ）でも登録を拒否する（レビュー11 / 不変条件5）。**
+    //    端末の鍵は実行を通す = exec があれば生トークンを回収できるので、分界は exec 有効時は
+    //    封じ込めにならない。逆に exec 無しの --write では list/revoke が gateExec で通らず、
+    //    checkout 権の長寿命鍵を発行できるのに**失効できない**。両方まとめて閉じるため登録ごと拒否。
+    const c = await startAuthServer(['--allow-write', '--token', EXEC_TOKEN, '--require-auth',
+        '--devices-file', join(tmpdir(), 'kjp-write-never.json')]);
+    try {
+        const r = await pairPost(`http://127.0.0.1:${c.port}`, 'request', { label: 'x' }, asPhone);
+        assert.equal(r.status, 403, '実行なしの構成で端末登録を許した（失効できない鍵を発行できる）');
+        assert.match((await r.json()).error, /--allow-exec/,
+            '実行が要る理由を告げていない（端末の鍵は生トークンと同等になる）');
+    } finally { c.child.kill(); }
 });
 
 test('🔒 同じマシンの別ポートのページからは登録できない（#62 と同型）', async () => {
@@ -7674,5 +7686,129 @@ test('🔒 同じマシンの別ポートのページからは登録できない
     } finally {
         s.child.kill();
         await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 実行トークンと一緒に来た読み取り秘密を goodTokens に昇格させない（#63 の回帰。11回目のレビュー）', async () => {
+    // 🚨 正規の exec 保有者のブラウザは /state のポールで
+    //    `x-kjp-token:<execToken>` と `Cookie:kjp_auth=<readSecret>` を同時に送る。
+    //    tokenWall が提示値を丸ごと覚えると readSecret が goodTokens に昇格し、
+    //    以後 readSecret を提示した試行が混雑の門・記録・遅延を素通りする
+    //    （痕跡ゼロ・無遅延の総当たりが正規運用で復活する）。
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-good-'));
+    const audit = join(dir, 'audit.jsonl');
+    const s = await startExec(['--require-auth', '--audit-log', audit]);
+    try {
+        const readSecret = readSecretOf(EXEC_TOKEN);
+        // 1) 正規の要求（壁を通る）。ここで readSecret が昇格するかどうかが分かれ目
+        const poll = await fetch(`${s.url}/api/v0/state?fresh=1`, {
+            headers: { 'x-kjp-token': EXEC_TOKEN, cookie: `kjp_auth=${readSecret}` },
+        });
+        const pollBody = await poll.text();
+        assert.equal(poll.status, 200, `正規のポールが通らない: ${pollBody}`);
+        // 2) 攻撃: 実行トークンの当てずっぽうを、読み取り秘密の Cookie を添えて
+        //    **オラクル経路（/session）** に投げる。ここが #63 の総当たり口で、
+        //    presentedTokenAudited は goodTokens.has が真なら壁の手前で短絡する
+        //    （= readSecret が昇格していると mutationFails.note を素通りし、痕跡ゼロ）。
+        const guess = 'WRONG-EXEC-TOKEN-GUESS-000000000000';
+        const attack = await fetch(`${s.url}/api/v0/session`, {
+            headers: { 'x-kjp-token': guess, cookie: `kjp_auth=${readSecret}` },
+        });
+        const attackBody = await attack.text();
+        // 当たっていないのでトークンは返らない（昇格の有無に関わらず）
+        assert.equal(JSON.parse(attackBody).token ?? null, null,
+            `当てずっぽうにトークンを返した: ${attackBody}`);
+        // 3) 🔒 外した試行は必ず記録される（vals を丸ごと remember するバグなら
+        //    readSecret が昇格して短絡し、この行が消える）
+        const log = await readFile(audit, 'utf8').catch(() => '');
+        assert.match(log, /mutation-token-failed/,
+            '🚨 実行トークンの当てずっぽうが記録されていない（読み取り秘密が goodTokens に昇格して壁を短絡した）');
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 承認待ちが無いのに残った合言葉ファイルは次の /pair アクセスで掃かれる（レビュー11・指摘D）', async () => {
+    // 🚨 current() は期限切れの pending を null にするがファイルは消さない。放置すると
+    //    serve.mjs --pair が死んだ合言葉を「まだ使える（5分で切れます）」と嘘表示していた。
+    //    ⚠️ 期限切れは時計を進めないと作れないが、sweep は「live な pending が無い」なら
+    //    理由を問わず掃くので、**人為的に残したファイル**で決定的に測れる。
+    const s = await startPair();
+    try {
+        const codeFile = join(s.dir, 'pair-code');
+        await writeFile(codeFile, 'DEAD-CODE\n', 'utf8');
+        // pending が無いので、どの /pair アクセスでも掃かれる
+        await pairPost(s.url, 'list', {}, asHost).then(r => r.text());
+        const gone = await readFile(codeFile, 'utf8').then(() => false, () => true);
+        assert.ok(gone,
+            '🚨 承認待ちが無いのに合言葉ファイルが残っている（--pair が死んだ値を「使える」と出す）');
+
+        // 逆に live な pending があるときは掃かない（有効な合言葉を消さない）
+        await pairPost(s.url, 'request', { label: 'x' }, asPhone).then(r => r.text());
+        await pairPost(s.url, 'list', {}, asHost).then(r => r.text());
+        const stillThere = await readFile(codeFile, 'utf8').then(() => true, () => false);
+        assert.ok(stillThere, '有効な合言葉まで消している');
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 /pair/request の連打は監査を集約する（レビュー11・指摘E。読み取り鍵での監査回転を防ぐ）', async () => {
+    // 🚨 read 認証だけで /pair/request を無制限に叩けると、1件1行の監査を書き続けて
+    //    2世代 rename の監査ログを回転させ、exec/kill/pair-claimed の記録を消せる。
+    //    failtracker で先頭数本だけ個別に残し、残りは集約行にまとめる（捨てずに読める）。
+    const s = await startPair();
+    try {
+        for (let i = 0; i < 8; i += 1) {
+            await pairPost(s.url, 'request', { label: `dev${i}` }, asPhone).then(r => r.text());
+        }
+        const log = await readFile(s.audit, 'utf8').catch(() => '');
+        const full = (log.match(/"event":"pair-request"/g) || []).length;
+        assert.match(log, /pair-request-summary/,
+            `🚨 連打が集約されていない（監査を回転させて記録を消せる）: 個別行 ${full} 本`);
+        // 個別行は無制限ではない（先頭数本に限る = 回転攻撃が成立しない）
+        assert.ok(full <= 5, `個別の pair-request 行が多すぎる（絞れていない）: ${full}`);
+    } finally {
+        s.child.kill();
+        await rm(s.dir, { recursive: true, force: true }).catch(() => {});
+    }
+});
+
+test('🔒 checkout はリポジトリの post-checkout フックを起動しない（レビュー11・指摘F）', async () => {
+    // 🚨 checkout は post-checkout フックを起動するので、以前は --allow-write が
+    //    「リポジトリ設定のコードを HTTP から起動できる」に等しく、唯一の防御の警告は
+    //    core.hooksPath を見落として custom hooksPath で沈黙していた。merge と対称に
+    //    フックを無効化した。**この検査が実際に効くこと（フックが本来走ること）は
+    //    変異 checkout-runs-hooks が保証する**（走らなければ marker が出ず SURVIVE する）。
+    const { child, url, session } = await startWritable();
+    const hookPath = join(repo, '.git', 'hooks', 'post-checkout');
+    const marker = join(repo, '.git', 'HOOK_RAN');
+    try {
+        // sh のみ（外部コマンドに依存しない）。Windows のパスは / に直す（git bash が解釈する）
+        const shMarker = marker.split(sep).join('/');
+        await writeFile(hookPath, `#!/bin/sh\n: > "${shMarker}"\n`,
+            { encoding: 'utf8', mode: 0o755 });
+        const wt = (await (await fetch(`${url}/api/v0/state?fresh=1`)).json())
+            .worktrees.find(w => w.branch === 'agent-b');
+        const post = ref => fetch(`${url}/api/v0/checkout`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', [session.tokenHeader]: session.token },
+            body: JSON.stringify({ worktree: wt.path, ref }),
+        });
+        const r = await post('機能/新規');
+        const d = await r.json();
+        assert.equal(r.status, 200, `checkout 失敗: ${JSON.stringify(d)}`);
+        // 🔒 フックが起動していない（marker が書かれていない）
+        const ran = await readFile(marker, 'utf8').then(() => true, () => false);
+        assert.equal(ran, false,
+            '🚨 checkout が post-checkout フックを起動した（--allow-write が実質コード実行に戻っている）');
+        // 後始末: worktree を戻す
+        await post('agent-b').then(x => x.json());
+    } finally {
+        child.kill();
+        await rm(hookPath, { force: true }).catch(() => {});
+        await rm(marker, { force: true }).catch(() => {});
     }
 });

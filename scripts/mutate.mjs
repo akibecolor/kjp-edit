@@ -116,6 +116,54 @@ const MUTANTS = [
         script: 'v0/theme-check.mjs',
     },
     {
+        // 🔒 レビュー11・指摘E: /pair/request を絞らず1件1行で監査に書くと、
+        //    read 鍵で監査ログを回転させ exec/kill の記録を消せる（登録妨害も増幅）。
+        name: 'pair-request-unmetered',
+        why: '/pair/request を絞らず1件1行で監査に書く（read 鍵で監査を回転させ記録を消せる）',
+        file: 'v0/server.mjs',
+        from: '                await pairFails.note(peerKey(req), {\n'
+            + "                    label: String(body.label ?? '').slice(0, LABEL_MAX), ...originHint(req),\n"
+            + '                });',
+        to: "                await auditExec({ event: 'pair-request', ...originHint(req) }, null);",
+        gone: 'pairFails.note(peerKey(req)',
+        pattern: '連打は監査を集約する',
+    },
+    {
+        // 🔒 レビュー11・指摘D: 期限切れ/承認待ち無しでも合言葉ファイルを掃かないと、
+        //    serve.mjs --pair が死んだ合言葉を「まだ使える（5分で切れます）」と嘘表示する。
+        name: 'pair-code-not-swept-on-expiry',
+        why: '承認待ちが無いのに合言葉ファイルを掃かない（--pair が死んだ合言葉を「使える」と嘘表示）',
+        file: 'v0/server.mjs',
+        from: '            if (!deviceBook.current()) await clearCodeFile();',
+        to: '            /* 変異: 期限切れの合言葉ファイルを掃かない */',
+        gone: 'if (!deviceBook.current()) await clearCodeFile();',
+        pattern: '残った合言葉ファイルは次の /pair アクセスで掃かれる',
+    },
+    {
+        // 🔒 11回目のレビュー / 不変条件5: 実行なしの構成で端末登録を許すと、
+        //    checkout 権の長寿命鍵を発行できるのに list/revoke が gateExec で通らず
+        //    失効できない。かつ端末の鍵は exec があれば生トークンを回収できる。
+        name: 'pair-allows-without-exec',
+        why: '実行なしの構成でも端末登録を許す（失効できない checkout 権の鍵を発行できる）',
+        file: 'v0/server.mjs',
+        from: "    if (!opts.allowExec) {\n        return '端末の登録は --allow-exec のときだけ使えます'",
+        to: "    if (false) {\n        return '端末の登録は --allow-exec のときだけ使えます'",
+        gone: "if (!opts.allowExec) {\n        return '端末の登録は --allow-exec",
+        pattern: '使えない構成では理由を返す',
+    },
+    {
+        // 🔒 11回目のレビュー: tokenWall が提示値を丸ごと覚えると、実行トークンと一緒に
+        //    来た読み取り秘密が goodTokens に昇格し、門・記録・遅延を素通りする鍵になる
+        name: 'goodtokens-remember-unfiltered',
+        why: '通った要求の提示値を絞らず goodTokens に覚える（読み取り秘密が実行の門を'
+            + '素通りする鍵に昇格。#63 の「痕跡ゼロ・無遅延の総当たり」が正規運用で復活）',
+        file: 'v0/server.mjs',
+        from: 'if (ok) goodTokens.remember(vals.filter(v => tokenMatches(v) || Boolean(deviceMatches(v))));',
+        to: 'if (ok) goodTokens.remember(vals);   /* 変異: 絞らず全部覚える */',
+        gone: 'vals.filter(v => tokenMatches(v) || Boolean(deviceMatches(v)))',
+        pattern: 'goodTokens に昇格させない',
+    },
+    {
         // 🔒 B4: 記録の自由文を読み取りの鍵で返す（argv だけ隠しても意味が無い）
         name: 'transcript-text-to-read-key',
         why: '記録の発話とコマンド行を読み取りの鍵で返す（execSessions を隠した根拠が成立しなくなる）',
@@ -3818,7 +3866,9 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         file: 'v0/server.mjs',
         from: "                    '-c', `core.hooksPath=${emptyHooks}`,",
         to: '                    /* 変異: hooks を通す */',
-        gone: 'core.hooksPath=${emptyHooks}',
+        // ⚠️ checkout も同じ `core.hooksPath=${emptyHooks}` を使うようになった（指摘F）ので、
+        //    merge 固有の**行頭インデント込み**で一意にする（写した瞬間に SKIP に落ちる型）
+        gone: "                    '-c', `core.hooksPath=${emptyHooks}`,",
         pattern: 'merge が hooks を実行しない',
     },
     {
@@ -3851,12 +3901,25 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         pattern: 'sequencer/todo が残っている',
     },
     {
+        // 🔒 レビュー11・指摘F: checkout でフックを無効化しないと、post-checkout が
+        //    起動して --allow-write が実質コード実行に戻る（custom hooksPath で警告も沈黙）。
+        name: 'checkout-runs-hooks',
+        why: 'checkout でフックを無効化しない（post-checkout が起動して実質コード実行に戻る）',
+        file: 'v0/server.mjs',
+        from: "                await git(['-c', `core.hooksPath=${emptyHooks}`,\n                    'checkout', '--end-of-options', ref, '--'],",
+        to: "                await git(['checkout', '--end-of-options', ref, '--'],",
+        gone: "`core.hooksPath=${emptyHooks}`,\n                    'checkout'",
+        pattern: 'post-checkout フックを起動しない',
+    },
+    {
         name: 'exec-capability',
         why: '--allow-exec なしで実行できてしまう',
         file: 'v0/server.mjs',
-        from: '    if (!opts.allowExec) {',
-        to: '    if (false) {',
-        gone: '!opts.allowExec',
+        // ⚠️ `if (!opts.allowExec) {` は pairingWhy にも増えた（レビュー11）ので、
+        //    gateExec 固有の denyJson まで含めて一意にする（写した瞬間に STALE になる型）
+        from: "    if (!opts.allowExec) {\n        denyJson(res, 403, '実行は無効です",
+        to: "    if (false) {\n        denyJson(res, 403, '実行は無効です",
+        gone: "if (!opts.allowExec) {\n        denyJson(res, 403, '実行は無効です",
         pattern: '--allow-exec なしでは exec の経路が存在しない',
     },
     // ⚠️ `exec-slot-reserve` はここにあったが #17 で消した。

@@ -251,8 +251,19 @@ if (has('--pair')) {
     let token = null;
     try { token = (await readFile(join(STATE_DIR, 'token-exec'), 'utf8')).trim(); } catch { /* 無い */ }
 
+    // 🚨 **「動いていない」と「動いているが管理トークンが無い」を分ける（11回目のレビュー）。**
+    //    以前はどちらも askDaemon が null になり、`--write` デーモンに対して
+    //    **現に走っているのに「デーモンが動いていない」と嘘表示**していた
+    //    （`--stop` の「停止しました」嘘と同型）。端末の登録は --allow-exec のデーモンで
+    //    だけ使えるので、token-exec が無い = そのデーモンでは pairing が無効、と告げる。
+    const cantAsk = !mine?.port ? 'down' : !token ? 'no-token' : null;
+    const cantAskWhy = cantAsk === 'down'
+        ? 'このリポジトリを配信しているデーモンが動いていません'
+        : 'デーモンは動いていますが、管理トークン（~/.kjp-edit/token-exec）がありません'
+            + '（端末の登録・失効は --allow-exec のデーモンでだけ使えます）';
+
     const askDaemon = async (path, body) => {
-        if (!mine?.port || !token) return null;
+        if (cantAsk) return null;
         try {
             const r = await fetch(`http://127.0.0.1:${mine.port}/api/v0/pair/${path}`, {
                 method: 'POST',
@@ -272,8 +283,9 @@ if (has('--pair')) {
     if (target) {
         const r = await askDaemon('revoke', { id: target });
         if (r === null) {
-            console.error('\n✖ 失効はデーモンが動いているときだけできます'
-                + '（台帳を直接書き換えると、動いているデーモンの記憶と食い違います）\n');
+            // ⚠️ 稼働状態と権限不足を区別して告げる（「分からない」と「無い」を分ける）
+            console.error(`\n✖ 失効できません: ${cantAskWhy}`);
+            console.error('   （台帳を直接書き換えると、動いているデーモンの記憶と食い違います）\n');
             process.exit(1);
         }
         if (r.code !== 200) {
@@ -284,21 +296,36 @@ if (has('--pair')) {
         process.exit(0);
     }
 
+    // 🚨 **先にデーモンへ聞く（レビュー11・指摘D）。** これで期限切れの合言葉ファイルが
+    //    サーバ側で掃かれる（/pair ハンドラ入口の sweep）。**その後で**ファイルを読むので、
+    //    死んだ合言葉を「まだ使える」と出す嘘が起きない。順序が守りの本体。
+    const listed = await askDaemon('list', {});
+    const pend = listed?.code === 200 ? listed.body.pending : null;
+
     // 合言葉（承認待ちがあるときだけ存在する）
     let code = null;
     try { code = (await readFile(codePath, 'utf8')).trim(); } catch { /* 無い */ }
 
-    const listed = await askDaemon('list', {});
     console.log('');
-    if (code) {
+    // 🔒 **合言葉の生死はデーモンの pending が真実。** デーモンに聞けているのに pending が
+    //    無いなら、ファイルに値が残っていても**それは死んでいる**ので出さない。
+    //    デーモンに聞けないときだけ、ファイルの値を「生死は確かめられない」と断って出す。
+    const showCode = code && (pend || listed === null);
+    if (showCode) {
         console.log(`🔑 合言葉: ${code}`);
-        console.log('   この値を**登録したい端末**に入力してください（5分で切れます）。');
-        const pend = listed?.code === 200 ? listed.body.pending : null;
         if (pend) {
-            console.log(`   要求している端末: ${pend.label}`
+            console.log('   この値を**登録したい端末**に入力してください。'
                 + `（あと ${Math.round((pend.expiresInMs ?? 0) / 1000)} 秒 / `
-                + `残り試行 ${pend.triesLeft}）`);
+                + `残り試行 ${pend.triesLeft} / 端末: ${pend.label}）`);
+        } else {
+            // listed === null: デーモンに聞けなかった（稼働状態と権限は下で告げる）
+            console.log('   ⚠ デーモンに聞けないので、この合言葉が**まだ生きているかは確かめられません**'
+                + '（期限切れかもしれません）。');
         }
+    } else if (code && !pend) {
+        // ファイルに値はあるがデーモンは pending 無しと答えた = 期限切れ（サーバが掃いた後）
+        console.log('承認待ちの要求はありません（前の合言葉は期限切れです）。');
+        console.log('   端末側で「この端末を登録」を押すと、ここに新しい合言葉が出ます。');
     } else {
         console.log('承認待ちの要求はありません。');
         console.log('   端末側で「この端末を登録」を押すと、ここに合言葉が出ます。');
@@ -308,7 +335,8 @@ if (has('--pair')) {
     if (listed === null) {
         // ⚠️ **「調べられない」を「無い」と言わない。** 台帳のファイルを読んで代わりに出すが、
         //    最終使用時刻は初回しか保存していないので**古いことがある**と告げる。
-        console.log('⚠ デーモンが動いていないので、台帳のファイルから読みます');
+        //    稼働状態と権限不足を取り違えない（cantAskWhy が事実を分けている）。
+        console.log(`⚠ デーモンに聞けないので台帳のファイルから読みます: ${cantAskWhy}`);
         console.log('  （最終使用は初回のぶんだけなので古いことがあります）');
         try {
             const raw = JSON.parse(await readFile(join(STATE_DIR, 'devices.json'), 'utf8'));

@@ -33,6 +33,9 @@ export const meta = {
 
 const range = args?.range ?? 'b1874a0..HEAD';
 const extraFocus = args?.focus ? `\n\n**特に見てほしい点**: ${args.focus}` : '';
+// ⚠️ **モデルを args で選べるようにする。** 既定はセッションのモデルを継ぐ（省略）。
+//    観点を変えても同じモデルで揃えたいとき（例: 全観点を fable で）に指定する。
+const MODEL = args?.model ?? undefined;
 
 // このリポジトリの流儀。レビュアーに毎回渡す（知らないと的が外れる）
 const CONTEXT = `
@@ -114,6 +117,51 @@ secretMatches() / requireMutation() / requireExec() / hostAllowed() / siteAllowe
 - トークンが URL / 履歴 / Referer / ログ / プロセス一覧（--token）に残る経路
 - 認証を通す3経路（Cookie / ヘッダ / クエリ）のどれかで意図しないものが通らないか
 - --no-auth / --require-auth / --allow-host の組み合わせで穴が開く並びはないか`,
+    },
+    {
+        key: 'pairing',
+        prompt: `**観点: 端末の承認となりすまし（\`docs/device-approval.md\`。新しい capability）。**
+
+見るもの: v0/devices.mjs 全体（DeviceBook: request / claim / match / revoke / list /
+current / pairCode / normalizeCode）、v0/devicekey.mjs（pickCredential /
+canMutateWith）、v0/server.mjs の /api/v0/pair/* の5経路（request / status /
+claim / list / revoke / cancel）と announceCode / clearCodeFile / deviceMatches /
+pairingWhy / authed() への device の合流、v0/app.html の登録 UI と鍵の枠、
+scripts/serve.mjs の --pair。
+
+背景と約束:
+- 承認の根拠は「**母艦でしか読めない合言葉を読めたこと**」。合言葉はデーモンの
+  stdout と ~/.kjp-edit/pair-code（0600）にだけ出て、**要求した端末には返さない**
+- 🚨 **peer アドレスも Host も「母艦にいること」を証明しない**（実測で撤回済み。
+  tailscale serve はループバックに繋ぎ直す）。だから根拠を合言葉の出口に置いた
+- 端末の鍵は localStorage（Cookie に入れない）。**実行は通すが生トークンの
+  払い出しは通さない**（/api/v0/session と /pair/list /pair/revoke は tokenMatches のみ）
+- 合言葉の照合は tokenWall（記録 + 遅延 + 混雑の門）+ 試行5回で要求ごと無効
+
+**なりすましを主眼に、疑うこと（これに限らない。壊れる形を探す）:**
+- **他人の端末になりすます。** 別の端末が出した承認要求を、id / 合言葉 / タイミングの
+  どれかを細工して横取りできないか。claim の id 照合（sameString）、要求が1件だけの
+  保持、pending の上書き、status が漏らす情報。**要求Aの最中に要求Bを割り込ませて
+  合言葉を掏り替える**窓
+- **母艦になりすます / 合言葉の出口を回り込む。** 応答・status・Cookie・監査ログ・
+  エラーメッセージ・タイミングのどれかから合言葉が漏れないか。pair-code ファイルの
+  権限（Windows は ACL で 0600 が効かない — その差で読めないか）、消し忘れ、
+  古い合言葉の再利用。announceCode が stdout に出す形と、それを読める相手
+- **合言葉の推測可能性。** pairCode の乱数源（rejection sampling の限界値、
+  createRandomBytes か Math.random か）、30種8文字の分布に偏りが無いか、
+  試行5回の数え方（並列に投げたときに5を超えないか、要求を作り直せば無限か）
+- **capability の昇格。** 承認した端末が (a) 生トークンを回収する、(b) 別の端末を
+  承認/失効/一覧する、(c) 読み取りしか許していないデーモンで実行に届く、経路。
+  authed() に device を合流させたことで、pair 以外の経路の判定が緩まないか
+- **鍵の取り違え（画面側）。** pickCredential の優先順位（URL > 貼った > 端末 >
+  保存済み URL）で、弱い鍵が強い鍵になりすます / 失効した端末の鍵に閉じ込められて
+  読み取りまで塞ぐ / 別オリジンの localStorage を読む経路
+- **DoS となりすましの合わせ技。** 誰でも /pair/request を積めると母艦の合言葉が
+  上書きされ続ける。--require-auth / --allow-host / --devices-file の無い構成で
+  経路が開く並び。Sec-Fetch-Site: same-site（別ポートのページ）で何ができるか
+- **各門を外して落ちる変異が実在するか。** scripts/mutate.mjs の pair-* を数え、
+  守りがあるのに変異が無い箇所を挙げる（実データ: ~/.kjp-edit/devices.json を
+  読んで良い。実際の hash / label / 失効の形を見て確認する）`,
     },
     {
         key: 'exec-session',
@@ -291,7 +339,7 @@ const perDimension = await pipeline(
         + '**思いつきを並べないでください。** 再現できたものを優先し、'
         + 'できなかったものは measured:false にしてください。'
         + '指摘が無ければ空配列で構いません（無理に埋めない）。',
-    { label: `review:${d.key}`, phase: 'Review', schema: FINDING_SCHEMA }),
+    { label: `review:${d.key}`, phase: 'Review', schema: FINDING_SCHEMA, model: MODEL }),
     (res, d) => {
         const found = (res?.findings ?? []).filter(f => f.severity !== 'MINOR');
         const minor = (res?.findings ?? []).length - found.length;
@@ -313,7 +361,7 @@ const perDimension = await pipeline(
                 + '前提が誤っている、そのコード経路に到達できない、などです。\n'
                 + '判断に迷うなら refuted:false（指摘は残す）にしてください。'
                 + '重大度が過大／過小だと思う場合は severityAdjust で直してください。',
-            { label: `verify:${d.key}`, phase: 'Verify', schema: VERDICT_SCHEMA })
+            { label: `verify:${d.key}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: MODEL })
                 .then(v => ({ dimension: d.key, finding: f, verdict: v }))));
     },
 );
