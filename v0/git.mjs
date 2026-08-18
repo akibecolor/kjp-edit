@@ -276,15 +276,31 @@ export async function worktreeStatus(cwd, filterNames = []) {
     );
     const entries = splitZ(stdout);
     let changed = 0, untracked = 0, unmerged = 0;
+    // 🔒 **未追跡の「パス」も集める（未追跡ファイルの編集に使う）。**
+    //    ⚠️ **spawn を増やさない**ためにここで拾う。worktree ごとに
+    //    `ls-files --others` を足すと本数に比例してプロセスが増える
+    //    （11本で 59 spawn になった事故。`stats.gitSpawns` を smoke が上限で固定している）。
+    //    ⚠️ `? ` は**未追跡かつ ignored でない**もの（ignored は `--ignored` を
+    //    付けたときだけ `! ` で出る）。つまり `.env` は既定でここに入らない。
+    //    ⚠️ `--untracked-files=normal` なので、**まるごと新しいディレクトリは
+    //    `dir/` に畳まれる**。その中身はここに出ない（編集の一覧にも出ない）。
+    //    畳まれた表記（末尾 `/`）はファイルではないので落とす。
+    const untrackedPaths = [];
     for (let i = 0; i < entries.length; i++) {
         const e = entries[i];
         if (e.startsWith('2 ')) { changed++; i++; continue; }   // 次のトークンは origPath
         if (e.startsWith('1 ')) changed++;
         else if (e.startsWith('u ')) { changed++; unmerged++; }
-        else if (e.startsWith('? ')) untracked++;
+        else if (e.startsWith('? ')) {
+            untracked++;
+            const p = toNFC(e.slice(2));
+            if (p && !p.endsWith('/')) untrackedPaths.push(p);
+        }
         // '! ' (ignored) と '# ' (header) は無視
     }
-    return { changed, untracked, unmerged, dirty: changed > 0 || untracked > 0 };
+    return {
+        changed, untracked, unmerged, untrackedPaths, dirty: changed > 0 || untracked > 0,
+    };
 }
 
 /**

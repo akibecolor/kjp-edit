@@ -139,6 +139,71 @@ const MUTANTS = [
         script: 'v0/open-check.mjs',
     },
     /* -----------------------------------------------------------------
+     * 📝 未追跡ファイルの編集（既定オフ。ignored は対象外）
+     * ----------------------------------------------------------------- */
+    {
+        // 📝 UI: 未追跡のタブを描かない（要件そのものが消える）
+        name: 'untracked-ui-no-tabs',
+        why: '未追跡ファイルのタブを描かない（画面から新規ファイルを開けない = 要件が消える）',
+        file: 'v0/app.html',
+        from: '    const untracked = (wt.untracked ?? []).slice(0, 6);',
+        to: '    const untracked = [];   /* 変異: 未追跡を描かない */',
+        gone: '(wt.untracked ?? []).slice(0, 6)',
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // 📝 UI: 未追跡を選んだ理由を言わない（無言で「取得できませんでした」になる）
+        name: 'untracked-ui-no-reason',
+        why: '未追跡を選んでも理由を出さず、ビューアに投げる（無言で壊れて見える）',
+        file: 'v0/app.html',
+        from: "      if ((wt.untracked ?? []).includes(obj.sel)) {",
+        to: '      if (false) {   /* 変異: 理由を出さない */',
+        gone: "(wt.untracked ?? []).includes(obj.sel)",
+        script: 'v0/render-check.mjs',
+    },
+    {
+        // 🚨 **守りの本体。** `--exclude-standard` を外すと `.env` が編集できてしまう
+        //    （CLAUDE.md「未追跡の .env に触れる経路を作らない」を破る）。
+        name: 'untracked-includes-ignored',
+        why: '未追跡の一覧から --exclude-standard を外す（gitignore された .env が編集できる）',
+        file: 'v0/server.mjs',
+        from: "            others = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', rel],",
+        to: "            others = await git(['ls-files', '--others', '-z', '--', rel],",
+        gone: "'--others', '--exclude-standard'",
+        pattern: 'gitignore されたファイル',
+    },
+    {
+        // 🔒 オプトインを外すと、既存の --write 構成の書き込み範囲が黙って広がる
+        name: 'untracked-no-optin',
+        why: '未追跡の編集をオプトイン無しで許す（--write の範囲が黙って広がる）',
+        file: 'v0/server.mjs',
+        from: '        if (!opts.allowUntracked) {',
+        to: '        if (false) {   /* 変異: オプトインを見ない */',
+        gone: 'if (!opts.allowUntracked) {',
+        pattern: '未追跡ファイルの編集は既定でできない',
+    },
+    {
+        // 🔒 一覧との照合を外すと、worktree 内の任意のファイルに広がる
+        name: 'untracked-no-allowlist',
+        why: '未追跡の一覧と照合せず、形が正しければ通す（worktree 内の任意のファイルに広がる）',
+        file: 'v0/server.mjs',
+        from: "        if (others.code !== 0 || !splitZ(others.stdout).map(p => toNFC(p)).includes(rel)) {",
+        to: "        if (false) {   /* 変異: 一覧と照合しない */",
+        gone: "others.code !== 0 || !splitZ(others.stdout).map(p => toNFC(p)).includes(rel)",
+        pattern: 'gitignore されたファイル',
+    },
+    {
+        // 🔒 --exec のとき自動で付ける配線（要件: 日常の構成で摩擦ゼロ）
+        name: 'serveargs-untracked-not-passed',
+        why: '--exec でも --allow-untracked を渡さない（実行できる構成なのに画面から未追跡を直せない）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (wantWrite && (wantExec || has('--untracked'))) args.push('--allow-untracked');",
+        to: '    /* 変異: 未追跡を渡さない */',
+        gone: "args.push('--allow-untracked')",
+        pattern: '未追跡の編集は --exec で自動、--write では明示',
+        testFile: 'scripts/serveargs.test.mjs',
+    },
+    /* -----------------------------------------------------------------
      * 📁 プロジェクトを開く（`docs/open-project.md`）
      * ----------------------------------------------------------------- */
     {
@@ -4265,9 +4330,12 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         name: 'write-tracked-check',
         why: 'git の追跡下かを見ない（未追跡の .env を読み書きできる）',
         file: 'v0/server.mjs',
-        from: '    if (ls.code !== 0 || !splitZ(ls.stdout).map(p => toNFC(p)).includes(rel)) {',
-        to: '    if (false) {',
-        gone: 'ls.code !== 0 ||',
+        // ⚠️ 未追跡の編集（オプトイン）を足したので `if (…) {` から
+        //    `const tracked = …` に形が変わった。**追跡判定を素通しにする**変異にする
+        //    （そうすると未追跡もオプトイン無しで通り、既定の守りが消える）
+        from: '    const tracked = ls.code === 0 && splitZ(ls.stdout).map(p => toNFC(p)).includes(rel);',
+        to: '    const tracked = true;   /* 変異: 追跡下かを見ない */',
+        gone: 'const tracked = ls.code === 0 &&',
         pattern: 'write: 未追跡ファイル',
     },
     {

@@ -3260,6 +3260,16 @@ function render(s) {
       //    差分のときに選べる形にすると「選んだのに何も変わらない」になる
       refSel.disabled = obj.mode !== 'blob';
       if (!obj.sel) return;
+      // 📝 **未追跡ファイルはビューアでは読めない**（差分も全文も git オブジェクト経由で、
+      //    そこには「コミットに入っているもの」しか無い）。**理由を出す**
+      //    — 黙って空や「取得できませんでした」を出すと、壊れていると誤解する。
+      if ((wt.untracked ?? []).includes(obj.sel)) {
+        holder.replaceChildren(el('div', 'note',
+          `${obj.sel} は**未追跡**です（まだ git に入っていません）。`
+          + ' 差分も全文も git の中身を読むので表示できません。'
+          + (session.canMutate ? '「編集」で中身を開けます。' : '')));
+        return;
+      }
       if (obj.mode === 'blob') loadBlob(holder, obj.viewRef, obj.sel);
       else loadDiff(holder, s.base, ownRef, obj.sel);
     };
@@ -3283,6 +3293,26 @@ function render(s) {
       tabs.append(b);
     }
     if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
+    /* 📝 **未追跡ファイル（`--allow-untracked` のときだけ payload に入る）。**
+     *
+     * エージェントが作った**まだ add していない新規ファイル**を画面から直すため。
+     * ⚠️ **差分のタブと見分けが付く形にする**（`+` を付ける）。混ぜると
+     *    「コミット済みの差分」と「まだ git に入っていないもの」を取り違える。
+     * ⚠️ ignored（`.env` 等）はここに入らない（サーバが `? ` = 未追跡かつ
+     *    ignored でないものだけを返す）。届かないものをタブに出さない。
+     * ⚠️ 上限で切ったら**必ず告げる**（一覧が静かに欠けるのが一番分からない）。 */
+    const untracked = (wt.untracked ?? []).slice(0, 6);
+    for (const p of untracked) {
+      const b = el('button', p === obj.sel ? 'on' : null, `+${p.split('/').pop()}`);
+      b.title = `${p}（未追跡。まだ git に入っていません）`;
+      b.addEventListener('click', () => openIn(p));
+      tabs.append(b);
+    }
+    const hiddenUntracked = (wt.untracked?.length ?? 0) - untracked.length
+      + (wt.untrackedMore ?? 0);
+    if (hiddenUntracked > 0) {
+      tabs.append(el('span', 'note warn', `⚠ 未追跡 他 ${hiddenUntracked} 件は出していません`));
+    }
     const wrap = el('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;height:100%';
     // ⚠️ 並びは viewbar（差分/全文） → tabs（ファイルと「編集」） → holder。
@@ -3295,7 +3325,10 @@ function render(s) {
     //    ⚠️ `session.token` で判定してはいけない（案内の URL で渡るのは
     //       読み取り専用の派生秘密で、それも `session.token` に入る。
     //       checkout / 取り込みと同じく `canMutate` で判定する）。
-    if (session.allowWrite && files.length && !wt.bare && !wt.prunable) {
+    // ⚠️ **未追跡だけがある worktree でも「編集」を出す**（files は差分のタブ）。
+    //    ここを files.length だけで判定すると、新規ファイルしか無い worktree で
+    //    タブは出るのにボタンが無い（押せない）状態になる。
+    if (session.allowWrite && (files.length || untracked.length) && !wt.bare && !wt.prunable) {
       if (session.canMutate) {
         const eb = el('button', null, '編集');
         eb.title = '選択中のファイルを編集する（保存前に差分を確認できます）';

@@ -950,6 +950,12 @@ try {
     await g(['add', '-A'], repo);
     await g(['commit', '-q', '-m', 'seed'], repo);
 
+    // 📝 未追跡ファイルの編集（利用者の要件 2026-08-18）を実ブラウザで測るための種。
+    //    ⚠️ ignored も1つ置く（**画面に出てはいけない**方の証拠）。
+    await writeFile(join(repo, '.gitignore'), 'ignored.txt\n', 'utf8');
+    await g(['add', '-A'], repo);
+    await g(['commit', '-q', '-m', 'ignore'], repo);
+
     // 🚨 #4 の検査用: **コミット済み差分ゼロ + 未コミット変更あり**の worktree を作る。
     //    ファイラが並べるのは `base...HEAD` の**コミット済み**差分なのに、
     //    カードの「変更 N・未追跡 N」は**未コミット**の数。別のものを同じ見た目で
@@ -970,6 +976,12 @@ try {
     await writeFile(edFile, 'one\ntwo\nthree\n', 'utf8');
     await g(['add', '-A'], edWt);
     await g(['commit', '-q', '-m', 'edit target'], edWt);
+    // 📝 未追跡ファイルの編集（利用者の要件 2026-08-18）の種は**ファイラのペインを持つ**
+    //    worktree に置く。差分ゼロの worktree に置くと**タブ自体が描かれず**、
+    //    「測れなかった」で落ちる（実測でそうなった）。
+    //    ⚠️ ignored も1つ置く（**画面に出てはいけない**方の証拠）。
+    await writeFile(join(edWt, '新規メモ.txt'), 'エージェントが作った\n', 'utf8');
+    await writeFile(join(edWt, 'ignored.txt'), 'SECRET\n', 'utf8');
     // 切り替え先のリポジトリ（中身は最小限。ここでは「切り替わること」だけを測る）
     await g(['init', '-q', '-b', 'main'], repo2);
     await g(['config', 'user.email', 'a@b'], repo2);
@@ -1003,7 +1015,9 @@ try {
             //    ⚠️ 統合のときにこの1語を落として、検査が「何も測っていない」状態に
             //       戻りかけた（マージで消えやすい1語なので理由をここに書く）。
             '--require-auth',
-            '--allow-exec', '--token', TOKEN],
+            '--allow-exec', '--token', TOKEN,
+            // 📝 未追跡ファイルの編集を測るため（既定オフなので明示的に付ける）
+            '--allow-untracked'],
         { shell: false, windowsHide: true });
     server.stdout.setEncoding('utf8');
     server.stderr.setEncoding('utf8');
@@ -1228,9 +1242,60 @@ try {
     //       （あれの後だと `?probe=1` の入口ごと作り直された状態を測る）。
     const blob = await evaluate(BLOB_CHECK);
 
+    // 📝 **未追跡の検査は編集器の検査より前**（あちらがエディタを開くと
+    //    ペインの中身が置き換わり、ファイラのタブが消えて測れない。実測で踏んだ）。
+    /* 📝 **未追跡ファイルが画面から開けること（利用者の要件 2026-08-18）。**
+     *
+     * 🚨 **ignored（`.env` 相当）がタブに出ていないことも同時に見る。**
+     *    出す側だけ測ると「届かないものまで並べた」に気付けない。
+     * ⚠️ 字面ではなく**実際に描かれたタブ**と、押した後に**中身が入った textarea**で測る。 */
+    const untrackedUi = await evaluate(`(async () => {
+      const wait = ms => new Promise(r => setTimeout(r, ms));
+      const panes = [...document.querySelectorAll('[data-pane-id]')];
+      const pane = panes.find(p => [...p.querySelectorAll('.tabs button')]
+        .some(b => (b.textContent || '').startsWith('+')));
+      if (!pane) {
+        return { error: '未追跡のタブ（+ 付き）を持つペインが無い',
+                 tabs: panes.flatMap(p => [...p.querySelectorAll('.tabs button')]
+                   .map(b => b.textContent)).slice(0, 12) };
+      }
+      const tabTexts = [...pane.querySelectorAll('.tabs button')].map(b => b.textContent);
+      const untrackedTab = [...pane.querySelectorAll('.tabs button')]
+        .find(b => (b.textContent || '').startsWith('+'));
+      // 選ぶと「未追跡なので表示できない」理由が出る（無言で壊れない）
+      untrackedTab.click();
+      await wait(400);
+      const note = (pane.innerText || '');
+      // 「編集」を押すと中身が入る
+      const eb = [...pane.querySelectorAll('.tabs button')].find(b => b.textContent === '編集');
+      if (!eb) return { error: '編集ボタンが無い', tabs: tabTexts };
+      eb.click();
+      for (let i = 0; i < 60; i++) {
+        await wait(100);
+        const ta = pane.querySelector('textarea');
+        if (ta && ta.value) break;
+      }
+      const ta = pane.querySelector('textarea');
+      return {
+        tabs: tabTexts,
+        saidUntracked: /未追跡/.test(note),
+        text: ta ? ta.value : null,
+        closed: await (async () => {
+          // ⚠️ **開けたら閉じる。** editing のままだとペインが作り直されず、
+          //    後続の編集器の検査が「ファイラのタブが無い」で落ちる（実測）。
+          const cb = [...pane.querySelectorAll('button')].find(b => b.textContent === '閉じる');
+          if (!cb) return false;
+          cb.click(); await wait(300); return true;
+        })(),
+      };
+    })()`);
+
     // 🚨 編集器は**描画の計測より前**（12,000行流した後だと自動更新が重くなり、
     //    「作り直されたか」を待つ時間の意味が変わる）
     const editor = await evaluate(EDITOR_CHECK);
+    // 📝 **未追跡の検査は「鍵を捨てて読み込み直す」より前**（後だと canMutate が false で
+    //    編集ボタンが描かれず、「編集ボタンが無い」で測れなくなる。実測で踏んだ）。
+
     // 保存が**実際に作業ツリーへ届いた**ことは、ブラウザではなくここで確かめる
     const onDisk = await readFile(edFile, 'utf8').catch(e => `(読めない: ${e.message})`);
 
@@ -1331,6 +1396,26 @@ try {
     if (probe.error) throw new Error(probe.error);
 
     const problems = [];
+    // 📝 未追跡の判定（測定は編集器の直後で済ませてある。ここは problems の後）
+    if (untrackedUi.error) {
+        problems.push(`未追跡の編集を測れなかった: ${untrackedUi.error}`
+            + `（タブ: ${JSON.stringify(untrackedUi.tabs)}）`);
+    } else {
+        // 🚨 ignored はタブに出てはいけない（届かないものを並べない / 秘密を示唆しない）
+        if (untrackedUi.tabs.some(t => /ignored/.test(t))) {
+            problems.push(`🚨 gitignore されたファイルがタブに出ている: ${JSON.stringify(untrackedUi.tabs)}`);
+        }
+        if (!untrackedUi.saidUntracked) {
+            problems.push('未追跡を選んでも「未追跡だから表示できない」と言っていない（無言で壊れて見える）');
+        }
+        if (!/エージェントが作った/.test(untrackedUi.text ?? '')) {
+            problems.push(`未追跡ファイルの中身が編集器に入らない: ${JSON.stringify(untrackedUi.text)}`);
+        }
+    }
+    console.log(`   未追跡: タブ ${JSON.stringify((untrackedUi.tabs ?? []).filter(t => t.startsWith('+')))}`
+        + ` / 理由を言った ${untrackedUi.saidUntracked ?? '(測れず)'}`
+        + ` / 中身 ${JSON.stringify((untrackedUi.text ?? '(測れず)').slice(0, 20))}`);
+
     // 🔒 リポジトリの切り替え（#複数リポジトリ）
     if (!reposel || reposel.error) {
         problems.push(`リポジトリの切り替えを測れなかった: ${reposel?.error ?? '結果が取れない'}`);
@@ -1727,6 +1812,8 @@ try {
     console.log(`   ドラッグ: ${dragLive?.fromHost} → ${dragLive?.movedTo}`
         + ` / 移動後の出力 ${dragLive?.lenMoved} → ${dragLive?.lenAfter} 文字`
         + ` / 戻し先 ${dragLive?.resetHost}`);
+
+
     // 🚨 **測った対象を必ず出す。** 「編集器を測っている」が嘘になっていないかは
     //    件数と結果の文言で分かる形にする（layout-check の教訓）。
     console.log(`   編集器: textarea ${editor?.count ?? '(測れず)'} 個 / `

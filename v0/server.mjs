@@ -55,6 +55,9 @@ function parseArgs(argv) {
         // 🔒 実行は書き込みと**別の** capability。checkout を許すことと
         //    任意コマンドを許すことは危険度が桁違いなので、まとめない。
         allowExec: false, execTimeoutMs: 10 * 60 * 1000, auditLog: null, tokenFile: null,
+        // 🔒 未追跡ファイルの編集（#11 の隣。既定オフ）。**ignored は含めない**ので
+        //    .env には届かない。詳しくは requireEditTarget の門3。
+        allowUntracked: false,
         // 端末の承認（`docs/device-approval.md`）。渡さないと**経路そのものが無い**
         devicesFile: null,
         // 🔒 読み取り用の派生秘密の配布先（`token-read`）。**回転のときに一緒に配り直す**
@@ -141,6 +144,7 @@ function parseArgs(argv) {
         else if (a === '--devices-file') opts.devicesFile = resolve(argv[++i]);
         else if (a === '--repos-file') opts.reposFile = resolve(argv[++i]);
         else if (a === '--read-secret-file') opts.readSecretFile = resolve(argv[++i]);
+        else if (a === '--allow-untracked') opts.allowUntracked = true;
         else if (a === '--audit-max-bytes') opts.auditMaxBytes = num('--audit-max-bytes', 512, 2 ** 40);
         else if (a === '--token-file') { opts.tokenFile = resolve(argv[++i]); opts.tokenExplicit = true; }
         else if (a === '--require-auth') opts.requireAuth = true;
@@ -162,6 +166,7 @@ function parseArgs(argv) {
             console.log('       --devices-file <path> 承認した端末の台帳（渡さないと端末の登録は無効）');
             console.log('       --repos-file <path>  「開く」で足したリポジトリの控え（渡さないとそのプロセスだけ）');
             console.log('       --read-secret-file <path> 読み取り用の派生秘密の配布先（回転時に一緒に配り直す）');
+            console.log('       --allow-untracked    未追跡ファイルも編集する（ignored は除く。--allow-write が要る）');
             console.log('       --audit-max-bytes <n> 監査ログの上限（既定 4194304。超えたら .1 に回す）');
             console.log('       --token-file <path>  トークンを永続化する（無ければ生成。リポジトリの外に置くこと）');
             console.log('       --require-auth       読み取りにもトークンを要求する（--allow-host のとき既定オン）');
@@ -1008,6 +1013,16 @@ async function collectFresh(repo) {
             },
             warnings: w.sequencer.warnings ?? [],
             files: w.files,
+            // 📝 **未追跡ファイルの一覧（`--allow-untracked` のときだけ）。**
+            //    ⚠️ 既定では**キーごと出さない**（使えない構成に一覧を配らない）。
+            //    ⚠️ ignored は入らない（`? ` は未追跡かつ ignored でないものだけ）。
+            //    ⚠️ まるごと新しいディレクトリは `dir/` に畳まれて中身が出ない
+            //       （`--untracked-files=normal`。数を増やさないための代償）。
+            //    上限を付けて**切ったら告げる**（画面が一覧で埋まらないように）。
+            ...(opts.allowUntracked ? {
+                untracked: (w.status?.untrackedPaths ?? []).slice(0, 50),
+                untrackedMore: Math.max(0, (w.status?.untrackedPaths ?? []).length - 50),
+            } : {}),
         })),
         // ローカルブランチ名。**checkout の候補はこれだけから作る。**
         // ⚠️ グラフの `%D` から推測してはいけない。short name では
@@ -1934,12 +1949,47 @@ async function requireEditTarget(req, res, body, { forWrite, repo }) {
         denyJson(res, 500, `追跡状態を確認できませんでした（書きません）: ${err.message}`);
         return null;
     }
-    if (ls.code !== 0 || !splitZ(ls.stdout).map(p => toNFC(p)).includes(rel)) {
-        denyJson(res, 400,
-            `git の追跡下にありません: ${rel}。`
-            + ' 画面から編集できるのは追跡されているファイルだけです'
-            + '（未追跡の .env などに触れる経路を作らないため）');
-        return null;
+    const tracked = ls.code === 0 && splitZ(ls.stdout).map(p => toNFC(p)).includes(rel);
+    if (!tracked) {
+        // 🔒 **未追跡ファイルの編集（既定オフ。`--allow-untracked`）。**
+        //
+        //    利用者の要件（2026-08-18）: エージェントが作った**まだ add していない
+        //    新規ファイル**を画面から直したい。⚠️ これは #11（`.env` = ignored を
+        //    人が触る）とは**別の需要**で、こちらは **ignored を含めない**。
+        //
+        // 🚨 **`--exclude-standard` が守りの本体。** これが無いと `.env` に届く
+        //    （このリポジトリが CLAUDE.md で「触れる経路を作らない」と約束した対象）。
+        // 🚨 **`git status` / `diff` / `add` を使ってはいけない。** あれらは作業ツリーと
+        //    index の中身を比べるので **`.gitattributes` の clean filter
+        //    （= リポジトリ設定の任意コマンド）を起動する**（8回目のレビューの BLOCKING）。
+        //    `ls-files --others` は**名前だけ**を見るので content conversion を伴わない。
+        // ⚠️ 一覧との照合で解決する（クライアントのパスをそのまま信じない）。
+        //    ここを「形が正しければ通す」にすると、worktree 内の任意のファイルに広がる。
+        if (!opts.allowUntracked) {
+            denyJson(res, 400,
+                `git の追跡下にありません: ${rel}。`
+                + ' 未追跡ファイルの編集は既定で無効です'
+                + '（--allow-untracked を付けて起動すると、gitignore されていない'
+                + '未追跡ファイルだけ編集できます。.env などの ignored は対象外）');
+            return null;
+        }
+        let others;
+        try {
+            others = await git(['ls-files', '--others', '--exclude-standard', '-z', '--', rel],
+                { cwd: wt.path, allowExit: [0, 1], withCode: true });
+        } catch (err) {
+            denyJson(res, 500, `未追跡かどうかを確認できませんでした（書きません）: ${err.message}`);
+            return null;
+        }
+        if (others.code !== 0 || !splitZ(others.stdout).map(p => toNFC(p)).includes(rel)) {
+            // ⚠️ **理由を分けて返す。** 「無い」と「ignored だから対象外」を混ぜると、
+            //    利用者が `.env` を開こうとして「ファイルが無い」と誤解する。
+            denyJson(res, 400,
+                `編集できません: ${rel}。`
+                + ' 追跡されておらず、gitignore されていない未追跡ファイルでもありません'
+                + '（gitignore されているファイル（.env など）は対象外です）');
+            return null;
+        }
     }
 
     // ---- 4. 実体が worktree の中にあること

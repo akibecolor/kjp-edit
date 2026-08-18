@@ -1141,3 +1141,24 @@ test('開いたリポジトリの控えはどの capability でも渡す', () =>
     // 渡さなければ付けない（要らない構成にファイルを作らせない）
     assert.ok(!base(['--exec']).includes('--repos-file'));
 });
+
+/**
+ * 🔒 **未追跡の編集は `--exec` で自動、`--write` では明示**（利用者の判断 2026-08-18）。
+ *
+ * 実行できる相手は既に `cat > file` で未追跡ファイルを書けるので、`--exec` で許しても
+ * **権限が1つも増えない**（「プロジェクトを開く」と同じ論理）。
+ * 一方 `--write` だけの構成で自動で付けると、既存のデーモンを更新した瞬間に
+ * 書き込みの範囲が**黙って広がる**。
+ */
+test('未追跡の編集は --exec で自動、--write では明示', () => {
+    assert.ok(base(['--exec']).includes('--allow-untracked'),
+        '--exec で未追跡が付いていない（日常の構成で画面から直せない）');
+    assert.ok(!base(['--write']).includes('--allow-untracked'),
+        '🚨 --write だけで未追跡が付いた（既存構成の範囲が黙って広がる）');
+    assert.ok(base(['--write', '--untracked']).includes('--allow-untracked'),
+        '明示しても付かない');
+    // 読み取り専用には付かない（書けないので意味が無い）
+    assert.ok(!base([]).includes('--allow-untracked'));
+    assert.ok(!base(['--untracked']).includes('--allow-untracked'),
+        '書き込みが無いのに未追跡だけ付いた');
+});

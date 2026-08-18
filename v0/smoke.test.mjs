@@ -8222,3 +8222,114 @@ test('🔒 回転したら読み取り用の派生秘密も配り直す（フッ
         await rm(dir2, { recursive: true, force: true }).catch(() => {});
     }
 });
+
+/* ===========================================================================
+ * 📝 未追跡ファイルの編集（利用者の要件 2026-08-18。既定オフ）
+ *
+ * 🚨 **これは #11（`.env` = ignored を人が触る）とは別の需要。**
+ *    こちらは「エージェントが作ったまだ add していない新規ファイル」で、
+ *    **ignored は含めない**（`--exclude-standard`）。だから `.env` には届かない。
+ * =========================================================================== */
+
+/** 未追跡・ignored・追跡のファイルを1つずつ置いた worktree を作る */
+async function withUntrackedFixture(fn, extra = []) {
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-untr-'));
+    const r = join(dir, 'proj');
+    await mkdir(r, { recursive: true });
+    const gg = a => g(a, r);
+    await gg(['init', '-q', '-b', 'main']);
+    await writeFile(join(r, 'tracked.txt'), 'tracked\n', 'utf8');
+    await writeFile(join(r, '.gitignore'), '.env\nsecret.key\n', 'utf8');
+    await gg(['add', '-A']);
+    await gg(['-c', 'user.email=t@e', '-c', 'user.name=t', 'commit', '-q', '-m', 'init']);
+    // 🔒 ignored（届いてはいけない）
+    await writeFile(join(r, '.env'), 'TOKEN=sekret\n', 'utf8');
+    await writeFile(join(r, 'secret.key'), 'kkk\n', 'utf8');
+    // 未追跡だが ignored ではない（編集したい対象）
+    await writeFile(join(r, '新規メモ.txt'), 'エージェントが作った\n', 'utf8');
+    const s = await startAuthServer(['--repo', r, '--allow-write', '--token', WRITE_TOKEN,
+        ...extra]);
+    const url = `http://127.0.0.1:${s.port}`;
+    // ⚠️ startAuthServer は共有フィクスチャを1本目の repo として渡すので、
+    //    ?repo= を指定しないと**別のリポジトリの worktree 一覧**と照合されて
+    //    「既知の worktree ではありません」で先に弾かれる（測る対象に届かない）
+    const post = (route, payload) => fetch(`${url}/api/v0/${route}?repo=${encodeURIComponent(r)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-kjp-token': WRITE_TOKEN },
+        body: JSON.stringify(payload),
+    });
+    try {
+        await fn({ url, repo: r, post });
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
+test('🔒 未追跡ファイルの編集は既定でできない（オプトインが要る）', async () => {
+    await withUntrackedFixture(async ({ repo: r, post }) => {
+        const res = await post('file', { worktree: r, path: '新規メモ.txt' });
+        assert.equal(res.status, 400, '既定で未追跡が編集できてしまう');
+        assert.match((await res.json()).error, /--allow-untracked/,
+            'オプトインの方法を告げていない');
+    });
+});
+
+test('📝 --allow-untracked なら未追跡ファイルを読んで書ける（要件そのもの）', async () => {
+    await withUntrackedFixture(async ({ repo: r, post }) => {
+        const read = await post('file', { worktree: r, path: '新規メモ.txt' });
+        const body = await read.json();
+        assert.equal(read.status, 200, `未追跡を読めない: ${JSON.stringify(body)}`);
+        assert.match(body.text, /エージェントが作った/, '中身が違う');
+
+        // 書き戻せる（楽観ロックは中身のハッシュなので未追跡でも効く）
+        const w = await post('write', {
+            worktree: r, path: '新規メモ.txt', text: '人が直した\n', baseOid: body.oid,
+        });
+        const wBody = await w.json();
+        assert.equal(w.status, 200, `書けない: ${JSON.stringify(wBody)}`);
+        assert.equal(await readFile(join(r, '新規メモ.txt'), 'utf8'), '人が直した\n');
+
+        // 🔒 古い oid では上書きされない（他が書き換えた後に潰さない）
+        const stale = await post('write', {
+            worktree: r, path: '新規メモ.txt', text: 'x\n', baseOid: body.oid,
+        });
+        assert.equal(stale.status, 409, '楽観ロックが効いていない');
+        void await stale.text();
+    }, ['--allow-untracked']);
+});
+
+test('🚨 --allow-untracked でも gitignore されたファイル（.env）には届かない', async () => {
+    // 🔒 これが守りの本体。`--exclude-standard` を外すと `.env` が編集できてしまう
+    //    （CLAUDE.md「未追跡の .env に触れる経路を作らない」を破る）。
+    await withUntrackedFixture(async ({ repo: r, post }) => {
+        for (const p of ['.env', 'secret.key']) {
+            const res = await post('file', { worktree: r, path: p });
+            assert.equal(res.status, 400, `🚨 ignored の ${p} が読めた`);
+            const err = (await res.json()).error;
+            assert.match(err, /gitignore/, `理由が「ignored だから」になっていない: ${err}`);
+            // 書き込みも通らない
+            const w = await post('write', {
+                worktree: r, path: p, text: 'x\n', baseOid: '0'.repeat(40),
+            });
+            assert.equal(w.status, 400, `🚨 ignored の ${p} に書けた`);
+            void await w.text();
+        }
+        // 中身が変わっていないことも確かめる（拒否したのに書けていた、を防ぐ）
+        assert.equal(await readFile(join(r, '.env'), 'utf8'), 'TOKEN=sekret\n');
+    }, ['--allow-untracked']);
+});
+
+test('🔒 未追跡でも worktree の外・存在しないパスは編集できない', async () => {
+    await withUntrackedFixture(async ({ repo: r, post }) => {
+        for (const p of ['../外.txt', '/etc/passwd', 'C:/Windows/win.ini']) {
+            const res = await post('file', { worktree: r, path: p });
+            assert.notEqual(res.status, 200, `worktree の外が読めた: ${p}`);
+            void await res.text();
+        }
+        // 存在しない未追跡パス（一覧に無いので通らない）
+        const missing = await post('file', { worktree: r, path: '無い.txt' });
+        assert.equal(missing.status, 400, '存在しないパスが通った');
+        void await missing.text();
+    }, ['--allow-untracked']);
+});

@@ -16,12 +16,15 @@ import { repoOf, reposOf, samePathish } from './winargs.mjs';
 
 /** 起動口が受け付けるフラグ。ここに無いものは黙って捨てずに止める */
 export const SERVE_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
+    // 🔒 未追跡ファイルの編集（--write と併用。--exec では自動で付く）
+    '--untracked',
     '--watch', '--agents-text', '--timeout', '--status', '--stop', '--all', '--help', '-h',
     // 🔑 端末の承認（`docs/device-approval.md`）。母艦で合言葉を読む／失効させる
     '--pair', '--revoke']);
 
 /** 自動起動の登録が受け付けるフラグ（`--status` 等はサブコマンドなので入らない） */
 export const AUTOSTART_FLAGS = new Set(['--repo', '--port', '--write', '--exec', '--allow-host',
+    '--untracked',
     '--watch', '--agents-text', '--timeout',
     // 🚨 検査専用: レジストリに触る手前で止める（#74 の門を変異で測るため）
     '--dry-run']);
@@ -182,6 +185,14 @@ export function serverArgs({
     const wantExec = has('--exec');
     const wantWrite = wantExec || has('--write');
     if (wantWrite) args.push('--allow-write');
+    // 🔒 **未追跡ファイルの編集（gitignore されたものは対象外）。**
+    //    `--exec` では**自動で付ける**: 実行できる相手は既に `cat > file` で
+    //    未追跡ファイルを書けるので、ここで許しても**権限が1つも増えない**
+    //    （「プロジェクトを開く」と同じ論理）。
+    //    ⚠️ `--write` だけの構成では**明示的な `--untracked` を要求する**。
+    //    自動で付けると、既存の `--write` デーモンを更新した瞬間に
+    //    書き込みの範囲が**黙って広がる**（このリポジトリが何度も踏んだ形）。
+    if (wantWrite && (wantExec || has('--untracked'))) args.push('--allow-untracked');
 
     const hosts = collectHosts(argv).hosts ?? [];
     // 🚨 **読み取り用と実行用でトークンのファイルを分ける。**
