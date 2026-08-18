@@ -84,6 +84,10 @@ function parseArgs(argv) {
         execSpawnDelayMs: 0,
         // 検査専用。状態キャッシュの TTL を伸ばす（既定 = CACHE_TTL_MS）
         stateTtlMs: null,
+        // ⚠️ 検査専用。「開いた」の記録を絞る窓（既定 = PAGE_OPEN_WINDOW_MS）。
+        //    60 秒を待たずに「絞った件数が次の記録に載る」を測るために縮める。
+        //    `--layout-probe` と同じ「既定では存在しない経路」の扱い。
+        pageOpenWindowMs: null,
         // 🔒 エージェントの活動観測。**リポジトリ外（~/.claude/projects/）を読む**ので
         //    読み取り側の不変条件（git cat-file 経由のみ）を破る。だから別 capability。
         //    さらに自由文（発話・コマンド行）は**もう一段別のフラグ**にする。
@@ -136,6 +140,7 @@ function parseArgs(argv) {
         else if (a === '--exec-stream-delay') opts.execStreamDelayMs = num('--exec-stream-delay', 0, 60000);
         else if (a === '--exec-spawn-delay') opts.execSpawnDelayMs = num('--exec-spawn-delay', 0, 60000);
         else if (a === '--state-ttl') opts.stateTtlMs = num('--state-ttl', 0, 600000);
+        else if (a === '--page-open-window') opts.pageOpenWindowMs = num('--page-open-window', 0, 3600000);
         else if (a === '--exec-retain') opts.execRetainMs = num('--exec-retain', 1, 86400) * 1000;
         // 🚨 「明示的に決めた」ことを記録する。長さだけを見ると、
         //    自動生成（32バイト = 43文字）が条件を満たしてしまう（6回目のレビュー）
@@ -2168,6 +2173,62 @@ async function auditExec(entry, repo = null) {
  *    **`xffReported`（申告）という名前で、値をそのまま信じない前提で残す。**
  *    中継が付けていなければ null（「分からない」を「無い」と書かない）。
  */
+/**
+ * 📝 **「画面を開いたか」を記録する（#5 の観察項目）。**
+ *
+ * なぜ要るか（実測で分かったこと）: 監査ログは**書き込み・実行・承認だけ**を
+ * 記録していたので、「開いてグラフを眺めた」は痕跡が残らなかった。
+ * 16日間の記録を数えたら遠隔からの実行は 08-04 と 08-06 の2日だけだったが、
+ * **「見なかった」ことの証拠にはならない**（読み取りは記録が無いので）。
+ * #5 は「自分はこれを実際に見るか」に答えるための観察期間なので、
+ * ここが測れないと**判断が記憶に頼ることになる**。
+ *
+ * 🔒 **残すのは「いつ・どこから・どの鍵で」だけ。** URL も自由文も残さない
+ *    （記録が秘密の持ち出し口にならないように。exec の `write` と同じ方針）。
+ * ⚠️ **状態の取得（`/api/v0/state`）では記録しない。** 15 秒ごとの自動更新なので
+ *    1日 5,760 件になり、ログが埋まって**他の記録が回転で消える**。
+ *    人の操作である**ページの読み込み**だけを見る。
+ * ⚠️ それでも携帯はタブ復帰で読み直すので、**同じ出所は 60 秒に1回**に絞る。
+ *    絞った件数は**次の記録に `suppressed` として載せる**（捨てない。
+ *    `auth-failed-summary` と同じ方針）。
+ */
+const PAGE_OPEN_WINDOW_MS = 60_000;
+/** キー（出所 + 鍵の種類）→ { at: 最後に記録した時刻, suppressed: 絞った件数 } */
+const pageOpens = new Map();
+
+/** ページの読み込みを記録する。絞られたら false を返す（呼び出し側は何もしない）。 */
+async function notePageOpen(req, url) {
+    const o = originHint(req);
+    // 🔒 **どの鍵で来たか。** 生トークン > 端末の鍵 > 読み取り専用の派生秘密 > なし。
+    //    ⚠️ ここで新たに認証はしない（既に authed() を通っている）。
+    //    presented の判定は `/api/v0/session` と同じ順序にする（食い違うと記録が嘘になる）。
+    const dev = deviceMatches(req.headers[TOKEN_HEADER]) ?? deviceMatches(url.searchParams.get('token'));
+    const presented = (tokenMatches(req.headers[TOKEN_HEADER])
+        || tokenMatches(url.searchParams.get('token'))) ? 'token'
+        : dev ? 'device'
+            : presentedReadSecret(req, url) ? 'read' : 'none';
+    const key = `${o.host ?? '?'} ${o.peer ?? '?'} ${presented}`;
+    const now = Date.now();
+    const prev = pageOpens.get(key);
+    if (prev && now - prev.at < (opts.pageOpenWindowMs ?? PAGE_OPEN_WINDOW_MS)) {
+        prev.suppressed += 1;
+        return false;
+    }
+    pageOpens.set(key, { at: now, suppressed: 0 });
+    await auditExec({
+        event: 'page-open',
+        ...o,
+        presented,
+        // 端末の鍵なら**どの端末か**（ラベルは登録時に本人が付けたもの）
+        device: dev?.label ?? null,
+        // 認証が要る構成か（ループバックのみの従来の使い方では要らない）
+        requiredAuth: opts.requireAuth === true,
+        // 🚨 絞った分を捨てない（「1回しか開いていない」と読めてしまう）
+        suppressed: prev?.suppressed ?? 0,
+    });
+    return true;
+}
+
 function originHint(req) {
     const raw = req.headers['x-forwarded-for'];
     const first = typeof raw === 'string' ? raw.split(',')[0].trim() : null;
@@ -4351,6 +4412,10 @@ async function handleRequest(req, res) {
         // 機能が揃っているのに片方ずつしか使えなかった（/layout は互換のため残す）。
         if (url.pathname === '/' || url.pathname === '/index.html'
             || url.pathname === '/layout' || url.pathname === '/layout-prototype.html') {
+            // 📝 **「開いたか」を記録する（#5）。** ここは人の操作なので数が少ない。
+            //    ⚠️ 応答を待たせない（記録に失敗しても画面は出す。auditExec は自分で
+            //    失敗を告知する）。**await しないので、記録漏れより表示を優先する。**
+            void notePageOpen(req, url);
             const html = await readFile(join(HERE, 'app.html'));
             res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
             res.end(html);

@@ -185,6 +185,37 @@ const MUTANTS = [
         pattern: 'HEAD ↔ 作業ツリーの差分が読める',
     },
     {
+        // 📝 #5 の観察項目。**記録が無いと判断が記憶に頼る**
+        name: 'page-open-not-recorded',
+        why: 'ページを開いても記録しない（「実際に開いたか」が測れないまま戻る）',
+        file: 'v0/server.mjs',
+        from: '            void notePageOpen(req, url);',
+        to: '            /* 変異: 記録しない */',
+        gone: 'void notePageOpen(req, url);',
+        pattern: 'ページを開くと記録される',
+    },
+    {
+        // 🚨 **絞りを外すと 15 秒ごとの自動更新で 1日 5,760 件になり、
+        //    回転で他の記録（実行・認証失敗・承認）が消える。** ここが守りの本体
+        name: 'page-open-no-throttle',
+        why: '「開いた」の記録を絞らない（自動更新でログが埋まり、他の記録が回転で消える）',
+        file: 'v0/server.mjs',
+        from: '    if (prev && now - prev.at < (opts.pageOpenWindowMs ?? PAGE_OPEN_WINDOW_MS)) {',
+        to: '    if (false) {   /* 変異: 絞らない */',
+        gone: 'if (prev && now - prev.at < (opts.pageOpenWindowMs ?? PAGE_OPEN_WINDOW_MS)) {',
+        pattern: 'ページを開くと記録される',
+    },
+    {
+        // 🚨 絞った件数を捨てると「1回しか開いていない」と読める（省略の告知と同じ型）
+        name: 'page-open-drops-suppressed',
+        why: '絞った件数を記録に載せない（開いた回数が過少に見える）',
+        file: 'v0/server.mjs',
+        from: '        suppressed: prev?.suppressed ?? 0,',
+        to: '        suppressed: 0,   /* 変異: 絞った分を捨てる */',
+        gone: 'suppressed: prev?.suppressed ?? 0,',
+        pattern: 'ページを開くと記録される',
+    },
+    {
         // 🚨 規則7（生の制御文字を書かない）は CLAUDE.md にあったのに**検査が0件**で、
         //    `v0/git.mjs` に続いて `v0/app.html` でも踏んだ。判定を外に出して測る。
         name: 'control-char-scan-blind',

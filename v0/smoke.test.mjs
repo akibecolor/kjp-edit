@@ -1030,6 +1030,83 @@ test('🚨 --require-auth: 読み取り用の鍵では走っているセッシ�
         assert.ok(!t.execSessionsHidden, '出しているのに「隠した」と言っている');
     } finally { s.child.kill(); }
 });
+/**
+ * 📝 **「画面を開いたか」を記録する（#5 の観察項目）。**
+ *
+ * なぜ要るか: 監査ログは書き込み・実行・承認だけを記録していたので、
+ * **「開いて眺めた」は痕跡が残らなかった。** 16日分を数えたら遠隔からの実行は
+ * 2日しか無かったが、それは「見なかった」ことの証拠にはならない。
+ * #5（ローンチ判定）が記憶ではなくデータで答えられるようにする。
+ */
+test('📝 ページを開くと記録されるが、状態の自動更新では記録されない（#5）', async () => {
+    const audit = join(repo, '..', `page-open-${Date.now()}.jsonl`);
+    // ⚠️ 絞る窓を 3 秒に縮める（既定 60 秒を待たずに「絞った件数が次に載る」を測る）。
+    //    🚨 **短くし過ぎない。** 120ms にしたら、状態の取得を測っている間に窓が明けて
+    //    「絞れていない」で落ちた（**コードではなく検査のタイミングが誤り**）。
+    //    間に挟む待ちの合計より確実に長くすること。
+    const WINDOW_MS = 3000;
+    const child = spawn(process.execPath,
+        [SERVER, '--repo', repo, '--port', '0', '--audit-log', audit,
+            '--page-open-window', String(WINDOW_MS)],
+        { shell: false, windowsHide: true, env: { ...process.env, ...isolatedConfig() } });
+    try {
+        const url = await new Promise((res, rej) => {
+            const t = setTimeout(() => rej(new Error('起動しなかった')), 15000);
+            let buf = '';
+            child.stdout.on('data', d => {
+                buf += d;
+                const m = buf.match(/http:[/][/]127[.]0[.]0[.]1:\d+/);
+                if (m) { clearTimeout(t); res(m[0]); }
+            });
+            child.on('error', rej);
+        });
+        const { readFile: rf } = await import('node:fs/promises');
+        const recs = async () => {
+            const text = await rf(audit, 'utf8').catch(() => '');
+            return text.split('\n').filter(Boolean).map(l => JSON.parse(l))
+                .filter(e => e.event === 'page-open');
+        };
+        const drain = async r => { await r.text(); };
+
+        // 1. ページを開くと1件
+        await drain(await fetch(`${url}/`));
+        await new Promise(r => setTimeout(r, 300));
+        let got = await recs();
+        assert.equal(got.length, 1, `開いたのに記録されない: ${got.length} 件`);
+        assert.equal(got[0].presented, 'none', 'ループバックで鍵なしなのに鍵を記録している');
+        assert.ok(got[0].peer, '出所（peer）が残っていない');
+        // 🔒 **自由文も URL も残さない**（記録が持ち出し口にならないように）
+        assert.deepEqual(Object.keys(got[0]).sort(),
+            ['at', 'device', 'event', 'host', 'peer', 'presented',
+                'requiredAuth', 'suppressed', 'xffReported'].sort(),
+            `想定外のフィールドを記録している: ${JSON.stringify(got[0])}`);
+
+        // 2. 🚨 **状態の取得では記録しない。** ここを外すと 15 秒ごとの自動更新で
+        //    1日 5,760 件になり、**回転で他の記録が消える**（守りの本体）。
+        for (let i = 0; i < 5; i++) await drain(await fetch(`${url}/api/v0/state`));
+        await new Promise(r => setTimeout(r, 200));
+        got = await recs();
+        assert.equal(got.length, 1,
+            `状態の取得で記録が増えた（自動更新でログが埋まる）: ${got.length} 件`);
+
+        // 3. 短い間に開き直しても増えない（携帯のタブ復帰で埋めない）
+        await drain(await fetch(`${url}/`));
+        await drain(await fetch(`${url}/`));
+        await new Promise(r => setTimeout(r, 200));
+        got = await recs();
+        assert.equal(got.length, 1, `絞れていない: ${got.length} 件`);
+
+        // 4. 🚨 **絞った分は捨てない。** 窓が明けた次の記録に件数が載る
+        //    （載せないと「1回しか開いていない」と読める）
+        await new Promise(r => setTimeout(r, WINDOW_MS + 200));
+        await drain(await fetch(`${url}/`));
+        await new Promise(r => setTimeout(r, 300));
+        got = await recs();
+        assert.equal(got.length, 2, `窓が明けたのに記録されない: ${got.length} 件`);
+        assert.equal(got[1].suppressed, 2,
+            `絞った件数を捨てている（開いた回数が過少に見える）: ${JSON.stringify(got[1])}`);
+    } finally { child.kill(); }
+});
 test('🔒 認証失敗は記録され、連続失敗は遅くなる（本文は残さない）', async () => {
     const audit = join(repo, '..', `auth-audit-${Date.now()}.jsonl`);
     const child = spawn(process.execPath,
