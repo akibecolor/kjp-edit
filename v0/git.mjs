@@ -710,15 +710,36 @@ export async function fileDiff(cwd, base, ref, path) {
  *    `.env` や新規ファイルはここから出てこない（`+` の経路と役割が分かれている）。
  * ⚠️ `--no-textconv` は必須（リポジトリ設定の `diff.<name>.textconv` から
  *    コマンドが起動しうる。`--no-ext-diff` では止まらない）。
+ * 🚨 **`filterNames` を必ず渡すこと（capability ゼロでの任意コード実行を止める）。**
+ *    ここは `fileDiff` と違って**作業ツリー側**を見るので、git は worktree の中身を
+ *    index の表現に直すために `.gitattributes` の **clean filter を実行する**。
+ *    `--no-ext-diff` も `--no-textconv` も**これを止めない**（実測）:
+ *      | 叩いた形 | clean filter |
+ *      |---|---|
+ *      | `diff --no-ext-diff --no-textconv main...side`（`fileDiff`） | 走らない |
+ *      | `diff --no-ext-diff --no-textconv HEAD`（ここ） | **走る** |
+ *      | 同上 + `filterNeutralizeArgs()` | 走らない |
+ *    実証: capability ゼロ・ループバックのみのデーモンに
+ *    `/api/v0/diff?mode=worktree` を1回投げるだけで、`.gitattributes`（`*.txt filter=pwn`）と
+ *    `.git/config` の `[filter "pwn"] clean = <コマンド>` からデーモンの env ごと
+ *    コードが走った。`core.fsmonitor` / merge driver と**同じクラスの穴**で、
+ *    `worktreeStatus` では8回目のレビューで既に塞いである。**新しい経路で再発させた。**
+ * @param {{name: string, hasProcess: boolean}[]} filterNames `repoFilterNames()` の結果
  */
-export async function worktreeFileDiff(cwd, path) {
+export async function worktreeFileDiff(cwd, path, filterNames = []) {
     if (!isSafeRepoPath(path)) throw new GitError(['diff'], 2, `path が不正です: ${path}`);
     const buf = await git([
+        ...filterNeutralizeArgs(filterNames),
         'diff', '--no-color', '--no-ext-diff', '--no-textconv',
         'HEAD', '--', path,
     ], { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
-    if (looksBinary(buf)) return { path, binary: true, text: null };
-    return { path, binary: false, text: toNFC(buf.toString('utf8')) };
+    // 潰したことは**呼ぶ側に返す**。潰すと作業ツリーの生バイトと index の
+    // 「掃除済み」の中身を比べることになるので、**実際の git と差分が違いうる**。
+    // 黙って違うものを見せない（このリポジトリで最も重い欠陥は「嘘の表示」）。
+    const filtered = (filterNames ?? []).map(f => (typeof f === 'string' ? f : f?.name))
+        .filter(Boolean);
+    if (looksBinary(buf)) return { path, binary: true, text: null, filtered };
+    return { path, binary: false, text: toNFC(buf.toString('utf8')), filtered };
 }
 
 /**

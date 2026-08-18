@@ -378,6 +378,17 @@ env:  LANGUAGE=en LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 GIT_PAGER=cat
 - 🔒 **HTTP から来た値を git に渡すときは `isSafeRepoPath()` / `isSafeRef()` を必ず通す。**
   `..` / 絶対パス / ドライブレター / 先頭 `-`（オプション注入）/ NUL を弾く。
   **パスは必ず `--` の後ろに置く**（無いと ref として解釈されうる）
+- 🚨 **作業ツリーを見る git コマンドは `filterNeutralizeArgs()` を必ず通す。**
+  `git status` / `git diff HEAD` は作業ツリーの中身を index の表現に直すために
+  **`.gitattributes` の clean filter（= 任意コマンド）を実行する**。
+  ⚠️ **`--no-ext-diff` も `--no-textconv` も止めない**（textconv とは別クラス）。
+  実測: `diff … main...side`（コミット間）は走らないが `diff … HEAD` は**走る**。
+  🚨 **写し元を1つに決めると、もう一方の守りが丸ごと落ちる。**
+  `worktreeFileDiff` は `fileDiff` から引数を写して `--no-textconv` は持ってきたが、
+  **`worktreeStatus` 側にしか無い** `filterNeutralizeArgs` は視野の外で、
+  **フラグ0個のデーモンが `/api/v0/diff?mode=worktree` 1回で任意コード実行**に戻っていた
+  （8回目のレビューで塞いだ穴の再発。`docs/editor-filer.md` §9）。
+  新しい経路を足すときは「**同じ対象を読む既存の関数**」を基準に守りを数える
 - 🔒 **ファイルの中身は `git cat-file` 経由で読み、`fs` で読まない。**
   git オブジェクト経由なら「コミットに入っているもの」に限定され、
   リポジトリ外や未追跡の `.env` に触れる経路を作らない

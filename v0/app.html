@@ -1411,7 +1411,19 @@ async function loadWorktreeDiff(holder, worktree, path) {
         `${path} に未コミットの変更はもうありません（一覧は最大15秒古いことがあります）`));
       return;
     }
-    holder.replaceChildren(renderDiff(d.text ?? ''));
+    // 🔒 **潰した filter があることは必ず告げる。** サーバは `.gitattributes` の
+    //    clean filter を無効化して読む（有効なままだと**任意コマンドが走る**）。
+    //    その結果、作業ツリーの生バイトと index の「掃除済み」の中身を比べることになり、
+    //    **実際の `git diff` と行が違いうる**。黙って違うものを見せない。
+    const parts = [];
+    if ((d.filtered ?? []).length) {
+      parts.push(el('div', 'note warn',
+        `リポジトリ設定の filter（${d.filtered.join(', ')}）を無効化して読みました`
+        + '（filter は任意コマンドを実行できるため）。'
+        + ' このファイルの差分は実際の git の出力と違うことがあります'));
+    }
+    parts.push(renderDiff(d.text ?? ''));
+    holder.replaceChildren(...parts);
   } catch (e) {
     holder.replaceChildren(el('div', 'note warn', `取得できませんでした: ${e.message}`));
   }

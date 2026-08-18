@@ -179,10 +179,34 @@ const MUTANTS = [
         why: 'mode=worktree を無視して base...HEAD を返す（エージェントが今書いたものが見えない）',
         file: 'v0/server.mjs',
         // ⚠️ 1行で一意になる形にする（複数行の錨はシェル越しで壊れやすい）
-        from: '                        ? await worktreeFileDiff(wtCwd, path)',
+        from: '                        ? await worktreeFileDiff(wtCwd, path, diffFilters)',
         to: '                        ? await fileDiff(repo, url.searchParams.get(\'base\') ?? \'HEAD\', ref, path)',
-        gone: '? await worktreeFileDiff(wtCwd, path)',
+        gone: '? await worktreeFileDiff(wtCwd, path, diffFilters)',
         pattern: 'HEAD ↔ 作業ツリーの差分が読める',
+    },
+    {
+        // 🚨 **`--no-textconv` とは別クラスの穴。** `git diff HEAD` は作業ツリーの中身を
+        //    index の表現に直すために clean filter を実行する（textconv のフラグでは止まらない）。
+        //    `worktreeStatus` では8回目のレビューで塞いだのに、`worktreeFileDiff` を
+        //    足したときに写し忘れて再発させた（capability ゼロで任意コード実行）。
+        name: 'worktree-diff-clean-filter',
+        why: '作業ツリー差分の filter 無効化を外す（.gitattributes の clean filter が読み取り経路から走る）',
+        file: 'v0/git.mjs',
+        from: "        ...filterNeutralizeArgs(filterNames),\n        'diff', '--no-color', '--no-ext-diff', '--no-textconv',",
+        to: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',",
+        gone: "...filterNeutralizeArgs(filterNames),\n        'diff', '--no-color',",
+        pattern: '作業ツリー差分が clean filter を実行しない',
+    },
+    {
+        // 🚨 **呼び出し側も測る。** 守りを関数に集約すると「渡していない」形の穴が
+        //    関数側の変異では見えなくなる（`secretsForMasking()` で実際に踏んだ型）。
+        name: 'worktree-diff-filters-not-passed',
+        why: '作業ツリー差分で filter を列挙せず空を渡す（関数側の守りが素通りする）',
+        file: 'v0/server.mjs',
+        from: '            const diffFilters = wtCwd ? await repoFilterNames(wtCwd) : [];',
+        to: '            const diffFilters = [];   /* 変異: 列挙しない */',
+        gone: 'const diffFilters = wtCwd ? await repoFilterNames(wtCwd) : [];',
+        pattern: '作業ツリー差分が clean filter を実行しない',
     },
     {
         // 🔒 登録済み worktree との照合を外すと、リポジトリ外の作業ツリーを読める

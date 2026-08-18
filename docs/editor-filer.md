@@ -95,6 +95,10 @@ worktree カードには「変更 N・未追跡 N」と数だけ出るので、
 - 🔒 **ignored なファイルはタブにも差分にも出ない**
 - 🔒 **未追跡ファイルは `dirtyFiles` に入らない**（`+` 側の役割と混ぜない）
 - 上限で切ったら**件数を告知**する
+- 🔒 **作業ツリー差分がリポジトリ設定のコマンドを実行しない。**
+  textconv（`--no-textconv`）だけでなく **`.gitattributes` の clean filter** も。
+  **別クラスの穴で、フラグでは止まらない**（§9 の BLOCKING）。
+  副作用（marker が書かれないこと）で測り、**差分が空でないことも同時に assert する**
 - `stats.gitSpawns` が**増えていない**（既存の上限テストで固定）
 - 390px で横溢れしない（タブが3種類になる = 過去に1つ足して溢れた場所）
 
@@ -114,6 +118,8 @@ worktree カードには「変更 N・未追跡 N」と数だけ出るので、
 | `untracked-view-via-blob` | 未追跡の閲覧を `blob`（読み取りの鍵）に載せる（**分界が崩れる**） | smoke |
 | `untracked-view-no-gate` | 閲覧で `requireEditTarget` を通さない | smoke |
 | `filer-tab-marks-same` | 3種類のタブの印を同じにする（見分けが付かない） | render-check |
+| `worktree-diff-clean-filter` | 作業ツリー差分の filter 無効化を外す（**capability ゼロで任意コード実行**。§9 で追加） | smoke |
+| `worktree-diff-filters-not-passed` | 呼び出し側が filter を列挙しない（関数側の守りが素通り。§9 で追加） | smoke |
 
 ## 8. やらないこと（この増分で。着手条件つき）
 
@@ -159,6 +165,50 @@ worktree カードには「変更 N・未追跡 N」と数だけ出るので、
 ⚠️ どちらも「**400 が返ったから守れている**」と読んでいた形で、
 **同じ結果に見える別の原因**を排除していなかった。`/spec-first` の
 「主張と検査を1対1に並べる」が効いた例として残す。
+
+### 🚨 実装後のレビューで見つかった BLOCKING 1件（`--no-textconv` では足りなかった）
+
+**`worktreeFileDiff` が `.gitattributes` の clean filter を実行していた。**
+`--no-ext-diff` も `--no-textconv` も**これを止めない**（textconv とは別クラス）。
+実測で切り分けた:
+
+| 叩いた形 | clean filter |
+|---|---|
+| `diff --no-ext-diff --no-textconv main...side`（`fileDiff` = コミット間） | 走らない |
+| `diff --no-ext-diff --no-textconv HEAD`（`worktreeFileDiff` = 作業ツリー側） | **走る** |
+| `status --porcelain=v2 -z`（`worktreeStatus`） | **走る**（8回目のレビューで対処済み） |
+| 上に `filterNeutralizeArgs()` を足す | 走らない |
+
+実証: **フラグ0個・ループバックのみ**のデーモンに
+`/api/v0/diff?mode=worktree` を1回投げるだけで、コミット済みの `.gitattributes`
+（`*.txt filter=pwn`）と `.git/config` の `[filter "pwn"] clean = <コマンド>` から
+**デーモンの env ごとコードが走った**（marker に `PWNED env.PATH=…` が書かれた）。
+同じ実験で `/api/v0/state` は走らせず、告知も出していた = **守りは既にあったのに
+新しい経路が通っていなかった**。
+
+🚨 **これは §9 の「写した守りも測る」を自分でやりながら踏んだ。**
+`fileDiff` から引数を写して `--no-textconv` は持ってきたが、
+**`worktreeStatus` 側にしか無い守り**（`filterNeutralizeArgs`）は、
+別の関数にあったので視野に入らなかった。
+**「写し元」を1つに決めると、もう一方の守りが丸ごと落ちる。**
+新しい経路を足すときは「**同じ対象（作業ツリー）を読む既存の関数**」を基準にする。
+
+直し方と、それを固定する検査:
+
+- `worktreeFileDiff(cwd, path, filterNames)` に `filterNeutralizeArgs()` を通す
+- 呼ぶ側（`/api/v0/diff`）が `repoFilterNames(wtCwd)` を渡す。
+  **コミット間の差分では渡さない**（走らないことを実測したので、無駄な 1 spawn を置かない）
+- 🔒 潰した filter 名を応答の `filtered` に載せ、**UI が告知する**。
+  潰すと作業ツリーの生バイトと index の「掃除済み」の中身を比べるので、
+  **実際の `git diff` と行が違いうる**（黙って違うものを見せない）
+- 検査は smoke で**副作用**（marker が書かれないこと）を測る。
+  ⚠️ 同時に **差分が空でないこと**も assert する — 空だと clean filter は
+  そもそも呼ばれず、守りを外しても緑になる（§9 の欠陥1と同じ型を繰り返さない）
+
+| 変異 | 何を外すか |
+|---|---|
+| `worktree-diff-clean-filter` | 関数側の `filterNeutralizeArgs()` を外す |
+| `worktree-diff-filters-not-passed` | 呼び出し側が列挙せず空を渡す（**集約した守りは呼び出し側も測る**） |
 
 ## 10. 測った結果
 

@@ -657,7 +657,8 @@ async function collectFresh(repo) {
     // 🔒 **`.gitattributes` の filter を潰す（capability ゼロでの任意コード実行を止める）。**
     //    `core.fsmonitor` と同じクラスの穴で、`git status` が作業ツリーと index を
     //    比べるときに clean filter を実行する（実測で marker が書かれた。8回目のレビュー）。
-    //    ⚠️ 1リポジトリあたり 2 spawn（--local と --worktree）。worktree の本数には比例しない。
+    //    ⚠️ 1リポジトリあたり 1 spawn（`config --show-scope --get-regexp`）。
+    //    worktree の本数には比例しない。
     const filters = await repoFilterNames(cwd);
     if (filters.length) {
         errors.push({
@@ -4290,11 +4291,18 @@ async function handleRequest(req, res) {
                 if (hit.bare) { denyJson(res, 400, 'bare worktree に作業ツリーはありません'); return; }
                 wtCwd = hit.path;
             }
+            // 🔒 **作業ツリー側を読むときだけ filter を潰す（任意コード実行を止める）。**
+            //    `git diff HEAD`（= 作業ツリー比較）は `.gitattributes` の clean filter を
+            //    実行する。`--no-ext-diff` / `--no-textconv` では止まらない（実測）。
+            //    `core.fsmonitor` と同じクラスの穴で、`worktreeStatus` では既に塞いである。
+            //    ⚠️ **コミット間の差分（`base...ref`）では要らない**（作業ツリーを見ないので
+            //    clean filter が走らないことを実測した）。要らない所に置くと 2 spawn 増えるだけ。
+            const diffFilters = wtCwd ? await repoFilterNames(wtCwd) : [];
             try {
                 const body = url.pathname === '/api/v0/blob'
                     ? await showBlob(repo, ref, path)
                     : (wtCwd
-                        ? await worktreeFileDiff(wtCwd, path)
+                        ? await worktreeFileDiff(wtCwd, path, diffFilters)
                         : await fileDiff(repo, url.searchParams.get('base') ?? 'HEAD', ref, path));
                 res.writeHead(200, {
                     'content-type': 'application/json; charset=utf-8',

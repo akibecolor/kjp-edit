@@ -8510,3 +8510,60 @@ test('🚨 作業ツリー差分もリポジトリ設定のコマンドを実行
         await g(['commit', '-q', '-m', 'chore: 作業ツリー差分の textconv テスト後始末'], repo).catch(() => {});
     }
 });
+
+test('🚨 作業ツリー差分が clean filter を実行しない（capability ゼロの任意コード実行）', async () => {
+    // 🚨 **`--no-textconv` / `--no-ext-diff` はこれを止めない。** 別クラスの穴。
+    //    `git diff HEAD` は作業ツリーの中身を index の表現に直すために
+    //    `.gitattributes` の **clean filter を実行する**（実測）:
+    //      diff --no-ext-diff --no-textconv main...side  → 走らない（コミット間）
+    //      diff --no-ext-diff --no-textconv HEAD         → **走る**（作業ツリー側）
+    //    `worktreeStatus` では8回目のレビューで塞いだのに、
+    //    `worktreeFileDiff` を**足したときに写し忘れて再発させた**。
+    //    実証: フラグ0個・ループバックのみのデーモンに /api/v0/diff?mode=worktree を
+    //    1回投げるだけで、デーモンの env ごとコードが走った。
+    const marker = join(repo, 'wt-clean-ran.txt').split(sep).join('/');
+    const hook = join(repo, 'wt-clean.sh').split(sep).join('/');
+    const { existsSync } = await import('node:fs');
+    const { chmod } = await import('node:fs/promises');
+    try {
+        // ⚠️ clean filter は**標準入力**で中身を受け取る（textconv のようにパス引数ではない）。
+        //    `cat` を忘れるとファイルが空になり、差分が別の理由で変わって測定が濁る。
+        await writeFile(hook, '#!/bin/sh\nprintf ran >> "' + marker + '"\ncat\n', 'utf8');
+        await chmod(hook, 0o755);
+        // 🚨 対象は **main worktree で追跡されている**ファイル（textconv の検査で
+        //    未追跡のファイルを指して「守りを外しても緑」を作った事故と同じ型）。
+        await writeFile(join(repo, 'wt-clean-target.txt'), 'もとの内容\n', 'utf8');
+        await writeFile(join(repo, '.gitattributes'), 'wt-clean-target.txt filter=evil3\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: 作業ツリー差分の clean filter テスト用'], repo);
+        await g(['config', 'filter.evil3.clean', hook], repo);
+        // 追跡ファイルを未コミットで変更する（作業ツリー差分の対象を作る）
+        await writeFile(join(repo, 'wt-clean-target.txt'), 'まだコミットしていない変更\n', 'utf8');
+
+        const q = new URLSearchParams({
+            mode: 'worktree', worktree: repo, path: 'wt-clean-target.txt',
+        });
+        const r = await fetch(`${baseUrl}/api/v0/diff?${q}`);
+        assert.equal(r.status, 200, `作業ツリー差分が取れない: ${r.status}`);
+        const body = await r.json();
+        // 🚨 **測っている対象が実在することを確かめる。** 差分が空だと clean filter は
+        //    そもそも呼ばれないので、守りを外しても緑になる（この検査自体が無意味になる）。
+        assert.ok((body.text ?? '').includes('まだコミットしていない変更'),
+            `作業ツリー差分が空 = 何も測れていない: ${JSON.stringify(body).slice(0, 200)}`);
+        await new Promise(x => setTimeout(x, 400));
+        assert.equal(existsSync(marker), false,
+            '🚨 作業ツリー差分から clean filter が実行された（capability ゼロで任意コード実行）');
+        // 🔒 **潰したことを黙らない。** 潰すと作業ツリーの生バイトと index の
+        //    「掃除済み」の中身を比べるので、実際の git と差分が違いうる。
+        assert.deepEqual(body.filtered, ['evil3'],
+            `潰した filter を告げていない: ${JSON.stringify(body.filtered)}`);
+    } finally {
+        await g(['config', '--unset', 'filter.evil3.clean'], repo).catch(() => {});
+        await rm(join(repo, '.gitattributes'), { force: true }).catch(() => {});
+        await rm(hook, { force: true }).catch(() => {});
+        await rm(marker, { force: true }).catch(() => {});
+        await rm(join(repo, 'wt-clean-target.txt'), { force: true }).catch(() => {});
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: 作業ツリー差分の clean filter テスト後始末'], repo).catch(() => {});
+    }
+});
