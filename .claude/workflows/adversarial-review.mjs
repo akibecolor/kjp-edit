@@ -293,6 +293,67 @@ v0/app.html の監視盤、v0/chatfilter.mjs、v0/argv.mjs。
   worktree と セッションが増えたときの payload サイズと git の起動数`,
     },
     {
+        key: 'editor',
+        prompt: `**観点: ファイルを読む・書く経路（エディタ / ファイラ。\`docs/editor-filer.md\`）。**
+
+見るもの: v0/server.mjs の requireEditTarget()（門1〜5）と /api/v0/file の
+読み側・書き側、/api/v0/diff の \`mode=worktree\`、payload の dirtyFiles /
+untracked（と More の告知）、v0/git.mjs の worktreeFileDiff / worktreeStatus /
+repoFilterNames / filterNeutralizeArgs、v0/app.html の3種類のタブ
+（素 = コミット済み / \`*\` = 未コミット / \`+\` = 未追跡）と loadWorktreeDiff /
+loadUntracked / openEditor、scripts/serveargs.mjs の --untracked。
+
+背景と約束:
+- **既定は \`git cat-file\` 経由でしか中身を読まない**（リポジトリ外・未追跡の
+  秘密ファイルに触れないことが構造で保証される）。**fs で読み書きするのは
+  requireEditTarget を通った後だけ**
+- **未追跡ファイルの編集は \`--allow-untracked\`（既定オフ）。** 対象は
+  「未追跡 **かつ** gitignore されていない」だけで、判定は
+  \`git ls-files --others --exclude-standard\`。**\`--exclude-standard\` が守りの本体**で、
+  外すと \`.env\` に届く（#11 は開いたまま = **ignored には届かないのが正しい**）
+- \`--exec\` では自動で有効。\`--write\` だけの構成では明示が要る
+  （理由: 実行できる相手は既に \`cat > file\` で書けるので権限が増えない）
+- 楽観ロックは中身のハッシュ（blobOid）
+- 🚨 **リポジトリ設定の任意コード実行を毎回疑う。** \`git status\` / \`git diff HEAD\` /
+  \`git add\` は作業ツリーの中身を index の表現に直すために \`.gitattributes\` の
+  **clean filter を実行する**（\`--no-ext-diff\` も \`--no-textconv\` も止めない）。
+  **この観点でちょうど1件 BLOCKING が出たばかり**（\`worktreeFileDiff\` が
+  \`filterNeutralizeArgs\` を通っておらず、フラグ0個のデーモンで任意コード実行。
+  8回目のレビューで塞いだ穴の再発。\`docs/editor-filer.md\` §9 に記録）
+
+疑うこと（これに限らない。壊れる形を探す）:
+- **門の順序と抜け。** requireEditTarget の1〜5（パスの形 → 既知の worktree →
+  追跡/未追跡 → 実体が worktree の中 → lstat）で、**認可より前に副作用**
+  （本文の読み込み・git の起動・fs アクセス）が起きないか。読み側と書き側で
+  同じ門を通っているか。\`--allow-untracked\` の判定が**フォールバックより後ろ**に無いか
+- **\`.env\` に届く形。** \`--exclude-standard\` を通り抜ける置き方
+  （\`.git/info/exclude\`、\`core.excludesFile\`、ネストした \`.gitignore\`、
+  negation パターン、\`assume-unchanged\` / \`skip-worktree\`、
+  index に入っているが worktree では ignored、大文字小文字、末尾の空白・ドット）。
+  **実際に一時リポジトリで試して**ほしい
+- **リポジトリ外に出る形。** symlink、junction / reparse point、\`..\` を含む NFC 正規化、
+  8.3 短縮名、linked worktree の \`.git\` ファイル、\`$GIT_DIR\` の中、
+  submodule の中、worktree のパスが別の worktree の接頭辞になる場合
+  （\`containsPath\` の境界。\`/a/b\` と \`/a/bc\`）
+- **他に content conversion を起こす git 呼び出しが残っていないか。**
+  リポジトリ全体で \`diff\` / \`status\` / \`add\` / \`stash\` / \`archive\` /
+  \`checkout\` / \`apply\` を数え、**作業ツリー側を見るのに
+  \`filterNeutralizeArgs\` を通っていないもの**を挙げる。
+  \`.process\`（常駐フィルタ）は \`.clean\` とは別キーである点も確認する
+- **capability の分界。** 読み取りの鍵（token-read）で未追跡の中身・dirtyFiles・
+  worktree 差分のどれかに届かないか。\`--write\` だけのデーモンに
+  \`--untracked\` が黙って付く経路、\`--exec\` から自動で入る経路が
+  **再起動をまたいで**意図どおりか（\`scripts/autostart.mjs\` の引き継ぎ）
+- **書き込みの正しさ。** blobOid の楽観ロックを回避できる並び（同時に2つ、
+  読んでから書くまでの窓）、\`write → truncate\` の順序が守る不変条件、
+  EOL / BOM の判定が中身を変えてしまう場合、上限超過・バイナリの拒否
+- **嘘の表示。** dirtyFiles / untracked の上限で切ったのに告知が出ない形、
+  差分が空なのに理由を出さない形、潰した filter を告げない形、
+  タブの3種類の印が見分けられなくなる形
+- **各門を外して落ちる変異が実在するか。** scripts/mutate.mjs を読み、
+  **守りがあるのに変異が無い箇所**を挙げてほしい（\`--dry\` は実行して良い）`,
+    },
+    {
         key: 'tests',
         prompt: `**観点: テストが本当に守りを検証しているか（偽陽性の探索）。**
 

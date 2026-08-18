@@ -3949,9 +3949,19 @@ async function handleRequest(req, res) {
                 //       （`cached = null` のままだと ES モジュールは strict なので
                 //        ReferenceError = この経路が丸ごと 500 になる。`node --check` では
                 //        見えず、smoke の「半端な状態が残ったと言う」が拾った）。
+                // 🔒 **下の数え直しにも filter の中和を渡す。** `worktreeStatus` は作業ツリーを
+                //    読むので `.gitattributes` の clean filter（= 並行エージェントが
+                //    `.git/config` に書ける任意コマンド）を実行する。
+                //    上の門（filter があれば 409）で普通は到達しないが、
+                //    **門の順序に守りを依存させない**（門を動かした瞬間に生きた穴になる。
+                //    「順序が守りの本体になっている場所がある」— CLAUDE.md）。
+                //    sibling の成功前の呼び出しは filterNames を渡しているのに、
+                //    この失敗経路だけ渡していなかった（レビュー13）。
+                // ⚠️ **次の3行は隣接させておく**（`merge-failed-cache` と
+                //    `merge-failed-recount` の錨。間にコメントを挟むと STALE になる）。
                 cachedByRepo.delete(repo);
                 const seqAfter = await sequencerState(wt.path).catch(() => null);
-                const stAfter = await worktreeStatus(wt.path).catch(() => null);
+                const stAfter = await worktreeStatus(wt.path, filterNames).catch(() => null);
                 // ⚠️ **「数え直せなかった」を「綺麗だ」と書かない**（分からないなら分からないと言う）
                 const leftover = (seqAfter === null || stAfter === null)
                     ? { counted: false, dirty: null, merging: null, changed: null, unmerged: null }
@@ -4323,6 +4333,7 @@ async function handleRequest(req, res) {
             || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'
             || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'
             || url.pathname === '/dirlabel.mjs'
+            || url.pathname === '/filertabs.mjs'
             || url.pathname === '/mergeplan.mjs'
             || url.pathname === '/inputnote.mjs'
             || url.pathname === '/theme.mjs'

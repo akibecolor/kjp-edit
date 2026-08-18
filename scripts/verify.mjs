@@ -128,6 +128,22 @@ let failed = false;
         }
     }
     bad.push(...await checkInlineModules(htmlFiles));
+    // 🚨 **生の制御文字を混入させない（CLAUDE.md 規則7。検査が1件も無かった）。**
+    //    生の NUL を1個入れるだけで git がそのファイルを **binary** と判定し、
+    //    `git diff` / `git log -p` / `git grep` の**全部から見えなくなる**
+    //    （`v0/git.mjs` が丸ごとレビュー不可能になった事故。その後 `v0/app.html` で
+    //     テンプレートリテラルの区切りとして**また入れた**）。
+    //    ⚠️ 規則として書いてあるだけでは防げない。**落ちる検査にする。**
+    //    許すのは tab (09) / LF (0a) / CR (0d) だけ。
+    for (const f of [...files, ...htmlFiles]) {
+        const buf = await readFile(f);
+        const at = buf.findIndex(c => (c < 0x09 || (c > 0x0d && c < 0x20) || c === 0x7f));
+        if (at !== -1) {
+            const near = buf.subarray(Math.max(0, at - 40), at).toString('utf8').split('\n').pop();
+            bad.push(`${relative(ROOT, f)}: 生の制御文字 0x${buf[at].toString(16)}`
+                + ` (offset ${at}) — エスケープ表記にすること。直前: ${JSON.stringify(near)}`);
+        }
+    }
     const label = `syntax (${files.length} mjs, ${htmlFiles.length} html)`;
     steps.push(bad.length
         ? { name: label, ok: false, detail: bad.slice(0, 5) }

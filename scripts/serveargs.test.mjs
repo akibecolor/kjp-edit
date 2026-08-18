@@ -264,6 +264,47 @@ test('🚨 自動起動の登録に --repo を全部引き継ぐ（ログオン�
     assert.deepEqual(repos, ['C:/a', 'C:/b'], '再起動後だけ1本になる形の回帰');
 });
 
+test('🚨 自動起動の登録に --untracked を引き継ぐ（ログオン後だけ未追跡編集が消えない）', () => {
+    // 🚨 **`--write --untracked` の構成だけが壊れる形だった。** `--exec` は
+    //    `serverArgs` が自動で `--allow-untracked` を付けるので、引き継ぎを
+    //    落としても露見しない = **手元では絶対に気付けない**（#30 / #45 と同型）。
+    const { args } = autostartServeArgs({
+        argv: ['--write', '--untracked'], repos: ['C:/a'], port: '7749',
+    });
+    assert.ok(args.includes('--untracked'),
+        `--untracked が引き継がれていない（ログオン後だけ未追跡編集が無効）: ${args.join(' ')}`);
+    // 🚨 **引き継いだ argv が実際にサーバのフラグになることまで見る。**
+    //    ここを見ないと「文字列は入っているが効かない」形が素通りする。
+    assert.ok(serverArgs({ argv: args, server: SERVER, repos: ['C:/a'], port: 7749 })
+        .includes('--allow-untracked'),
+        '引き継いだ argv から --allow-untracked が生えない');
+    // ⚠️ 打っていないなら付けない（自動で権限を広げない）
+    assert.ok(!autostartServeArgs({ argv: ['--write'], repos: ['C:/a'], port: '7749' })
+        .args.includes('--untracked'), '打っていない --untracked が生えた');
+});
+
+test('🚨 configDiff は --untracked の差を見る（「既に動いています」で黙らせない）', () => {
+    const runningWrite = 'node /x/server.mjs --repo C:/r --port 7749 --allow-write';
+    // 🚨 これが [] だと serve.mjs は「既に動いています → URL」で exit 0 し、
+    //    打った --untracked が無効なことを**1文字も言わない**
+    //    （--timeout が集合に入っていなかったのと同型の再発。8回目のレビュー）
+    assert.deepEqual(
+        configDiff(['--write', '--untracked'], runningWrite, { repos: ['C:/r'] })
+            .map(d => d.what),
+        ['--allow-untracked'],
+        '--untracked の差が見えていない（要求が黙って無効になる）');
+    // 既に有効なら差分なし（毎回止めない）
+    assert.deepEqual(
+        configDiff(['--write', '--untracked'],
+            `${runningWrite} --allow-untracked`, { repos: ['C:/r'] }), []);
+    // ⚠️ `--exec` は untracked を含む（serverArgs が自動で付ける）。
+    //    ここが食い違うと「差分あり」と言い続けて再起動を促し続ける
+    assert.deepEqual(
+        configDiff(['--exec'],
+            'node /x/server.mjs --repo C:/r --port 7749 --allow-write --allow-exec'
+            + ' --allow-untracked', { repos: ['C:/r'] }), []);
+});
+
 test('repos を配列で渡し忘れたら黙って通さない', () => {
     // 単数の `repo` を渡すと `--repo undefined` になり「別の場所を見ている」で
     // 気付くことになる。起動前に止める
@@ -402,8 +443,16 @@ test('🔒 動いているデーモンの capability を読める（実行を黙
 });
 
 test('要求した capability をサーバ側の名前に直せる（差分を出すため）', () => {
-    assert.deepEqual(requestedCaps(['--exec']).sort(), ['--allow-exec', '--allow-write']);
+    // ⚠️ `--exec` は `--allow-untracked` も要求する（`serverArgs` が自動で付けるから）。
+    //    ここと `serverArgs` の条件が食い違うと configDiff が嘘をつく
+    assert.deepEqual(requestedCaps(['--exec']).sort(),
+        ['--allow-exec', '--allow-untracked', '--allow-write']);
     assert.deepEqual(requestedCaps(['--write']), ['--allow-write']);
+    // 🚨 `--write` 単独では付かない（既存デーモンの更新で範囲が黙って広がらない）
+    assert.deepEqual(requestedCaps(['--write', '--untracked']).sort(),
+        ['--allow-untracked', '--allow-write']);
+    assert.deepEqual(requestedCaps(['--untracked']), [],
+        '--write が無ければ untracked は要求しない（serverArgs と同じ条件）');
     assert.deepEqual(requestedCaps(['--agents-text']).sort(),
         ['--allow-transcript-text', '--watch-agents']);
     assert.deepEqual(requestedCaps(['--watch']), ['--watch-agents']);
@@ -414,7 +463,7 @@ test('要求した capability をサーバ側の名前に直せる（差分を�
     // 読み取り専用のデーモンが動いている状態で --exec を要求したら差分が出る
     const missing = requestedCaps(['--exec'])
         .filter(c => !runningCaps('node v0/server.mjs --repo C:/r').includes(c));
-    assert.deepEqual(missing.sort(), ['--allow-exec', '--allow-write'],
+    assert.deepEqual(missing.sort(), ['--allow-exec', '--allow-untracked', '--allow-write'],
         '黙って無視すると「打ったのに効かない」状態になる');
 });
 
@@ -481,7 +530,12 @@ test('🚨 --timeout の値が無い形を既定に落とさない', () => {
       「既に動いています → URL」で exit 0 になり、**前のデーモンが 600 秒のまま**
       走り続けていた（実測 551 秒でまだ走っていた仕事が、この経路で無言で旧設定に戻る）。 */
 
+/* ⚠️ **`serverArgs` が実際に出す形と揃えること。** ここが古いと
+ *    「差分あり」と言い続けて再起動を促し続ける形の偽陽性になる。
+ *    `--exec` は `--allow-untracked` を自動で付ける（実行できる相手は既に
+ *    `cat > file` で未追跡ファイルを書けるので権限が増えない）。 */
 const RUNNING_EXEC = 'node C:/x/v0/server.mjs --repo C:/r --port 7749 --allow-write'
+    + ' --allow-untracked'
     + ' --allow-exec --token-file C:/s/token-exec --audit-log C:/s/a.jsonl'
     + ' --exec-timeout 3600 --allow-host box-a.ts.net';
 
@@ -518,8 +572,9 @@ test('🚨 「既に動いています」の差分は値まで見る（上限と
         '上限を要求していないのに差分を出してはいけない');
 
     // (4) capability の差分は今まで通り出す（読み取り専用のデーモンに --exec を要求）
+    //     ⚠️ `--exec` は `--allow-untracked` も連れてくる（`serverArgs` と同じ条件で数える）
     assert.deepEqual(configDiff(['--exec'], 'node v0/server.mjs --repo C:/r').map(d => d.what)
-        .sort(), ['--allow-exec', '--allow-write']);
+        .sort(), ['--allow-exec', '--allow-untracked', '--allow-write']);
 
     // (5) 上限は --exec と一緒でなければサーバに渡らないので要求として数えない
     assert.deepEqual(configDiff(['--timeout', '7200'], 'node v0/server.mjs --repo C:/r'), []);

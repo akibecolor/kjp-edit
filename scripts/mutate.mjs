@@ -185,6 +185,65 @@ const MUTANTS = [
         pattern: 'HEAD ↔ 作業ツリーの差分が読める',
     },
     {
+        // 🚨 レビュー13。`--exec` は自動で付くので**露見しない**が、
+        //    `--write --untracked` ではログオン後だけ未追跡編集が黙って無効になる
+        name: 'autostart-drops-untracked',
+        why: '自動起動が --untracked を引き継がない（再起動後だけ未追跡編集が消える）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (!has('--exec') && has('--untracked')) args.push('--untracked');",
+        to: "    /* 変異: 引き継がない */",
+        gone: "if (!has('--exec') && has('--untracked')) args.push('--untracked');",
+        testFile: 'scripts/serveargs.test.mjs',
+        pattern: '自動起動の登録に --untracked を引き継ぐ',
+    },
+    {
+        // 🚨 レビュー13。`--timeout` が集合に入っていなかったのと同型の再発。
+        //    差分が見えないと serve.mjs が「既に動いています」で exit 0 する
+        name: 'configdiff-blind-untracked',
+        why: 'configDiff が --untracked の差を見ない（要求が黙って無効になる）',
+        file: 'scripts/serveargs.mjs',
+        from: "    if (a.includes('--exec') || (a.includes('--write') && a.includes('--untracked'))) {\n        out.push('--allow-untracked');\n    }",
+        to: "    /* 変異: untracked を数えない */",
+        gone: "out.push('--allow-untracked');",
+        testFile: 'scripts/serveargs.test.mjs',
+        pattern: 'configDiff は --untracked の差を見る',
+    },
+    {
+        // 🚨 レビュー13 の SERIOUS。同じファイルがコミット済みにも未コミットにもあると、
+        //    素タブが作業ツリー差分を出して**印と中身が食い違っていた**
+        name: 'filer-tab-kind-ignored',
+        why: '押されたタブの種別を無視して所属で振り分ける（素タブが未コミット差分を出す）',
+        file: 'v0/filertabs.mjs',
+        from: "    const k = (!kind || kind === 'auto')",
+        to: "    const k = (true)   /* 変異: 種別を無視する */",
+        gone: "const k = (!kind || kind === 'auto')",
+        testFile: 'v0/filertabs.test.mjs',
+        pattern: '同じファイルがコミット済みにも未コミットにもあるとき',
+    },
+    {
+        // 🚨 レビュー13。`*` / `+` を選んでいると 15 秒ごとに選択が先頭へ飛んでいた
+        name: 'filer-restore-ignores-kind',
+        why: '復元が種別を見ない（`*` を選んでいると自動更新で別のタブに移る）',
+        file: 'v0/filertabs.mjs',
+        from: '        const hit = list.find(t => t.path === prev.path && t.kind === kind);',
+        to: '        const hit = list.find(t => t.path === prev.path);   /* 変異: 種別を見ない */',
+        gone: 'list.find(t => t.path === prev.path && t.kind === kind)',
+        testFile: 'v0/filertabs.test.mjs',
+        pattern: '復元は種別まで見る',
+    },
+    {
+        // 🚨 レビュー13 の MINOR。画面の上限とサーバの上限の**両方**を足さないと
+        //    「全部見えている」と読める表示になる（省略したのに告知しない型）
+        name: 'filer-hidden-count-partial',
+        why: '省略の件数をサーバ側の残数しか数えない（画面で切った分が消える）',
+        file: 'v0/filertabs.mjs',
+        from: '        hiddenDirty: Math.max(0, (wt?.dirtyFiles?.length ?? 0) - dirty.length)\n            + (wt?.dirtyMore ?? 0),',
+        to: '        hiddenDirty: (wt?.dirtyMore ?? 0),   /* 変異: 画面で切った分を数えない */',
+        gone: "hiddenDirty: Math.max(0, (wt?.dirtyFiles?.length ?? 0) - dirty.length)",
+        testFile: 'v0/filertabs.test.mjs',
+        pattern: '省略したら件数を告げる',
+    },
+    {
         // 🚨 **`--no-textconv` とは別クラスの穴。** `git diff HEAD` は作業ツリーの中身を
         //    index の表現に直すために clean filter を実行する（textconv のフラグでは止まらない）。
         //    `worktreeStatus` では8回目のレビューで塞いだのに、`worktreeFileDiff` を
@@ -225,20 +284,23 @@ const MUTANTS = [
         // 📝 UI: 未追跡のタブを描かない（要件そのものが消える）
         name: 'untracked-ui-no-tabs',
         why: '未追跡ファイルのタブを描かない（画面から新規ファイルを開けない = 要件が消える）',
-        file: 'v0/app.html',
-        from: '    const untracked = (wt.untracked ?? []).slice(0, 6);',
+        // ⚠️ タブの組み立ては `filertabs.mjs` に出した（レビュー13）。
+        //    **描く側ではなく組み立て側**を外す形に付け替える
+        file: 'v0/filertabs.mjs',
+        from: "    const untracked = (wt?.untracked ?? []).slice(0, limit);",
         to: '    const untracked = [];   /* 変異: 未追跡を描かない */',
-        gone: '(wt.untracked ?? []).slice(0, 6)',
+        gone: "(wt?.untracked ?? []).slice(0, limit)",
         script: 'v0/render-check.mjs',
     },
     {
         // 📝 UI: 未追跡を選んだ理由を言わない（無言で「取得できませんでした」になる）
         name: 'untracked-ui-no-reason',
         why: '未追跡を選んでも読み取り専用の閲覧に回さず、ビューアに投げる（cat-file では読めないので中身が出ない）',
-        file: 'v0/app.html',
-        from: "      if ((wt.untracked ?? []).includes(obj.sel)) {",
-        to: '      if (false) {   /* 変異: 理由を出さない */',
-        gone: "(wt.untracked ?? []).includes(obj.sel)",
+        // ⚠️ 振り分けは `filertabs.mjs` の `viewFor` に出した（レビュー13）
+        file: 'v0/filertabs.mjs',
+        from: "    if (k === 'untracked') return 'untracked';",
+        to: "    /* 変異: 未追跡をビューアに投げる */",
+        gone: "if (k === 'untracked') return 'untracked';",
         script: 'v0/render-check.mjs',
     },
     {
@@ -2106,7 +2168,8 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + 'RCE 可能なデーモンの URL を黙って案内する）',
         file: 'scripts/serveargs.mjs',
         from: "    const tokens = new Set(String(cmd ?? '').split(/\\s+/));\n"
-            + "    return ['--allow-exec', '--allow-write', '--watch-agents', '--allow-transcript-text',\n"
+            + "    return ['--allow-exec', '--allow-write', '--allow-untracked',\n"
+            + "        '--watch-agents', '--allow-transcript-text',\n"
             + "        '--allow-host'].filter(f => tokens.has(f));",
         to: '    return [];',
         gone: 'tokens.has(f)',
@@ -2681,6 +2744,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + "            || url.pathname === '/pathlabel.mjs' || url.pathname === '/mergeresult.mjs'\n"
             + "            || url.pathname === '/linediff.mjs' || url.pathname === '/blobview.mjs'\n"
             + "            || url.pathname === '/dirlabel.mjs'\n"
+            + "            || url.pathname === '/filertabs.mjs'\n"
             + "            || url.pathname === '/mergeplan.mjs'\n"
             + "            || url.pathname === '/inputnote.mjs'\n"
             + "            || url.pathname === '/theme.mjs'\n"
@@ -4081,7 +4145,7 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
             + '（MERGE_HEAD と staged 変更を残したまま「拒否しました」と返す）',
         file: 'v0/server.mjs',
         from: '                const seqAfter = await sequencerState(wt.path).catch(() => null);\n'
-            + '                const stAfter = await worktreeStatus(wt.path).catch(() => null);',
+            + '                const stAfter = await worktreeStatus(wt.path, filterNames).catch(() => null);',
         to: '                const seqAfter = null, stAfter = null;   /* 変異: 数え直さない */',
         gone: 'const seqAfter = await sequencerState(wt.path).catch(() => null)',
         pattern: 'merge が途中で失敗したら',

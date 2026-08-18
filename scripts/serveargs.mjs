@@ -275,6 +275,13 @@ export function autostartServeArgs({ argv, repos, port }) {
     args.push('--port', String(port));
     if (has('--exec')) args.push('--exec');
     else if (has('--write')) args.push('--write');
+    // 🚨 **未追跡の編集も引き継ぐ。** `--exec` は `serverArgs` が自動で
+    //    `--allow-untracked` を付けるので落としても露見しないが、
+    //    **`--write --untracked` の構成では引き継がないと、ログオン後だけ
+    //    未追跡ファイルの編集が黙って無効になる**（実測で `--untracked` が脱落し、
+    //    その argv を `serverArgs` に食わせても `--allow-untracked` が付かなかった）。
+    //    このファイルが #30 / #45 で何度も警告している「再起動後だけ壊れる」形。
+    if (!has('--exec') && has('--untracked')) args.push('--untracked');
     const hosts = collectHosts(argv);
     if (hosts.error !== undefined) return { error: hosts.error };
     for (const h of hosts.hosts) args.push('--allow-host', h);
@@ -306,7 +313,8 @@ export function runningCaps(cmd) {
     //    当たるし、テンプレートリテラルの中で `\s` が潰れて `s` になる事故もある
     //    （実際に踏んだ）。**空白で切ってトークンとして比べる。**
     const tokens = new Set(String(cmd ?? '').split(/\s+/));
-    return ['--allow-exec', '--allow-write', '--watch-agents', '--allow-transcript-text',
+    return ['--allow-exec', '--allow-write', '--allow-untracked',
+        '--watch-agents', '--allow-transcript-text',
         '--allow-host'].filter(f => tokens.has(f));
 }
 
@@ -316,6 +324,14 @@ export function requestedCaps(argv) {
     const out = [];
     if (a.includes('--exec')) { out.push('--allow-exec', '--allow-write'); }
     else if (a.includes('--write')) out.push('--allow-write');
+    // 🚨 **`serverArgs` が実際に付けるものと同じ条件で数える。**
+    //    ここに入れないと `configDiff` が untracked の差を見ないので、
+    //    `--write` のデーモンが動いている所に `--write --untracked` を打つと
+    //    **「既に動いています」で exit 0** し、要求が黙って無効になる
+    //    （`--timeout` が集合に入っていなかったのと同型の再発）。
+    if (a.includes('--exec') || (a.includes('--write') && a.includes('--untracked'))) {
+        out.push('--allow-untracked');
+    }
     if (a.includes('--agents-text')) out.push('--watch-agents', '--allow-transcript-text');
     else if (a.includes('--watch')) out.push('--watch-agents');
     if (a.includes('--allow-host')) out.push('--allow-host');
@@ -511,6 +527,12 @@ export function describeCaps(cmd) {
     if (caps.includes('--allow-exec')) parts.push('🚨 実行（任意コマンド）');
     else if (caps.includes('--allow-write')) parts.push('書き込み（checkout / 編集）');
     else parts.push('読み取り専用');
+    // ⚠️ **`--write` のときだけ出す。** `--exec` では常に有効なので、
+    //    書いても情報が増えず「実行」の重さが薄まる。ここは
+    //    「打った `--untracked` が効いているか」を確かめる唯一の手段。
+    if (caps.includes('--allow-untracked') && !caps.includes('--allow-exec')) {
+        parts.push('未追跡も編集');
+    }
     // 🚨 **実行の絶対上限を必ず出す。** ここは「何が有効か」を確認する唯一の手段で、
     //    上限は**投げた仕事が完走するか**を決める。出さないと
     //    `--timeout 3600` を打ったのに 600 秒のデーモンに案内されたことが分からない。

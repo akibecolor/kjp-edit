@@ -747,6 +747,24 @@ const READKEY_CHECK = `(async () => {
  */
 const EDITOR_CHECK = `(async () => {
   const wait = ms => new Promise(r => setTimeout(r, ms));
+  // 🚨 **編集する対象を明示的に選ぶ。** 前の検査（未追跡の閲覧）が \`+新規メモ.txt\` を
+  //    選んだままなので、選択に頼ると**別のファイルを編集して**しまう。
+  //    ⚠️ 以前これに気付かなかったのは、**選択が自動更新で先頭に戻るバグ**が
+  //    たまたま元に戻していたから（レビュー13 でそれを直したら露見した）。
+  //    「壊れた挙動に依存した検査」は、直した瞬間に落ちる = 検査の方が誤り。
+  let target = null;
+  for (let i = 0; i < 300 && !target; i++) {
+    target = [...document.querySelectorAll('.tabs button')]
+      .find(b => b.dataset && b.dataset.key === 'committed::edit-me.txt');
+    if (!target) await wait(100);
+  }
+  if (!target) return { error: 'edit-me.txt のタブが無い（コミット済み差分が出ていない）' };
+  target.click();
+  // 選ばれたことを確かめてから進む（押しただけで進むと前の対象のまま測る）
+  for (let i = 0; i < 100 && !target.classList.contains('on'); i++) await wait(50);
+  if (!target.classList.contains('on')) {
+    return { error: 'タブを押しても選択されない（点灯の照合がずれている）' };
+  }
   let btn = null;
   for (let i = 0; i < 300 && !btn; i++) {
     btn = [...document.querySelectorAll('.tabs button')].find(b => b.textContent === '編集');

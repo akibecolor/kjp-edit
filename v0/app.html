@@ -484,6 +484,9 @@ import { uniqueLabels } from './dirlabel.mjs';
 import { mergeOutcome } from './mergeresult.mjs';
 import { mergeTargets } from './mergeplan.mjs';
 import { inputNote } from './inputnote.mjs';
+// ファイラのタブ（素 / `*` / `+`）の組み立てと振り分け。**中に書くと測れない**
+// （レビュー13 が3件の欠陥を同時に出した場所。`filertabs.mjs` の冒頭参照）
+import { buildTabs, restoreSelection, viewFor, tabKey } from './filertabs.mjs';
 import { nextTheme, resolveTheme, THEME_LABEL } from './theme.mjs';
 import {
   pickCredential, canMutateWith, deviceLabel, DEVICE_KEY, URL_KEY,
@@ -3300,13 +3303,20 @@ function render(s) {
     //    走っているコンソールを作り直さないのと同じ理由。
     //    ⚠️ ヘッダのタグは上の ensurePane が更新するので、状態表示は古くならない。
     if (obj.editing) continue;
-    const files = (wt.files ?? []).slice(0, 6);
+    // 🚨 **タブの組み立てと振り分けは `filertabs.mjs`（外のモジュール）。**
+    //    ここに書いていたせいでレビュー13 が3件の欠陥を同時に出した
+    //    （振り分けが集合の所属 / 復元が種別を見ない / 点灯が title 照合）。
+    //    **app.html の中のロジックはテストできない = 宣言が破れても気付けない。**
+    const { tabs: tabDefs, hiddenDirty, hiddenUntracked } = buildTabs(wt);
     const tabs = el('div', 'tabs');
     const holder = el('div');
     obj.holder = holder;         // ⚠️ DOM を後から探さない（S1: セレクタが wrap を掴んでいた）
-    // 復元キーは worktree+path。path だけだと同名ファイルで別 worktree に引き継がれる
-    const prev = obj.selWt === wt.path ? obj.sel : null;
-    const initial = files.find(f => f.path === prev)?.path ?? files[0]?.path;
+    // 復元キーは worktree+path+種別。path だけだと同名ファイルで別 worktree に引き継がれ、
+    // 種別を落とすと `*` / `+` を選んでいるときに自動更新で先頭へ飛ぶ
+    const sel0 = restoreSelection(tabDefs,
+      obj.selWt === wt.path && obj.sel ? { path: obj.sel, kind: obj.selKind } : null);
+    const initial = sel0?.path;
+    const initialKind = sel0?.kind ?? null;
 
     // ---- 表示の切り替え（差分 / 全文）と、全文を読む ref ----
     // 🚨 **選んだモードと ref を obj に持って復元する。** ペインの中身は
@@ -3339,22 +3349,20 @@ function render(s) {
       // 📝 **未追跡ファイルはビューアでは読めない**（差分も全文も git オブジェクト経由で、
       //    そこには「コミットに入っているもの」しか無い）。**理由を出す**
       //    — 黙って空や「取得できませんでした」を出すと、壊れていると誤解する。
-      if ((wt.untracked ?? []).includes(obj.sel)) {
-        // 📝 **編集画面に入らずに読む（#77 の B）。**
+      // 🚨 **押されたタブの種別で振り分ける（判断は `filertabs.mjs` の `viewFor`）。**
+      //    ⚠️ `openDiff()`（他のカードからの遷移）は種別を知らないので `'auto'` で来る。
+      //    そのときだけ所属から推定する。
+      switch (viewFor(obj.selKind, obj.mode, wt, obj.sel)) {
+        // 📝 **未追跡は編集画面に入らずに読む（#77 の B）。**
         //    スマホでは誤タッチで内容が変わりうるので、「見るだけ」に textarea を開かない。
         // 🔒 経路は**編集と同じ**（`/api/v0/file` の読み側）。`blob` に fs 読みを足すと
         //    読み取りの鍵で作業ツリーが見えることになり、capability の分界が崩れる。
-        loadUntracked(holder, wt.path, obj.sel);
-        return;
+        case 'untracked': loadUntracked(holder, wt.path, obj.sel); break;
+        // 📝 未コミットの変更は **HEAD ↔ 作業ツリー**で見る（`base...HEAD` では出ない）
+        case 'worktree-diff': loadWorktreeDiff(holder, wt.path, obj.sel); break;
+        case 'blob': loadBlob(holder, obj.viewRef, obj.sel); break;
+        default: loadDiff(holder, s.base, ownRef, obj.sel);
       }
-      // 📝 未コミットの変更は **HEAD ↔ 作業ツリー**で見る（`base...HEAD` では出ない）。
-      //    ⚠️ 「全文」を選んでいるときは従来どおり git の中身を読む（ref を選べる意味を保つ）。
-      if ((wt.dirtyFiles ?? []).includes(obj.sel) && obj.mode !== 'blob') {
-        loadWorktreeDiff(holder, wt.path, obj.sel);
-        return;
-      }
-      if (obj.mode === 'blob') loadBlob(holder, obj.viewRef, obj.sel);
-      else loadDiff(holder, s.base, ownRef, obj.sel);
     };
     bDiff.addEventListener('click', () => { obj.mode = 'diff'; show(); });
     bBlob.addEventListener('click', () => { obj.mode = 'blob'; show(); });
@@ -3363,53 +3371,48 @@ function render(s) {
       if (obj.mode === 'blob') show();
     });
 
-    const openIn = path => {
-      for (const o of tabs.children) o.classList.toggle('on', o.title === path);
-      obj.sel = path; obj.selWt = wt.path;
+    // 🚨 **点灯の照合を `title` でやらない。** `*` / `+` のタブは title に注釈
+    //    （「（未コミットの変更）」など）を足しているので `o.title === path` に
+    //    一致せず、**`*` を押すと素タブが点灯していた**（押した先と光る先が別）。
+    //    種別 + パスの組を dataset に持って照合する。
+    const openIn = (path, kind = 'auto') => {
+      const key = tabKey(kind, path);
+      for (const o of tabs.children) {
+        o.classList?.toggle('on', Boolean(o.dataset?.key)
+          && (o.dataset.key === key || (kind === 'auto' && o.dataset.path === path)));
+      }
+      obj.sel = path; obj.selWt = wt.path; obj.selKind = kind;
       show();
     };
     obj.openIn = openIn;
-    for (const f of files) {
-      const b = el('button', f.path === initial ? 'on' : null, f.path.split('/').pop());
-      b.title = f.path;
-      b.addEventListener('click', () => openIn(f.path));
-      tabs.append(b);
-    }
-    if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
-    /* 📝 **未コミットで変更された追跡ファイル（#77 の A）。**
+    /* 📝 **3種類のタブ（#77 の A / B）。**
      *
      * エージェントは作業中ほとんどコミットしないので、`base...HEAD` のタブだけだと
      * **「今まさに書いたもの」が一覧に出ない**（実測で3 worktree すべて 0 件だった）。
      * ⚠️ **印を3種類で分ける**（素 = コミット済み / `*` = 未コミット / `+` = 未追跡）。
-     *    同じ見た目にすると「何の差分を見ているか」が分からなくなる（#4 と同じ型の事故）。 */
-    const dirty = (wt.dirtyFiles ?? []).slice(0, 6);
-    for (const dp of dirty) {
-      const b = el('button', dp === obj.sel ? 'on' : null, `*${dp.split('/').pop()}`);
-      b.title = `${dp}（未コミットの変更）`;
-      b.addEventListener('click', () => openIn(dp));
+     *    同じ見た目にすると「何の差分を見ているか」が分からなくなる（#4 と同じ型の事故）。
+     * ⚠️ 印・並び・上限・告知の件数は `filertabs.mjs` が決める（テストできる場所に置く）。 */
+    for (const t of tabDefs) {
+      const b = el('button',
+        (t.path === initial && t.kind === initialKind) ? 'on' : null, t.label);
+      b.title = t.title;
+      b.dataset.key = tabKey(t.kind, t.path);
+      b.dataset.path = t.path;
+      b.addEventListener('click', () => openIn(t.path, t.kind));
       tabs.append(b);
     }
-    const hiddenDirty = (wt.dirtyFiles?.length ?? 0) - dirty.length + (wt.dirtyMore ?? 0);
+    if (!tabDefs.length) tabs.append(el('button', 'on', '(差分なし)'));
     if (hiddenDirty > 0) {
       tabs.append(el('span', 'note warn', `⚠ 未コミット 他 ${hiddenDirty} 件は出していません`));
     }
     /* 📝 **未追跡ファイル（`--allow-untracked` のときだけ payload に入る）。**
      *
      * エージェントが作った**まだ add していない新規ファイル**を画面から直すため。
-     * ⚠️ **差分のタブと見分けが付く形にする**（`+` を付ける）。混ぜると
+     * ⚠️ **差分のタブと見分けが付く形にする**（`+` を付ける。`filertabs.mjs`）。混ぜると
      *    「コミット済みの差分」と「まだ git に入っていないもの」を取り違える。
      * ⚠️ ignored（`.env` 等）はここに入らない（サーバが `? ` = 未追跡かつ
      *    ignored でないものだけを返す）。届かないものをタブに出さない。
      * ⚠️ 上限で切ったら**必ず告げる**（一覧が静かに欠けるのが一番分からない）。 */
-    const untracked = (wt.untracked ?? []).slice(0, 6);
-    for (const p of untracked) {
-      const b = el('button', p === obj.sel ? 'on' : null, `+${p.split('/').pop()}`);
-      b.title = `${p}（未追跡。まだ git に入っていません）`;
-      b.addEventListener('click', () => openIn(p));
-      tabs.append(b);
-    }
-    const hiddenUntracked = (wt.untracked?.length ?? 0) - untracked.length
-      + (wt.untrackedMore ?? 0);
     if (hiddenUntracked > 0) {
       tabs.append(el('span', 'note warn', `⚠ 未追跡 他 ${hiddenUntracked} 件は出していません`));
     }
@@ -3426,9 +3429,9 @@ function render(s) {
     //       読み取り専用の派生秘密で、それも `session.token` に入る。
     //       checkout / 取り込みと同じく `canMutate` で判定する）。
     // ⚠️ **未追跡だけがある worktree でも「編集」を出す**（files は差分のタブ）。
-    //    ここを files.length だけで判定すると、新規ファイルしか無い worktree で
+    //    ここをコミット済み差分だけで判定すると、新規ファイルしか無い worktree で
     //    タブは出るのにボタンが無い（押せない）状態になる。
-    if (session.allowWrite && (files.length || untracked.length || dirty.length)
+    if (session.allowWrite && tabDefs.length
       && !wt.bare && !wt.prunable) {
       if (session.canMutate) {
         const eb = el('button', null, '編集');
@@ -3445,7 +3448,7 @@ function render(s) {
     }
     wrap.append(holder);
     obj.body.replaceChildren(wrap);
-    if (initial) { obj.sel = initial; obj.selWt = wt.path; show(); }
+    if (initial) { obj.sel = initial; obj.selWt = wt.path; obj.selKind = initialKind; show(); }
     else {
       show();   // モードの見た目（どちらが選ばれているか）は中身が無くても出す
       holder.append(el('div', 'note', `${wt.branch ?? wt.name} は base と同じ内容です`));
