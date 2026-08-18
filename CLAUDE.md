@@ -186,6 +186,20 @@ node v0/open-check.mjs           # 「開く」で足して切り替えられる
   解除を忘れ、**計測が 1.2 秒で終わってもイベントループが 240 秒生き続けた**
   （`verify.mjs` の `render 240.7s` は遅いからではなくこれ。遅さと取り違えて原因を探した）
 
+## Claude の資産（skill / agent / workflow / hook / MCP）
+
+**新しく作る・直す・捨てるときは `.claude/skills/claude-assets/SKILL.md`（`/claude-assets`）。**
+置き場所と frontmatter の正典（公式ドキュメント由来）、**どれを作るかの選び方**、
+そして**増やしすぎないための棚卸し**が入っている。
+
+⚠️ **まず「作らない」を検討する。** 1回しか使わない手順、既存に数行足せば済むもの、
+「あると便利そう」だけのものは作らない（**実際に困ってから作る**）。
+⚠️ **`scripts/*.mjs` は Claude 資産ではない**（人間も CI も叩く道具）。skill 化しない。
+
+今あるもの: `/spec-first`（要件凍結）・`/claude-assets`（これ）・
+`verifier`（反証の subagent）・`adversarial-review.mjs`（9観点レビュー）・
+`Stop` フック（`verify.mjs`）。
+
 ## 🚨 中くらい以上の開発は、要件を先に凍結する
 
 **認可・capability に触る / 新しい経路を足す / 複数ファイルに跨る / コミット2本以上**に
