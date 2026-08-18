@@ -188,13 +188,14 @@ node v0/open-check.mjs           # 「開く」で足して切り替えられる
 
 ## Claude の資産（skill / agent / workflow / hook / MCP）
 
-**新しく作る・直す・捨てるときは `.claude/skills/claude-assets/SKILL.md`（`/claude-assets`）。**
-置き場所と frontmatter の正典（公式ドキュメント由来）、**どれを作るかの選び方**、
-そして**増やしすぎないための棚卸し**が入っている。
+**作る・直す・捨てるときは `/claude-assets`。** 一般的な選び方と frontmatter の正典は
+**個人側**（`~/.claude/skills/`）に、**このリポジトリ固有のこと**はプロジェクト側にある
+（同名なので**プロジェクト側が優先して読まれる**）。`/spec-first` も同じ2層構成。
 
 ⚠️ **まず「作らない」を検討する。** 1回しか使わない手順、既存に数行足せば済むもの、
 「あると便利そう」だけのものは作らない（**実際に困ってから作る**）。
-⚠️ **`scripts/*.mjs` は Claude 資産ではない**（人間も CI も叩く道具）。skill 化しない。
+⚠️ **`scripts/*.mjs`（11本）は Claude 資産ではない**（人間も CI も叩く道具）。skill 化しない。
+⚠️ **個人側に固有名詞を入れない**（他プロジェクトで嘘になる。上げる前に抜く）。
 
 今あるもの: `/spec-first`（要件凍結）・`/claude-assets`（これ）・
 `verifier`（反証の subagent）・`adversarial-review.mjs`（9観点レビュー）・
