@@ -106,12 +106,52 @@ CLAUDE.md が「中に置いたロジックはテストできない = 宣言が�
    「守りを1箇所に集約する」たびに起きる。錨にする行の**隣接**を壊さないこと
    （コメントを2行の間に挟んで2件落とした）。ソースにその旨を書いた
 
+## 体制の改修（このレビューの後に入れた）
+
+上の3点をそのまま `adversarial-review.mjs` に反映した。
+
+| 反省 | 直したこと |
+|---|---|
+| 1. MINOR が報告から落ちる | **重大度で捨てない。** 重大な順に反証するが、打ち切った分は `unverified` として**別の欄で報告する**。verify エージェントが落ちた分もここに来る |
+| 1'. 重大度が自己申告 | レビュアーへの指示に「**迷ったら重い側に**」を追加。反証側にも「**『重大ではない』は反証ではない**」（`severityAdjust` で軽くする）を明記 |
+| 2. 観点の足し忘れ | **`Scope` フェーズを追加。** 変更されたファイルのうち、どの観点の「見るもの」にも挙がっていないものを `coverage.uncovered` に出す。レビューと並行に走るので待ち時間は増えない |
+| （新規）結果が返らない観点 | `failedDimensions` に名前で出す。以前セッション上限で2観点が黙って抜けた |
+
+⚠️ `Scope` は**知らせるだけで観点を足してはくれない**。
+「新しい面を足したら同じコミットで観点も足す」を CLAUDE.md に書いた。
+
+### 🚨 ついでに見つかった: workflow 自体が一度も構文検査されていなかった
+
+`verify.mjs` の `sources()` は **`.claude*` を除外**するので、
+`adversarial-review.mjs` は構文検査の対象外だった。
+**壊れていると気付くのは「レビューを走らせよう」とした瞬間で、
+それは capability を足した直後（一番急いでいるとき）と決まっている。**
+
+⚠️ workflow は top-level `return` を使うので `node --check` は**必ず**
+`Illegal return statement` を出す。だから `export` を外して async 関数に包んでから検査する。
+
+そして判定（制御文字の走査と包み方）は **`scripts/sourcecheck.mjs` に出した** —
+`verify.mjs` の中に書くと**この検査自身が検査されない**。
+実際、制御文字の規則は CLAUDE.md にあったのに**検査が0件で、同じ日に2回踏んだ**。
+
+⚠️ 最初に置いた変異 `workflow-syntax-wrap-hides-errors` が **SURVIVED した**。
+原因はテストではなく**変異の方**で、`return` の行だけ差し替えても継続行（`+ …`）が
+残って `${body}` が付き、**中身を捨てられていなかった**。最終行に当て直して KILLED。
+
 ## 検証
 
 ```
-node scripts/verify.mjs          → 9段すべて緑（unit 412 / smoke 211 / 3 skip）
-node scripts/mutate.mjs --dry    → 405 件すべて字面一致・STALE 0
+node scripts/verify.mjs          → 9段すべて緑（unit 417 / smoke 211 / 3 skip）
+node scripts/mutate.mjs --dry    → 408 件すべて字面一致・STALE 0
 ```
+
+体制の改修で足した変異:
+
+| 変異 | 結果 |
+|---|---|
+| `control-char-scan-blind` | KILLED |
+| `control-char-scan-too-strict`（厳しすぎて普通のソースを落とす方向） | KILLED |
+| `workflow-syntax-wrap-hides-errors` | KILLED（変異を直してから） |
 
 | 変異 | 結果 |
 |---|---|

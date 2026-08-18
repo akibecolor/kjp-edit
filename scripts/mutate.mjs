@@ -185,6 +185,44 @@ const MUTANTS = [
         pattern: 'HEAD ↔ 作業ツリーの差分が読める',
     },
     {
+        // 🚨 規則7（生の制御文字を書かない）は CLAUDE.md にあったのに**検査が0件**で、
+        //    `v0/git.mjs` に続いて `v0/app.html` でも踏んだ。判定を外に出して測る。
+        name: 'control-char-scan-blind',
+        why: '生の制御文字を見逃す（git が binary と判定して diff / grep から消える）',
+        file: 'scripts/sourcecheck.mjs',
+        from: '        if (c < 0x09 || (c > 0x0d && c < 0x20) || c === 0x7f) {',
+        to: '        if (false) {   /* 変異: 制御文字を見逃す */',
+        gone: 'if (c < 0x09 || (c > 0x0d && c < 0x20) || c === 0x7f) {',
+        testFile: 'scripts/sourcecheck.test.mjs',
+        pattern: '生の NUL を見つける',
+    },
+    {
+        // 🚨 逆向き。厳しすぎて普通のソースを落とすと、検査ごと外される
+        name: 'control-char-scan-too-strict',
+        why: 'tab / LF / CR も制御文字として落とす（普通のソースが全部失敗する）',
+        file: 'scripts/sourcecheck.mjs',
+        from: '        if (c < 0x09 || (c > 0x0d && c < 0x20) || c === 0x7f) {',
+        to: '        if (c < 0x20 || c === 0x7f) {   /* 変異: 改行も落とす */',
+        gone: 'c < 0x09 ||',
+        testFile: 'scripts/sourcecheck.test.mjs',
+        pattern: 'tab / LF / CR は通す',
+    },
+    {
+        // 🚨 workflow が壊れていると**レビューそのものが走らない**。しかも気付くのは
+        //    capability を足した直後（一番急いでいるとき）と決まっている
+        name: 'workflow-syntax-wrap-hides-errors',
+        why: 'workflow を包むときに中身ごと捨てる（本当の構文エラーを見逃す）',
+        file: 'scripts/sourcecheck.mjs',
+        // ⚠️ **最後の行に当てる。** 先頭の `return` の行だけ差し替えても
+        //    継続行（`+ ...`）が残って `${body}` が付いてしまい、**変異が効かない**
+        //    （最初そう書いて SURVIVED した。テストではなく変異が誤っていた）。
+        from: "        + `async function __main() {\\n${body}\\n}\\n`;",
+        to: "        + 'async function __main() {}\\n';   /* 変異: 中身を捨てる */",
+        gone: "async function __main() {\\n${body}",
+        testFile: 'scripts/sourcecheck.test.mjs',
+        pattern: '本当の構文エラー」は落ちる',
+    },
+    {
         // 🚨 レビュー13。`--exec` は自動で付くので**露見しない**が、
         //    `--write --untracked` ではログオン後だけ未追跡編集が黙って無効になる
         name: 'autostart-drops-untracked',

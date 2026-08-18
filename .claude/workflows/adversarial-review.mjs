@@ -17,17 +17,38 @@
 // 使い方:
 //   /review                      → 直近のレビュー以降を見る（既定）
 //   args = { range: 'b1874a0..HEAD', focus: '認証' }
+//   args = { only: ['editor','auth'], model: 'fable', maxVerifyPerDimension: 4 }
 //
 // ⚠️ レビュアーは**読むだけ**。修正はしない（誰がどう直したかを追えなくなる）。
+//
+// 🚨 **レビュー13 で、この体制そのものに2つ穴が見つかった。両方直してある。**
+//
+//   1. **重大度で足切りしていた。** MINOR は反証の対象から外れるだけでなく、
+//      **報告からも落ちていた**（`log()` に件数だけ出て、中身は journal.jsonl の中）。
+//      重大度は**レビュアーの自己申告**なので足切りの基準として弱く、実際に
+//      MINOR と付いた指摘が「同じ日に直した BLOCKING と同じクラス」だった
+//      （merge の失敗経路だけ filter の中和を渡していない）。
+//      → **重大な順に反証するが、打ち切った分は `unverified` として報告に載せる。**
+//        「反証して生き残った」と「まだ見ていない」を**別の欄に分ける**。
+//
+//   2. **観点に無い面は誰も見ない。** `editor`（ファイルを読む・書く経路）の観点は
+//      #77 でその面ができてから**3コミット分存在しなかった**。その間に
+//      「capability ゼロで任意コード実行」が入り、レビューではなく作者が偶然見つけた。
+//      → **`Scope` フェーズで網羅を測る。** 変更されたファイルのうち、どの観点の
+//        「見るもの」にも挙がっていないものを `coverage.uncovered` に出す。
+//
+//   ⚠️ **新しい面を足したら、同じコミットで観点も足す。** 上の測定は
+//      足し忘れを**知らせるだけ**で、足してはくれない。
 
 export const meta = {
     name: 'adversarial-review',
     description: '独立したレビュアーを並列で走らせ、指摘を敵対的に検証して報告する',
     whenToUse: '実装をまとめてコミットした後、次の機能に進む前。特に認証・実行・リポジトリ外の読み取りに触ったとき',
     phases: [
+        { title: 'Scope', detail: 'どの観点も見ていない変更を探す（観点の足し忘れ）' },
         { title: 'Review', detail: '観点ごとに独立して読む（互いの結果を見ない）' },
         { title: 'Verify', detail: '各指摘を別のエージェントが反証しようとする' },
-        { title: 'Synthesize', detail: '生き残った指摘を重大度順にまとめる' },
+        { title: 'Synthesize', detail: '生き残った指摘 / 未検証 / 反証を分けて出す' },
     ],
 };
 
@@ -384,6 +405,71 @@ if (only) {
     if (unknown.length) throw new Error(`そんな観点はありません: ${unknown.join(', ')}`);
 }
 
+/**
+ * 🚨 **観点の網羅を測る（レビュー13 の反省2）。**
+ *
+ * `editor`（ファイルを読む・書く経路）の観点は **#77 でその面ができてから
+ * レビュー13 まで存在しなかった。** つまり新しい capability が3コミット分、
+ * **どの観点の担当でもないまま**通っていた。
+ * 観点の一覧は手で書くので、**足し忘れは構造的に起きる**。だから測る。
+ *
+ * ⚠️ ワークフローの本体は fs も child_process も触れないので、これはエージェントに頼む。
+ * ⚠️ 結果は「観点を足すべき」という指摘であって、レビューそのものではない。
+ */
+const COVERAGE_SCHEMA = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['changed', 'uncovered'],
+    properties: {
+        changed: {
+            type: 'array', maxItems: 100, items: { type: 'string' },
+            description: 'この範囲で変更された、レビュー対象になりうるソース',
+        },
+        uncovered: {
+            type: 'array',
+            maxItems: 20,
+            description: 'どの観点の「見るもの」にも挙がっていない変更',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['file', 'why'],
+                properties: {
+                    file: { type: 'string' },
+                    why: { type: 'string', description: '何が見られないままか' },
+                },
+            },
+        },
+        suggestedDimension: {
+            type: 'string',
+            description: '足すべき観点があれば、その key と主題を1行で',
+        },
+    },
+};
+
+phase('Scope');
+// ⚠️ レビューと**並行**に走らせる（結果を待たない = 全体の待ち時間を増やさない）
+const coveragePromise = agent(
+    `あなたは kjp-edit のレビュー体制そのものを点検する係です。**コードの欠陥は探しません。**
+
+やること:
+1. \`git diff --name-only ${range}\` で変更されたファイルを列挙する
+   （ドキュメントと \`.claude/\` は対象外。ソースと検査だけを見る）
+2. \`.claude/workflows/adversarial-review.mjs\` を読み、**各観点の「見るもの」に
+   挙がっているファイル**を集める（DIMENSIONS の prompt に書いてある）
+3. **1 にあって 2 に無いもの**を \`uncovered\` に挙げる。
+   「その観点で当然カバーされる」と言えるなら挙げない
+   （例: \`v0/server.mjs\` はほぼ全観点に出てくるので、行が違っても挙げない。
+    ⚠️ ただし**新しいルートや新しい関門**が増えていて、
+    どの観点の prompt もそれを名指ししていないなら挙げる）
+4. 足すべき観点があれば \`suggestedDimension\` に「key: 主題」の形で1行
+
+背景（なぜこれをやるか）: #77 でファイルを読む・書く面ができたのに、
+**その面を主対象にする観点が3コミット分存在しなかった**。
+その間に「capability ゼロで任意コード実行」が入って、レビューではなく
+作者が偶然見つけた。**観点の一覧は手で書くので足し忘れが構造的に起きる。**`,
+    { label: 'scope:coverage', phase: 'Scope', schema: COVERAGE_SCHEMA, model: MODEL },
+);
+
 phase('Review');
 if (only) {
     log(`⚠ 部分レビュー: ${targetDims.length}/${DIMENSIONS.length} 観点だけ走らせます`
@@ -392,26 +478,49 @@ if (only) {
     log(`範囲 ${range} を ${DIMENSIONS.length} 観点で並列にレビューします`);
 }
 
+// 🚨 **1観点あたり何件まで反証するか。** 打ち切った分は**捨てずに報告に載せる**（下記）。
+const MAX_VERIFY = Number.isInteger(args?.maxVerifyPerDimension)
+    ? args.maxVerifyPerDimension : 4;
+
+const RANK = { BLOCKING: 0, SERIOUS: 1, MINOR: 2 };
+const rankOf = f => RANK[f?.severity] ?? 3;
+
 const perDimension = await pipeline(
     targetDims,
     d => agent(`${CONTEXT}\n\n${d.prompt}${extraFocus}\n\n`
         + '重大度の基準: BLOCKING = 秘密の漏洩 / 任意コード実行 / データ破壊 / '
         + '嘘の表示。SERIOUS = 資源の取り残し・誤検出・守りの抜け。MINOR = その他。\n'
+        + '⚠️ **重大度に迷ったら重い側にしてください。** 軽く付けた指摘は'
+        + '反証が後回しになります（実際に「MINOR」と付いた指摘が'
+        + '「capability ゼロの任意コード実行と同じクラス」だったことがあります）。\n'
         + '**思いつきを並べないでください。** 再現できたものを優先し、'
         + 'できなかったものは measured:false にしてください。'
         + '指摘が無ければ空配列で構いません（無理に埋めない）。',
     { label: `review:${d.key}`, phase: 'Review', schema: FINDING_SCHEMA, model: MODEL }),
     (res, d) => {
-        const found = (res?.findings ?? []).filter(f => f.severity !== 'MINOR');
-        const minor = (res?.findings ?? []).length - found.length;
-        if (minor) log(`${d.key}: MINOR ${minor} 件は検証を省略しました`);
-        if (!found.length) return [];
-        // 重大な順に、1観点あたり最大3件まで検証する（打ち切ったら告知する）
-        const rank = { BLOCKING: 0, SERIOUS: 1 };
-        const sorted = [...found].sort((a, b) => rank[a.severity] - rank[b.severity]);
-        const take = sorted.slice(0, 3);
-        if (sorted.length > take.length) {
-            log(`${d.key}: 検証は上位 ${take.length} 件に絞りました（${sorted.length} 件中）`);
+        // 🚨 **「結果が返らなかった」を「指摘なし」と読み違えない。**
+        //    以前セッション上限で2観点が落ち、結果には何も出ずに
+        //    「全部見た」と読める報告になった（それが `only` を作った理由）。
+        //    今回は**結果の中で名指しする**。
+        if (!res) {
+            log(`🚨 ${d.key}: レビュアーが結果を返さなかった。`
+                + 'この観点は**見ていない**（「指摘なし」ではない）');
+            return [{ dimension: d.key, failed: true }];
+        }
+        const findings = res.findings ?? [];
+        if (!findings.length) return [];
+        // 🚨 **重大度で捨てない（レビュー13 の反省1）。**
+        //    以前は MINOR を反証の対象から外し、**報告からも落としていた**。
+        //    重大度は**レビュアーの自己申告**なので足切りの基準として弱く、
+        //    実際に MINOR と付いた指摘が「今日直した BLOCKING と同じクラス」だった
+        //    （merge の失敗経路だけ filter の中和を渡していない）。
+        //    重大な順に反証はするが、**打ち切った分も報告に載せる**。
+        const sorted = [...findings].sort((a, b) => rankOf(a) - rankOf(b));
+        const take = sorted.slice(0, MAX_VERIFY);
+        const skipped = sorted.slice(MAX_VERIFY);
+        if (skipped.length) {
+            log(`⚠ ${d.key}: 反証を省略した ${skipped.length} 件（**捨てずに報告に載せます**）: `
+                + skipped.map(f => `[${f.severity}] ${f.title}`).join(' / '));
         }
         return parallel(take.map(f => () =>
             agent(`${CONTEXT}\n\n**あなたの仕事は、以下の指摘を反証することです。**\n`
@@ -421,33 +530,63 @@ const perDimension = await pipeline(
                 + '**成り立たない理由を探してください。** 既に他の守りで防がれている、'
                 + '前提が誤っている、そのコード経路に到達できない、などです。\n'
                 + '判断に迷うなら refuted:false（指摘は残す）にしてください。'
-                + '重大度が過大／過小だと思う場合は severityAdjust で直してください。',
+                + '重大度が過大／過小だと思う場合は severityAdjust で直してください。\n'
+                + '⚠️ **「重大ではない」は反証ではありません。** 成り立つなら'
+                + 'refuted:false のまま severityAdjust で軽くしてください。',
             { label: `verify:${d.key}`, phase: 'Verify', schema: VERDICT_SCHEMA, model: MODEL })
-                .then(v => ({ dimension: d.key, finding: f, verdict: v }))));
+                .then(v => ({ dimension: d.key, finding: f, verdict: v })))
+        ).then(rs => [
+            ...rs,
+            // 反証していない指摘は verdict:null で通す（**落とさない**）
+            ...skipped.map(f => ({ dimension: d.key, finding: f, verdict: null })),
+        ]);
     },
 );
 
 phase('Synthesize');
 const all = perDimension.flat().filter(Boolean);
-const survived = all.filter(x => x.verdict && !x.verdict.refuted).map(x => ({
-    dimension: x.dimension,
-    ...x.finding,
-    severity: x.verdict.severityAdjust && x.verdict.severityAdjust !== 'keep'
-        ? x.verdict.severityAdjust : x.finding.severity,
-    verifyNote: x.verdict.reason,
-}));
-const refuted = all.filter(x => x.verdict?.refuted);
-log(`検証 ${all.length} 件 → 生き残り ${survived.length} 件 / 反証 ${refuted.length} 件`);
+const failedDimensions = all.filter(x => x.failed).map(x => x.dimension);
+const items = all.filter(x => !x.failed && x.finding);
+const withVerdict = f => ({
+    dimension: f.dimension,
+    ...f.finding,
+    severity: f.verdict?.severityAdjust && f.verdict.severityAdjust !== 'keep'
+        ? f.verdict.severityAdjust : f.finding.severity,
+    verifyNote: f.verdict?.reason ?? null,
+});
+const survived = items.filter(x => x.verdict && !x.verdict.refuted).map(withVerdict);
+// 🚨 **反証していない指摘。「無い」ではない。** verify エージェントが落ちた分もここに来る。
+const unverified = items.filter(x => !x.verdict).map(withVerdict);
+const refuted = items.filter(x => x.verdict?.refuted);
+survived.sort((a, b) => rankOf(a) - rankOf(b));
+unverified.sort((a, b) => rankOf(a) - rankOf(b));
 
-const rank = { BLOCKING: 0, SERIOUS: 1, MINOR: 2 };
-survived.sort((a, b) => rank[a.severity] - rank[b.severity]);
+const coverage = await coveragePromise;
+if (!coverage) {
+    log('⚠ 範囲の網羅を測れなかった（観点の足し忘れは検出していません）');
+} else if (coverage.uncovered?.length) {
+    log(`🚨 どの観点も見ていない変更が ${coverage.uncovered.length} 件: `
+        + coverage.uncovered.map(u => u.file).join(', ')
+        + (coverage.suggestedDimension ? ` → 観点の案: ${coverage.suggestedDimension}` : ''));
+}
+log(`指摘 ${items.length} 件 → 生き残り ${survived.length} / 反証 ${refuted.length}`
+    + ` / **未検証 ${unverified.length}**`
+    + (failedDimensions.length ? ` / 🚨 結果が返らなかった観点 ${failedDimensions.join(', ')}` : ''));
 
 return {
     range,
     // 🚨 どの観点を見たかを結果に入れる（部分実行を全体と読み違えないため）
     dimensions: targetDims.map(d => d.key),
     partial: only ? { seen: targetDims.map(d => d.key), total: DIMENSIONS.length } : null,
+    // 🚨 **走らせたのに結果が返らなかった観点。「指摘なし」と読み違えない。**
+    failedDimensions,
+    // 🚨 **観点の足し忘れ。** null は「測れなかった」（「無かった」ではない）
+    coverage: coverage
+        ? { uncovered: coverage.uncovered ?? [], suggestedDimension: coverage.suggestedDimension ?? null }
+        : null,
     confirmed: survived,
+    // 🚨 **反証していない指摘。読み飛ばさないこと**（ここに BLOCKING 級が混じった実例がある）
+    unverified,
     refuted: refuted.map(x => ({
         dimension: x.dimension, title: x.finding.title, reason: x.verdict.reason,
     })),
@@ -455,5 +594,7 @@ return {
         blocking: survived.filter(f => f.severity === 'BLOCKING').length,
         serious: survived.filter(f => f.severity === 'SERIOUS').length,
         minor: survived.filter(f => f.severity === 'MINOR').length,
+        unverified: unverified.length,
+        uncovered: coverage?.uncovered?.length ?? null,
     },
 };

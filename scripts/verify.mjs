@@ -18,6 +18,10 @@ import { join, relative } from 'node:path';
 import { tmpdir } from 'node:os';
 // 要約は純関数として切り出してテストしてある（#52）
 import { summarizeTests, detailLines, testDetail } from './testsummary.mjs';
+// 🚨 判定を**外に出して**ある。中に書くと**この検査自身が検査されない**
+//    （生の制御文字の規則は CLAUDE.md にあったのに検査が0件で、2回踏んだ）。
+//    `scripts/sourcecheck.test.mjs` が固定している。
+import { findControlChar, wrapWorkflowForCheck } from './sourcecheck.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const quick = process.argv.includes('--quick');
@@ -78,6 +82,54 @@ async function sources(dir, exts = ['.mjs'], acc = []) {
  *    描画バグ（マージの第二親レーンが繋がらない、レーン色が6本目で衝突する）が
  *    verify.mjs を緑のまま通り抜けた構造的な原因はここ（レビューで発覚）。
  */
+/**
+ * 🚨 **`.claude/workflows/*.mjs` を構文検査する（レビュー13）。**
+ *
+ * `sources()` は `.claude*` を除外するので、**敵対的レビューのスクリプトは
+ * 一度も構文検査されていなかった。** 壊れていると気付くのは
+ * 「レビューを走らせよう」とした瞬間で、しかもそれは
+ * **capability を足した直後**（一番急いでいるとき）と決まっている。
+ *
+ * ⚠️ workflow は top-level `return` を使うので `node --check` は必ず
+ *    `Illegal return statement` を出す。**`export` を外して async 関数に包んでから**
+ *    検査する（包まないと「本当の構文エラー」と区別できない）。
+ * ⚠️ 実行はしない（エージェントを起動してしまう）。構文だけ見る。
+ */
+async function checkWorkflows() {
+    const bad = [];
+    const wfDir = join(ROOT, '.claude', 'workflows');
+    let names;
+    try {
+        names = (await readdir(wfDir)).filter(n => n.endsWith('.mjs'));
+    } catch {
+        return { bad, count: 0 };   // 無ければ何も言わない
+    }
+    const dir = await mkdtemp(join(tmpdir(), 'kjp-wf-'));
+    try {
+        for (const name of names) {
+            const file = join(wfDir, name);
+            const buf = await readFile(file);
+            const ctrl = findControlChar(buf);
+            if (ctrl) {
+                bad.push(`.claude/workflows/${name}: 生の制御文字 0x${ctrl.byte.toString(16)}`
+                    + ` (offset ${ctrl.offset}) — エスケープ表記にすること`);
+                continue;
+            }
+            const tmp = join(dir, name);
+            await writeFile(tmp, wrapWorkflowForCheck(buf.toString('utf8')), 'utf8');
+            const r = await run(['--check', tmp], { timeout: 20_000 });
+            if (r.code !== 0) {
+                const first = r.output.split('\n')
+                    .find(l => l.includes('Error') || l.includes('^')) ?? '';
+                bad.push(`.claude/workflows/${name}: ${first.trim()}`);
+            }
+        }
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+    return { bad, count: names.length };
+}
+
 async function checkInlineModules(htmlFiles) {
     const bad = [];
     const dir = await mkdtemp(join(tmpdir(), 'kjp-verify-'));
@@ -134,17 +186,20 @@ let failed = false;
     //    （`v0/git.mjs` が丸ごとレビュー不可能になった事故。その後 `v0/app.html` で
     //     テンプレートリテラルの区切りとして**また入れた**）。
     //    ⚠️ 規則として書いてあるだけでは防げない。**落ちる検査にする。**
-    //    許すのは tab (09) / LF (0a) / CR (0d) だけ。
+    //    判定は `sourcecheck.mjs`（この検査自身を検査できる場所）。
     for (const f of [...files, ...htmlFiles]) {
         const buf = await readFile(f);
-        const at = buf.findIndex(c => (c < 0x09 || (c > 0x0d && c < 0x20) || c === 0x7f));
-        if (at !== -1) {
-            const near = buf.subarray(Math.max(0, at - 40), at).toString('utf8').split('\n').pop();
-            bad.push(`${relative(ROOT, f)}: 生の制御文字 0x${buf[at].toString(16)}`
-                + ` (offset ${at}) — エスケープ表記にすること。直前: ${JSON.stringify(near)}`);
+        const ctrl = findControlChar(buf);
+        if (ctrl) {
+            const near = buf.subarray(Math.max(0, ctrl.offset - 40), ctrl.offset)
+                .toString('utf8').split('\n').pop();
+            bad.push(`${relative(ROOT, f)}: 生の制御文字 0x${ctrl.byte.toString(16)}`
+                + ` (offset ${ctrl.offset}) — エスケープ表記にすること。直前: ${JSON.stringify(near)}`);
         }
     }
-    const label = `syntax (${files.length} mjs, ${htmlFiles.length} html)`;
+    const wf = await checkWorkflows();
+    bad.push(...wf.bad);
+    const label = `syntax (${files.length} mjs, ${htmlFiles.length} html, ${wf.count} workflow)`;
     steps.push(bad.length
         ? { name: label, ok: false, detail: bad.slice(0, 5) }
         : { name: label, ok: true });
