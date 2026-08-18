@@ -1262,10 +1262,13 @@ try {
       const tabTexts = [...pane.querySelectorAll('.tabs button')].map(b => b.textContent);
       const untrackedTab = [...pane.querySelectorAll('.tabs button')]
         .find(b => (b.textContent || '').startsWith('+'));
-      // 選ぶと「未追跡なので表示できない」理由が出る（無言で壊れない）
+      // 📝 選ぶだけで中身が読める（編集画面に入らない）
       untrackedTab.click();
       await wait(400);
       const note = (pane.innerText || '');
+      // 🚨 **「編集」を押す前に測る。** 押した後に見ると当然 textarea があるので、
+      //    「見るだけで textarea が開いていない」を**測れていない**状態になる（実測で踏んだ）。
+      const noTextareaWhenViewing = !pane.querySelector('textarea');
       // 「編集」を押すと中身が入る
       const eb = [...pane.querySelectorAll('.tabs button')].find(b => b.textContent === '編集');
       if (!eb) return { error: '編集ボタンが無い', tabs: tabTexts };
@@ -1278,7 +1281,12 @@ try {
       const ta = pane.querySelector('textarea');
       return {
         tabs: tabTexts,
-        saidUntracked: /未追跡/.test(note),
+        // 📝 #77-B: 未追跡を選んだら**編集に入らず中身が出る**（注意書きだけで終わらない）。
+        //    ⚠️ 以前は「未追跡なので表示できません」の注意書きを測っていたが、
+        //    B で挙動を変えた（読み取り専用で中身を出す）ので、**中身が出たか**を測る。
+        viewedContent: /エージェントが作った/.test(note),
+        // 見るだけのときに textarea を開いていない（スマホの誤タッチで内容が変わらない）
+        viewedWithoutTextarea: noTextareaWhenViewing,
         text: ta ? ta.value : null,
         closed: await (async () => {
           // ⚠️ **開けたら閉じる。** editing のままだとペインが作り直されず、
@@ -1405,15 +1413,19 @@ try {
         if (untrackedUi.tabs.some(t => /ignored/.test(t))) {
             problems.push(`🚨 gitignore されたファイルがタブに出ている: ${JSON.stringify(untrackedUi.tabs)}`);
         }
-        if (!untrackedUi.saidUntracked) {
-            problems.push('未追跡を選んでも「未追跡だから表示できない」と言っていない（無言で壊れて見える）');
+        // 📝 #77-B: 選んだだけで中身が読める（編集画面に入らない）
+        if (!untrackedUi.viewedContent) {
+            problems.push('未追跡を選んでも中身が出ない（読み取り専用の閲覧が効いていない）');
+        }
+        if (!untrackedUi.viewedWithoutTextarea) {
+            problems.push('見るだけなのに textarea を開いている（スマホの誤タッチで内容が変わる）');
         }
         if (!/エージェントが作った/.test(untrackedUi.text ?? '')) {
             problems.push(`未追跡ファイルの中身が編集器に入らない: ${JSON.stringify(untrackedUi.text)}`);
         }
     }
     console.log(`   未追跡: タブ ${JSON.stringify((untrackedUi.tabs ?? []).filter(t => t.startsWith('+')))}`
-        + ` / 理由を言った ${untrackedUi.saidUntracked ?? '(測れず)'}`
+        + ` / 閲覧 ${untrackedUi.viewedContent ?? "(測れず)"} / textareaなし ${untrackedUi.viewedWithoutTextarea ?? "(測れず)"}`
         + ` / 中身 ${JSON.stringify((untrackedUi.text ?? '(測れず)').slice(0, 20))}`);
 
     // 🔒 リポジトリの切り替え（#複数リポジトリ）

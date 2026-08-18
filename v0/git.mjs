@@ -268,6 +268,23 @@ export async function changedFiles(cwd, base, head) {
  *    旧パスが `1 `/`2 `/`? `/`u ` で始まっていると二重にカウントされる。
  *    （`log()` の `%D` で踏んだのと同じ罠をここでも踏んでいた。レビューで発覚）
  */
+/**
+ * `status --porcelain=v2` の行から**パスだけ**を取り出す（先頭 n 個の空白区切りを飛ばす）。
+ *
+ * 🚨 **`split(' ')` で取り出さない。** パスは空白を含みうるので、
+ *    分割すると**空白入りのファイル名が切れる**（このリポジトリが
+ *    「パスを含むコマンドは常に -z」と決めている理由と同じ型の壊れ方）。
+ *    n 個目の空白の**後ろ全部**を返す。
+ */
+function afterFields(line, n) {
+    let at = -1;
+    for (let k = 0; k < n; k++) {
+        at = line.indexOf(' ', at + 1);
+        if (at === -1) return '';
+    }
+    return line.slice(at + 1);
+}
+
 export async function worktreeStatus(cwd, filterNames = []) {
     const stdout = await git(
         [...filterNeutralizeArgs(filterNames),
@@ -286,12 +303,34 @@ export async function worktreeStatus(cwd, filterNames = []) {
     //    `dir/` に畳まれる**。その中身はここに出ない（編集の一覧にも出ない）。
     //    畳まれた表記（末尾 `/`）はファイルではないので落とす。
     const untrackedPaths = [];
+    // 🔒 **未コミットで変更された「追跡ファイル」のパスも集める（#77 の A）。**
+    //    エージェントは作業中ほとんどコミットしないので、`base...HEAD` だけを
+    //    並べると**「今まさに書いたもの」が一覧に出ない**（実測で3 worktree すべて 0 件）。
+    //    ⚠️ ここも spawn を増やさないために status の解析で拾う。
+    //    ⚠️ **未追跡は入れない**（`+` の役割と混ぜない。`*` は追跡ファイルの変更）。
+    const dirtyPaths = [];
     for (let i = 0; i < entries.length; i++) {
         const e = entries[i];
-        if (e.startsWith('2 ')) { changed++; i++; continue; }   // 次のトークンは origPath
-        if (e.startsWith('1 ')) changed++;
-        else if (e.startsWith('u ')) { changed++; unmerged++; }
-        else if (e.startsWith('? ')) {
+        if (e.startsWith('2 ')) {
+            // `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>` + NUL + `<origPath>`
+            // 🚨 rename は**2トークン**（CLAUDE.md）。次のトークンを必ず読み飛ばす
+            changed++;
+            const p2 = afterFields(e, 9);
+            if (p2) dirtyPaths.push(toNFC(p2));
+            i++;
+            continue;
+        }
+        if (e.startsWith('1 ')) {
+            // `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`
+            changed++;
+            const p1 = afterFields(e, 8);
+            if (p1) dirtyPaths.push(toNFC(p1));
+        } else if (e.startsWith('u ')) {
+            // `u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>`
+            changed++; unmerged++;
+            const pu = afterFields(e, 10);
+            if (pu) dirtyPaths.push(toNFC(pu));
+        } else if (e.startsWith('? ')) {
             untracked++;
             const p = toNFC(e.slice(2));
             if (p && !p.endsWith('/')) untrackedPaths.push(p);
@@ -299,7 +338,8 @@ export async function worktreeStatus(cwd, filterNames = []) {
         // '! ' (ignored) と '# ' (header) は無視
     }
     return {
-        changed, untracked, unmerged, untrackedPaths, dirty: changed > 0 || untracked > 0,
+        changed, untracked, unmerged, untrackedPaths, dirtyPaths,
+        dirty: changed > 0 || untracked > 0,
     };
 }
 
@@ -654,6 +694,28 @@ export async function fileDiff(cwd, base, ref, path) {
     const buf = await git([
         'diff', '--no-color', '--no-ext-diff', '--no-textconv',
         `${base}...${ref}`, '--', path,
+    ], { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
+    if (looksBinary(buf)) return { path, binary: true, text: null };
+    return { path, binary: false, text: toNFC(buf.toString('utf8')) };
+}
+
+/**
+ * **HEAD ↔ 作業ツリー**の差分（#77 の A）。「エージェントが今何を書いたか」を見るための経路。
+ *
+ * 🚨 **`fileDiff` と別関数にする。** あちらは `base...ref` の**コミット済み**差分で、
+ *    cwd はリポジトリのルートでよい。こちらは**その worktree の作業ツリー**を見るので、
+ *    cwd が**対象の worktree でなければ意味が違う**（別の場所の変更を見せてしまう）。
+ *    呼ぶ側が登録済み worktree との照合を済ませてから渡すこと。
+ * 🔒 **追跡ファイルだけが対象。** `git diff` は未追跡も ignored も見ないので、
+ *    `.env` や新規ファイルはここから出てこない（`+` の経路と役割が分かれている）。
+ * ⚠️ `--no-textconv` は必須（リポジトリ設定の `diff.<name>.textconv` から
+ *    コマンドが起動しうる。`--no-ext-diff` では止まらない）。
+ */
+export async function worktreeFileDiff(cwd, path) {
+    if (!isSafeRepoPath(path)) throw new GitError(['diff'], 2, `path が不正です: ${path}`);
+    const buf = await git([
+        'diff', '--no-color', '--no-ext-diff', '--no-textconv',
+        'HEAD', '--', path,
     ], { cwd, raw: true, maxBytes: MAX_BLOB_BYTES + 1024 });
     if (looksBinary(buf)) return { path, binary: true, text: null };
     return { path, binary: false, text: toNFC(buf.toString('utf8')) };

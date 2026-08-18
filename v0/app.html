@@ -1391,6 +1391,70 @@ async function loadDiff(holder, base, ref, path) {
   }
 }
 
+/**
+ * 📝 **HEAD ↔ 作業ツリーの差分（#77 の A）。「エージェントが今何を書いたか」。**
+ *
+ * ⚠️ 経路は既存の `/api/v0/diff` のまま（`mode=worktree`）。**新しい中身の返し口を作らない**
+ *    （経路を散らすと認可を1つ忘れる、というのがこの repo の事故の型）。
+ * ⚠️ 対象の worktree はサーバが登録済み一覧と照合する。ここでパスを組み立てない。
+ */
+async function loadWorktreeDiff(holder, worktree, path) {
+  holder.replaceChildren(el('div', 'note', `読み込み中: ${path}（未コミットの変更）`));
+  try {
+    const res = await fetch(api('/api/v0/diff', { mode: 'worktree', worktree, path }));
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error ?? `HTTP ${res.status}`);
+    if (d.binary) { holder.replaceChildren(el('div', 'note', 'バイナリファイル')); return; }
+    // ⚠️ **空を黙って出さない。** ここが空なら「変更が消えた」= 一覧が古い可能性がある
+    if (!(d.text ?? '').trim()) {
+      holder.replaceChildren(el('div', 'note',
+        `${path} に未コミットの変更はもうありません（一覧は最大15秒古いことがあります）`));
+      return;
+    }
+    holder.replaceChildren(renderDiff(d.text ?? ''));
+  } catch (e) {
+    holder.replaceChildren(el('div', 'note warn', `取得できませんでした: ${e.message}`));
+  }
+}
+
+/**
+ * 📝 **未追跡ファイルを読み取り専用で見る（#77 の B）。**
+ *
+ * 🔒 **経路は編集と同じ `/api/v0/file`（読み側）。** `blob` は `git cat-file` 経由なので
+ *    未追跡は構造的に読めない。そこに fs 読みを足すと**読み取りの鍵で作業ツリーが見える**
+ *    ことになり、capability の分界が崩れる（`docs/editor-filer.md` の不変条件2）。
+ *    つまりここで読めるのは「**編集できる相手**」だけで、権限は1つも増えていない。
+ * ⚠️ 読めないときは**理由をそのまま出す**（黙って空にしない）。
+ */
+async function loadUntracked(holder, worktree, path) {
+  holder.replaceChildren(el('div', 'note', `読み込み中: ${path}（未追跡）`));
+  try {
+    // ⚠️ `post` は openEditor のローカルなのでここからは使えない。鍵はヘッダで送る
+    //    （案内 URL に載るのは読み取り専用の派生秘密なので、それだけだと 403 になる）。
+    const res = await fetch('/api/v0/file', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(session.token ? { [session.tokenHeader]: session.token } : {}),
+      },
+      body: JSON.stringify({ worktree, path }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      holder.replaceChildren(el('div', 'note warn',
+        `${path} は未追跡です（まだ git に入っていません）。読めません: ${d.error ?? `HTTP ${res.status}`}`));
+      return;
+    }
+    // 全文ビューアと同じ形で描く（行番号・上限・切ったら告知）
+    renderBlob(holder, planBlobView({
+      path, ref: '作業ツリー（未追跡）', size: d.bytes ?? (d.text ?? '').length,
+      binary: false, tooLarge: false, text: d.text ?? '',
+    }));
+  } catch (e) {
+    holder.replaceChildren(el('div', 'note warn', `取得できませんでした: ${e.message}`));
+  }
+}
+
 /* ===== 最小エディタ（--allow-write の枠内） =====
  *
  * 🚨 **自動更新で編集中の textarea を作り直さない。**
@@ -3264,10 +3328,17 @@ function render(s) {
       //    そこには「コミットに入っているもの」しか無い）。**理由を出す**
       //    — 黙って空や「取得できませんでした」を出すと、壊れていると誤解する。
       if ((wt.untracked ?? []).includes(obj.sel)) {
-        holder.replaceChildren(el('div', 'note',
-          `${obj.sel} は**未追跡**です（まだ git に入っていません）。`
-          + ' 差分も全文も git の中身を読むので表示できません。'
-          + (session.canMutate ? '「編集」で中身を開けます。' : '')));
+        // 📝 **編集画面に入らずに読む（#77 の B）。**
+        //    スマホでは誤タッチで内容が変わりうるので、「見るだけ」に textarea を開かない。
+        // 🔒 経路は**編集と同じ**（`/api/v0/file` の読み側）。`blob` に fs 読みを足すと
+        //    読み取りの鍵で作業ツリーが見えることになり、capability の分界が崩れる。
+        loadUntracked(holder, wt.path, obj.sel);
+        return;
+      }
+      // 📝 未コミットの変更は **HEAD ↔ 作業ツリー**で見る（`base...HEAD` では出ない）。
+      //    ⚠️ 「全文」を選んでいるときは従来どおり git の中身を読む（ref を選べる意味を保つ）。
+      if ((wt.dirtyFiles ?? []).includes(obj.sel) && obj.mode !== 'blob') {
+        loadWorktreeDiff(holder, wt.path, obj.sel);
         return;
       }
       if (obj.mode === 'blob') loadBlob(holder, obj.viewRef, obj.sel);
@@ -3293,6 +3364,23 @@ function render(s) {
       tabs.append(b);
     }
     if (!files.length) tabs.append(el('button', 'on', '(差分なし)'));
+    /* 📝 **未コミットで変更された追跡ファイル（#77 の A）。**
+     *
+     * エージェントは作業中ほとんどコミットしないので、`base...HEAD` のタブだけだと
+     * **「今まさに書いたもの」が一覧に出ない**（実測で3 worktree すべて 0 件だった）。
+     * ⚠️ **印を3種類で分ける**（素 = コミット済み / `*` = 未コミット / `+` = 未追跡）。
+     *    同じ見た目にすると「何の差分を見ているか」が分からなくなる（#4 と同じ型の事故）。 */
+    const dirty = (wt.dirtyFiles ?? []).slice(0, 6);
+    for (const dp of dirty) {
+      const b = el('button', dp === obj.sel ? 'on' : null, `*${dp.split('/').pop()}`);
+      b.title = `${dp}（未コミットの変更）`;
+      b.addEventListener('click', () => openIn(dp));
+      tabs.append(b);
+    }
+    const hiddenDirty = (wt.dirtyFiles?.length ?? 0) - dirty.length + (wt.dirtyMore ?? 0);
+    if (hiddenDirty > 0) {
+      tabs.append(el('span', 'note warn', `⚠ 未コミット 他 ${hiddenDirty} 件は出していません`));
+    }
     /* 📝 **未追跡ファイル（`--allow-untracked` のときだけ payload に入る）。**
      *
      * エージェントが作った**まだ add していない新規ファイル**を画面から直すため。
@@ -3328,7 +3416,8 @@ function render(s) {
     // ⚠️ **未追跡だけがある worktree でも「編集」を出す**（files は差分のタブ）。
     //    ここを files.length だけで判定すると、新規ファイルしか無い worktree で
     //    タブは出るのにボタンが無い（押せない）状態になる。
-    if (session.allowWrite && (files.length || untracked.length) && !wt.bare && !wt.prunable) {
+    if (session.allowWrite && (files.length || untracked.length || dirty.length)
+      && !wt.bare && !wt.prunable) {
       if (session.canMutate) {
         const eb = el('button', null, '編集');
         eb.title = '選択中のファイルを編集する（保存前に差分を確認できます）';

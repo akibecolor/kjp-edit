@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve, relative } from 'node:path';
 import {
     git, listWorktrees, log, aheadBehind, commonDir,
-    changedFiles, worktreeStatus, sequencerState,
+    changedFiles, worktreeStatus, sequencerState, worktreeFileDiff,
     refMap, resolveRef, worktreeGitDirs, stats, splitZ,
     showBlob, fileDiff, toNFC, samePath, containsPath, isSafeRepoPath, isSafeRef,
     mergePreview, mergeDriverNames, repoFilterNames,
@@ -1013,6 +1013,13 @@ async function collectFresh(repo) {
             },
             warnings: w.sequencer.warnings ?? [],
             files: w.files,
+            // 📝 **未コミットで変更された追跡ファイル（#77 の A）。**
+            //    「エージェントが今何を書いたか」がこのツールの中心的な価値なので、
+            //    **読み取りの鍵にも返す**（利用者の判断 2026-08-18。`docs/editor-filer.md` §4）。
+            //    ⚠️ `git diff` 由来なので **ignored も未追跡も入らない**（追跡ファイルだけ）。
+            //    ⚠️ 上限で切ったら**件数を告げる**（黙って省略しない）。
+            dirtyFiles: (w.status?.dirtyPaths ?? []).slice(0, 50),
+            dirtyMore: Math.max(0, (w.status?.dirtyPaths ?? []).length - 50),
             // 📝 **未追跡ファイルの一覧（`--allow-untracked` のときだけ）。**
             //    ⚠️ 既定では**キーごと出さない**（使えない構成に一覧を配らない）。
             //    ⚠️ ignored は入らない（`? ` は未追跡かつ ignored でないものだけ）。
@@ -4264,10 +4271,31 @@ async function handleRequest(req, res) {
         if (url.pathname === '/api/v0/blob' || url.pathname === '/api/v0/diff') {
             const path = url.searchParams.get('path') ?? '';
             const ref = url.searchParams.get('ref') ?? 'HEAD';
+            // 📝 **HEAD ↔ 作業ツリーの差分（#77 の A）。新しいエンドポイントは作らない。**
+            //    エージェントは作業中ほとんどコミットしないので、`base...HEAD` だけでは
+            //    「今まさに書いたもの」が見えない（実測で3 worktree すべて 0 件）。
+            // 🔒 **対象の worktree を登録済み一覧と照合する。** ここを緩めると
+            //    リポジトリ外の作業ツリーを読めることになる（編集の門と同じ根拠）。
+            //    ⚠️ cwd が対象の worktree でないと**別の場所の変更**を見せてしまうので、
+            //    照合して解決した path だけを cwd にする。
+            const wantWorktree = url.searchParams.get('mode') === 'worktree';
+            let wtCwd = null;
+            if (wantWorktree && url.pathname === '/api/v0/diff') {
+                const wantPath = toNFC(url.searchParams.get('worktree') ?? '');
+                const hit = (await listWorktrees(repo)).find(w => samePath(w.path, wantPath));
+                if (!hit) {
+                    denyJson(res, 400, `既知の worktree ではありません: ${wantPath}`);
+                    return;
+                }
+                if (hit.bare) { denyJson(res, 400, 'bare worktree に作業ツリーはありません'); return; }
+                wtCwd = hit.path;
+            }
             try {
                 const body = url.pathname === '/api/v0/blob'
                     ? await showBlob(repo, ref, path)
-                    : await fileDiff(repo, url.searchParams.get('base') ?? 'HEAD', ref, path);
+                    : (wtCwd
+                        ? await worktreeFileDiff(wtCwd, path)
+                        : await fileDiff(repo, url.searchParams.get('base') ?? 'HEAD', ref, path));
                 res.writeHead(200, {
                     'content-type': 'application/json; charset=utf-8',
                     'cache-control': 'no-store',

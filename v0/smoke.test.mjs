@@ -8333,3 +8333,180 @@ test('🔒 未追跡でも worktree の外・存在しないパスは編集で�
         void await missing.text();
     }, ['--allow-untracked']);
 });
+
+/* ===========================================================================
+ * 📝 #77-A: 未コミットの変更をファイラに並べ、HEAD ↔ 作業ツリーの差分を見る
+ *
+ * 🚨 エージェントは作業中ほとんどコミットしないので、`base...HEAD` だけを並べると
+ *    「今まさに書いたもの」が一覧に出ない（実測で母艦の3 worktree すべて 0 件だった）。
+ * =========================================================================== */
+
+/** 追跡・未追跡・ignored・空白入りの名前を1つずつ持つ worktree を作る */
+async function withDirtyFixture(fn, extra = []) {
+    const dir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-dirty-'));
+    const r = join(dir, 'proj');
+    await mkdir(r, { recursive: true });
+    const gg = a => g(a, r);
+    await gg(['init', '-q', '-b', 'main']);
+    await writeFile(join(r, 'tracked.txt'), 'もとの内容\n', 'utf8');
+    await writeFile(join(r, 'sp ace.txt'), 'space\n', 'utf8');
+    await writeFile(join(r, '.gitignore'), 'ign.txt\n', 'utf8');
+    await gg(['add', '-A']);
+    await gg(['-c', 'user.email=t@e', '-c', 'user.name=t', 'commit', '-q', '-m', 'init']);
+    // 未コミットの変更（追跡）／ignored／未追跡
+    await writeFile(join(r, 'tracked.txt'), 'エージェントが書いた\n', 'utf8');
+    await writeFile(join(r, 'sp ace.txt'), 'space changed\n', 'utf8');
+    await writeFile(join(r, 'ign.txt'), 'SECRET\n', 'utf8');
+    await writeFile(join(r, 'brand-new.txt'), '新規\n', 'utf8');
+    const s = await startAuthServer(['--repo', r, ...extra]);
+    const url = `http://127.0.0.1:${s.port}`;
+    try {
+        await fn({ url, repo: r });
+    } finally {
+        s.child.kill();
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
+test('📝 未コミットの変更が payload に出る（ignored も未追跡も混ざらない）', async () => {
+    await withDirtyFixture(async ({ url, repo: r }) => {
+        const st = await (await fetch(`${url}/api/v0/state?fresh=1&repo=${encodeURIComponent(r)}`)).json();
+        const wt = st.worktrees.find(w => sameRepoPath(w.path, r)) ?? st.worktrees[0];
+        const dirty = wt.dirtyFiles ?? [];
+        // 🚨 空白入りのパスが壊れない（split(' ') で取ると切れる）
+        assert.deepEqual([...dirty].sort(), ['sp ace.txt', 'tracked.txt'],
+            `未コミットの一覧が違う: ${JSON.stringify(dirty)}`);
+        // 🔒 ignored は入らない
+        assert.equal(dirty.includes('ign.txt'), false, '🚨 gitignore されたファイルが混ざった');
+        // 🔒 未追跡は `+` 側の役割。ここに混ぜない
+        assert.equal(dirty.includes('brand-new.txt'), false, '🚨 未追跡が未コミットに混ざった');
+    });
+});
+
+test('📝 HEAD ↔ 作業ツリーの差分が読める（base...HEAD とは別の内容）', async () => {
+    await withDirtyFixture(async ({ url, repo: r }) => {
+        const q = new URLSearchParams({
+            mode: 'worktree', worktree: r, path: 'tracked.txt', repo: r,
+        });
+        const res = await fetch(`${url}/api/v0/diff?${q}`);
+        const d = await res.json();
+        assert.equal(res.status, 200, `作業ツリー差分が取れない: ${JSON.stringify(d)}`);
+        assert.match(d.text ?? '', /エージェントが書いた/, '今の変更が差分に出ていない');
+        assert.match(d.text ?? '', /もとの内容/, 'HEAD 側が差分に出ていない');
+        // base...HEAD は「コミット済み差分ゼロ」なので空（別物であることを示す）
+        const q2 = new URLSearchParams({ base: 'main', ref: 'main', path: 'tracked.txt', repo: r });
+        const d2 = await (await fetch(`${url}/api/v0/diff?${q2}`)).json();
+        assert.equal((d2.text ?? '').trim(), '',
+            `base...HEAD が空でない（検査の前提が崩れている）: ${d2.text}`);
+    });
+});
+
+test('🔒 作業ツリー差分は登録済み worktree にしか出さない', async () => {
+    await withDirtyFixture(async ({ url, repo: r }) => {
+        // 🚨 **「git が失敗した 400」と「門が弾いた 400」を区別する。**
+        //    最初は存在しないディレクトリだけで測っていたので、照合を外す変異でも
+        //    git 側が落ちて 400 になり、**守りを外しても緑**だった（SURVIVED で気付いた）。
+        //    そこで**別の本物の git リポジトリ**（登録されていない）を用意して、
+        //    門が無ければ 200 で中身が読めてしまう形にする。
+        const outsideDir = await mkdtemp(join(realpathSync(tmpdir()), 'kjp-outside-'));
+        const outside = join(outsideDir, 'other');
+        await mkdir(outside, { recursive: true });
+        const og = a => g(a, outside);
+        await og(['init', '-q', '-b', 'main']);
+        await writeFile(join(outside, 'tracked.txt'), 'よそのリポジトリ\n', 'utf8');
+        await og(['add', '-A']);
+        await og(['-c', 'user.email=t@e', '-c', 'user.name=t', 'commit', '-q', '-m', 'other']);
+        await writeFile(join(outside, 'tracked.txt'), 'よその未コミット変更\n', 'utf8');
+        try {
+            const q = new URLSearchParams({
+                mode: 'worktree', worktree: outside, path: 'tracked.txt', repo: r,
+            });
+            const res = await fetch(`${url}/api/v0/diff?${q}`);
+            const body = await res.text();
+            assert.equal(res.status, 400,
+                `🚨 登録されていない別リポジトリの作業ツリーを読めた: ${body.slice(0, 200)}`);
+            assert.equal(body.includes('よその未コミット変更'), false,
+                '🚨 よそのリポジトリの中身が返っている');
+        } finally {
+            await rm(outsideDir, { recursive: true, force: true }).catch(() => {});
+        }
+        for (const w of [join(r, '..'), 'C:/Windows', '/etc']) {
+            const q = new URLSearchParams({
+                mode: 'worktree', worktree: w, path: 'tracked.txt', repo: r,
+            });
+            const res = await fetch(`${url}/api/v0/diff?${q}`);
+            assert.equal(res.status, 400, `既知でない worktree が通った: ${w}`);
+            void await res.text();
+        }
+        // 🔒 ignored なファイルは作業ツリー差分にも出ない（git diff は追跡だけを見る）
+        const q = new URLSearchParams({
+            mode: 'worktree', worktree: r, path: 'ign.txt', repo: r,
+        });
+        const d = await (await fetch(`${url}/api/v0/diff?${q}`)).json();
+        assert.equal((d.text ?? '').trim(), '', `🚨 ignored の中身が差分に出た: ${d.text}`);
+    });
+});
+
+test('📝 未追跡は編集に入らず読める（経路は編集と同じ門）', async () => {
+    await withDirtyFixture(async ({ url, repo: r }) => {
+        const read = await fetch(`${url}/api/v0/file?repo=${encodeURIComponent(r)}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-kjp-token': WRITE_TOKEN },
+            body: JSON.stringify({ worktree: r, path: 'brand-new.txt' }),
+        });
+        const d = await read.json();
+        assert.equal(read.status, 200, `未追跡を読めない: ${JSON.stringify(d)}`);
+        assert.match(d.text, /新規/, '中身が違う');
+        // 🔒 blob（読み取りの鍵の経路）では従来どおり読めない（分界を保つ）
+        const q = new URLSearchParams({ ref: 'HEAD', path: 'brand-new.txt', repo: r });
+        const viaBlob = await fetch(`${url}/api/v0/blob?${q}`);
+        assert.equal(viaBlob.status, 400, '🚨 未追跡が blob 経由で読めた（分界が崩れている）');
+        void await viaBlob.text();
+    }, ['--allow-write', '--token', WRITE_TOKEN, '--allow-untracked']);
+});
+
+test('🚨 作業ツリー差分もリポジトリ設定のコマンドを実行しない（写した守りを未検証にしない）', async () => {
+    // 🚨 `worktreeFileDiff` は `fileDiff` と**同じ引数を写して**作った。
+    //    片方だけ検査があると「新しい方は外しても誰も気付かない」状態になる
+    //    （このリポジトリが「写した瞬間に守りが未検証になる」で何度も踏んだ型）。
+    // ⚠️ バックスラッシュの正規表現はシェル越しの編集で壊れるので sep 分割で書く
+    const marker = join(repo, 'wt-textconv-ran.txt').split(sep).join('/');
+    const hook = join(repo, 'wt-textconv.sh').split(sep).join('/');
+    const { existsSync } = await import('node:fs');
+    const { chmod } = await import('node:fs/promises');
+    try {
+        await writeFile(hook, '#!/bin/sh\nprintf ran >> "' + marker + '"\ncat "$1"\n', 'utf8');
+        await chmod(hook, 0o755);
+        // 🚨 **対象は「main worktree で追跡されている」ファイルでなければならない。**
+        //    最初 `shared.txt` を使ったが、あれは**agent worktree にしか無い**ので
+        //    main では未追跡 → `git diff HEAD` が空 → textconv が呼ばれず、
+        //    **守りを外しても検査が緑のまま**だった（変異が SURVIVED して気付いた）。
+        await writeFile(join(repo, 'wt-diff-target.txt'), 'もとの内容\n', 'utf8');
+        await writeFile(join(repo, '.gitattributes'), 'wt-diff-target.txt diff=evil2\n', 'utf8');
+        await g(['add', '-A'], repo);
+        await g(['commit', '-q', '-m', 'chore: 作業ツリー差分の textconv テスト用'], repo);
+        await g(['config', 'diff.evil2.textconv', hook], repo);
+        await g(['config', 'diff.evil2.command', hook], repo);
+        // 追跡ファイルを未コミットで変更する（作業ツリー差分の対象を作る）
+        await writeFile(join(repo, 'wt-diff-target.txt'), 'まだコミットしていない変更\n', 'utf8');
+
+        const q = new URLSearchParams({
+            mode: 'worktree', worktree: repo, path: 'wt-diff-target.txt',
+        });
+        const r = await fetch(`${baseUrl}/api/v0/diff?${q}`);
+        assert.equal(r.status, 200, `作業ツリー差分が取れない: ${r.status}`);
+        await r.json();
+        await new Promise(x => setTimeout(x, 400));
+        assert.equal(existsSync(marker), false,
+            '🚨 作業ツリー差分から textconv / ext-diff が実行された（読み取り経路から任意コード実行）');
+    } finally {
+        await g(['config', '--unset', 'diff.evil2.textconv'], repo).catch(() => {});
+        await g(['config', '--unset', 'diff.evil2.command'], repo).catch(() => {});
+        await rm(join(repo, '.gitattributes'), { force: true }).catch(() => {});
+        await rm(hook, { force: true }).catch(() => {});
+        await rm(marker, { force: true }).catch(() => {});
+        await rm(join(repo, 'wt-diff-target.txt'), { force: true }).catch(() => {});
+        await g(['add', '-A'], repo).catch(() => {});
+        await g(['commit', '-q', '-m', 'chore: 作業ツリー差分の textconv テスト後始末'], repo).catch(() => {});
+    }
+});

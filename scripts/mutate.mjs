@@ -139,6 +139,62 @@ const MUTANTS = [
         script: 'v0/open-check.mjs',
     },
     /* -----------------------------------------------------------------
+     * 📝 #77-A: 未コミットの変更をファイラに並べる（docs/editor-filer.md §7）
+     * ----------------------------------------------------------------- */
+    {
+        // 🚨 `*`（未コミット）と `+`（未追跡）の役割を混ぜると、何を見ているか分からなくなる
+        name: 'dirty-files-includes-untracked',
+        why: '未コミットの一覧に未追跡も混ぜる（*  と + の役割が壊れ、何の差分か分からなくなる）',
+        file: 'v0/git.mjs',
+        from: "            if (p && !p.endsWith('/')) untrackedPaths.push(p);",
+        to: "            if (p && !p.endsWith('/')) { untrackedPaths.push(p); dirtyPaths.push(p); }",
+        gone: "if (p && !p.endsWith('/')) untrackedPaths.push(p);",
+        pattern: '未コミットの変更が payload に出る',
+    },
+    {
+        // 🚨 空白入りのパスを split で取ると切れる（-z を使う理由と同じ型）
+        name: 'dirty-path-split-space',
+        why: 'status の行から split で取り出す（空白入りのファイル名が切れて開けなくなる）',
+        file: 'v0/git.mjs',
+        from: '    return line.slice(at + 1);',
+        to: "    return line.split(' ')[n] ?? '';   /* 変異: 空白で割る */",
+        gone: 'return line.slice(at + 1);',
+        pattern: '未コミットの変更が payload に出る',
+    },
+    {
+        // 🚨 **写した守りも測る。** `worktreeFileDiff` は `fileDiff` と同じ引数を持つので、
+        //    片方だけ変異があると「新しい方は外しても誰も気付かない」状態になる
+        //    （このリポジトリが「写した瞬間に変異が外れる」で何度も踏んだ型）。
+        name: 'worktree-diff-no-textconv',
+        why: '作業ツリー差分で --no-textconv を外す（リポジトリ設定の textconv が読み取り経路から走る）',
+        file: 'v0/git.mjs',
+        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',\n        'HEAD', '--', path,",
+        to: "        'diff', '--no-color', '--no-ext-diff',\n        'HEAD', '--', path,",
+        gone: "'--no-textconv',\n        'HEAD', '--', path,",
+        pattern: '作業ツリー差分もリポジトリ設定のコマンドを実行しない',
+    },
+    {
+        // 🚨 「今の変更」を見に行かず、コミット済み差分を返す（要件そのものが消える）
+        name: 'dirty-diff-uses-committed',
+        why: 'mode=worktree を無視して base...HEAD を返す（エージェントが今書いたものが見えない）',
+        file: 'v0/server.mjs',
+        // ⚠️ 1行で一意になる形にする（複数行の錨はシェル越しで壊れやすい）
+        from: '                        ? await worktreeFileDiff(wtCwd, path)',
+        to: '                        ? await fileDiff(repo, url.searchParams.get(\'base\') ?? \'HEAD\', ref, path)',
+        gone: '? await worktreeFileDiff(wtCwd, path)',
+        pattern: 'HEAD ↔ 作業ツリーの差分が読める',
+    },
+    {
+        // 🔒 登録済み worktree との照合を外すと、リポジトリ外の作業ツリーを読める
+        name: 'dirty-diff-any-worktree',
+        why: '作業ツリー差分の worktree 照合を外す（リポジトリ外の作業ツリーを読める）',
+        file: 'v0/server.mjs',
+        from: '                const hit = (await listWorktrees(repo)).find(w => samePath(w.path, wantPath));',
+        to: '                const hit = { path: wantPath, bare: false };   /* 変異: 照合しない */',
+        gone: 'const hit = (await listWorktrees(repo)).find(w => samePath(w.path, wantPath));',
+        pattern: '作業ツリー差分は登録済み worktree にしか出さない',
+    },
+    /* -----------------------------------------------------------------
      * 📝 未追跡ファイルの編集（既定オフ。ignored は対象外）
      * ----------------------------------------------------------------- */
     {
@@ -154,7 +210,7 @@ const MUTANTS = [
     {
         // 📝 UI: 未追跡を選んだ理由を言わない（無言で「取得できませんでした」になる）
         name: 'untracked-ui-no-reason',
-        why: '未追跡を選んでも理由を出さず、ビューアに投げる（無言で壊れて見える）',
+        why: '未追跡を選んでも読み取り専用の閲覧に回さず、ビューアに投げる（cat-file では読めないので中身が出ない）',
         file: 'v0/app.html',
         from: "      if ((wt.untracked ?? []).includes(obj.sel)) {",
         to: '      if (false) {   /* 変異: 理由を出さない */',
@@ -3410,18 +3466,20 @@ if (opts.allowExec && (!opts.token || opts.token.length < 24)) {`,
         why: 'diff で --no-textconv を外す（リポジトリ設定 diff.<name>.textconv の'
             + 'コマンドが無認証の読み取り経路から走る = RCE）',
         file: 'v0/git.mjs',
-        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',",
-        to: "        'diff', '--no-color', '--no-ext-diff',",
-        gone: "'--no-ext-diff', '--no-textconv'",
+        // ⚠️ `worktreeFileDiff` にも同じ引数ができたので、**次の行まで含めて**一意にする
+        //    （写した瞬間に既存の変異が STALE になる型。新しい方は別変異で測る）
+        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',\n        `${base}...${ref}`, '--', path,",
+        to: "        'diff', '--no-color', '--no-ext-diff',\n        `${base}...${ref}`, '--', path,",
+        gone: "'--no-textconv',\n        `${base}...${ref}`",
         pattern: 'diff がリポジトリ設定のコマンドを実行しない',
     },
     {
         name: 'diff-no-ext-diff',
         why: 'diff で --no-ext-diff を外す（diff.<name>.command の外部差分ツールが走る）',
         file: 'v0/git.mjs',
-        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',",
-        to: "        'diff', '--no-color', '--no-textconv',",
-        gone: "'--no-color', '--no-ext-diff'",
+        from: "        'diff', '--no-color', '--no-ext-diff', '--no-textconv',\n        `${base}...${ref}`, '--', path,",
+        to: "        'diff', '--no-color', '--no-textconv',\n        `${base}...${ref}`, '--', path,",
+        gone: "'--no-color', '--no-ext-diff', '--no-textconv',\n        `${base}...${ref}`",
         // ⚠️ 「`--no-textconv` があるから測れない」と書きかけたが、**実測では落ちる**
         //    （`diff.evil.command` が起動する）。推測でコメントを書かないこと。
         pattern: 'diff がリポジトリ設定のコマンドを実行しない',
